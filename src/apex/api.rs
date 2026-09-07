@@ -24,6 +24,7 @@ pub unsafe extern "C" fn apex_emit(
     ptr: *const Input,
     count: usize,
     shared: u32,
+    private: u32,
     path: *const c_char,
 ) -> i32 {
     report(
@@ -46,7 +47,7 @@ pub unsafe extern "C" fn apex_emit(
                     ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let p = mir::compile(&ops, shared)?;
+            let p = mir::compile(&ops, shared, private)?;
             eprintln!(
                 "apex: {} instructions, s{} v{}, shared {}, private {}/lane",
                 p.code.len(),
@@ -125,7 +126,7 @@ pub unsafe extern "C" fn apex_tool(
                         .map_err(|_| "invalid MIR value")?;
                     ops.push(mir::Op::new(op, p[0], p[1], p[2], p[3], p[4]));
                 }
-                let p = mir::compile(&ops, shared)?;
+                let p = mir::compile(&ops, shared, 0)?;
                 std::fs::write(output, p.bytes()?).map_err(|e| e.to_string())?;
             } else if mode == "--assemble" {
                 // Assembly preserves all variable launch requirements.

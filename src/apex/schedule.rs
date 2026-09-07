@@ -53,7 +53,7 @@ impl Scheduler {
         }
         // Preserve potentially aliasing memory order; independent reads overlap.
         if i.asynchronous() {
-            if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57) {
+            if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57 | 0x59) {
                 wait |= self.live();
             } else {
                 wait |= self.stores;
@@ -79,7 +79,7 @@ impl Scheduler {
             let t = self.tokens.iter().position(Option::is_none).unwrap();
             i.c = t as u8;
             self.tokens[t] = Some(writes.clone());
-            if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57) {
+            if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57 | 0x59) {
                 self.stores |= 1 << t;
             }
         } else {

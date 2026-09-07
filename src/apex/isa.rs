@@ -33,7 +33,7 @@ impl Inst {
         }
     }
     pub fn asynchronous(self) -> bool {
-        (0x50..=0x57).contains(&self.op)
+        (0x50..=0x59).contains(&self.op)
     }
     pub fn control(self) -> bool {
         matches!(self.op, 1 | 2 | 4 | 5 | 7)
@@ -77,6 +77,8 @@ impl Inst {
             0x55 => [v, v, if self.imm == 2 { vp } else { v }, None],
             0x56 => [v, None, None, None],
             0x57 => [None, None, v, None],
+            0x58 => [v, v, None, None],
+            0x59 => [None, v, v, None],
             _ => return Err(format!("unknown opcode {:02x}", self.op)),
         })
     }
@@ -105,7 +107,7 @@ impl Inst {
             }
         }
         let valid = match self.op {
-            2 | 4 | 5 | 0x10 | 0x20 | 0x56 | 0x57 => true,
+            2 | 4 | 5 | 0x10 | 0x20 | 0x56..=0x59 => true,
             3 => self.imm > 0 && self.imm < 16,
             0x40 => self.imm <= 4,
             0x41 => self.imm <= 6,
@@ -202,6 +204,8 @@ pub const NAMES: &[(u8, &str)] = &[
     (0x55, "shared_atomic_add"),
     (0x56, "private_load"),
     (0x57, "private_store"),
+    (0x58, "private_load_index"),
+    (0x59, "private_store_index"),
 ];
 
 pub fn assemble(text: &str) -> Result<Vec<Inst>, String> {
@@ -283,7 +287,7 @@ impl Program {
             if matches!(i.op, 4 | 5) && i.imm as usize >= self.code.len() {
                 return Err("branch out of code".into());
             }
-            if matches!(i.op, 0x56 | 0x57) && i.imm >= self.private / 4 {
+            if matches!(i.op, 0x56..=0x59) && i.imm >= self.private / 4 {
                 return Err("private word out of allocation".into());
             }
             for Reg(c, r) in i.regs(false).into_iter().chain(i.regs(true)) {

@@ -46,7 +46,10 @@ fn roles(op: u8, imm: u32) -> Result<[Option<(Class, u8)>; 4], String> {
     }
 }
 
-pub fn compile(ops: &[Op], shared: u32) -> Result<Program, String> {
+pub fn compile(ops: &[Op], shared: u32, source_private: u32) -> Result<Program, String> {
+    if source_private % 4 != 0 {
+        return Err("unaligned source private size".into());
+    }
     // Out-of-SSA phi webs use mutable virtual registers. Preserve their homes
     // across every mask arm and backedge; linear SSA keeps interval reuse.
     let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
@@ -105,7 +108,7 @@ pub fn compile(ops: &[Op], shared: u32) -> Result<Program, String> {
     order.sort_by_key(|(&id, v)| (v.2, id));
     let mut homes = BTreeMap::new();
     let mut occupied: Vec<(Class, u8, u8, usize)> = Vec::new();
-    let mut words = 0u32;
+    let mut words = source_private / 4;
     for (&id, &(cl, n, start, end)) in order {
         occupied.retain(|v| v.3 >= start);
         let first = if cl == Class::S { 4 } else { 0 };

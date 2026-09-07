@@ -79,7 +79,7 @@ fn raw_waw_tokens_and_branches() {
 }
 #[test]
 fn metadata_and_private_bounds() {
-    let p = mir::compile(&[Op::new(0x40, 0, 0, 0, 0, 0)], 0).unwrap();
+    let p = mir::compile(&[Op::new(0x40, 0, 0, 0, 0, 0)], 0, 0).unwrap();
     let mut bytes = p.bytes().unwrap();
     assert_eq!(Program::parse(&bytes).unwrap().code, p.code);
     bytes.push(0);
@@ -104,7 +104,7 @@ fn pressure_and_long_chain() {
         Op::new(0x20, 500, 0, 0, 0, 0),
         Op::new(0x54, 0, 500, v, 0, 0),
     ]);
-    let p = mir::compile(&chain, 4).unwrap();
+    let p = mir::compile(&chain, 4, 0).unwrap();
     assert_eq!(p.private, 0);
     for lane in 0..16 {
         assert_eq!(arithmetic_slice(&p, lane), lane + 450);
@@ -125,12 +125,22 @@ fn pressure_and_long_chain() {
         Op::new(0x20, 500, 0, 0, 0, 0),
         Op::new(0x54, 0, 500, sum, 0, 0),
     ]);
-    let p = mir::compile(&pressure, 4).unwrap();
+    let p = mir::compile(&pressure, 4, 0).unwrap();
     assert!(p.private > 0);
     assert!(p.vector <= 64);
     schedule::validate(&p.code).unwrap();
     for lane in 0..16 {
         assert_eq!(arithmetic_slice(&p, lane), lane * 2550);
+    }
+    let reserved = mir::compile(&pressure, 4, 64).unwrap();
+    assert_eq!(reserved.private, p.private + 64);
+    assert!(reserved
+        .code
+        .iter()
+        .filter(|i| matches!(i.op, 0x56 | 0x57))
+        .all(|i| i.imm >= 16));
+    for lane in 0..16 {
+        assert_eq!(arithmetic_slice(&reserved, lane), lane * 2550);
     }
 }
 
@@ -294,7 +304,7 @@ fn atomic_pairs_and_bank_repair() {
         Op::new(0x20, 8, 0, 0, 0, 3),
         Op::new(0x32, 12, 0, 4, 8, 0),
     ];
-    let p = mir::compile(&ops, 0).unwrap();
+    let p = mir::compile(&ops, 0, 0).unwrap();
     assert!(p.code.iter().any(|i| i.op == 0x21));
     assert!(p.code.iter().all(|i| i.bank_legal()));
 }

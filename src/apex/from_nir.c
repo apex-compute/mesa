@@ -114,6 +114,9 @@ int apex_from_nir(nir_shader *nir, const char *path)
    NIR_PASS(_, nir, nir_inline_functions);
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_function_temp, glsl_get_natural_size_align_bytes);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_function_temp, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
@@ -167,7 +170,7 @@ int apex_from_nir(nir_shader *nir, const char *path)
       emit(&ops, 0x10, control.zero, 0, 0, 0, 0);
    if (!emit_cf(&control, &impl->body)) goto done;
    nir_validate_shader(nir, "Apex backend boundary");
-   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, path);
+   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, nir->scratch_size, path);
 done:
    util_dynarray_fini(&ops);
    return result;
@@ -258,6 +261,13 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
             case nir_intrinsic_barrier:
                if (nir_intrinsic_execution_scope(i)!=SCOPE_WORKGROUP || nir_intrinsic_memory_scope(i)>SCOPE_DEVICE) goto unsupported;
                emit(&ops,7,0,0,0,0,0); break;
+            case nir_intrinsic_load_scratch:
+            case nir_intrinsic_store_scratch: {
+               bool store=i->intrinsic==nir_intrinsic_store_scratch;
+               if (i->num_components!=1 || nir_intrinsic_align_mul(i)<4 || nir_intrinsic_align_offset(i)%4) goto unsupported;
+               emit(&ops,store?0x59:0x58,store?0:value(&i->def,0),value(i->src[store?1:0].ssa,0),store?value(i->src[0].ssa,0):0,0,0);
+               break;
+            }
             case nir_intrinsic_load_shared:
             case nir_intrinsic_store_shared: {
                bool store=i->intrinsic==nir_intrinsic_store_shared;
