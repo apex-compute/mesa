@@ -62,6 +62,9 @@ if with_gallium_or_lvp or with_gbm or with_platform_wayland or with_platform_x11
   subdir('loader')
 endif
 subdir('compiler')
+if get_option('apex-compiler')
+  subdir('apex')
+endif
 if with_poly
   subdir('poly')
 endif

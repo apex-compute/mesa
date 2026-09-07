@@ -1,6 +1,9 @@
 # Copyright © 2017-2019 Intel Corporation
 # SPDX-License-Identifier: MIT
 
+option('apex-compiler', type : 'boolean', value : false,
+       description : 'Build the standalone Apex native compute compiler')
+
 option(
   'split-debug',
   type : 'feature',

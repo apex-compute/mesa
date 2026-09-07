@@ -1069,6 +1069,7 @@ if with_gallium_rusticl or with_microsoft_clc
 endif
 
 with_gfx_compute = [
+  get_option('apex-compiler'),
   with_any_opengl,
   with_any_vk,
   with_clc,
