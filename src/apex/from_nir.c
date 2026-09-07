@@ -82,6 +82,17 @@ static int atomic_op(nir_atomic_op op)
    }
 }
 
+struct loop_masks { uint32_t live, iteration; struct loop_masks *parent; };
+struct control_state {
+   struct util_dynarray *ops;
+   uint32_t *temporary;
+   uint32_t zero, discard;
+   struct loop_masks *loop;
+};
+static bool emit_block(struct util_dynarray *ops, nir_block *block, uint32_t *temporary,
+                       struct control_state *control);
+static bool emit_cf(struct control_state *c, struct exec_list *list);
+
 int apex_from_nir(nir_shader *nir, const char *path)
 {
    nir_validate_shader(nir, "Apex SPIR-V import");
@@ -119,7 +130,10 @@ int apex_from_nir(nir_shader *nir, const char *path)
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_cse);
    } while (progress);
+   NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
+   NIR_PASS(_, nir, nir_lower_continue_constructs);
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
+   NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    nir_validate_shader(nir, "Apex normalized NIR");
    if (getenv("APEX_DUMP_NIR")) nir_print_shader(nir, stderr);
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -147,12 +161,25 @@ int apex_from_nir(nir_shader *nir, const char *path)
       }
       emit(&ops, 7, 0, 0, 0, 0, 0);
    }
-   nir_foreach_block(block, impl) {
-      /* Structured control must not silently become linear execution. */
-      if (block->cf_node.parent != &impl->cf_node ||
-          (block->successors[0] && block->successors[0] != impl->end_block)) {
-         fprintf(stderr, "apex: unsupported NIR control flow\n"); goto done;
-      }
+   struct control_state control = { .ops=&ops, .temporary=&temporary,
+                                    .zero=temporary++, .discard=temporary++ };
+   if (exec_list_length(&impl->body)>1)
+      emit(&ops, 0x10, control.zero, 0, 0, 0, 0);
+   if (!emit_cf(&control, &impl->body)) goto done;
+   nir_validate_shader(nir, "Apex backend boundary");
+   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, path);
+done:
+   util_dynarray_fini(&ops);
+   return result;
+}
+
+static bool emit_block(struct util_dynarray *output, nir_block *block,
+                       uint32_t *next_temporary, struct control_state *control)
+{
+   struct util_dynarray ops = *output;
+   uint32_t temporary = *next_temporary;
+   bool result = true;
+   {
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
          if (def && (def->bit_size != 32 || def->num_components > 4)) goto unsupported;
@@ -163,6 +190,18 @@ int apex_from_nir(nir_shader *nir, const char *path)
          } else if (instr->type == nir_instr_type_alu) {
             nir_alu_instr *a = nir_instr_as_alu(instr);
             unsigned op = alu_op(a->op);
+            if (a->op==nir_op_inot || a->op==nir_op_ine32 || a->op==nir_op_uge32) {
+               uint32_t all=temporary++, operand=value(a->src[0].src.ssa,a->src[0].swizzle[0]);
+               emit(&ops,0x20,all,0,0,0,UINT32_MAX);
+               if (a->op!=nir_op_inot) {
+                  uint32_t comparison=temporary++;
+                  emit(&ops,a->op==nir_op_ine32?0x2b:0x2a,comparison,operand,
+                       value(a->src[1].src.ssa,a->src[1].swizzle[0]),0,0);
+                  operand=comparison;
+               }
+               emit(&ops,0x27,value(&a->def,0),operand,all,0,0);
+               continue;
+            }
             if (nir_op_is_vec(a->op)) {
                for (unsigned j = 0; j < a->def.num_components; j++)
                   emit(&ops, 0x21, value(&a->def,j), value(a->src[j].src.ssa,a->src[j].swizzle[0]),0,0,0);
@@ -176,6 +215,16 @@ int apex_from_nir(nir_shader *nir, const char *path)
          } else if (instr->type == nir_instr_type_intrinsic) {
             nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
             switch (i->intrinsic) {
+            case nir_intrinsic_decl_reg:
+               if (nir_intrinsic_bit_size(i)!=32 || nir_intrinsic_num_components(i)!=1 ||
+                   nir_intrinsic_num_array_elems(i)) goto unsupported;
+               emit(&ops,0x20,value(&i->def,0),0,0,0,0); break;
+            case nir_intrinsic_load_reg:
+               if (i->def.num_components!=1) goto unsupported;
+               emit(&ops,0x21,value(&i->def,0),value(i->src[0].ssa,0),0,0,0); break;
+            case nir_intrinsic_store_reg:
+               if (i->num_components!=1) goto unsupported;
+               emit(&ops,0x21,value(i->src[1].ssa,0),value(i->src[0].ssa,0),0,0,0); break;
             case nir_intrinsic_load_subgroup_invocation:
             case nir_intrinsic_load_local_invocation_index:
                emit(&ops,0x40,value(&i->def,0),0,0,0,i->intrinsic==nir_intrinsic_load_subgroup_invocation?0:1); break;
@@ -256,16 +305,72 @@ int apex_from_nir(nir_shader *nir, const char *path)
             }
             default: goto unsupported;
             }
+         } else if (instr->type == nir_instr_type_jump) {
+            nir_jump_instr *jump = nir_instr_as_jump(instr);
+            if (!control->loop || (jump->type!=nir_jump_break && jump->type!=nir_jump_continue)) goto unsupported;
+            uint32_t current=temporary++;
+            emit(&ops,6,current,control->zero,0,0,0);
+            emit(&ops,0x17,control->loop->iteration,control->loop->iteration,current,0,0);
+            if (jump->type==nir_jump_break)
+               emit(&ops,0x17,control->loop->live,control->loop->live,current,0,0);
          } else { goto unsupported; }
          continue;
 unsupported:
          fprintf(stderr,"apex: unsupported normalized NIR instruction: ");
-         nir_print_instr(instr, stderr); fprintf(stderr,"\n"); goto done;
+         nir_print_instr(instr, stderr); fprintf(stderr,"\n"); result=false; goto done;
       }
    }
-   nir_validate_shader(nir, "Apex backend boundary");
-   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, path);
 done:
-   util_dynarray_fini(&ops);
+   *output=ops;
+   *next_temporary=temporary;
    return result;
+}
+
+static void restore_mask(struct control_state *c, uint32_t mask)
+{
+   if (c->loop) {
+      uint32_t filtered=(*c->temporary)++;
+      emit(c->ops,0x15,filtered,mask,c->loop->iteration,0,0);
+      mask=filtered;
+   }
+   emit(c->ops,6,c->discard,mask,0,0,0);
+}
+
+static bool emit_cf(struct control_state *c, struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node,node,node,list) {
+      if (node->type==nir_cf_node_block) {
+         if (!emit_block(c->ops,nir_cf_node_as_block(node),c->temporary,c)) return false;
+      } else if (node->type==nir_cf_node_if) {
+         nir_if *nif=nir_cf_node_as_if(node);
+         uint32_t condition=(*c->temporary)++, saved=(*c->temporary)++, otherwise=(*c->temporary)++;
+         emit(c->ops,0x43,condition,value(nif->condition.ssa,0),0,0,0);
+         emit(c->ops,6,saved,condition,0,0,0);
+         if (!emit_cf(c,&nif->then_list)) return false;
+         emit(c->ops,0x17,otherwise,saved,condition,0,0);
+         restore_mask(c,otherwise);
+         if (!emit_cf(c,&nif->else_list)) return false;
+         restore_mask(c,saved);
+      } else if (node->type==nir_cf_node_loop) {
+         nir_loop *loop=nir_cf_node_as_loop(node);
+         if (!exec_list_is_empty(&loop->continue_list)) {
+            fprintf(stderr,"apex: loop continue construct must be lowered\n"); return false;
+         }
+         uint32_t saved=(*c->temporary)++;
+         struct loop_masks masks={.live=(*c->temporary)++, .iteration=(*c->temporary)++, .parent=c->loop};
+         emit(c->ops,6,saved,c->zero,0,0,0);
+         emit(c->ops,0x11,masks.live,saved,0,0,0);
+         uint32_t header=util_dynarray_num_elements(c->ops,struct apex_op);
+         emit(c->ops,0x11,masks.iteration,masks.live,0,0,0);
+         emit(c->ops,6,c->discard,masks.iteration,0,0,0);
+         c->loop=&masks;
+         if (!emit_cf(c,&loop->body)) return false;
+         emit(c->ops,5,0,masks.live,0,0,header);
+         c->loop=masks.parent;
+         restore_mask(c,saved);
+      } else {
+         fprintf(stderr,"apex: unsupported control-flow node\n"); return false;
+      }
+   }
+   return true;
 }

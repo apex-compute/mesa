@@ -47,13 +47,16 @@ fn roles(op: u8, imm: u32) -> Result<[Option<(Class, u8)>; 4], String> {
 }
 
 pub fn compile(ops: &[Op], shared: u32) -> Result<Program, String> {
-    // Fixed conservative intervals preserve values even across forward branches.
-    // MIR control is provided through physical scheduling tests; SSA CFG lowering
-    // rejects loops until a liveness/phi implementation is available.
+    // Out-of-SSA phi webs use mutable virtual registers. Preserve their homes
+    // across every mask arm and backedge; linear SSA keeps interval reuse.
+    let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
     let mut values: BTreeMap<u32, (Class, u8, usize, usize)> = BTreeMap::new();
     for (pc, o) in ops.iter().enumerate() {
-        if matches!(o.op, 3 | 4 | 5) {
-            return Err("SSA MIR control-flow requires CFG lowering".into());
+        if o.op == 3 {
+            return Err("MIR scheduler owns waits".into());
+        }
+        if matches!(o.op, 4 | 5) && o.imm as usize >= ops.len() {
+            return Err("MIR branch target outside program".into());
         }
         let roles = roles(o.op, o.imm)?;
         for (field, role) in roles.iter().enumerate() {
@@ -70,21 +73,32 @@ pub fn compile(ops: &[Op], shared: u32) -> Result<Program, String> {
         } else if o.op != 0xf2 && o.imm != 0 {
             return Err("reserved MIR immediate".into());
         }
-        for f in 1..4 {
-            if let Some((cl, n)) = roles[f] {
-                let v = values
-                    .get_mut(&o.args[f])
-                    .ok_or("MIR use before definition")?;
-                if (v.0, v.1) != (cl, n) {
-                    return Err("MIR type mismatch".into());
+        if let Some((cl, n)) = roles[0] {
+            if let Some(v) = values.get_mut(&o.args[0]) {
+                if !control || (v.0, v.1) != (cl, n) {
+                    return Err("MIR redefinition/type mismatch".into());
                 }
                 v.3 = pc;
+            } else {
+                values.insert(o.args[0], (cl, n, pc, pc));
             }
         }
-        if let Some((cl, n)) = roles[0] {
-            if values.insert(o.args[0], (cl, n, pc, pc)).is_some() {
-                return Err("MIR is not SSA".into());
+    }
+    for (pc, o) in ops.iter().enumerate() {
+        for (f, role) in roles(o.op, o.imm)?.iter().enumerate().skip(1) {
+            if let Some((cl, n)) = role {
+                let v = values.get_mut(&o.args[f]).ok_or("undefined MIR value")?;
+                if (v.0, v.1) != (*cl, *n) || (!control && v.2 >= pc) {
+                    return Err("MIR type/order mismatch".into());
+                }
+                v.3 = v.3.max(pc);
             }
+        }
+    }
+    if control {
+        for v in values.values_mut() {
+            v.2 = 0;
+            v.3 = ops.len();
         }
     }
     let mut order: Vec<_> = values.iter().collect();
@@ -118,7 +132,9 @@ pub fn compile(ops: &[Op], shared: u32) -> Result<Program, String> {
         homes.insert(id, home);
     }
     let mut native = Vec::new();
+    let mut instruction_map = Vec::new();
     for o in ops {
+        instruction_map.push(native.len());
         let roles = roles(o.op, o.imm)?;
         let mut fields = [0; 4];
         let mut stores = Vec::new();
@@ -254,6 +270,12 @@ pub fn compile(ops: &[Op], shared: u32) -> Result<Program, String> {
         }
         native.push(i);
         native.extend(stores);
+    }
+    for i in &mut native {
+        if matches!(i.op, 4 | 5) {
+            i.imm =
+                u32::try_from(instruction_map[i.imm as usize]).map_err(|_| "code size overflow")?;
+        }
     }
     if native.last().is_none_or(|i| !matches!(i.op, 1 | 2)) {
         native.push(Inst::new(1));
