@@ -85,12 +85,13 @@ static int atomic_op(nir_atomic_op op)
 int apex_from_nir(nir_shader *nir, const char *path)
 {
    nir_validate_shader(nir, "Apex SPIR-V import");
-   if (nir->info.zero_initialize_shared_memory) {
-      fprintf(stderr,"apex: zero-initialized shared memory is not yet lowered\n"); return 1;
-   }
+   bool zero_shared = nir->info.zero_initialize_shared_memory;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_shared) {
       if (var->constant_initializer) {
-         fprintf(stderr,"apex: shared initializers are not yet lowered\n"); return 1;
+         if (!var->constant_initializer->is_null_constant) {
+            fprintf(stderr,"apex: shared initializer must be zero\n"); return 1;
+         }
+         zero_shared = true;
       }
    }
    if (nir->info.workgroup_size_variable || nir->info.workgroup_size[0]!=16 ||
@@ -127,6 +128,25 @@ int apex_from_nir(nir_shader *nir, const char *path)
    struct util_dynarray ops;
    util_dynarray_init(&ops, NULL);
    int result = 1;
+   if (zero_shared && nir->info.shared_size) {
+      /* Each lane clears one word per 64-byte chunk. Padding belongs to this
+       * workgroup allocation, so the final partial chunk cannot touch a neighbor. */
+      if (nir->info.shared_size > 32768) goto done;
+      nir->info.shared_size = (nir->info.shared_size + 63) & ~63u;
+      uint32_t lane = temporary++, shift = temporary++, offset = temporary++;
+      uint32_t zero = temporary++;
+      emit(&ops, 0x40, lane, 0, 0, 0, 1);
+      emit(&ops, 0x20, shift, 0, 0, 0, 2);
+      emit(&ops, 0x28, offset, lane, shift, 0, 0);
+      emit(&ops, 0x20, zero, 0, 0, 0, 0);
+      for (unsigned base = 0; base < nir->info.shared_size; base += 64) {
+         uint32_t chunk = temporary++, address = temporary++;
+         emit(&ops, 0x20, chunk, 0, 0, 0, base);
+         emit(&ops, 0x22, address, offset, chunk, 0, 0);
+         emit(&ops, 0x54, 0, address, zero, 0, 0);
+      }
+      emit(&ops, 7, 0, 0, 0, 0, 0);
+   }
    nir_foreach_block(block, impl) {
       /* Structured control must not silently become linear execution. */
       if (block->cf_node.parent != &impl->cf_node ||
