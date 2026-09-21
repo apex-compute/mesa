@@ -50,6 +50,10 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    switch (i->intrinsic) {
    case nir_intrinsic_load_base_global_invocation_id:
       replacement = nir_imm_ivec3(b, 0, 0, 0); break;
+   case nir_intrinsic_load_workgroup_id:
+      /* One native launch is one 16x1x1 workgroup. The queue supplies its
+       * coarse base; there is no second in-launch workgroup index. */
+      replacement = nir_imm_ivec3(b, 0, 0, 0); break;
    case nir_intrinsic_vulkan_resource_index:
       if (nir_intrinsic_desc_set(i) || nir_intrinsic_binding(i) ||
           !nir_src_is_const(i->src[0]) || nir_src_as_uint(i->src[0])) {
@@ -234,7 +238,7 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
             case nir_intrinsic_load_global_invocation_id:
                for (unsigned j=0;j<3;j++) emit(&ops,0x40,value(&i->def,j),0,0,0,2+j);
                break;
-            case nir_intrinsic_load_workgroup_id:
+            case nir_intrinsic_load_base_workgroup_id:
                for (unsigned j=0;j<3;j++) {
                   uint32_t scalar=temporary++;
                   emit(&ops,0x41,scalar,0,0,0,j);
