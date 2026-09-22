@@ -10,6 +10,33 @@ pub struct Input {
     c: u32,
     imm: u32,
 }
+#[repr(C)]
+pub struct CompileResult {
+    data: *mut u8,
+    size: usize,
+    diagnostic: [u8; 1024],
+}
+impl Default for CompileResult {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            size: 0,
+            diagnostic: [0; 1024],
+        }
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn apex_compile_result_finish(result: &mut CompileResult) {
+    if !result.data.is_null() {
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                result.data,
+                result.size,
+            )));
+        }
+    }
+    *result = CompileResult::default();
+}
 fn report(result: Result<(), String>) -> i32 {
     match result {
         Ok(()) => 0,
@@ -25,44 +52,45 @@ pub unsafe extern "C" fn apex_emit(
     count: usize,
     shared: u32,
     private: u32,
-    path: *const c_char,
+    result: &mut CompileResult,
 ) -> i32 {
-    report(
-        std::panic::catch_unwind(|| {
-            let input = if count == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(ptr, count) }
-            };
-            let ops = input
-                .iter()
-                .map(|i| {
-                    Ok(mir::Op::new(
-                        u8::try_from(i.op).map_err(|_| "opcode overflow")?,
-                        i.d,
-                        i.a,
-                        i.b,
-                        i.c,
-                        i.imm,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let p = mir::compile(&ops, shared, private)?;
-            eprintln!(
-                "apex: {} instructions, s{} v{}, shared {}, private {}/lane",
-                p.code.len(),
-                p.scalar,
-                p.vector,
-                p.shared,
-                p.private
-            );
-            let path = unsafe { CStr::from_ptr(path) }
-                .to_str()
-                .map_err(|_| "path UTF8")?;
-            std::fs::write(path, p.bytes()?).map_err(|e| e.to_string())
-        })
-        .unwrap_or_else(|_| Err("compiler panic".into())),
-    )
+    *result = CompileResult::default();
+    let compiled = std::panic::catch_unwind(|| {
+        let input = if count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, count) }
+        };
+        let ops = input
+            .iter()
+            .map(|i| {
+                Ok(mir::Op::new(
+                    u8::try_from(i.op).map_err(|_| "opcode overflow")?,
+                    i.d,
+                    i.a,
+                    i.b,
+                    i.c,
+                    i.imm,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let p = mir::compile(&ops, shared, private)?;
+        p.bytes()
+    })
+    .unwrap_or_else(|_| Err("compiler panic".into()));
+    match compiled {
+        Ok(bytes) => {
+            let bytes = Box::leak(bytes.into_boxed_slice());
+            result.data = bytes.as_mut_ptr();
+            result.size = bytes.len();
+            0
+        }
+        Err(error) => {
+            let count = error.len().min(result.diagnostic.len() - 1);
+            result.diagnostic[..count].copy_from_slice(&error.as_bytes()[..count]);
+            1
+        }
+    }
 }
 #[no_mangle]
 pub unsafe extern "C" fn apex_tool(

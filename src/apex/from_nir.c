@@ -92,26 +92,36 @@ struct control_state {
    uint32_t *temporary;
    uint32_t zero, discard;
    struct loop_masks *loop;
+   struct apex_compile_result *output;
 };
 static bool emit_block(struct util_dynarray *ops, nir_block *block, uint32_t *temporary,
                        struct control_state *control);
 static bool emit_cf(struct control_state *c, struct exec_list *list);
 
-int apex_from_nir(nir_shader *nir, const char *path)
+static int fail(struct apex_compile_result *output, const char *message)
 {
+   snprintf(output->diagnostic, sizeof(output->diagnostic), "%s", message);
+   return 1;
+}
+
+int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
+{
+   *output = (struct apex_compile_result){0};
+   if (nir->info.stage != MESA_SHADER_COMPUTE)
+      return fail(output, "only compute shaders are supported");
    nir_validate_shader(nir, "Apex SPIR-V import");
    bool zero_shared = nir->info.zero_initialize_shared_memory;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_shared) {
       if (var->constant_initializer) {
          if (!var->constant_initializer->is_null_constant) {
-            fprintf(stderr,"apex: shared initializer must be zero\n"); return 1;
+            return fail(output, "shared initializer must be zero");
          }
          zero_shared = true;
       }
    }
    if (nir->info.workgroup_size_variable || nir->info.workgroup_size[0]!=16 ||
        nir->info.workgroup_size[1]!=1 || nir->info.workgroup_size[2]!=1) {
-      fprintf(stderr,"apex: initial standalone launch requires local size 16x1x1\n"); return 1;
+      return fail(output, "native launch requires local size 16x1x1");
    }
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
@@ -127,7 +137,7 @@ int apex_from_nir(nir_shader *nir, const char *path)
    NIR_PASS(_, nir, nir_lower_system_values);
    bool invalid = false;
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
-   if (invalid) { fprintf(stderr, "apex: only SSBO set 0 binding 0 is supported\n"); return 1; }
+   if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    bool progress;
    do {
@@ -152,7 +162,10 @@ int apex_from_nir(nir_shader *nir, const char *path)
    if (zero_shared && nir->info.shared_size) {
       /* Each lane clears one word per 64-byte chunk. Padding belongs to this
        * workgroup allocation, so the final partial chunk cannot touch a neighbor. */
-      if (nir->info.shared_size > 32768) goto done;
+      if (nir->info.shared_size > 32768) {
+         fail(output, "shared memory exceeds 32768 bytes");
+         goto done;
+      }
       nir->info.shared_size = (nir->info.shared_size + 63) & ~63u;
       uint32_t lane = temporary++, shift = temporary++, offset = temporary++;
       uint32_t zero = temporary++;
@@ -169,12 +182,12 @@ int apex_from_nir(nir_shader *nir, const char *path)
       emit(&ops, 7, 0, 0, 0, 0, 0);
    }
    struct control_state control = { .ops=&ops, .temporary=&temporary,
-                                    .zero=temporary++, .discard=temporary++ };
+                                    .zero=temporary++, .discard=temporary++, .output=output };
    if (exec_list_length(&impl->body)>1)
       emit(&ops, 0x10, control.zero, 0, 0, 0, 0);
    if (!emit_cf(&control, &impl->body)) goto done;
    nir_validate_shader(nir, "Apex backend boundary");
-   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, nir->scratch_size, path);
+   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, nir->scratch_size, output);
 done:
    util_dynarray_fini(&ops);
    return result;
@@ -330,8 +343,18 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else { goto unsupported; }
          continue;
 unsupported:
-         fprintf(stderr,"apex: unsupported normalized NIR instruction: ");
-         nir_print_instr(instr, stderr); fprintf(stderr,"\n"); result=false; goto done;
+         if (instr->type == nir_instr_type_intrinsic)
+            snprintf(control->output->diagnostic, sizeof(control->output->diagnostic),
+                     "unsupported normalized NIR intrinsic: %s",
+                     nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name);
+         else if (instr->type == nir_instr_type_alu)
+            snprintf(control->output->diagnostic, sizeof(control->output->diagnostic),
+                     "unsupported normalized NIR ALU: %s",
+                     nir_op_infos[nir_instr_as_alu(instr)->op].name);
+         else
+            snprintf(control->output->diagnostic, sizeof(control->output->diagnostic),
+                     "unsupported normalized NIR instruction type: %u", instr->type);
+         result=false; goto done;
       }
    }
 done:
@@ -368,7 +391,7 @@ static bool emit_cf(struct control_state *c, struct exec_list *list)
       } else if (node->type==nir_cf_node_loop) {
          nir_loop *loop=nir_cf_node_as_loop(node);
          if (!exec_list_is_empty(&loop->continue_list)) {
-            fprintf(stderr,"apex: loop continue construct must be lowered\n"); return false;
+            fail(c->output, "loop continue construct must be lowered"); return false;
          }
          uint32_t saved=(*c->temporary)++;
          struct loop_masks masks={.live=(*c->temporary)++, .iteration=(*c->temporary)++, .parent=c->loop};
@@ -383,7 +406,7 @@ static bool emit_cf(struct control_state *c, struct exec_list *list)
          c->loop=masks.parent;
          restore_mask(c,saved);
       } else {
-         fprintf(stderr,"apex: unsupported control-flow node\n"); return false;
+         fail(c->output, "unsupported control-flow node"); return false;
       }
    }
    return true;

@@ -4,6 +4,7 @@
 #include "compiler/spirv/nir_spirv.h"
 #include "compiler/spirv/spirv.h"
 #include "compiler/spirv/spirv_info.h"
+#include "util/u_math.h"
 #include <spirv-tools/libspirv.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,8 +55,32 @@ int main(int argc, char **argv)
    nir_shader *nir = spirv_to_nir(words, size / 4, NULL, MESA_SHADER_COMPUTE,
                                 "main", &spv, &opts);
    free(words);
-   int result = nir ? apex_from_nir(nir, argv[2]) : 1;
+   struct apex_compile_result compiled = {0};
+   int result = nir ? apex_from_nir(nir, &compiled) : 1;
    ralloc_free(nir);
    glsl_type_singleton_decref();
+   if (result) {
+      if (compiled.diagnostic[0])
+         fprintf(stderr, "apex: %s\n", compiled.diagnostic);
+   } else {
+      uint32_t h[10];
+      memcpy(h, compiled.data, sizeof(h));
+      fprintf(stderr, "apex: %u instructions, s%u v%u, shared %u, private %u/lane\n",
+              util_le32_to_cpu(h[2]), util_le32_to_cpu(h[4]), util_le32_to_cpu(h[5]),
+              util_le32_to_cpu(h[6]), util_le32_to_cpu(h[7]));
+      f = fopen(argv[2], "wb");
+      if (!f) {
+         perror(argv[2]);
+         result = 1;
+      } else {
+         bool written = fwrite(compiled.data, 1, compiled.size, f) == compiled.size;
+         int closed = fclose(f);
+         if (!written || closed) {
+            fprintf(stderr, "apex: could not write %s\n", argv[2]);
+            result = 1;
+         }
+      }
+   }
+   apex_compile_result_finish(&compiled);
    return result;
 }

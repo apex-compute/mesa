@@ -15,3 +15,11 @@ executable('apex-compile', 'main.c',
   install : false,
 )
 apex_rust.test('apex-native', apex_rs, suite : ['apex'])
+apex_compiler_test = executable('apex-compiler-test', 'compiler_test.c',
+  include_directories : [inc_include, inc_src],
+  dependencies : [idep_nir, idep_mesautil],
+  link_with : [apex_nir, apex_rs],
+  link_language : 'cpp',
+  install : false,
+)
+test('apex-compiler', apex_compiler_test, suite : ['apex'])
