@@ -62,9 +62,6 @@ if with_gallium_or_lvp or with_gbm or with_platform_wayland or with_platform_x11
   subdir('loader')
 endif
 subdir('compiler')
-if get_option('apex-compiler')
-  subdir('apex')
-endif
 if with_poly
   subdir('poly')
 endif
@@ -77,8 +74,11 @@ endif
 if with_wayland_bind_display
   subdir('egl/wayland/wayland-drm')
 endif
-if with_any_vk or with_gallium_zink
+if with_any_vk or with_gallium_zink or get_option('apex-compiler')
   subdir('vulkan')
+endif
+if get_option('apex-compiler')
+  subdir('apex')
 endif
 if with_virtio_vk
   subdir('virtio/vulkan')

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Standalone compiler: no winsys, kernel driver, or ICD dependency.
+# Compiler and internal Vulkan pipeline gate; no installed ICD.
 add_languages('rust', required : true)
 apex_rust = import('rust')
 apex_rs = static_library('apex_rs', 'lib.rs', rust_abi : 'c')
@@ -23,3 +23,4 @@ apex_compiler_test = executable('apex-compiler-test', 'compiler_test.c',
   install : false,
 )
 test('apex-compiler', apex_compiler_test, suite : ['apex'])
+subdir('vulkan')

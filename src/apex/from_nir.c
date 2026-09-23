@@ -50,6 +50,10 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    switch (i->intrinsic) {
    case nir_intrinsic_load_base_global_invocation_id:
       replacement = nir_imm_ivec3(b, 0, 0, 0); break;
+   case nir_intrinsic_load_local_invocation_id:
+      /* The admitted workgroup size is exactly 16x1x1. */
+      replacement = nir_vec3(b, nir_load_local_invocation_index(b),
+                            nir_imm_int(b, 0), nir_imm_int(b, 0)); break;
    case nir_intrinsic_load_workgroup_id:
       /* One native launch is one 16x1x1 workgroup. The queue supplies its
        * coarse base; there is no second in-launch workgroup index. */
