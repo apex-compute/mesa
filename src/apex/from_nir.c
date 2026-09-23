@@ -108,6 +108,41 @@ static nir_def *lower_fp32_sign_conversion(nir_builder *b, nir_instr *instr, voi
    return nir_bcsel(b, nir_ilt_imm(b, x, 0), nir_ineg(b, magnitude), magnitude);
 }
 
+static bool fp32_minmax_sign(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *a = nir_instr_as_alu(instr);
+   return a->def.bit_size == 32 &&
+          (a->op == nir_op_fmin || a->op == nir_op_fmax || a->op == nir_op_fsign);
+}
+
+static nir_def *lower_fp32_minmax_sign(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_alu_instr *a = nir_instr_as_alu(instr);
+   nir_def *x = nir_ssa_for_alu_src(b, a, 0);
+   nir_def *abs_x = nir_iand_imm(b, x, 0x7fffffffu);
+   nir_def *nan_x = nir_ult(b, nir_imm_int(b, 0x7f800000u), abs_x);
+   if (a->op == nir_op_fsign) {
+      nir_def *one = nir_ior_imm(b, nir_iand_imm(b, x, 0x80000000u), 0x3f800000u);
+      return nir_bcsel(b, nan_x, nir_imm_int(b, 0),
+                      nir_bcsel(b, nir_ieq_imm(b, abs_x, 0), x, one));
+   }
+   nir_def *y = nir_ssa_for_alu_src(b, a, 1);
+   nir_def *abs_y = nir_iand_imm(b, y, 0x7fffffffu);
+   nir_def *nan_y = nir_ult(b, nir_imm_int(b, 0x7f800000u), abs_y);
+   bool minimum = a->op == nir_op_fmin;
+   nir_def *ordered = minimum ? nir_bcsel(b, nir_flt(b, x, y), x, y) :
+                                nir_bcsel(b, nir_flt(b, x, y), y, x);
+   /* NIR requires minimumNumber/maximumNumber: -0 < +0 and a single
+    * NaN yields the numeric operand. Quiet a pair of NaNs canonically. */
+   nir_def *zeros = minimum ? nir_ior(b, x, y) : nir_iand(b, x, y);
+   ordered = nir_bcsel(b, nir_ieq_imm(b, nir_ior(b, abs_x, abs_y), 0), zeros, ordered);
+   return nir_bcsel(b, nan_x,
+                   nir_bcsel(b, nan_y, nir_imm_int(b, 0x7fc00000u), y),
+                   nir_bcsel(b, nan_y, x, ordered));
+}
+
 static bool fp32_comparison(const nir_instr *instr, const void *data)
 {
    if (instr->type != nir_instr_type_alu)
@@ -257,6 +292,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
    if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_minmax_sign, lower_fp32_minmax_sign, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, int32_division, lower_int32_division, NULL);
    bool progress;
