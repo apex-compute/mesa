@@ -42,6 +42,7 @@ static struct {
 static const unsigned starts[] = {48, 1088, 48, 48};
 static const unsigned biases[] = {37, 101, 112, 112};
 static const unsigned scales[] = {3, 7, 7, 7};
+static const unsigned invocations[] = {16, 16, 12, 12};
 static int sync_fd = -1;
 
 int __real_ioctl(int fd, unsigned long request, ...);
@@ -170,7 +171,8 @@ drm_ioctl(unsigned long request, void *arg)
          r->status = mock.fault == 205 ? 4 : 5;
          return 0;
       }
-      for (unsigned i = 0; i < 16; i++) mock.payload[i] = biases[d] + scales[d] * i;
+      for (unsigned i = 0; i < invocations[d]; i++)
+         mock.payload[i] = biases[d] + scales[d] * i;
       memcpy(local, mock.payload, sizeof(mock.payload));
       memcpy(mock.expected + starts[d], mock.payload, sizeof(mock.payload));
       r->status = 1;
@@ -238,7 +240,7 @@ __wrap_ioctl(int fd, unsigned long request, ...)
    case 9:
       CHECK(r->handle == 27 && r->bytes == sizeof(mock.payload));
       CHECK((void *)(uintptr_t)r->user_ptr == mock.mapped + starts[d]);
-      for (unsigned i = 0; i < 16; i++)
+      for (unsigned i = 0; i < invocations[d]; i++)
          mock.payload[i] = biases[d] + scales[d] * i;
       memcpy((void *)(uintptr_t)r->user_ptr, mock.payload, r->bytes);
       memcpy(mock.expected + starts[d], mock.payload, r->bytes);
@@ -733,7 +735,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
          uint32_t expected = 0xd00d0000 + i;
          if (i == 2047) expected = 0x12345678;
-         if (i >= 48 && i < 64) expected = 112 + 7 * (i - 48);
+         if (i >= 48 && i < 60) expected = 112 + 7 * (i - 48);
+         if (i >= 60 && i < 64) expected = 37 + 3 * (i - 48);
          if (i >= 1088 && i < 1104) expected = 101 + 7 * (i - 1088);
          CHECK(mock.mapped[i] == expected);
       }
