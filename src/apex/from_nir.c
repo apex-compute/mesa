@@ -5,6 +5,13 @@
 #include "util/u_dynarray.h"
 #include <stdio.h>
 
+const struct nir_shader_compiler_options apex_nir_options = {
+   .lower_fdiv = true, .lower_flrp32 = true,
+   .lower_bit_count = true, .lower_bitfield_reverse = true, .lower_mul_high = true,
+   .lower_mul_2x32_64 = true,
+   .lower_extract_byte = true, .lower_extract_word = true,
+};
+
 static uint32_t value(nir_def *def, unsigned component)
 {
    return def->index * 4 + component;
@@ -227,6 +234,8 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    bool progress;
    do {
       progress = false;
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_lower_alu);
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
@@ -295,6 +304,13 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else if (instr->type == nir_instr_type_alu) {
             nir_alu_instr *a = nir_instr_as_alu(instr);
             unsigned op = alu_op(a->op);
+            if (a->op == nir_op_b2i32) {
+               uint32_t one = temporary++;
+               emit(&ops, 0x20, one, 0, 0, 0, 1);
+               emit(&ops, 0x25, value(&a->def, 0),
+                    value(a->src[0].src.ssa, a->src[0].swizzle[0]), one, 0, 0);
+               continue;
+            }
             if (a->op == nir_op_ineg) {
                uint32_t zero = temporary++;
                emit(&ops, 0x20, zero, 0, 0, 0, 0);

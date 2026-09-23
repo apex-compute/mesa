@@ -44,7 +44,6 @@ int main(int argc, char **argv)
       .Shader = true, .GroupNonUniform = true, .GroupNonUniformBallot = true,
       .GroupNonUniformShuffle = true, .ShaderClockKHR = true,
    };
-   struct nir_shader_compiler_options opts = { .lower_fdiv = true, .lower_flrp32 = true };
    struct spirv_to_nir_options spv = {
       .environment = NIR_SPIRV_VULKAN, .capabilities = &caps,
       .ssbo_addr_format = nir_address_format_32bit_index_offset,
@@ -53,7 +52,7 @@ int main(int argc, char **argv)
       .skip_os_break_in_debug_build = true,
    };
    nir_shader *nir = spirv_to_nir(words, size / 4, NULL, MESA_SHADER_COMPUTE,
-                                "main", &spv, &opts);
+                                "main", &spv, &apex_nir_options);
    free(words);
    struct apex_compile_result compiled = {0};
    int result = nir ? apex_from_nir(nir, &compiled) : 1;

@@ -44,9 +44,6 @@ create_compute_pipeline(struct vk_device *device,
    if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
       return VK_PIPELINE_COMPILE_REQUIRED;
 
-   static const struct nir_shader_compiler_options nir_options = {
-      .lower_fdiv = true, .lower_flrp32 = true,
-   };
    const struct spirv_to_nir_options spirv_options = {
       .environment = NIR_SPIRV_VULKAN,
       .ssbo_addr_format = nir_address_format_32bit_index_offset,
@@ -56,7 +53,7 @@ create_compute_pipeline(struct vk_device *device,
    };
    nir_shader *nir = NULL;
    VkResult result = vk_pipeline_shader_stage_to_nir(
-      device, flags, &info->stage, &spirv_options, &nir_options, NULL, &nir);
+      device, flags, &info->stage, &spirv_options, &apex_nir_options, NULL, &nir);
    if (result != VK_SUCCESS)
       return result;
 

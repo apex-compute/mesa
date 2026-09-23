@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 struct nir_shader;
+struct nir_shader_compiler_options;
+extern const struct nir_shader_compiler_options apex_nir_options;
 /* Initialize to zero before compilation. Success returns owned APX bytes;
  * failure returns no bytes and a NUL-terminated diagnostic. Finish before reuse.
  * No compiler call writes files or requires a process-global error sink. */
