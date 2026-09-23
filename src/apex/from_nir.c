@@ -73,6 +73,42 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+static bool fp32_comparison(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *a = nir_instr_as_alu(instr);
+   return (a->op == nir_op_flt || a->op == nir_op_fge ||
+           a->op == nir_op_feq || a->op == nir_op_fneu) &&
+          a->src[0].src.ssa->bit_size == 32 && a->src[1].src.ssa->bit_size == 32;
+}
+
+static nir_def *lower_fp32_comparison(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_alu_instr *a = nir_instr_as_alu(instr);
+   nir_def *x = nir_ssa_for_alu_src(b, a, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, a, 1);
+   nir_def *abs_x = nir_iand_imm(b, x, 0x7fffffffu);
+   nir_def *abs_y = nir_iand_imm(b, y, 0x7fffffffu);
+   nir_def *inf = nir_imm_int(b, 0x7f800000u);
+   nir_def *unordered = nir_ior(b, nir_ult(b, inf, abs_x), nir_ult(b, inf, abs_y));
+   nir_def *ordered = nir_inot(b, unordered);
+   nir_def *both_zero = nir_ieq_imm(b, nir_ior(b, abs_x, abs_y), 0);
+   if (a->op == nir_op_feq || a->op == nir_op_fneu) {
+      nir_def *equal = nir_iand(b, ordered, nir_ior(b, nir_ieq(b, x, y), both_zero));
+      return a->op == nir_op_feq ? equal : nir_inot(b, equal);
+   }
+   /* IEEE magnitude bits increase with magnitude. Invert negative encodings
+    * and flip the sign bit on nonnegative encodings to obtain unsigned order.
+    * NaNs are unordered; the two zero encodings compare equal. */
+   nir_def *negative_mask = nir_imm_int(b, UINT32_MAX);
+   nir_def *positive_mask = nir_imm_int(b, 0x80000000u);
+   nir_def *key_x = nir_ixor(b, x, nir_bcsel(b, nir_ilt_imm(b, x, 0), negative_mask, positive_mask));
+   nir_def *key_y = nir_ixor(b, y, nir_bcsel(b, nir_ilt_imm(b, y, 0), negative_mask, positive_mask));
+   nir_def *less = nir_iand(b, nir_ult(b, key_x, key_y), nir_inot(b, both_zero));
+   return nir_iand(b, ordered, a->op == nir_op_flt ? less : nir_inot(b, less));
+}
+
 static int atomic_op(nir_atomic_op op)
 {
    switch (op) {
@@ -143,6 +179,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
    if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
    bool progress;
    do {
       progress = false;
