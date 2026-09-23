@@ -317,9 +317,18 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_minmax_sign, lower_fp32_minmax_sign, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, int32_division, lower_int32_division, NULL);
+   const nir_lower_subgroups_options subgroups = {
+      .subgroup_size = 16, .ballot_bit_size = 32, .ballot_components = 1,
+      .lower_to_scalar = true, .lower_vote = true, .lower_vote_ieq = true,
+      .lower_vote_bool_eq = true, .lower_elect = true,
+      .lower_first_invocation_to_ballot = true, .lower_read_first_invocation = true,
+      .lower_subgroup_masks = true, .lower_inverse_ballot = true,
+   };
    bool progress;
    do {
       progress = false;
+      NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
+      NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, uint32_msb, lower_uint32_msb, NULL);
       NIR_PASS(progress, nir, nir_lower_alu);
@@ -528,6 +537,7 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
                for (unsigned j=1;j<i->def.num_components;j++) emit(&ops,0x20,value(&i->def,j),0,0,0,0);
                break;
             }
+            case nir_intrinsic_read_invocation:
             case nir_intrinsic_shuffle:
                if (i->num_components!=1) goto unsupported;
                emit(&ops,0x44,value(&i->def,0),value(i->src[0].ssa,0),value(i->src[1].ssa,0),0,0); break;
