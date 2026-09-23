@@ -80,6 +80,33 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+static bool fp32_sign_conversion(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *a = nir_instr_as_alu(instr);
+   return a->def.bit_size == 32 && a->src[0].src.ssa->bit_size == 32 &&
+          (a->op == nir_op_fneg || a->op == nir_op_fabs ||
+           a->op == nir_op_i2f32 || a->op == nir_op_f2i32);
+}
+
+static nir_def *lower_fp32_sign_conversion(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_alu_instr *a = nir_instr_as_alu(instr);
+   nir_def *x = nir_ssa_for_alu_src(b, a, 0);
+   if (a->op == nir_op_fneg)
+      return nir_ixor(b, x, nir_imm_int(b, 0x80000000u));
+   if (a->op == nir_op_fabs)
+      return nir_iand_imm(b, x, 0x7fffffffu);
+   if (a->op == nir_op_i2f32) {
+      /* INT_MIN's magnitude is representable as an unsigned word. */
+      nir_def *magnitude = nir_u2f32(b, nir_iabs(b, x));
+      return nir_ixor(b, magnitude, nir_iand_imm(b, x, 0x80000000u));
+   }
+   nir_def *magnitude = nir_f2u32(b, nir_iand_imm(b, x, 0x7fffffffu));
+   return nir_bcsel(b, nir_ilt_imm(b, x, 0), nir_ineg(b, magnitude), magnitude);
+}
+
 static bool fp32_comparison(const nir_instr *instr, const void *data)
 {
    if (instr->type != nir_instr_type_alu)
@@ -241,6 +268,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_cse);
    } while (progress);
+   NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_sign_conversion, lower_fp32_sign_conversion, NULL);
    NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_continue_constructs);
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
