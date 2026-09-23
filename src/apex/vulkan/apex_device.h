@@ -11,6 +11,7 @@ enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 /* Host table limits; descriptors are ordinary LOCAL memory. */
 #define APEX_MAX_DESCRIPTORS 4096
 #define APEX_MAX_BINDINGS 1024
+#define APEX_MAX_PUSH_CONSTANTS 256
 struct apex_binding_layout {
    uint32_t offset, count, flags;
    VkDescriptorType type;

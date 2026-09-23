@@ -144,6 +144,38 @@ apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
    vk_pipeline_free(device, alloc, vk);
 }
 
+static bool
+lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   struct descriptor_lowering *ctx = data;
+   if (i->intrinsic != nir_intrinsic_load_push_constant)
+      return false;
+   unsigned base = nir_intrinsic_base(i), size = ctx->pipeline->push_size;
+   if (i->def.bit_size != 32 || i->num_components > 4 ||
+       nir_intrinsic_align_mul(i) < 4 || nir_intrinsic_align_offset(i) % 4 ||
+       base % 4 || base > size) {
+      ctx->invalid = true;
+      return false;
+   }
+   unsigned table_bytes = (ctx->pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor);
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *values[4];
+   for (unsigned c = 0; c < i->num_components; c++) {
+      unsigned end = base + c * 4 + 4;
+      nir_def *inside = end <= size ? nir_ule_imm(b, i->src[0].ssa, size - end) : nir_imm_false(b);
+      nir_push_if(b, inside);
+      nir_def *value = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
+         nir_iadd_imm(b, i->src[0].ssa, table_bytes + base + c * 4), .align_mul = 4);
+      nir_push_else(b, NULL);
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_pop_if(b, NULL);
+      values[c] = nir_if_phi(b, value, zero);
+   }
+   nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
 static const struct vk_pipeline_ops pipeline_ops = {
    .destroy = apex_pipeline_destroy,
 };
@@ -205,11 +237,21 @@ create_compute_pipeline(struct vk_device *device,
       }
       if (pipeline->descriptor_count > APEX_MAX_DESCRIPTORS)
          goto unsupported_layout;
+      for (unsigned r = 0; r < layout->push_range_count; r++) {
+         const VkPushConstantRange *range = &layout->push_ranges[r];
+         if (range->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || !range->size ||
+             range->offset % 4 || range->size % 4 || range->offset >= APEX_MAX_PUSH_CONSTANTS ||
+             range->size > APEX_MAX_PUSH_CONSTANTS - range->offset)
+            goto unsupported_layout;
+         pipeline->push_size = MAX2(pipeline->push_size, range->offset + range->size);
+      }
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
                nir_address_format_32bit_index_offset);
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
       struct descriptor_lowering ctx = {.pipeline = pipeline};
       nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
       nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
+      nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
       if (ctx.invalid)
          goto unsupported_layout;
    }

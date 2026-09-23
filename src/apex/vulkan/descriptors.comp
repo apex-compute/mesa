@@ -7,6 +7,10 @@ layout(set = 1, binding = 2, std140) uniform Constants {
    uint weights[16];
 } constants[2];
 layout(set = 0, binding = 3, std430) buffer Output { uvec4 values[]; } destination;
+layout(push_constant) uniform Push {
+   layout(offset = 16) uvec4 bias;
+   layout(offset = 48) uint weights[4];
+} push;
 void main()
 {
    uint lane = gl_LocalInvocationIndex;
@@ -14,6 +18,7 @@ void main()
    uint index = lane == 13u ? 0x3fffffffu : lane;
    uint value = sources[which].values[index];
    destination.values[lane] = uvec4(value,
-      value * constants[which].affine.x + constants[which].affine.z + constants[which].weights[lane],
+      value * constants[which].affine.x + constants[which].affine.z + constants[which].weights[lane]
+         + push.bias[which + 2u] + push.weights[lane & 3u],
       sources[which].values.length(), sources[which ^ 1u].values[lane + 8u]);
 }

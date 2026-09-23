@@ -16,6 +16,7 @@ struct apex_pipeline {
    struct vk_pipeline_layout *layout;
    uint32_t set_offsets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint32_t descriptor_count;
+   uint32_t push_size;
    BITSET_DECLARE(used_descriptors, APEX_MAX_DESCRIPTORS);
 };
 

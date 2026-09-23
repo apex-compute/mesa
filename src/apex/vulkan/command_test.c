@@ -152,6 +152,14 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(addr == mock.gems[1].va + (d == 1 ? 48 : 1088) * 4);
       CHECK(util_le32_to_cpu(extra[2]) == sizeof(mock.payload) && !extra[3]);
       for (unsigned i = 12; i < 28; i++) CHECK(!rows[i]); /* unused set + sentinel */
+      CHECK(mock.pipelines[p]->push_size == 256);
+      for (unsigned i = 0; i < 64; i++) {
+         uint32_t expected = i < 4 ? 0 : 0xa5100000 + i * 37;
+         if (d == 1 && i == 6) expected = 0xc0ffee00;
+         if (d == 1 && i == 7) expected = 0xabad1dea;
+         if (d >= 2) expected = i == 63 ? 0xdecafbad : 0;
+         CHECK(rows[28 + i] == expected);
+      }
       CHECK(r->workgroups == 1);
       CHECK(!memcmp(mock.gems[h].local, mock.pipelines[p]->code.data, r->program_bytes));
       void *local = mock.gems[1].local + starts[d] * 4;
@@ -348,9 +356,11 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    CHECK(v->CreateDescriptorSetLayout(dev, &set_info, NULL, &set_layout) == VK_SUCCESS);
    VkDescriptorSetLayout layouts[2] = {set_layout, set_layout};
    VkPipelineLayout layout;
+   const VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 16, 240};
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .setLayoutCount = tables ? 2 : 1, .pSetLayouts = layouts,
+      .pushConstantRangeCount = tables ? 1 : 0, .pPushConstantRanges = &push_range,
    };
    CHECK(v->CreatePipelineLayout(dev, &layout_info, NULL, &layout) == VK_SUCCESS);
    const uint32_t values[] = {7, 101};
@@ -493,6 +503,18 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    CHECK(v->AllocateCommandBuffers(dev, &command_alloc, &cmd) == VK_SUCCESS);
    const VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
    CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   if (tables) {
+      uint32_t values[60];
+      for (unsigned i = 0; i < ARRAY_SIZE(values); i++) values[i] = 0xa5100000 + (i + 4) * 37;
+      const uint32_t bad_ranges[][2] = {{252, 8}, {UINT32_MAX - 3, 4}, {17, 4}, {16, 5}};
+      for (unsigned i = 0; i < ARRAY_SIZE(bad_ranges); i++) {
+         v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                              bad_ranges[i][0], bad_ranges[i][1], values);
+         CHECK(v->EndCommandBuffer(cmd) == VK_ERROR_FEATURE_NOT_PRESENT);
+         CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+         CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+      }
+   }
    if (dynamic) {
       uint32_t offsets[] = {4, 64, 0, 12, 0, 64};
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, sets, 5, offsets);
@@ -506,7 +528,23 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       memset(offsets, 0xff, sizeof(offsets)); /* Consumed at bind, before dispatch. */
    } else if (tables)
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
+   if (tables) {
+      uint32_t values[60];
+      for (unsigned i = 0; i < ARRAY_SIZE(values); i++) values[i] = 0xa5100000 + (i + 4) * 37;
+      v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 16, sizeof(values), values);
+      memset(values, 0xff, sizeof(values)); /* Consume before dispatch, not submission. */
+   }
    for (unsigned i = 0; i < 2; i++) {
+      if (tables && i) {
+         uint32_t values[] = {0xc0ffee00, 0xabad1dea};
+         const VkPushConstantsInfo push = {
+            .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO, .layout = layout,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 24,
+            .size = sizeof(values), .pValues = values,
+         };
+         v->CmdPushConstants2(cmd, &push);
+         memset(values, 0xff, sizeof(values));
+      }
       v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[i]);
       if (dynamic && i) {
          uint32_t offsets[] = {20, 0, 64};
@@ -527,6 +565,10 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          .memoryBarrierCount = 1, .pMemoryBarriers = &barrier,
       };
       v->CmdPipelineBarrier2(cmd, &dependency);
+   }
+   if (tables) {
+      const uint32_t values[60] = {0};
+      v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 16, sizeof(values), values);
    }
    if (dynamic) {
       /* Rebinding the same set must not mutate either recorded dispatch. */
@@ -653,6 +695,10 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 0, NULL);
       if (tables && !dynamic)
          v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
+      if (tables) {
+         const uint32_t value = 0xdecafbad;
+         v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 252, sizeof(value), &value);
+      }
       v->CmdDispatch(cmd, 1, 1, 1);
       CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
       CHECK(v->QueueSubmit2(queue, 1, &submit, fence) == VK_SUCCESS);

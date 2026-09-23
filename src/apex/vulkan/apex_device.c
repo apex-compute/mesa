@@ -53,12 +53,14 @@ struct apex_dispatch {
    struct apex_pipeline *pipeline;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint32_t groups;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
 };
 struct apex_command_buffer {
    struct vk_command_buffer vk;
    struct list_head dispatches;
    struct apex_pipeline *pipeline;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_memory, vk.base, VkDeviceMemory, VK_OBJECT_TYPE_DEVICE_MEMORY);
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_buffer, vk.base, VkBuffer, VK_OBJECT_TYPE_BUFFER);
@@ -519,6 +521,7 @@ clear_commands(struct apex_command_buffer *cmd)
    for (unsigned s = 0; s < ARRAY_SIZE(cmd->sets); s++)
       bound_set_unref(cmd, cmd->sets[s]);
    memset(cmd->sets, 0, sizeof(cmd->sets));
+   memset(cmd->push, 0, sizeof(cmd->push));
 }
 
 static void
@@ -632,6 +635,19 @@ apex_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint point,
 }
 
 static VKAPI_ATTR void VKAPI_CALL
+apex_CmdPushConstants2(VkCommandBuffer handle, const VkPushConstantsInfo *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   uint32_t offset = info->offset, size = info->size;
+   if (info->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || offset % 4 || size % 4 ||
+       !size || offset >= APEX_MAX_PUSH_CONSTANTS || size > APEX_MAX_PUSH_CONSTANTS - offset) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   memcpy(cmd->push + offset, info->pValues, size);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
 apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
@@ -650,6 +666,7 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
    }
    *dispatch = (struct apex_dispatch) {.pipeline = cmd->pipeline, .groups = x};
    memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
+   memcpy(dispatch->push, cmd->push, sizeof(dispatch->push));
    for (unsigned s = 0; s < ARRAY_SIZE(dispatch->sets); s++)
       if (dispatch->sets[s])
          dispatch->sets[s]->refs++;
@@ -679,10 +696,12 @@ drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
    struct apex_pipeline *pipeline = dispatch->pipeline;
    if (!pipeline->layout)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   size_t bytes = (pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor);
+   size_t push_offset = (pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor);
+   size_t bytes = push_offset + pipeline->push_size;
    struct apex_buffer_descriptor *rows = calloc(1, bytes);
    if (!rows)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   memcpy((uint8_t *)rows + push_offset, dispatch->push, pipeline->push_size);
    VkResult result = VK_ERROR_DEVICE_LOST;
    struct apex_bo table = {0};
    for (unsigned s = 0; s < pipeline->layout->set_count; s++) {
@@ -876,6 +895,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .FreeDescriptorSets = apex_FreeDescriptorSets, .UpdateDescriptorSets = apex_UpdateDescriptorSets,
       .BeginCommandBuffer = apex_BeginCommandBuffer, .EndCommandBuffer = apex_EndCommandBuffer,
       .CmdBindPipeline = apex_CmdBindPipeline, .CmdBindDescriptorSets = apex_CmdBindDescriptorSets,
+      .CmdPushConstants2 = apex_CmdPushConstants2,
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
       .QueueWaitIdle = apex_QueueWaitIdle,
    };

@@ -123,8 +123,10 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    alloc.pSetLayouts = &sets[1];
    CHECK(v->AllocateDescriptorSets(dev, &alloc, &allocated[1]) == VK_SUCCESS);
    v->DestroyDescriptorPool(dev, pool, NULL);
+   const VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 16, 48};
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = sets,
+      .pushConstantRangeCount = 1, .pPushConstantRanges = &push_range,
    };
    VkPipelineLayout layout;
    CHECK(v->CreatePipelineLayout(dev, &layout_info, NULL, &layout) == VK_SUCCESS);
@@ -137,6 +139,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
    CHECK(p->descriptor_count == 5 && p->set_offsets[0] == 0 && p->set_offsets[1] == 1);
+   CHECK(p->push_size == 64);
    CHECK(p->layout->dynamic_descriptor_offset[1] == (dynamic ? 1 : 0));
    VkDescriptorSetLayout swapped[] = {sets[1], sets[0]};
    VkPipelineLayoutCreateInfo wrong_layout_info = layout_info;
@@ -167,6 +170,21 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
          VK_ERROR_FEATURE_NOT_PRESENT && !rejected);
    v->DestroyPipelineLayout(dev, wrong_layout, NULL);
    v->DestroyDescriptorSetLayout(dev, swapped[1], NULL);
+   const VkPushConstantRange rejected_ranges[] = {
+      {VK_SHADER_STAGE_COMPUTE_BIT, 16, 244},
+      {VK_SHADER_STAGE_COMPUTE_BIT, 18, 48},
+      {VK_SHADER_STAGE_COMPUTE_BIT, 16, 49},
+      {VK_SHADER_STAGE_FRAGMENT_BIT, 16, 48},
+   };
+   wrong_layout_info = layout_info;
+   for (unsigned r = 0; r < ARRAY_SIZE(rejected_ranges); r++) {
+      wrong_layout_info.pPushConstantRanges = &rejected_ranges[r];
+      CHECK(v->CreatePipelineLayout(dev, &wrong_layout_info, NULL, &wrong_layout) == VK_SUCCESS);
+      wrong_info.layout = wrong_layout;
+      CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &wrong_info, NULL, &rejected) ==
+            VK_ERROR_FEATURE_NOT_PRESENT && !rejected);
+      v->DestroyPipelineLayout(dev, wrong_layout, NULL);
+   }
    v->DestroyPipelineLayout(dev, layout, NULL);
    for (unsigned s = 0; s < 2; s++) v->DestroyDescriptorSetLayout(dev, sets[s], NULL);
    v->DestroyShaderModule(dev, module, NULL);
