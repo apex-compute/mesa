@@ -324,6 +324,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       .lower_subgroup_masks = true, .lower_inverse_ballot = true,
       .lower_relative_shuffle = true, .lower_quad = true,
       .lower_reduce = true,
+      .lower_rotate_to_shuffle = true,
    };
    bool progress;
    do {
