@@ -6,6 +6,7 @@
 
 #define APEX_DRM_CAP_SHMEM (1U << 0)
 #define APEX_DRM_CAP_EXEC (1U << 1)
+#define APEX_DRM_CAP_GPUVM (1U << 2)
 
 /* Output only. Capabilities describe this DRM interface, not the raw device. */
 struct drm_apex_info {
@@ -53,12 +54,70 @@ struct drm_apex_exec {
 	__u64 timestamp;
 };
 
+#define APEX_DRM_VM_BIND_MAP 1U
+#define APEX_DRM_VM_BIND_UNMAP 2U
+#define APEX_DRM_VM_READ (1U << 0)
+#define APEX_DRM_VM_WRITE (1U << 1)
+#define APEX_DRM_VM_EXEC (1U << 2)
+
+/* Update the calling DRM file's implicit VM. MAP installs one fixed,
+ * page-aligned GEM range; overlapping mappings are rejected. EXEC and WRITE
+ * permissions are mutually exclusive. UNMAP removes one exact mapping and
+ * requires flags, handle, pad and offset to be zero. Bind changes are
+ * synchronous: no queue can retain the old page tables on return. */
+struct drm_apex_vm_bind {
+	__u32 operation;
+	__u32 flags;
+	__u32 handle;
+	__u32 pad;
+	__u64 va;
+	__u64 offset;
+	__u64 bytes;
+};
+
+#define APEX_DRM_TRANSFER_TO_LOCAL 1U
+#define APEX_DRM_TRANSFER_FROM_LOCAL 2U
+
+/* Explicitly copy one byte range between a GEM object's shmem CPU view and
+ * its GEM-owned LOCAL backing. TO_LOCAL is a CPU flush/upload; FROM_LOCAL is
+ * a CPU invalidate/download. Bytes outside the range are unchanged. */
+struct drm_apex_gem_transfer {
+	__u32 handle;
+	__u32 direction;
+	__u32 flags;
+	__u32 pad;
+	__u64 offset;
+	__u64 bytes;
+};
+
+/* Synchronous dispatch through the calling DRM file's persistent VM. The
+ * exact program extent must be covered by an RX mapping and pass APX
+ * admission; data_va must select an RW mapping. This operation performs no
+ * implicit shmem/LOCAL transfer. flags and output fields must be zero on
+ * entry. Status values match drm_apex_exec. */
+struct drm_apex_vm_exec {
+	__u64 program_va;
+	__u64 program_bytes;
+	__u64 data_va;
+	__u32 workgroups;
+	__u32 flags;
+	__u32 status;
+	__u32 reason;
+	__u64 timestamp;
+};
+
 #define DRM_APEX_INFO 0x00
 #define DRM_APEX_GEM_CREATE 0x01
 #define DRM_APEX_GEM_MMAP 0x02
 #define DRM_APEX_EXEC 0x03
+#define DRM_APEX_VM_BIND 0x04
+#define DRM_APEX_GEM_TRANSFER 0x05
+#define DRM_APEX_VM_EXEC 0x06
 #define DRM_IOCTL_APEX_INFO DRM_IOR(DRM_COMMAND_BASE + DRM_APEX_INFO, struct drm_apex_info)
 #define DRM_IOCTL_APEX_GEM_CREATE DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_GEM_CREATE, struct drm_apex_gem_create)
 #define DRM_IOCTL_APEX_GEM_MMAP DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_GEM_MMAP, struct drm_apex_gem_mmap)
 #define DRM_IOCTL_APEX_EXEC DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_EXEC, struct drm_apex_exec)
+#define DRM_IOCTL_APEX_VM_BIND DRM_IOW(DRM_COMMAND_BASE + DRM_APEX_VM_BIND, struct drm_apex_vm_bind)
+#define DRM_IOCTL_APEX_GEM_TRANSFER DRM_IOW(DRM_COMMAND_BASE + DRM_APEX_GEM_TRANSFER, struct drm_apex_gem_transfer)
+#define DRM_IOCTL_APEX_VM_EXEC DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_VM_EXEC, struct drm_apex_vm_exec)
 #endif

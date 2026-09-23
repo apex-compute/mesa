@@ -22,7 +22,7 @@
 struct apex_memory {
    struct vk_device_memory vk;
    void *data;
-   uint32_t handle;
+   struct apex_bo bo;
 };
 struct apex_buffer {
    struct vk_buffer vk;
@@ -85,6 +85,67 @@ gem_create(struct apex_device *device, uint64_t size, uint32_t *handle, void **d
    return VK_ERROR_MEMORY_MAP_FAILED;
 }
 
+void
+apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
+{
+   if (bo->va) {
+      struct drm_apex_vm_bind bind = {
+         .operation = APEX_DRM_VM_BIND_UNMAP, .va = bo->va, .bytes = bo->size,
+      };
+      if (ioctl(device->fd, DRM_IOCTL_APEX_VM_BIND, &bind)) {
+         /* Keep this address reserved until file close if unbind failed. */
+         vk_device_set_lost(&device->vk, "Apex VM unbind failed");
+      } else {
+         mtx_lock(&device->va_mutex);
+         util_vma_heap_free(&device->va_heap, bo->va, bo->size);
+         mtx_unlock(&device->va_mutex);
+      }
+   }
+   if (bo->map)
+      munmap(bo->map, bo->size);
+   if (bo->handle && gem_close(device, bo->handle))
+      vk_device_set_lost(&device->vk, "Apex GEM close failed");
+   *bo = (struct apex_bo){0};
+}
+
+static VkResult
+bo_create(struct apex_device *device, uint64_t size, uint32_t flags, struct apex_bo *bo)
+{
+   bo->size = align64(size, 4096);
+   VkResult result = gem_create(device, bo->size, &bo->handle, &bo->map);
+   if (result != VK_SUCCESS)
+      return result;
+   mtx_lock(&device->va_mutex);
+   uint64_t va = util_vma_heap_alloc(&device->va_heap, bo->size, 4096);
+   mtx_unlock(&device->va_mutex);
+   if (va) {
+      struct drm_apex_vm_bind bind = {
+         .operation = APEX_DRM_VM_BIND_MAP, .flags = flags, .handle = bo->handle,
+         .va = va, .bytes = bo->size,
+      };
+      if (!ioctl(device->fd, DRM_IOCTL_APEX_VM_BIND, &bind)) {
+         bo->va = va;
+         return VK_SUCCESS;
+      }
+      mtx_lock(&device->va_mutex);
+      util_vma_heap_free(&device->va_heap, va, bo->size);
+      mtx_unlock(&device->va_mutex);
+   }
+   apex_bo_finish(device, bo);
+   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+static VkResult
+bo_transfer(struct apex_device *device, struct apex_bo *bo, uint32_t direction,
+            uint64_t offset, uint64_t bytes)
+{
+   struct drm_apex_gem_transfer transfer = {
+      .handle = bo->handle, .direction = direction, .offset = offset, .bytes = bytes,
+   };
+   return ioctl(device->fd, DRM_IOCTL_APEX_GEM_TRANSFER, &transfer) ?
+      vk_device_set_lost(&device->vk, "Apex memory transfer failed") : VK_SUCCESS;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
                     const VkAllocationCallbacks *alloc, VkDeviceMemory *out)
@@ -93,14 +154,16 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    *out = VK_NULL_HANDLE;
    if (info->memoryTypeIndex || info->pNext)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   if (info->allocationSize > 64 * 1024 * 1024)
+   if (!info->allocationSize || info->allocationSize > 64 * 1024 * 1024)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    struct apex_memory *mem = vk_device_memory_create(&device->vk, info, alloc, sizeof(*mem));
    if (!mem)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    VkResult result;
    if (device->transport == APEX_TRANSPORT_DRM) {
-      result = gem_create(device, info->allocationSize, &mem->handle, &mem->data);
+      result = bo_create(device, info->allocationSize,
+                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, &mem->bo);
+      mem->data = mem->bo.map;
    } else {
       mem->data = vk_zalloc2(&device->vk.alloc, alloc, info->allocationSize, 8,
                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -122,8 +185,7 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
    if (!memory)
       return;
    if (device->transport == APEX_TRANSPORT_DRM) {
-      munmap(memory->data, memory->vk.size);
-      gem_close(device, memory->handle);
+      apex_bo_finish(device, &memory->bo);
    } else {
       vk_free2(&device->vk.alloc, alloc, memory->data);
    }
@@ -148,12 +210,38 @@ apex_UnmapMemory2(VkDevice dev, const VkMemoryUnmapInfo *info)
    return info->flags ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS;
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL
-apex_MappedMemoryRanges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges)
+static VkResult
+mapped_memory_ranges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges,
+                     uint32_t direction)
 {
-   /* Both shmem and qualification shadow memory are host coherent. Submission
-    * completes device release before exposing output to the host. */
+   VK_FROM_HANDLE(apex_device, device, dev);
+   for (unsigned i = 0; i < count; i++) {
+      VK_FROM_HANDLE(apex_memory, memory, ranges[i].memory);
+      if (ranges[i].offset >= memory->vk.size)
+         return VK_ERROR_MEMORY_MAP_FAILED;
+      uint64_t bytes = ranges[i].size == VK_WHOLE_SIZE ?
+         memory->vk.size - ranges[i].offset : ranges[i].size;
+      if (!bytes || bytes > memory->vk.size - ranges[i].offset)
+         return VK_ERROR_MEMORY_MAP_FAILED;
+      if (device->transport == APEX_TRANSPORT_DRM) {
+         VkResult result = bo_transfer(device, &memory->bo, direction, ranges[i].offset, bytes);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_FlushMappedMemoryRanges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges)
+{
+   return mapped_memory_ranges(dev, count, ranges, APEX_DRM_TRANSFER_TO_LOCAL);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_InvalidateMappedMemoryRanges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges)
+{
+   return mapped_memory_ranges(dev, count, ranges, APEX_DRM_TRANSFER_FROM_LOCAL);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -475,26 +563,31 @@ native_command(struct apex_device *device, uint32_t operation)
 
 static VkResult
 drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch,
-             struct apex_memory *memory, uint64_t offset, uint64_t bytes)
+             struct apex_memory *memory, uint64_t offset)
 {
-   uint32_t program;
-   void *code;
-   VkResult result = gem_create(device, dispatch->pipeline->code.size, &program, &code);
-   if (result != VK_SUCCESS)
-      return result;
-   memcpy(code, dispatch->pipeline->code.data, dispatch->pipeline->code.size);
-   struct drm_apex_exec args = {
-      .program_handle = program, .program_bytes = dispatch->pipeline->code.size,
-      .data_handle = memory->handle, .data_offset = offset, .data_bytes = bytes,
+   struct apex_pipeline *pipeline = dispatch->pipeline;
+   if (!pipeline->program.handle) {
+      VkResult result = bo_create(device, pipeline->code.size,
+                                 APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, &pipeline->program);
+      if (result != VK_SUCCESS)
+         return result;
+      memcpy(pipeline->program.map, pipeline->code.data, pipeline->code.size);
+      result = bo_transfer(device, &pipeline->program, APEX_DRM_TRANSFER_TO_LOCAL,
+                           0, pipeline->code.size);
+      if (result != VK_SUCCESS) {
+         apex_bo_finish(device, &pipeline->program);
+         return result;
+      }
+   }
+   struct drm_apex_vm_exec args = {
+      .program_va = pipeline->program.va, .program_bytes = pipeline->code.size,
+      .data_va = memory->bo.va + offset,
       .workgroups = dispatch->groups,
    };
-   /* Do not retry EXEC on EINTR: the kernel cancels/drains the accepted job. */
-   result = !ioctl(device->fd, DRM_IOCTL_APEX_EXEC, &args) && args.status == 1 ?
+   /* No implicit data transfer. Host visibility requires flush/invalidate.
+    * Do not retry EXEC on EINTR: the kernel cancels/drains the accepted job. */
+   return !ioctl(device->fd, DRM_IOCTL_APEX_VM_EXEC, &args) && args.status == 1 ?
       VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-   munmap(code, dispatch->pipeline->code.size);
-   if (gem_close(device, program))
-      result = VK_ERROR_DEVICE_LOST;
-   return result;
 }
 
 static VkResult
@@ -508,7 +601,7 @@ dispatch_compute(struct apex_device *device, const struct apex_dispatch *dispatc
    if (!bytes || bytes > buffer->vk.size - binding->offset)
       return VK_ERROR_DEVICE_LOST;
    if (device->transport == APEX_TRANSPORT_DRM)
-      return drm_dispatch(device, dispatch, buffer->memory, buffer->offset + binding->offset, bytes);
+      return drm_dispatch(device, dispatch, buffer->memory, buffer->offset + binding->offset);
    void *data = (uint8_t *)buffer->memory->data + buffer->offset + binding->offset;
    if (native_command(device, APEX_NATIVE_CREATE))
       return VK_ERROR_DEVICE_LOST;
@@ -601,17 +694,17 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       return VK_ERROR_FEATURE_NOT_PRESENT;
    if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};
-      if (ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 1 ||
-          (caps.capabilities & (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_EXEC)) !=
-          (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_EXEC))
+      if (ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 2 ||
+          (caps.capabilities & (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM)) !=
+          (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM))
          return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,
       .AllocateMemory = apex_AllocateMemory, .FreeMemory = apex_FreeMemory,
       .MapMemory2 = apex_MapMemory2, .UnmapMemory2 = apex_UnmapMemory2,
-      .FlushMappedMemoryRanges = apex_MappedMemoryRanges,
-      .InvalidateMappedMemoryRanges = apex_MappedMemoryRanges,
+      .FlushMappedMemoryRanges = apex_FlushMappedMemoryRanges,
+      .InvalidateMappedMemoryRanges = apex_InvalidateMappedMemoryRanges,
       .CreateBuffer = apex_CreateBuffer, .DestroyBuffer = apex_DestroyBuffer,
       .GetDeviceBufferMemoryRequirements = apex_GetDeviceBufferMemoryRequirements,
       .BindBufferMemory2 = apex_BindBufferMemory2,
@@ -630,6 +723,11 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->vk.command_buffer_ops = &command_ops;
    device->fd = fd;
    device->transport = transport;
+   if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
+      vk_device_finish(&device->vk);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   util_vma_heap_init(&device->va_heap, 2 * 1024 * 1024, (1ull << 39) - 2 * 1024 * 1024);
    if (transport == APEX_TRANSPORT_DRM)
       vk_device_set_drm_fd(&device->vk, fd);
    if (physical->supported_sync_types) {
@@ -638,6 +736,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    }
    result = vk_queue_init(&device->queue, &device->vk, &info->pQueueCreateInfos[0], 0);
    if (result != VK_SUCCESS) {
+      util_vma_heap_finish(&device->va_heap);
+      mtx_destroy(&device->va_mutex);
       vk_device_finish(&device->vk);
       return result;
    }
@@ -646,6 +746,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       result = vk_queue_enable_submit_thread(&device->queue);
       if (result != VK_SUCCESS) {
          vk_queue_finish(&device->queue);
+         util_vma_heap_finish(&device->va_heap);
+         mtx_destroy(&device->va_mutex);
          vk_device_finish(&device->vk);
          return result;
       }
@@ -657,5 +759,7 @@ void
 apex_device_finish(struct apex_device *device)
 {
    vk_queue_finish(&device->queue);
+   util_vma_heap_finish(&device->va_heap);
+   mtx_destroy(&device->va_mutex);
    vk_device_finish(&device->vk);
 }

@@ -3,6 +3,7 @@
 #define APEX_PIPELINE_H
 
 #include "apex/apex.h"
+#include "apex_device.h"
 #include "vk_pipeline.h"
 
 /* Fixed compute launch ABI: one SSBO at set 0/binding 0, local size 16x1x1.
@@ -10,6 +11,7 @@
 struct apex_pipeline {
    struct vk_pipeline vk;
    struct apex_compile_result code;
+   struct apex_bo program;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_pipeline, vk.base, VkPipeline,

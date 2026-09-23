@@ -28,14 +28,19 @@ static struct {
    int drm_fd;
    unsigned objects, live, exec_calls;
    uint64_t next_offset;
-   struct { uint64_t offset, size; bool live; } gems[8];
+   struct {
+      uint64_t offset, size, va;
+      uint32_t flags, uploads;
+      uint8_t *local;
+      bool live;
+   } gems[8];
    struct apex_pipeline *pipelines[3];
    uint32_t *mapped;
    uint32_t expected[2048], payload[800];
 } mock;
-static const unsigned starts[] = {48, 1088, 48};
-static const unsigned biases[] = {37, 101, 112};
-static const unsigned scales[] = {3, 7, 7};
+static const unsigned starts[] = {48, 1088, 48, 48};
+static const unsigned biases[] = {37, 101, 112, 112};
+static const unsigned scales[] = {3, 7, 7, 7};
 static int sync_fd = -1;
 
 int __real_ioctl(int fd, unsigned long request, ...);
@@ -46,8 +51,9 @@ drm_ioctl(unsigned long request, void *arg)
 {
    if (request == DRM_IOCTL_APEX_INFO) {
       *(struct drm_apex_info *)arg = (struct drm_apex_info) {
-         .version = mock.fault == 208 ? 2 : 1,
-         .capabilities = APEX_DRM_CAP_SHMEM | (mock.fault == 207 ? 0 : APEX_DRM_CAP_EXEC),
+         .version = mock.fault == 208 ? 1 : 2,
+         .capabilities = APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_EXEC |
+                         (mock.fault == 207 ? 0 : APEX_DRM_CAP_GPUVM),
          .max_buffer_bytes = 64 * 1024 * 1024,
       };
    } else if (request == DRM_IOCTL_APEX_GEM_CREATE) {
@@ -61,6 +67,8 @@ drm_ioctl(unsigned long request, void *arg)
       mock.gems[h].size = r->size;
       mock.gems[h].offset = mock.next_offset;
       mock.gems[h].live = true;
+      mock.gems[h].local = calloc(1, r->size);
+      CHECK(mock.gems[h].local);
       mock.live++;
       mock.next_offset += r->size + 4096;
       CHECK(!ftruncate(mock.drm_fd, mock.next_offset));
@@ -69,38 +77,77 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(!r->flags && r->handle <= mock.objects && mock.gems[r->handle].live);
       if (r->handle > 1 && mock.fault == 202) { errno = EIO; return -1; }
       r->offset = r->handle > 1 && mock.fault == 203 ? 1 : mock.gems[r->handle].offset;
+   } else if (request == DRM_IOCTL_APEX_VM_BIND) {
+      struct drm_apex_vm_bind *r = arg;
+      CHECK(!r->pad && !r->offset && r->bytes && !(r->bytes % 4096));
+      CHECK(r->va >= 2 * 1024 * 1024 && !(r->va % 4096) &&
+            r->va + r->bytes <= (1ull << 39));
+      if (r->operation == APEX_DRM_VM_BIND_MAP) {
+         unsigned h = r->handle;
+         CHECK(h && h <= mock.objects && mock.gems[h].live && !mock.gems[h].va);
+         CHECK(r->bytes == mock.gems[h].size);
+         CHECK(r->flags == (APEX_DRM_VM_READ | (h >= 2 && h <= 4 ? APEX_DRM_VM_EXEC : APEX_DRM_VM_WRITE)));
+         if (h > 1 && mock.fault == 209) { errno = ENOMEM; return -1; }
+         for (unsigned i = 1; i <= mock.objects; i++)
+            CHECK(!mock.gems[i].va || r->va + r->bytes <= mock.gems[i].va ||
+                  r->va >= mock.gems[i].va + mock.gems[i].size);
+         mock.gems[h].va = r->va;
+         mock.gems[h].flags = r->flags;
+      } else {
+         CHECK(r->operation == APEX_DRM_VM_BIND_UNMAP && !r->flags && !r->handle);
+         unsigned h;
+         for (h = 1; h <= mock.objects && mock.gems[h].va != r->va; h++);
+         CHECK(h <= mock.objects && mock.gems[h].size == r->bytes);
+         mock.gems[h].va = 0;
+      }
+   } else if (request == DRM_IOCTL_APEX_GEM_TRANSFER) {
+      struct drm_apex_gem_transfer *r = arg;
+      unsigned h = r->handle;
+      CHECK(h && h <= mock.objects && mock.gems[h].live && !r->flags && !r->pad);
+      CHECK(r->bytes && r->offset <= mock.gems[h].size &&
+            r->bytes <= mock.gems[h].size - r->offset);
+      if (h > 1 && mock.fault == 210) { errno = EIO; return -1; }
+      void *local = mock.gems[h].local + r->offset;
+      off_t offset = mock.gems[h].offset + r->offset;
+      if (r->direction == APEX_DRM_TRANSFER_TO_LOCAL) {
+         mock.gems[h].uploads++;
+         CHECK(pread(mock.drm_fd, local, r->bytes, offset) == r->bytes);
+      } else {
+         CHECK(r->direction == APEX_DRM_TRANSFER_FROM_LOCAL && h == 1);
+         CHECK(pwrite(mock.drm_fd, local, r->bytes, offset) == r->bytes);
+      }
    } else if (request == DRM_IOCTL_GEM_CLOSE) {
       struct drm_gem_close *r = arg;
       CHECK(r->handle <= mock.objects && mock.gems[r->handle].live);
+      CHECK(!mock.gems[r->handle].va);
+      free(mock.gems[r->handle].local);
       mock.gems[r->handle].live = false;
       mock.live--;
    } else {
-      CHECK(request == DRM_IOCTL_APEX_EXEC);
-      struct drm_apex_exec *r = arg;
+      CHECK(request == DRM_IOCTL_APEX_VM_EXEC);
+      struct drm_apex_vm_exec *r = arg;
       unsigned d = mock.dispatch;
+      unsigned p = MIN2(d, 2), h = p + 2;
       mock.exec_calls++;
-      CHECK(d < 3 && r->program_handle == d + 2 && r->data_handle == 1);
-      CHECK(mock.gems[r->program_handle].live && mock.gems[1].live);
+      CHECK(d < 4 && r->program_va == mock.gems[h].va);
+      CHECK(mock.gems[h].live && mock.gems[1].live);
+      CHECK(mock.gems[h].uploads == 1 && mock.gems[1].uploads == 2);
       CHECK(!r->flags && !r->status && !r->reason && !r->timestamp);
-      CHECK(!r->program_offset && r->program_bytes == mock.pipelines[d]->code.size);
-      CHECK(r->data_offset == starts[d] * 4 && r->data_bytes == sizeof(mock.payload));
+      CHECK(r->program_bytes == mock.pipelines[p]->code.size);
+      CHECK(r->data_va == mock.gems[1].va + starts[d] * 4);
       CHECK(r->workgroups == 1);
-      void *code = malloc(r->program_bytes);
-      CHECK(code && pread(mock.drm_fd, code, r->program_bytes,
-                          mock.gems[r->program_handle].offset) == r->program_bytes);
-      CHECK(!memcmp(code, mock.pipelines[d]->code.data, r->program_bytes));
-      free(code);
-      off_t offset = mock.gems[1].offset + r->data_offset;
-      CHECK(pread(mock.drm_fd, mock.payload, r->data_bytes, offset) == r->data_bytes);
-      CHECK(!memcmp(mock.payload, mock.expected + starts[d], r->data_bytes));
+      CHECK(!memcmp(mock.gems[h].local, mock.pipelines[p]->code.data, r->program_bytes));
+      void *local = mock.gems[1].local + starts[d] * 4;
+      memcpy(mock.payload, local, sizeof(mock.payload));
+      CHECK(!memcmp(mock.payload, mock.expected + starts[d], sizeof(mock.payload)));
       if (mock.fault == 204) { errno = EINTR; return -1; }
       if (mock.fault == 205 || mock.fault == 206) {
          r->status = mock.fault == 205 ? 4 : 5;
          return 0;
       }
       for (unsigned i = 0; i < 16; i++) mock.payload[i] = biases[d] + scales[d] * i;
-      CHECK(pwrite(mock.drm_fd, mock.payload, r->data_bytes, offset) == r->data_bytes);
-      memcpy(mock.expected + starts[d], mock.payload, r->data_bytes);
+      memcpy(local, mock.payload, sizeof(mock.payload));
+      memcpy(mock.expected + starts[d], mock.payload, sizeof(mock.payload));
       r->status = 1;
       mock.dispatch++;
    }
@@ -281,6 +328,24 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    CHECK(v->MapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mock.mapped) == VK_SUCCESS);
    for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++)
       mock.mapped[i] = mock.expected[i] = 0xd00d0000 + i;
+   const VkMappedMemoryRange whole = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = memory, .size = VK_WHOLE_SIZE,
+   };
+   CHECK(v->FlushMappedMemoryRanges(dev, 1, &whole) == VK_SUCCESS);
+   /* Nonzero-offset WHOLE_SIZE must transfer only the remaining tail. */
+   VkMappedMemoryRange range = whole;
+   range.offset = sizeof(mock.expected) - 64;
+   mock.mapped[2047] = mock.expected[2047] = 0x12345678;
+   mock.mapped[100] = 0xbad; /* Outside this flush must remain unchanged in LOCAL. */
+   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+   mock.mapped[100] = mock.expected[100];
+   range.offset = sizeof(mock.expected);
+   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_ERROR_MEMORY_MAP_FAILED);
+   range.offset = 0;
+   range.size = 0;
+   CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_ERROR_MEMORY_MAP_FAILED);
+   range.size = sizeof(mock.expected) + 64;
+   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_ERROR_MEMORY_MAP_FAILED);
    VkBuffer buffers[2];
    const VkBufferCreateInfo buffer_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 3456,
@@ -413,7 +478,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(result == VK_ERROR_DEVICE_LOST);
       CHECK(v->QueueWaitIdle(queue) == VK_ERROR_DEVICE_LOST);
       if (transport == APEX_TRANSPORT_DRM) {
-         CHECK(mock.live == 1 && !mock.calls[APEX_NATIVE_CREATE]);
+         CHECK(mock.live == (fault >= 204 && fault <= 206 ? 2 : 1) && !mock.calls[APEX_NATIVE_CREATE]);
          CHECK(mock.exec_calls == (fault >= 204 && fault <= 206 ? 1 : 0));
          CHECK(!memcmp(mock.mapped, mock.expected, sizeof(mock.expected)));
       } else {
@@ -429,6 +494,14 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(mock.exec_calls == exec_calls);
    } else {
       CHECK(result == VK_SUCCESS && v->QueueWaitIdle(queue) == VK_SUCCESS);
+      if (transport == APEX_TRANSPORT_DRM) {
+         CHECK(mock.mapped[48] == 0xd00d0030 && mock.mapped[1088] == 0xd00d0440);
+         range.offset = 1088 * 4;
+         range.size = 64;
+         CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+         CHECK(mock.mapped[48] == 0xd00d0030 && mock.mapped[1088] == 101);
+      }
+      CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &whole) == VK_SUCCESS);
       if (sync_fd >= 0) {
          uint64_t value;
          CHECK(v->GetSemaphoreCounterValue(dev, timeline, &value) == VK_SUCCESS && value == 11);
@@ -442,10 +515,14 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       }
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
          uint32_t expected = 0xd00d0000 + i;
+         if (i == 2047) expected = 0x12345678;
          if (i >= 48 && i < 64) expected = 37 + 3 * (i - 48);
          if (i >= 1088 && i < 1104) expected = 101 + 7 * (i - 1088);
          CHECK(mock.mapped[i] == expected);
       }
+      /* An unflushed shadow write must not overwrite retained GPU data. */
+      if (transport == APEX_TRANSPORT_DRM)
+         mock.mapped[100] = 0xbad;
       /* Reset must discard both old dispatches and bound pipeline/set state. */
       CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
       CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
@@ -464,13 +541,21 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          CHECK(v->GetFenceStatus(dev, fence) == VK_SUCCESS);
          CHECK(v->GetSemaphoreCounterValue(dev, timeline, &value) == VK_SUCCESS && value == 23);
       }
+      if (transport == APEX_TRANSPORT_DRM) {
+         VkSubmitInfo2 repeat = submit;
+         repeat.waitSemaphoreInfoCount = repeat.signalSemaphoreInfoCount = 0;
+         CHECK(v->QueueSubmit2(queue, 1, &repeat, VK_NULL_HANDLE) == VK_SUCCESS);
+         CHECK(v->DeviceWaitIdle(dev) == VK_SUCCESS);
+      }
+      CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &whole) == VK_SUCCESS);
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
          uint32_t expected = 0xd00d0000 + i;
+         if (i == 2047) expected = 0x12345678;
          if (i >= 48 && i < 64) expected = 112 + 7 * (i - 48);
          if (i >= 1088 && i < 1104) expected = 101 + 7 * (i - 1088);
          CHECK(mock.mapped[i] == expected);
       }
-      if (mocked) CHECK(mock.dispatch == 3 && mock.step == 0);
+      if (mocked) CHECK(mock.dispatch == (transport == APEX_TRANSPORT_DRM ? 4 : 3) && mock.step == 0);
    }
    if (sync_fd >= 0) {
       v->DestroyFence(dev, fence, NULL);
@@ -488,6 +573,21 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    for (unsigned i = 0; i < 2; i++) v->DestroyBuffer(dev, buffers[i], NULL);
    v->UnmapMemory(dev, memory);
    v->FreeMemory(dev, memory, NULL);
+   if (fault < 0 && transport == APEX_TRANSPORT_DRM) {
+      /* Free all objects, then reuse the address with a non-page-sized BO. */
+      VkMemoryAllocateInfo odd = mem_info;
+      odd.allocationSize = 4097;
+      CHECK(v->AllocateMemory(dev, &odd, NULL, &memory) == VK_SUCCESS);
+      CHECK(v->MapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mock.mapped) == VK_SUCCESS);
+      for (unsigned i = 0; i < odd.allocationSize; i++)
+         CHECK(((uint8_t *)mock.mapped)[i] == 0);
+      if (mocked) {
+         CHECK(mock.objects == 5 && mock.live == 1);
+         CHECK(mock.gems[5].va == (1ull << 39) - 8192);
+      }
+      v->UnmapMemory(dev, memory);
+      v->FreeMemory(dev, memory, NULL);
+   }
    apex_device_finish(&device);
    if (mock.drm_fd >= 0) {
       CHECK(!mock.live && !close(mock.drm_fd));
@@ -543,8 +643,8 @@ int main(int argc, char **argv)
    if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};
       CHECK(!ioctl(fd, DRM_IOCTL_APEX_INFO, &caps));
-      if (!(caps.capabilities & APEX_DRM_CAP_EXEC)) {
-         fprintf(stderr, "SKIP Apex Mesa DRM execution: kernel/image does not advertise EXEC\n");
+      if (caps.version != 2 || !(caps.capabilities & APEX_DRM_CAP_GPUVM)) {
+         fprintf(stderr, "SKIP Apex Mesa DRM execution: kernel/image does not advertise GPUVM v2\n");
          CHECK(!close(fd));
          free(spirv);
          vk_physical_device_finish(&physical);
@@ -555,16 +655,17 @@ int main(int argc, char **argv)
    run(&physical, spirv, size, fd, -1, transport);
    if (fd >= 0) {
       CHECK(close(fd) == 0);
-      printf("PASS Apex Mesa %s command submission: 3 dispatches, 2 buffers, 2048 words/guards\n",
-             transport == APEX_TRANSPORT_DRM ? "DRM" : "native");
+      printf("PASS Apex Mesa %s command submission: %u dispatches, 2 buffers, 2048 words/guards\n",
+             transport == APEX_TRANSPORT_DRM ? "DRM GPUVM" : "native",
+             transport == APEX_TRANSPORT_DRM ? 4 : 3);
    } else {
       const int faults[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 99, 100, 101};
       for (unsigned i = 0; i < ARRAY_SIZE(faults); i++)
          run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE);
-      const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208};
+      const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210};
       for (unsigned i = 0; i < ARRAY_SIZE(drm_faults); i++)
          run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM);
-      puts("PASS Apex Mesa native/DRM transport: GEM, binding, offsets, reset, cleanup, device loss (mock ioctl)");
+      puts("PASS Apex Mesa native/DRM transport: persistent GPUVA, explicit ranges, retained data/programs, cleanup, device loss (mock ioctl)");
       if (sync_fd >= 0) {
          CHECK(!close(sync_fd));
          puts("PASS Apex Mesa DRM syncobjs: timeline wait-before-signal, binary dependency, fence reuse, fault wakeup (mock execution)");

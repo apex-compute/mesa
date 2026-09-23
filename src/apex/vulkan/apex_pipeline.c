@@ -10,6 +10,8 @@ apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
                       const VkAllocationCallbacks *alloc)
 {
    struct apex_pipeline *pipeline = (struct apex_pipeline *)vk;
+   if (pipeline->program.handle)
+      apex_bo_finish((struct apex_device *)device, &pipeline->program);
    apex_compile_result_finish(&pipeline->code);
    vk_pipeline_free(device, alloc, vk);
 }
