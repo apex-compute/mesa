@@ -33,25 +33,26 @@ struct apex_descriptor_pool {
    struct vk_object_base base;
    struct list_head sets;
    uint32_t capacity, allocated;
+   uint64_t descriptors, used;
 };
 struct apex_descriptor_set {
    struct vk_object_base base;
    struct list_head link;
    struct apex_descriptor_pool *pool;
-   struct vk_descriptor_set_layout *layout;
-   VkDescriptorBufferInfo buffer;
+   struct apex_set_layout *layout;
+   VkDescriptorBufferInfo buffers[];
 };
 struct apex_dispatch {
    struct list_head link;
    struct apex_pipeline *pipeline;
-   struct apex_descriptor_set *set;
+   struct apex_descriptor_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint32_t groups;
 };
 struct apex_command_buffer {
    struct vk_command_buffer vk;
    struct list_head dispatches;
    struct apex_pipeline *pipeline;
-   struct apex_descriptor_set *set;
+   struct apex_descriptor_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_memory, vk.base, VkDeviceMemory, VK_OBJECT_TYPE_DEVICE_MEMORY);
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_buffer, vk.base, VkBuffer, VK_OBJECT_TYPE_BUFFER);
@@ -301,23 +302,47 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    *out = VK_NULL_HANDLE;
    const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags =
       vk_find_struct_const(info->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
-   VkDescriptorBindingFlags flags = binding_flags && binding_flags->bindingCount ?
-      binding_flags->pBindingFlags[0] : 0;
-   if ((info->flags & ~VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) ||
-       (flags & ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
-       info->bindingCount != 1 || info->pBindings[0].binding != 0 ||
-       info->pBindings[0].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
-       info->pBindings[0].descriptorCount != 1 ||
-       info->pBindings[0].stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+   if (info->flags & ~VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   struct vk_descriptor_set_layout *layout =
-      vk_descriptor_set_layout_zalloc(&device->vk, sizeof(*layout), info);
+   unsigned count = 0, descriptors = 0;
+   for (unsigned i = 0; i < info->bindingCount; i++) {
+      const VkDescriptorSetLayoutBinding *b = &info->pBindings[i];
+      VkDescriptorBindingFlags flags = binding_flags && binding_flags->bindingCount ?
+         binding_flags->pBindingFlags[i] : 0;
+      if (b->binding >= APEX_MAX_BINDINGS || b->descriptorCount > APEX_MAX_DESCRIPTORS - descriptors ||
+          (flags & ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
+          b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          b->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      descriptors += b->descriptorCount;
+      count = MAX2(count, b->binding + 1);
+   }
+   if (device->transport == APEX_TRANSPORT_NATIVE &&
+       (count != 1 || descriptors != 1))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct apex_set_layout *layout = vk_descriptor_set_layout_zalloc(&device->vk,
+      sizeof(*layout) + count * sizeof(layout->bindings[0]), info);
    if (!layout)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   const uint32_t key[] = {info->flags, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                           1, VK_SHADER_STAGE_COMPUTE_BIT, flags};
-   _mesa_blake3_compute(key, sizeof(key), layout->blake3);
-   *out = vk_descriptor_set_layout_to_handle(layout);
+   layout->binding_count = count;
+   layout->descriptor_count = descriptors;
+   for (unsigned i = 0; i < info->bindingCount; i++) {
+      unsigned b = info->pBindings[i].binding;
+      layout->bindings[b].count = info->pBindings[i].descriptorCount;
+      layout->bindings[b].flags = binding_flags && binding_flags->bindingCount ?
+         binding_flags->pBindingFlags[i] : 0;
+   }
+   unsigned offset = 0;
+   for (unsigned b = 0; b < count; b++) {
+      layout->bindings[b].offset = offset;
+      offset += layout->bindings[b].count;
+   }
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   _mesa_blake3_update(&hash, &info->flags, sizeof(info->flags));
+   _mesa_blake3_update(&hash, layout->bindings, count * sizeof(layout->bindings[0]));
+   _mesa_blake3_final(&hash, layout->vk.blake3);
+   *out = vk_descriptor_set_layout_to_handle(&layout->vk);
    return VK_SUCCESS;
 }
 
@@ -341,7 +366,8 @@ apex_CreateDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo *info,
    if (!pool)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    list_inithead(&pool->sets);
-   pool->capacity = MIN2(info->maxSets, descriptors);
+   pool->capacity = info->maxSets;
+   pool->descriptors = descriptors;
    *out = apex_descriptor_pool_to_handle(pool);
    return VK_SUCCESS;
 }
@@ -351,7 +377,8 @@ free_set(struct vk_device *device, struct apex_descriptor_set *set)
 {
    list_del(&set->link);
    set->pool->allocated--;
-   vk_descriptor_set_layout_unref(device, set->layout);
+   set->pool->used -= set->layout->descriptor_count;
+   vk_descriptor_set_layout_unref(device, &set->layout->vk);
    vk_object_free(device, NULL, set);
 }
 
@@ -395,20 +422,31 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
    VK_FROM_HANDLE(apex_descriptor_pool, pool, info->descriptorPool);
    for (unsigned i = 0; i < info->descriptorSetCount; i++)
       out[i] = VK_NULL_HANDLE;
+   uint64_t descriptors = 0;
+   for (unsigned i = 0; i < info->descriptorSetCount; i++) {
+      const struct apex_set_layout *layout =
+         (const void *)vk_descriptor_set_layout_from_handle(info->pSetLayouts[i]);
+      descriptors += layout->descriptor_count;
+   }
+   if (descriptors > pool->descriptors - pool->used)
+      return VK_ERROR_OUT_OF_POOL_MEMORY;
    if (info->descriptorSetCount > pool->capacity - pool->allocated)
       return VK_ERROR_OUT_OF_POOL_MEMORY;
    for (unsigned i = 0; i < info->descriptorSetCount; i++) {
+      struct apex_set_layout *layout =
+         (void *)vk_descriptor_set_layout_from_handle(info->pSetLayouts[i]);
       struct apex_descriptor_set *set = vk_object_zalloc(&device->vk, NULL,
-         sizeof(*set), VK_OBJECT_TYPE_DESCRIPTOR_SET);
+         sizeof(*set) + layout->descriptor_count * sizeof(set->buffers[0]), VK_OBJECT_TYPE_DESCRIPTOR_SET);
       if (!set) {
          apex_FreeDescriptorSets(dev, info->descriptorPool, i, out);
          memset(out, 0, info->descriptorSetCount * sizeof(*out));
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
       set->pool = pool;
-      set->layout = vk_descriptor_set_layout_ref(vk_descriptor_set_layout_from_handle(info->pSetLayouts[i]));
+      set->layout = (void *)vk_descriptor_set_layout_ref(&layout->vk);
       list_addtail(&set->link, &pool->sets);
       pool->allocated++;
+      pool->used += layout->descriptor_count;
       out[i] = apex_descriptor_set_to_handle(set);
    }
    return VK_SUCCESS;
@@ -420,16 +458,21 @@ apex_UpdateDescriptorSets(VkDevice dev, uint32_t write_count, const VkWriteDescr
 {
    for (unsigned i = 0; i < write_count; i++) {
       VK_FROM_HANDLE(apex_descriptor_set, set, writes[i].dstSet);
-      assert(writes[i].dstBinding == 0 && writes[i].dstArrayElement == 0 &&
-             writes[i].descriptorCount == 1 && writes[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-      set->buffer = writes[i].pBufferInfo[0];
+      assert(writes[i].dstBinding < set->layout->binding_count &&
+             writes[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+      unsigned start = set->layout->bindings[writes[i].dstBinding].offset + writes[i].dstArrayElement;
+      assert(start + writes[i].descriptorCount <= set->layout->descriptor_count);
+      memcpy(&set->buffers[start], writes[i].pBufferInfo,
+             writes[i].descriptorCount * sizeof(set->buffers[0]));
    }
    for (unsigned i = 0; i < copy_count; i++) {
       VK_FROM_HANDLE(apex_descriptor_set, src, copies[i].srcSet);
       VK_FROM_HANDLE(apex_descriptor_set, dst, copies[i].dstSet);
-      assert(!copies[i].srcBinding && !copies[i].dstBinding && !copies[i].srcArrayElement &&
-             !copies[i].dstArrayElement && copies[i].descriptorCount == 1);
-      dst->buffer = src->buffer;
+      unsigned from = src->layout->bindings[copies[i].srcBinding].offset + copies[i].srcArrayElement;
+      unsigned to = dst->layout->bindings[copies[i].dstBinding].offset + copies[i].dstArrayElement;
+      assert(from + copies[i].descriptorCount <= src->layout->descriptor_count &&
+             to + copies[i].descriptorCount <= dst->layout->descriptor_count);
+      memmove(&dst->buffers[to], &src->buffers[from], copies[i].descriptorCount * sizeof(src->buffers[0]));
    }
 }
 
@@ -441,7 +484,7 @@ clear_commands(struct apex_command_buffer *cmd)
       vk_free(&cmd->vk.pool->alloc, dispatch);
    }
    cmd->pipeline = NULL;
-   cmd->set = NULL;
+   memset(cmd->sets, 0, sizeof(cmd->sets));
 }
 
 static void
@@ -517,11 +560,13 @@ apex_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint point,
                            const VkDescriptorSet *sets, uint32_t dynamic_count, const uint32_t *offsets)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   if (point != VK_PIPELINE_BIND_POINT_COMPUTE || first || count != 1 || dynamic_count) {
+   if (point != VK_PIPELINE_BIND_POINT_COMPUTE || first > MESA_VK_MAX_DESCRIPTOR_SETS ||
+       count > MESA_VK_MAX_DESCRIPTOR_SETS - first || dynamic_count) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   cmd->set = apex_descriptor_set_from_handle(sets[0]);
+   for (unsigned s = 0; s < count; s++)
+      cmd->sets[first + s] = apex_descriptor_set_from_handle(sets[s]);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -530,7 +575,8 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    if (!x || !y || !z)
       return;
-   if (x > 1024 || y != 1 || z != 1 || !cmd->pipeline || !cmd->set) {
+   if (x > 1024 || y != 1 || z != 1 || !cmd->pipeline ||
+       (!cmd->pipeline->layout && !cmd->sets[0])) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -540,7 +586,8 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
-   *dispatch = (struct apex_dispatch) {.pipeline = cmd->pipeline, .set = cmd->set, .groups = x};
+   *dispatch = (struct apex_dispatch) {.pipeline = cmd->pipeline, .groups = x};
+   memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
    list_addtail(&dispatch->link, &cmd->dispatches);
 }
 
@@ -562,46 +609,92 @@ native_command(struct apex_device *device, uint32_t operation)
 }
 
 static VkResult
-drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch,
-             struct apex_memory *memory, uint64_t offset)
+drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
 {
    struct apex_pipeline *pipeline = dispatch->pipeline;
+   if (!pipeline->layout)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   size_t bytes = (pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor);
+   struct apex_buffer_descriptor *rows = calloc(1, bytes);
+   if (!rows)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   VkResult result = VK_ERROR_DEVICE_LOST;
+   struct apex_bo table = {0};
+   for (unsigned s = 0; s < pipeline->layout->set_count; s++) {
+      const struct apex_set_layout *layout = (const void *)pipeline->layout->set_layouts[s];
+      if (!layout || !layout->descriptor_count)
+         continue;
+      const struct apex_descriptor_set *set = dispatch->sets[s];
+      for (unsigned d = 0; d < layout->descriptor_count; d++) {
+         if (!BITSET_TEST(pipeline->used_descriptors, pipeline->set_offsets[s] + d))
+            continue;
+         if (!set || memcmp(set->layout->vk.blake3, layout->vk.blake3, BLAKE3_OUT_LEN))
+            goto out;
+         const VkDescriptorBufferInfo *binding = &set->buffers[d];
+         VK_FROM_HANDLE(apex_buffer, buffer, binding->buffer);
+         /* Unwritten descriptors use the zero row. No nullDescriptor feature
+          * is advertised. Unused bindings are never dereferenced above. */
+         if (!buffer)
+            continue;
+         if (!buffer->memory || binding->offset >= buffer->vk.size)
+            goto out;
+         uint64_t range = binding->range == VK_WHOLE_SIZE ?
+            buffer->vk.size - binding->offset : binding->range;
+         if (!range || range > UINT32_MAX || range > buffer->vk.size - binding->offset)
+            goto out;
+         uint64_t va = buffer->memory->bo.va + buffer->offset + binding->offset;
+         rows[pipeline->set_offsets[s] + d] = (struct apex_buffer_descriptor) {
+            util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range), 0,
+         };
+      }
+   }
    if (!pipeline->program.handle) {
-      VkResult result = bo_create(device, pipeline->code.size,
-                                 APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, &pipeline->program);
+      result = bo_create(device, pipeline->code.size,
+                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, &pipeline->program);
       if (result != VK_SUCCESS)
-         return result;
+         goto out;
       memcpy(pipeline->program.map, pipeline->code.data, pipeline->code.size);
       result = bo_transfer(device, &pipeline->program, APEX_DRM_TRANSFER_TO_LOCAL,
                            0, pipeline->code.size);
       if (result != VK_SUCCESS) {
          apex_bo_finish(device, &pipeline->program);
-         return result;
+         goto out;
       }
    }
+   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, &table);
+   if (result != VK_SUCCESS)
+      goto out;
+   memcpy(table.map, rows, bytes);
+   result = bo_transfer(device, &table, APEX_DRM_TRANSFER_TO_LOCAL, 0, bytes);
+   if (result != VK_SUCCESS)
+      goto out;
    struct drm_apex_vm_exec args = {
       .program_va = pipeline->program.va, .program_bytes = pipeline->code.size,
-      .data_va = memory->bo.va + offset,
+      .data_va = table.va,
       .workgroups = dispatch->groups,
    };
    /* No implicit data transfer. Host visibility requires flush/invalidate.
     * Do not retry EXEC on EINTR: the kernel cancels/drains the accepted job. */
-   return !ioctl(device->fd, DRM_IOCTL_APEX_VM_EXEC, &args) && args.status == 1 ?
+   result = !ioctl(device->fd, DRM_IOCTL_APEX_VM_EXEC, &args) && args.status == 1 ?
       VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+out:
+   apex_bo_finish(device, &table);
+   free(rows);
+   return result;
 }
 
 static VkResult
 dispatch_compute(struct apex_device *device, const struct apex_dispatch *dispatch)
 {
-   const VkDescriptorBufferInfo *binding = &dispatch->set->buffer;
+   if (device->transport == APEX_TRANSPORT_DRM)
+      return drm_dispatch(device, dispatch);
+   const VkDescriptorBufferInfo *binding = &dispatch->sets[0]->buffers[0];
    VK_FROM_HANDLE(apex_buffer, buffer, binding->buffer);
    if (!buffer || !buffer->memory || binding->offset >= buffer->vk.size)
       return VK_ERROR_DEVICE_LOST;
    uint64_t bytes = binding->range == VK_WHOLE_SIZE ? buffer->vk.size - binding->offset : binding->range;
    if (!bytes || bytes > buffer->vk.size - binding->offset)
       return VK_ERROR_DEVICE_LOST;
-   if (device->transport == APEX_TRANSPORT_DRM)
-      return drm_dispatch(device, dispatch, buffer->memory, buffer->offset + binding->offset);
    void *data = (uint8_t *)buffer->memory->data + buffer->offset + binding->offset;
    if (native_command(device, APEX_NATIVE_CREATE))
       return VK_ERROR_DEVICE_LOST;

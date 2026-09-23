@@ -45,9 +45,94 @@ fail_alloc(void *data, size_t size, size_t alignment, VkSystemAllocationScope sc
    return NULL;
 }
 
+static void
+test_descriptors(struct vk_physical_device *physical, const char *path, const char *output)
+{
+   struct apex_device device;
+   const float priority = 1;
+   const VkDeviceQueueCreateInfo queue_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueCount = 1, .pQueuePriorities = &priority,
+   };
+   const VkDeviceCreateInfo device_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
+   };
+   CHECK(apex_device_init(&device, physical, &device_info, NULL, -1,
+                          APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
+   /* Compiler/layout test only: choose the DRM descriptor ABI without a fd.
+    * No memory allocation, submission or ioctl occurs in this test. */
+   device.transport = APEX_TRANSPORT_DRM;
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   FILE *f = fopen(path, "rb");
+   CHECK(f && fseek(f, 0, SEEK_END) == 0);
+   long size = ftell(f);
+   CHECK(size > 0 && size % 4 == 0);
+   rewind(f);
+   uint32_t *spirv = malloc(size);
+   CHECK(spirv && fread(spirv, 1, size, f) == size && !fclose(f));
+   VkShaderModule module;
+   const VkShaderModuleCreateInfo module_info = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = spirv,
+   };
+   CHECK(v->CreateShaderModule(dev, &module_info, NULL, &module) == VK_SUCCESS);
+   free(spirv);
+   VkDescriptorSetLayout sets[2];
+   for (unsigned s = 0; s < 2; s++) {
+      VkDescriptorSetLayoutBinding binding = {
+         .binding = s ? 5 : 3, .descriptorCount = s ? 2 : 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      };
+      VkDescriptorSetLayoutCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .bindingCount = 1, .pBindings = &binding,
+      };
+      CHECK(v->CreateDescriptorSetLayout(dev, &info, NULL, &sets[s]) == VK_SUCCESS);
+   }
+   const VkPipelineLayoutCreateInfo layout_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = sets,
+   };
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &layout_info, NULL, &layout) == VK_SUCCESS);
+   const VkComputePipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = layout,
+      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"},
+   };
+   VkPipeline pipeline;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
+   struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
+   CHECK(p->descriptor_count == 3 && p->set_offsets[0] == 0 && p->set_offsets[1] == 1);
+   VkDescriptorSetLayout swapped[] = {sets[1], sets[0]};
+   VkPipelineLayoutCreateInfo wrong_layout_info = layout_info;
+   wrong_layout_info.pSetLayouts = swapped;
+   VkPipelineLayout wrong_layout;
+   CHECK(v->CreatePipelineLayout(dev, &wrong_layout_info, NULL, &wrong_layout) == VK_SUCCESS);
+   VkComputePipelineCreateInfo wrong_info = info;
+   wrong_info.layout = wrong_layout;
+   VkPipeline rejected;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &wrong_info, NULL, &rejected) ==
+         VK_ERROR_FEATURE_NOT_PRESENT && !rejected);
+   v->DestroyPipelineLayout(dev, wrong_layout, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   for (unsigned s = 0; s < 2; s++) v->DestroyDescriptorSetLayout(dev, sets[s], NULL);
+   v->DestroyShaderModule(dev, module, NULL);
+   CHECK(p->layout->set_count == 2); /* The pipeline retains layout metadata. */
+   if (output) {
+      char name[4096];
+      CHECK(snprintf(name, sizeof(name), "%s/mesa-descriptors.apx", output) < sizeof(name));
+      f = fopen(name, "wb");
+      CHECK(f && fwrite(p->code.data, 1, p->code.size, f) == p->code.size && !fclose(f));
+   }
+   v->DestroyPipeline(dev, pipeline, NULL);
+   apex_device_finish(&device);
+}
+
 int main(int argc, char **argv)
 {
-   CHECK(argc == 2 || argc == 3);
+   CHECK(argc == 3 || argc == 4);
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -75,19 +160,19 @@ int main(int argc, char **argv)
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
-   struct vk_device device;
+   struct apex_device device = {.transport = APEX_TRANSPORT_NATIVE};
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,
    };
    const VkDeviceCreateInfo device_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-   CHECK(vk_device_init(&device, &physical, &dispatch, &device_info, NULL) == VK_SUCCESS);
-   VkDevice dev = vk_device_to_handle(&device);
+   CHECK(vk_device_init(&device.vk, &physical, &dispatch, &device_info, NULL) == VK_SUCCESS);
+   VkDevice dev = apex_device_to_handle(&device);
    VkShaderModule module;
    const VkShaderModuleCreateInfo module_info = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
       .codeSize = size, .pCode = spirv,
    };
-   CHECK(device.dispatch_table.CreateShaderModule(dev, &module_info, NULL, &module) == VK_SUCCESS);
+   CHECK(device.vk.dispatch_table.CreateShaderModule(dev, &module_info, NULL, &module) == VK_SUCCESS);
    free(spirv);
 
    VkComputePipelineCreateInfo infos[3] = {{
@@ -110,7 +195,7 @@ int main(int argc, char **argv)
    infos[2].stage.pSpecializationInfo = &specialization;
    infos[2].stage.pName = "alternate";
    VkPipeline pipelines[3];
-   CHECK(device.dispatch_table.CreateComputePipelines(dev, VK_NULL_HANDLE, 3,
+   CHECK(device.vk.dispatch_table.CreateComputePipelines(dev, VK_NULL_HANDLE, 3,
                                                        infos, NULL, pipelines) == VK_SUCCESS);
    for (unsigned i = 0; i < 3; i++) {
       struct apex_pipeline *p = apex_pipeline_from_handle(pipelines[i]);
@@ -132,12 +217,12 @@ int main(int argc, char **argv)
          VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(mixed[0] && !mixed[1] && mixed[2]);
    for (unsigned i = 0; i < 3; i++)
-      device.dispatch_table.DestroyPipeline(dev, mixed[i], NULL);
+      device.vk.dispatch_table.DestroyPipeline(dev, mixed[i], NULL);
    batch[1].flags = VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT;
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 3, batch, NULL, mixed) ==
          VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(mixed[0] && !mixed[1] && !mixed[2]);
-   device.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
+   device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
 
    VkPipelineCreateFlags2CreateInfo flags2 = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
@@ -154,7 +239,7 @@ int main(int argc, char **argv)
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 3, batch, NULL, mixed) ==
          VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(mixed[0] && !mixed[1] && !mixed[2]);
-   device.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
+   device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
    VkAllocationCallbacks allocation = *vk_default_allocator();
    allocation.pfnAllocation = fail_alloc;
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, infos, &allocation, mixed) ==
@@ -179,19 +264,20 @@ int main(int argc, char **argv)
    CHECK(!mixed[0]);
    subgroup.requiredSubgroupSize = 16;
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) == VK_SUCCESS);
-   device.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
+   device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
 
    /* Compiled pipelines survive both the module and specialization storage. */
-   device.dispatch_table.DestroyShaderModule(dev, module, NULL);
+   device.vk.dispatch_table.DestroyShaderModule(dev, module, NULL);
    memset(values, 0, sizeof(values));
-   if (argc == 3) {
-      write_fixture(argv[2], "mesa-default", pipelines[0], 37, 3);
-      write_fixture(argv[2], "mesa-specialized", pipelines[1], 101, 7);
-      write_fixture(argv[2], "mesa-entrypoint", pipelines[2], 112, 7);
+   if (argc == 4) {
+      write_fixture(argv[3], "mesa-default", pipelines[0], 37, 3);
+      write_fixture(argv[3], "mesa-specialized", pipelines[1], 101, 7);
+      write_fixture(argv[3], "mesa-entrypoint", pipelines[2], 112, 7);
    }
    for (unsigned i = 0; i < 3; i++)
-      device.dispatch_table.DestroyPipeline(dev, pipelines[i], NULL);
-   vk_device_finish(&device);
+      device.vk.dispatch_table.DestroyPipeline(dev, pipelines[i], NULL);
+   vk_device_finish(&device.vk);
+   test_descriptors(&physical, argv[2], argc == 4 ? argv[3] : NULL);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex Mesa compute pipelines: specialization, entrypoints, lifetime, failures");

@@ -3,9 +3,25 @@
 #define APEX_DEVICE_H
 #include "vk_device.h"
 #include "vk_queue.h"
+#include "vk_descriptor_set_layout.h"
 #include "util/vma.h"
 
 enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
+
+/* Host table limits; descriptors are ordinary LOCAL memory. */
+#define APEX_MAX_DESCRIPTORS 4096
+#define APEX_MAX_BINDINGS 1024
+struct apex_binding_layout {
+   uint32_t offset, count, flags;
+};
+struct apex_set_layout {
+   struct vk_descriptor_set_layout vk;
+   uint32_t binding_count, descriptor_count;
+   struct apex_binding_layout bindings[];
+};
+struct apex_buffer_descriptor {
+   uint32_t low, high, bytes, reserved;
+};
 
 struct apex_bo {
    void *map;

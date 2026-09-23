@@ -1,9 +1,117 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_pipeline.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "vk_device.h"
 #include "vk_log.h"
+
+struct descriptor_lowering {
+   struct apex_pipeline *pipeline;
+   bool invalid;
+};
+
+static bool
+lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   struct descriptor_lowering *ctx = data;
+   nir_def *replacement;
+   b->cursor = nir_before_instr(&i->instr);
+   switch (i->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index: {
+      unsigned set = nir_intrinsic_desc_set(i), binding = nir_intrinsic_binding(i);
+      if (set >= ctx->pipeline->layout->set_count ||
+          nir_intrinsic_desc_type(i) != nir_descriptor_type_storage_buffer) {
+         ctx->invalid = true;
+         return false;
+      }
+      const struct apex_set_layout *layout =
+         (const void *)ctx->pipeline->layout->set_layouts[set];
+      if (!layout || binding >= layout->binding_count || !layout->bindings[binding].count) {
+         ctx->invalid = true;
+         return false;
+      }
+      nir_def *index = i->src[0].ssa;
+      BITSET_SET_COUNT(ctx->pipeline->used_descriptors,
+         ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset,
+         layout->bindings[binding].count);
+      /* Invalid descriptor indices select the zero-filled sentinel row. */
+      nir_def *slot = nir_bcsel(b, nir_ult_imm(b, index, layout->bindings[binding].count),
+         nir_iadd_imm(b, index, ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset),
+         nir_imm_int(b, ctx->pipeline->descriptor_count));
+      replacement = nir_vec2(b, slot, nir_imm_int(b, 0));
+      break;
+   }
+   case nir_intrinsic_load_vulkan_descriptor:
+      replacement = i->src[0].ssa;
+      break;
+   default:
+      return false;
+   }
+   nir_def_rewrite_uses(&i->def, replacement);
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
+static bool
+lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   struct descriptor_lowering *ctx = data;
+   bool store = i->intrinsic == nir_intrinsic_store_ssbo;
+   bool size = i->intrinsic == nir_intrinsic_get_ssbo_size;
+   if (i->intrinsic == nir_intrinsic_ssbo_atomic ||
+       i->intrinsic == nir_intrinsic_ssbo_atomic_swap ||
+       i->intrinsic == nir_intrinsic_vulkan_resource_reindex) {
+      ctx->invalid = true;
+      return false;
+   }
+   if (!store && !size && i->intrinsic != nir_intrinsic_load_ssbo)
+      return false;
+   if (!size && ((store ? i->src[0].ssa->bit_size : i->def.bit_size) != 32 ||
+                 i->num_components > 4 ||
+                 nir_intrinsic_align_mul(i) < 4 || nir_intrinsic_align_offset(i) % 4)) {
+      ctx->invalid = true;
+      return false;
+   }
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *row = nir_imul_imm(b, i->src[store ? 1 : 0].ssa, sizeof(struct apex_buffer_descriptor));
+   nir_def *words[3];
+   for (unsigned c = 0; c < 3; c++)
+      words[c] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_iadd_imm(b, row, c * 4), .align_mul = 4);
+   if (size) {
+      nir_def_rewrite_uses(&i->def, words[2]);
+   } else {
+      nir_def *base = nir_vec2(b, words[0], words[1]);
+      nir_def *offset = i->src[store ? 2 : 1].ssa;
+      nir_def *values[4];
+      for (unsigned c = 0; c < i->num_components; c++) {
+         if (store && !(nir_intrinsic_write_mask(i) & (1u << c)))
+            continue;
+         /* Subtract from the range before comparing: offset + width may wrap. */
+         nir_def *inside = nir_iand(b, nir_uge_imm(b, words[2], c * 4 + 4),
+            nir_uge(b, nir_iadd_imm(b, words[2], -(int)(c * 4 + 4)), offset));
+         nir_push_if(b, inside);
+         nir_def *address = nir_build_addr_iadd(b, base, nir_address_format_2x32bit_global,
+            nir_var_mem_global, nir_iadd_imm(b, offset, c * 4));
+         nir_def *loaded = NULL;
+         if (store)
+            nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), address,
+                                 .align_mul = 4, .access = nir_intrinsic_access(i));
+         else
+            loaded = nir_load_global_2x32(b, 1, 32, address,
+                                        .align_mul = 4, .access = nir_intrinsic_access(i));
+         nir_push_else(b, NULL);
+         nir_def *zero = nir_imm_int(b, 0);
+         nir_pop_if(b, NULL);
+         if (!store)
+            values[c] = nir_if_phi(b, loaded, zero);
+      }
+      if (!store)
+         nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
+   }
+   nir_instr_remove(&i->instr);
+   return true;
+}
 
 static void
 apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
@@ -12,6 +120,8 @@ apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
    struct apex_pipeline *pipeline = (struct apex_pipeline *)vk;
    if (pipeline->program.handle)
       apex_bo_finish((struct apex_device *)device, &pipeline->program);
+   if (pipeline->layout)
+      vk_pipeline_layout_unref(device, pipeline->layout);
    apex_compile_result_finish(&pipeline->code);
    vk_pipeline_free(device, alloc, vk);
 }
@@ -65,6 +175,25 @@ create_compute_pipeline(struct vk_device *device,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    pipeline->vk.stages = VK_SHADER_STAGE_COMPUTE_BIT;
+   struct vk_pipeline_layout *layout = vk_pipeline_layout_from_handle(info->layout);
+   if (((struct apex_device *)device)->transport == APEX_TRANSPORT_DRM) {
+      if (!layout)
+         goto unsupported_layout;
+      pipeline->layout = vk_pipeline_layout_ref(layout);
+      for (unsigned s = 0; s < layout->set_count; s++) {
+         const struct apex_set_layout *set = (const void *)layout->set_layouts[s];
+         pipeline->set_offsets[s] = pipeline->descriptor_count;
+         if (set) pipeline->descriptor_count += set->descriptor_count;
+      }
+      if (pipeline->descriptor_count > APEX_MAX_DESCRIPTORS)
+         goto unsupported_layout;
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
+      struct descriptor_lowering ctx = {.pipeline = pipeline};
+      nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
+      nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
+      if (ctx.invalid)
+         goto unsupported_layout;
+   }
    int failed = apex_from_nir(nir, &pipeline->code);
    ralloc_free(nir);
    if (failed) {
@@ -75,6 +204,11 @@ create_compute_pipeline(struct vk_device *device,
    }
    *out = apex_pipeline_to_handle(pipeline);
    return VK_SUCCESS;
+
+unsupported_layout:
+   ralloc_free(nir);
+   apex_pipeline_destroy(device, &pipeline->vk, alloc);
+   return VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

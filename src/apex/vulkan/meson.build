@@ -7,6 +7,10 @@ apex_pipeline_spv = custom_target('apex-pipeline-spv',
   input : 'pipeline.spvasm', output : 'pipeline.spv',
   command : [find_program('spirv-as'), '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
 )
+apex_descriptors_spv = custom_target('apex-descriptors-spv',
+  input : 'descriptors.comp', output : 'descriptors.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+)
 apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
@@ -15,7 +19,9 @@ apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
 )
 test('apex-pipeline-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_pipeline_spv], suite : ['apex'])
-test('apex-pipeline', apex_pipeline_test, args : [apex_pipeline_spv], suite : ['apex'])
+test('apex-descriptors-spirv', find_program('spirv-val'),
+  args : ['--target-env', 'vulkan1.1', apex_descriptors_spv], suite : ['apex'])
+test('apex-pipeline', apex_pipeline_test, args : [apex_pipeline_spv, apex_descriptors_spv], suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],

@@ -5,13 +5,18 @@
 #include "apex/apex.h"
 #include "apex_device.h"
 #include "vk_pipeline.h"
+#include "vk_pipeline_layout.h"
+#include "util/bitset.h"
 
-/* Fixed compute launch ABI: one SSBO at set 0/binding 0, local size 16x1x1.
- * No device discovery or API capability advertisement is provided here. */
+/* Local size remains 16x1x1. No API capability advertisement yet. */
 struct apex_pipeline {
    struct vk_pipeline vk;
    struct apex_compile_result code;
    struct apex_bo program;
+   struct vk_pipeline_layout *layout;
+   uint32_t set_offsets[MESA_VK_MAX_DESCRIPTOR_SETS];
+   uint32_t descriptor_count;
+   BITSET_DECLARE(used_descriptors, APEX_MAX_DESCRIPTORS);
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_pipeline, vk.base, VkPipeline,

@@ -2,6 +2,7 @@
 #include "apex_device.h"
 #include "apex_pipeline.h"
 #include "apex_native_uapi.h"
+#include "compiler/spirv/spirv.h"
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_drm_syncobj.h"
@@ -33,7 +34,7 @@ static struct {
       uint32_t flags, uploads;
       uint8_t *local;
       bool live;
-   } gems[8];
+   } gems[16];
    struct apex_pipeline *pipelines[3];
    uint32_t *mapped;
    uint32_t expected[2048], payload[800];
@@ -60,6 +61,7 @@ drm_ioctl(unsigned long request, void *arg)
       struct drm_apex_gem_create *r = arg;
       CHECK(!r->flags && !r->handle && r->size);
       if (mock.objects && mock.fault == 201) { errno = ENOMEM; return -1; }
+      if (mock.objects == 2 && mock.fault == 213) { errno = ENOMEM; return -1; }
       unsigned h = ++mock.objects;
       CHECK(h < ARRAY_SIZE(mock.gems));
       r->size = align64(r->size, 4096);
@@ -86,8 +88,9 @@ drm_ioctl(unsigned long request, void *arg)
          unsigned h = r->handle;
          CHECK(h && h <= mock.objects && mock.gems[h].live && !mock.gems[h].va);
          CHECK(r->bytes == mock.gems[h].size);
-         CHECK(r->flags == (APEX_DRM_VM_READ | (h >= 2 && h <= 4 ? APEX_DRM_VM_EXEC : APEX_DRM_VM_WRITE)));
+         CHECK(r->flags == (APEX_DRM_VM_READ | (h == 2 || h == 4 || h == 6 ? APEX_DRM_VM_EXEC : APEX_DRM_VM_WRITE)));
          if (h > 1 && mock.fault == 209) { errno = ENOMEM; return -1; }
+         if (h == 3 && mock.fault == 211) { errno = ENOMEM; return -1; }
          for (unsigned i = 1; i <= mock.objects; i++)
             CHECK(!mock.gems[i].va || r->va + r->bytes <= mock.gems[i].va ||
                   r->va >= mock.gems[i].va + mock.gems[i].size);
@@ -107,6 +110,7 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(r->bytes && r->offset <= mock.gems[h].size &&
             r->bytes <= mock.gems[h].size - r->offset);
       if (h > 1 && mock.fault == 210) { errno = EIO; return -1; }
+      if (h == 3 && mock.fault == 212) { errno = EIO; return -1; }
       void *local = mock.gems[h].local + r->offset;
       off_t offset = mock.gems[h].offset + r->offset;
       if (r->direction == APEX_DRM_TRANSFER_TO_LOCAL) {
@@ -127,14 +131,27 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(request == DRM_IOCTL_APEX_VM_EXEC);
       struct drm_apex_vm_exec *r = arg;
       unsigned d = mock.dispatch;
-      unsigned p = MIN2(d, 2), h = p + 2;
+      unsigned p = MIN2(d, 2), h = 2 * p + 2;
       mock.exec_calls++;
       CHECK(d < 4 && r->program_va == mock.gems[h].va);
       CHECK(mock.gems[h].live && mock.gems[1].live);
       CHECK(mock.gems[h].uploads == 1 && mock.gems[1].uploads == 2);
       CHECK(!r->flags && !r->status && !r->reason && !r->timestamp);
       CHECK(r->program_bytes == mock.pipelines[p]->code.size);
-      CHECK(r->data_va == mock.gems[1].va + starts[d] * 4);
+      unsigned table = d < 3 ? h + 1 : 8;
+      CHECK(r->data_va == mock.gems[table].va && mock.gems[table].live);
+      CHECK(mock.gems[table].uploads == 1);
+      const uint32_t *rows = (const void *)mock.gems[table].local;
+      for (unsigned i = 0; i < 4; i++) CHECK(!rows[i]); /* unused binding 0 */
+      const uint32_t *row = rows + 4; /* shader binding 7, element 0 */
+      uint64_t va = (uint64_t)util_le32_to_cpu(row[1]) << 32 | util_le32_to_cpu(row[0]);
+      CHECK(va == mock.gems[1].va + starts[d] * 4);
+      CHECK(util_le32_to_cpu(row[2]) == sizeof(mock.payload) && !row[3]);
+      const uint32_t *extra = rows + 8;
+      uint64_t addr = (uint64_t)util_le32_to_cpu(extra[1]) << 32 | util_le32_to_cpu(extra[0]);
+      CHECK(addr == mock.gems[1].va + (d == 1 ? 48 : 1088) * 4);
+      CHECK(util_le32_to_cpu(extra[2]) == sizeof(mock.payload) && !extra[3]);
+      for (unsigned i = 12; i < 28; i++) CHECK(!rows[i]); /* unused set + sentinel */
       CHECK(r->workgroups == 1);
       CHECK(!memcmp(mock.gems[h].local, mock.pipelines[p]->code.data, r->program_bytes));
       void *local = mock.gems[1].local + starts[d] * 4;
@@ -276,30 +293,52 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    v->GetDeviceQueue(dev, 0, 0, &queue);
    CHECK(queue == vk_queue_to_handle(&device.queue));
    VkShaderModule module;
+   bool tables = transport == APEX_TRANSPORT_DRM;
+   uint32_t *code = malloc(size);
+   CHECK(code);
+   memcpy(code, spirv, size);
+   if (tables) {
+      unsigned changed = 0;
+      for (unsigned pos = 5; pos < size / 4; pos += code[pos] >> 16) {
+         CHECK(code[pos] >> 16);
+         if ((code[pos] & 0xffff) == SpvOpDecorate && code[pos+2] == SpvDecorationBinding) {
+            CHECK(code[pos+3] == 0);
+            code[pos+3] = 7;
+            changed++;
+         }
+      }
+      CHECK(changed == 1);
+   }
    const VkShaderModuleCreateInfo module_info = {
-      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = spirv,
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = code,
    };
    CHECK(v->CreateShaderModule(dev, &module_info, NULL, &module) == VK_SUCCESS);
-   const VkDescriptorSetLayoutBinding binding = {
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+   free(code);
+   const VkDescriptorSetLayoutBinding binding[] = {
+      {.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
    };
    VkDescriptorSetLayout set_layout;
-   const VkDescriptorBindingFlags binding_flags = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+   const VkDescriptorBindingFlags binding_flags[] = {
+      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+   };
    const VkDescriptorSetLayoutBindingFlagsCreateInfo binding_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-      .bindingCount = 1, .pBindingFlags = &binding_flags,
+      .bindingCount = tables ? 2 : 1, .pBindingFlags = binding_flags,
    };
    const VkDescriptorSetLayoutCreateInfo set_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
       .pNext = &binding_info, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
-      .bindingCount = 1, .pBindings = &binding,
+      .bindingCount = tables ? 2 : 1, .pBindings = binding,
    };
    CHECK(v->CreateDescriptorSetLayout(dev, &set_info, NULL, &set_layout) == VK_SUCCESS);
+   VkDescriptorSetLayout layouts[2] = {set_layout, set_layout};
    VkPipelineLayout layout;
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .setLayoutCount = 1, .pSetLayouts = &set_layout,
+      .setLayoutCount = tables ? 2 : 1, .pSetLayouts = layouts,
    };
    CHECK(v->CreatePipelineLayout(dev, &layout_info, NULL, &layout) == VK_SUCCESS);
    const uint32_t values[] = {7, 101};
@@ -358,7 +397,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(req.size == 3456 && req.alignment == 64 && req.memoryTypeBits == 1);
       CHECK(v->BindBufferMemory(dev, buffers[i], memory, i ? 4096 : 64) == VK_SUCCESS);
    }
-   const VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+   const VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, tables ? 6 : 2};
    const VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
@@ -366,7 +405,6 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    };
    VkDescriptorPool pool;
    CHECK(v->CreateDescriptorPool(dev, &pool_info, NULL, &pool) == VK_SUCCESS);
-   VkDescriptorSetLayout layouts[2] = {set_layout, set_layout};
    VkDescriptorSetAllocateInfo set_alloc = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = pool, .descriptorSetCount = 2, .pSetLayouts = layouts,
@@ -388,6 +426,29 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    writes[1] = writes[0];
    writes[1].dstSet = sets[1];
    v->UpdateDescriptorSets(dev, 2, writes, 0, NULL);
+   if (tables) {
+      VkDescriptorBufferInfo array[] = {bindings[1], bindings[0]};
+      VkWriteDescriptorSet extra = writes[0];
+      extra.dstBinding = 7;
+      extra.descriptorCount = 2;
+      extra.pBufferInfo = array;
+      for (unsigned s = 0; s < 2; s++) {
+         extra.dstSet = sets[s];
+         v->UpdateDescriptorSets(dev, 1, &extra, 0, NULL);
+      }
+      /* Array element writes and copies must preserve their neighbors. */
+      extra.dstSet = sets[0];
+      extra.dstArrayElement = 1;
+      extra.descriptorCount = 1;
+      extra.pBufferInfo = &bindings[0];
+      v->UpdateDescriptorSets(dev, 1, &extra, 0, NULL);
+      VkCopyDescriptorSet copy = {
+         .sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
+         .srcSet = sets[1], .srcBinding = 7,
+         .dstSet = sets[0], .dstBinding = 7, .dstArrayElement = 1, .descriptorCount = 1,
+      };
+      v->UpdateDescriptorSets(dev, 0, NULL, 1, &copy);
+   }
    VkCommandPool command_pool;
    const VkCommandPoolCreateInfo command_pool_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -402,6 +463,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    CHECK(v->AllocateCommandBuffers(dev, &command_alloc, &cmd) == VK_SUCCESS);
    const VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
    CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   if (tables)
+      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
    for (unsigned i = 0; i < 2; i++) {
       v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[i]);
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[i], 0, NULL);
@@ -423,6 +486,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    v->CmdDispatch(cmd, 0, 1, 1);
    CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
    writes[0].pBufferInfo = &bindings[0];
+   writes[0].dstBinding = tables ? 7 : 0;
    v->UpdateDescriptorSets(dev, 1, writes, 0, NULL);
    const VkCommandBufferSubmitInfo cb_submit = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd,
@@ -478,7 +542,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(result == VK_ERROR_DEVICE_LOST);
       CHECK(v->QueueWaitIdle(queue) == VK_ERROR_DEVICE_LOST);
       if (transport == APEX_TRANSPORT_DRM) {
-         CHECK(mock.live == (fault >= 204 && fault <= 206 ? 2 : 1) && !mock.calls[APEX_NATIVE_CREATE]);
+         CHECK(mock.live == ((fault >= 204 && fault <= 206) || fault >= 211 ? 2 : 1) && !mock.calls[APEX_NATIVE_CREATE]);
          CHECK(mock.exec_calls == (fault >= 204 && fault <= 206 ? 1 : 0));
          CHECK(!memcmp(mock.mapped, mock.expected, sizeof(mock.expected)));
       } else {
@@ -532,6 +596,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
       v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[2]);
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 0, NULL);
+      if (tables)
+         v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
       v->CmdDispatch(cmd, 1, 1, 1);
       CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
       CHECK(v->QueueSubmit2(queue, 1, &submit, fence) == VK_SUCCESS);
@@ -582,8 +648,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       for (unsigned i = 0; i < odd.allocationSize; i++)
          CHECK(((uint8_t *)mock.mapped)[i] == 0);
       if (mocked) {
-         CHECK(mock.objects == 5 && mock.live == 1);
-         CHECK(mock.gems[5].va == (1ull << 39) - 8192);
+         CHECK(mock.objects == 9 && mock.live == 1);
+         CHECK(mock.gems[9].va == (1ull << 39) - 8192);
       }
       v->UnmapMemory(dev, memory);
       v->FreeMemory(dev, memory, NULL);
@@ -662,7 +728,7 @@ int main(int argc, char **argv)
       const int faults[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 99, 100, 101};
       for (unsigned i = 0; i < ARRAY_SIZE(faults); i++)
          run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE);
-      const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210};
+      const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213};
       for (unsigned i = 0; i < ARRAY_SIZE(drm_faults); i++)
          run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM);
       puts("PASS Apex Mesa native/DRM transport: persistent GPUVA, explicit ranges, retained data/programs, cleanup, device loss (mock ioctl)");
