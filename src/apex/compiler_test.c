@@ -121,6 +121,39 @@ int main(int argc, char **argv)
    apex_compile_result_finish(&a);
    apex_compile_result_finish(&b);
 
+   const struct {
+      mesa_scope scope;
+      nir_variable_mode modes;
+      nir_memory_semantics semantics;
+      bool supported;
+   } barriers[] = {
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_ACQUIRE, true},
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_RELEASE, true},
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_ACQ_REL, true},
+      {SCOPE_DEVICE, nir_var_mem_shared, NIR_MEMORY_ACQ_REL, true},
+      {SCOPE_WORKGROUP, nir_var_mem_ssbo, NIR_MEMORY_ACQ_REL, false},
+      {SCOPE_DEVICE, nir_var_mem_ssbo, NIR_MEMORY_ACQ_REL, false},
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_MAKE_AVAILABLE | NIR_MEMORY_RELEASE, false},
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_MAKE_VISIBLE | NIR_MEMORY_ACQUIRE, false},
+   };
+   for (unsigned n = 0; n < ARRAY_SIZE(barriers); n++) {
+      nir = shader(17);
+      builder = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+      nir_barrier(&builder, .execution_scope = SCOPE_NONE, .memory_scope = barriers[n].scope,
+                   .memory_modes = barriers[n].modes, .memory_semantics = barriers[n].semantics);
+      if (!barriers[n].supported) {
+         reject(nir, &a, "barrier");
+         continue;
+      }
+      CHECK(apex_from_nir(nir, &a) == 0);
+      ralloc_free(nir);
+      check_binary(&a, 17);
+      bool drain = false;
+      for (size_t i = 40; i < a.size; i += 8) drain |= a.data[i] == 7;
+      CHECK(drain);
+      apex_compile_result_finish(&a);
+   }
+
    nir = global_shader(4, 4);
    CHECK(apex_from_nir(nir, &a) == 0);
    ralloc_free(nir);

@@ -532,7 +532,15 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
                if (i->num_components!=1) goto unsupported;
                emit(&ops,0x44,value(&i->def,0),value(i->src[0].ssa,0),value(i->src[1].ssa,0),0,0); break;
             case nir_intrinsic_barrier:
-               if (nir_intrinsic_execution_scope(i)!=SCOPE_WORKGROUP || nir_intrinsic_memory_scope(i)>SCOPE_DEVICE) goto unsupported;
+               if (nir_intrinsic_execution_scope(i) == SCOPE_NONE) {
+                  /* Shared storage is workgroup-local even when SPIR-V uses
+                   * Device scope, as GLSL memoryBarrierShared does. */
+                  if ((nir_intrinsic_memory_modes(i) & ~nir_var_mem_shared) ||
+                      (nir_intrinsic_memory_semantics(i) & ~NIR_MEMORY_ACQ_REL)) goto unsupported;
+               } else if (nir_intrinsic_execution_scope(i) != SCOPE_WORKGROUP ||
+                          nir_intrinsic_memory_scope(i) > SCOPE_DEVICE) goto unsupported;
+               /* The scheduler drains all memory tokens before this boundary.
+                * One admitted 16-lane workgroup occupies one physical wave. */
                emit(&ops,7,0,0,0,0,0); break;
             case nir_intrinsic_load_scratch:
             case nir_intrinsic_store_scratch: {
