@@ -80,17 +80,43 @@ test_descriptors(struct vk_physical_device *physical, const char *path, const ch
    free(spirv);
    VkDescriptorSetLayout sets[2];
    for (unsigned s = 0; s < 2; s++) {
-      VkDescriptorSetLayoutBinding binding = {
-         .binding = s ? 5 : 3, .descriptorCount = s ? 2 : 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      VkDescriptorSetLayoutBinding bindings[] = {
+         {.binding = s ? 5 : 3, .descriptorCount = s ? 2 : 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+         {.binding = 2, .descriptorCount = 2, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       };
       VkDescriptorSetLayoutCreateInfo info = {
          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-         .bindingCount = 1, .pBindings = &binding,
+         .bindingCount = s ? 2 : 1, .pBindings = bindings,
       };
       CHECK(v->CreateDescriptorSetLayout(dev, &info, NULL, &sets[s]) == VK_SUCCESS);
    }
+   const VkDescriptorPoolSize sizes[] = {
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+   };
+   const VkDescriptorPoolCreateInfo pool_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+      .maxSets = 4, .poolSizeCount = 2, .pPoolSizes = sizes,
+   };
+   VkDescriptorPool pool;
+   CHECK(v->CreateDescriptorPool(dev, &pool_info, NULL, &pool) == VK_SUCCESS);
+   VkDescriptorSetAllocateInfo alloc = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = pool, .descriptorSetCount = 2, .pSetLayouts = sets,
+   };
+   VkDescriptorSet allocated[2], extra;
+   CHECK(v->AllocateDescriptorSets(dev, &alloc, allocated) == VK_SUCCESS);
+   alloc.descriptorSetCount = 1;
+   alloc.pSetLayouts = &sets[1];
+   CHECK(v->AllocateDescriptorSets(dev, &alloc, &extra) == VK_ERROR_OUT_OF_POOL_MEMORY && !extra);
+   alloc.pSetLayouts = &sets[0];
+   CHECK(v->AllocateDescriptorSets(dev, &alloc, &extra) == VK_SUCCESS);
+   CHECK(v->FreeDescriptorSets(dev, pool, 1, &allocated[1]) == VK_SUCCESS);
+   alloc.pSetLayouts = &sets[1];
+   CHECK(v->AllocateDescriptorSets(dev, &alloc, &allocated[1]) == VK_SUCCESS);
+   v->DestroyDescriptorPool(dev, pool, NULL);
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = sets,
    };
@@ -104,7 +130,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path, const ch
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
-   CHECK(p->descriptor_count == 3 && p->set_offsets[0] == 0 && p->set_offsets[1] == 1);
+   CHECK(p->descriptor_count == 5 && p->set_offsets[0] == 0 && p->set_offsets[1] == 1);
    VkDescriptorSetLayout swapped[] = {sets[1], sets[0]};
    VkPipelineLayoutCreateInfo wrong_layout_info = layout_info;
    wrong_layout_info.pSetLayouts = swapped;
@@ -116,6 +142,24 @@ test_descriptors(struct vk_physical_device *physical, const char *path, const ch
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &wrong_info, NULL, &rejected) ==
          VK_ERROR_FEATURE_NOT_PRESENT && !rejected);
    v->DestroyPipelineLayout(dev, wrong_layout, NULL);
+   const VkDescriptorSetLayoutBinding wrong_types[] = {
+      {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       .descriptorCount = 2, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 5, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       .descriptorCount = 2, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+   };
+   const VkDescriptorSetLayoutCreateInfo wrong_set_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 2, .pBindings = wrong_types,
+   };
+   swapped[0] = sets[0];
+   CHECK(v->CreateDescriptorSetLayout(dev, &wrong_set_info, NULL, &swapped[1]) == VK_SUCCESS);
+   CHECK(v->CreatePipelineLayout(dev, &wrong_layout_info, NULL, &wrong_layout) == VK_SUCCESS);
+   wrong_info.layout = wrong_layout;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &wrong_info, NULL, &rejected) ==
+         VK_ERROR_FEATURE_NOT_PRESENT && !rejected);
+   v->DestroyPipelineLayout(dev, wrong_layout, NULL);
+   v->DestroyDescriptorSetLayout(dev, swapped[1], NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);
    for (unsigned s = 0; s < 2; s++) v->DestroyDescriptorSetLayout(dev, sets[s], NULL);
    v->DestroyShaderModule(dev, module, NULL);

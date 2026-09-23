@@ -13,10 +13,12 @@ enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 #define APEX_MAX_BINDINGS 1024
 struct apex_binding_layout {
    uint32_t offset, count, flags;
+   VkDescriptorType type;
 };
 struct apex_set_layout {
    struct vk_descriptor_set_layout vk;
    uint32_t binding_count, descriptor_count;
+   uint32_t counts[2]; /* storage, uniform */
    struct apex_binding_layout bindings[];
 };
 struct apex_buffer_descriptor {

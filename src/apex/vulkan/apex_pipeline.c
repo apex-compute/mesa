@@ -21,13 +21,20 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
    case nir_intrinsic_vulkan_resource_index: {
       unsigned set = nir_intrinsic_desc_set(i), binding = nir_intrinsic_binding(i);
       if (set >= ctx->pipeline->layout->set_count ||
-          nir_intrinsic_desc_type(i) != nir_descriptor_type_storage_buffer) {
+          (nir_intrinsic_desc_type(i) != nir_descriptor_type_storage_buffer &&
+           nir_intrinsic_desc_type(i) != nir_descriptor_type_uniform_buffer)) {
          ctx->invalid = true;
          return false;
       }
       const struct apex_set_layout *layout =
          (const void *)ctx->pipeline->layout->set_layouts[set];
       if (!layout || binding >= layout->binding_count || !layout->bindings[binding].count) {
+         ctx->invalid = true;
+         return false;
+      }
+      VkDescriptorType type = nir_intrinsic_desc_type(i) == nir_descriptor_type_uniform_buffer ?
+         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      if (layout->bindings[binding].type != type) {
          ctx->invalid = true;
          return false;
       }
@@ -65,7 +72,8 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
       ctx->invalid = true;
       return false;
    }
-   if (!store && !size && i->intrinsic != nir_intrinsic_load_ssbo)
+   if (!store && !size && i->intrinsic != nir_intrinsic_load_ssbo &&
+       i->intrinsic != nir_intrinsic_load_ubo)
       return false;
    if (!size && ((store ? i->src[0].ssa->bit_size : i->def.bit_size) != 32 ||
                  i->num_components > 4 ||
@@ -187,7 +195,8 @@ create_compute_pipeline(struct vk_device *device,
       }
       if (pipeline->descriptor_count > APEX_MAX_DESCRIPTORS)
          goto unsupported_layout;
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
+               nir_address_format_32bit_index_offset);
       struct descriptor_lowering ctx = {.pipeline = pipeline};
       nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
       nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);

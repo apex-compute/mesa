@@ -33,7 +33,7 @@ struct apex_descriptor_pool {
    struct vk_object_base base;
    struct list_head sets;
    uint32_t capacity, allocated;
-   uint64_t descriptors, used;
+   uint64_t descriptors[2], used[2]; /* storage, uniform */
 };
 struct apex_descriptor_set {
    struct vk_object_base base;
@@ -252,7 +252,7 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
    if (info->flags || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
-       (vk_buffer_usage_flags(info) & ~VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))
+       (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
@@ -311,7 +311,8 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
          binding_flags->pBindingFlags[i] : 0;
       if (b->binding >= APEX_MAX_BINDINGS || b->descriptorCount > APEX_MAX_DESCRIPTORS - descriptors ||
           (flags & ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
-          b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          (b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+           (b->descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || device->transport == APEX_TRANSPORT_NATIVE)) ||
           b->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       descriptors += b->descriptorCount;
@@ -329,6 +330,9 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    for (unsigned i = 0; i < info->bindingCount; i++) {
       unsigned b = info->pBindings[i].binding;
       layout->bindings[b].count = info->pBindings[i].descriptorCount;
+      layout->bindings[b].type = info->pBindings[i].descriptorType;
+      layout->counts[layout->bindings[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER] +=
+         layout->bindings[b].count;
       layout->bindings[b].flags = binding_flags && binding_flags->bindingCount ?
          binding_flags->pBindingFlags[i] : 0;
    }
@@ -355,11 +359,12 @@ apex_CreateDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo *info,
    if (info->flags & ~(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT |
                         VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT))
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   uint64_t descriptors = 0;
+   uint64_t descriptors[2] = {0};
    for (unsigned i = 0; i < info->poolSizeCount; i++) {
-      if (info->pPoolSizes[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+      VkDescriptorType type = info->pPoolSizes[i].type;
+      if (type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
          return VK_ERROR_FEATURE_NOT_PRESENT;
-      descriptors += info->pPoolSizes[i].descriptorCount;
+      descriptors[type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER] += info->pPoolSizes[i].descriptorCount;
    }
    struct apex_descriptor_pool *pool = vk_object_zalloc(&device->vk, alloc,
       sizeof(*pool), VK_OBJECT_TYPE_DESCRIPTOR_POOL);
@@ -367,7 +372,7 @@ apex_CreateDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo *info,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    list_inithead(&pool->sets);
    pool->capacity = info->maxSets;
-   pool->descriptors = descriptors;
+   memcpy(pool->descriptors, descriptors, sizeof(descriptors));
    *out = apex_descriptor_pool_to_handle(pool);
    return VK_SUCCESS;
 }
@@ -377,7 +382,8 @@ free_set(struct vk_device *device, struct apex_descriptor_set *set)
 {
    list_del(&set->link);
    set->pool->allocated--;
-   set->pool->used -= set->layout->descriptor_count;
+   for (unsigned type = 0; type < 2; type++)
+      set->pool->used[type] -= set->layout->counts[type];
    vk_descriptor_set_layout_unref(device, &set->layout->vk);
    vk_object_free(device, NULL, set);
 }
@@ -422,14 +428,16 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
    VK_FROM_HANDLE(apex_descriptor_pool, pool, info->descriptorPool);
    for (unsigned i = 0; i < info->descriptorSetCount; i++)
       out[i] = VK_NULL_HANDLE;
-   uint64_t descriptors = 0;
+   uint64_t descriptors[2] = {0};
    for (unsigned i = 0; i < info->descriptorSetCount; i++) {
       const struct apex_set_layout *layout =
          (const void *)vk_descriptor_set_layout_from_handle(info->pSetLayouts[i]);
-      descriptors += layout->descriptor_count;
+      for (unsigned type = 0; type < 2; type++)
+         descriptors[type] += layout->counts[type];
    }
-   if (descriptors > pool->descriptors - pool->used)
-      return VK_ERROR_OUT_OF_POOL_MEMORY;
+   for (unsigned type = 0; type < 2; type++)
+      if (descriptors[type] > pool->descriptors[type] - pool->used[type])
+         return VK_ERROR_OUT_OF_POOL_MEMORY;
    if (info->descriptorSetCount > pool->capacity - pool->allocated)
       return VK_ERROR_OUT_OF_POOL_MEMORY;
    for (unsigned i = 0; i < info->descriptorSetCount; i++) {
@@ -446,7 +454,8 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
       set->layout = (void *)vk_descriptor_set_layout_ref(&layout->vk);
       list_addtail(&set->link, &pool->sets);
       pool->allocated++;
-      pool->used += layout->descriptor_count;
+      for (unsigned type = 0; type < 2; type++)
+         pool->used[type] += layout->counts[type];
       out[i] = apex_descriptor_set_to_handle(set);
    }
    return VK_SUCCESS;
@@ -459,7 +468,7 @@ apex_UpdateDescriptorSets(VkDevice dev, uint32_t write_count, const VkWriteDescr
    for (unsigned i = 0; i < write_count; i++) {
       VK_FROM_HANDLE(apex_descriptor_set, set, writes[i].dstSet);
       assert(writes[i].dstBinding < set->layout->binding_count &&
-             writes[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+             writes[i].descriptorType == set->layout->bindings[writes[i].dstBinding].type);
       unsigned start = set->layout->bindings[writes[i].dstBinding].offset + writes[i].dstArrayElement;
       assert(start + writes[i].descriptorCount <= set->layout->descriptor_count);
       memcpy(&set->buffers[start], writes[i].pBufferInfo,

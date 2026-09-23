@@ -2,6 +2,10 @@
 #version 450
 layout(local_size_x = 16) in;
 layout(set = 1, binding = 5, std430) readonly buffer Input { uint values[]; } sources[2];
+layout(set = 1, binding = 2, std140) uniform Constants {
+   uvec4 affine;
+   uint weights[16];
+} constants[2];
 layout(set = 0, binding = 3, std430) buffer Output { uvec4 values[]; } destination;
 void main()
 {
@@ -9,6 +13,7 @@ void main()
    uint which = lane & 1u;
    uint index = lane == 13u ? 0x3fffffffu : lane;
    uint value = sources[which].values[index];
-   destination.values[lane] = uvec4(value, value * 7u + lane,
+   destination.values[lane] = uvec4(value,
+      value * constants[which].affine.x + constants[which].affine.z + constants[which].weights[lane],
       sources[which].values.length(), sources[which ^ 1u].values[lane + 8u]);
 }
