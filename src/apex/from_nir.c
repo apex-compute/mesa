@@ -11,6 +11,7 @@ const struct nir_shader_compiler_options apex_nir_options = {
    .lower_mul_2x32_64 = true,
    .lower_extract_byte = true, .lower_extract_word = true,
    .lower_bitfield_extract = true, .lower_bitfield_insert = true,
+   .lower_ifind_msb = true, .lower_find_lsb = true,
 };
 
 static uint32_t value(nir_def *def, unsigned component)
@@ -222,6 +223,27 @@ static nir_def *lower_int32_division(nir_builder *b, nir_instr *instr, void *dat
    return result;
 }
 
+static bool uint32_msb(const nir_instr *instr, const void *data)
+{
+   return instr->type == nir_instr_type_alu &&
+          nir_instr_as_alu(instr)->op == nir_op_ufind_msb &&
+          nir_instr_as_alu(instr)->src[0].src.ssa->bit_size == 32;
+}
+
+static nir_def *lower_uint32_msb(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_def *x = nir_ssa_for_alu_src(b, nir_instr_as_alu(instr), 0);
+   nir_def *remaining = x;
+   nir_def *index = nir_imm_int(b, 0);
+   for (unsigned shift = 16; shift; shift >>= 1) {
+      nir_def *high = nir_ushr_imm(b, remaining, shift);
+      nir_def *nonzero = nir_ine_imm(b, high, 0);
+      remaining = nir_bcsel(b, nonzero, high, remaining);
+      index = nir_ior(b, index, nir_bcsel(b, nonzero, nir_imm_int(b, shift), nir_imm_int(b, 0)));
+   }
+   return nir_bcsel(b, nir_ieq_imm(b, x, 0), nir_imm_int(b, -1), index);
+}
+
 static int atomic_op(nir_atomic_op op)
 {
    switch (op) {
@@ -299,6 +321,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    do {
       progress = false;
       NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_shader_lower_instructions, uint32_msb, lower_uint32_msb, NULL);
       NIR_PASS(progress, nir, nir_lower_alu);
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
