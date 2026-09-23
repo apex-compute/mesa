@@ -2,6 +2,7 @@
 #include "apex_device.h"
 #include "apex_native_uapi.h"
 #include "apex_pipeline.h"
+#include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
 #include "vk_command_buffer.h"
@@ -12,11 +13,13 @@
 #include "util/os_time.h"
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <time.h>
 
 struct apex_memory {
    struct vk_device_memory vk;
    void *data;
+   uint32_t handle;
 };
 struct apex_buffer {
    struct vk_buffer vk;
@@ -53,6 +56,32 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(apex_descriptor_pool, base, VkDescriptorPool, VK_
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_descriptor_set, base, VkDescriptorSet, VK_OBJECT_TYPE_DESCRIPTOR_SET);
 VK_DEFINE_HANDLE_CASTS(apex_command_buffer, vk.base, VkCommandBuffer, VK_OBJECT_TYPE_COMMAND_BUFFER);
 
+static int
+gem_close(struct apex_device *device, uint32_t handle)
+{
+   struct drm_gem_close args = {.handle = handle};
+   return ioctl(device->fd, DRM_IOCTL_GEM_CLOSE, &args);
+}
+
+static VkResult
+gem_create(struct apex_device *device, uint64_t size, uint32_t *handle, void **data)
+{
+   struct drm_apex_gem_create create = {.size = size};
+   if (ioctl(device->fd, DRM_IOCTL_APEX_GEM_CREATE, &create))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct drm_apex_gem_mmap map = {.handle = create.handle};
+   if (!ioctl(device->fd, DRM_IOCTL_APEX_GEM_MMAP, &map)) {
+      void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd, map.offset);
+      if (ptr != MAP_FAILED) {
+         *handle = create.handle;
+         *data = ptr;
+         return VK_SUCCESS;
+      }
+   }
+   gem_close(device, create.handle);
+   return VK_ERROR_MEMORY_MAP_FAILED;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
                     const VkAllocationCallbacks *alloc, VkDeviceMemory *out)
@@ -66,11 +95,17 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    struct apex_memory *mem = vk_device_memory_create(&device->vk, info, alloc, sizeof(*mem));
    if (!mem)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   mem->data = vk_zalloc2(&device->vk.alloc, alloc, info->allocationSize, 8,
-                          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!mem->data) {
+   VkResult result;
+   if (device->transport == APEX_TRANSPORT_DRM) {
+      result = gem_create(device, info->allocationSize, &mem->handle, &mem->data);
+   } else {
+      mem->data = vk_zalloc2(&device->vk.alloc, alloc, info->allocationSize, 8,
+                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      result = mem->data ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (result != VK_SUCCESS) {
       vk_device_memory_destroy(&device->vk, alloc, &mem->vk);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+      return result;
    }
    *out = apex_memory_to_handle(mem);
    return VK_SUCCESS;
@@ -83,7 +118,12 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
    VK_FROM_HANDLE(apex_memory, memory, handle);
    if (!memory)
       return;
-   vk_free2(&device->vk.alloc, alloc, memory->data);
+   if (device->transport == APEX_TRANSPORT_DRM) {
+      munmap(memory->data, memory->vk.size);
+      gem_close(device, memory->handle);
+   } else {
+      vk_free2(&device->vk.alloc, alloc, memory->data);
+   }
    vk_device_memory_destroy(&device->vk, alloc, &memory->vk);
 }
 
@@ -108,7 +148,8 @@ apex_UnmapMemory2(VkDevice dev, const VkMemoryUnmapInfo *info)
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_MappedMemoryRanges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges)
 {
-   /* Shadow memory is host coherent; native submission owns upload/release. */
+   /* Both shmem and qualification shadow memory are host coherent. Submission
+    * completes device release before exposing output to the host. */
    return VK_SUCCESS;
 }
 
@@ -426,11 +467,35 @@ static int
 native_command(struct apex_device *device, uint32_t operation)
 {
    struct apex_ioctl_native r = {.operation = operation};
-   return ioctl(device->native_fd, APEX_IOCTL_NATIVE, &r);
+   return ioctl(device->fd, APEX_IOCTL_NATIVE, &r);
 }
 
 static VkResult
-native_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
+drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch,
+             struct apex_memory *memory, uint64_t offset, uint64_t bytes)
+{
+   uint32_t program;
+   void *code;
+   VkResult result = gem_create(device, dispatch->pipeline->code.size, &program, &code);
+   if (result != VK_SUCCESS)
+      return result;
+   memcpy(code, dispatch->pipeline->code.data, dispatch->pipeline->code.size);
+   struct drm_apex_exec args = {
+      .program_handle = program, .program_bytes = dispatch->pipeline->code.size,
+      .data_handle = memory->handle, .data_offset = offset, .data_bytes = bytes,
+      .workgroups = dispatch->groups,
+   };
+   /* Do not retry EXEC on EINTR: the kernel cancels/drains the accepted job. */
+   result = !ioctl(device->fd, DRM_IOCTL_APEX_EXEC, &args) && args.status == 1 ?
+      VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+   munmap(code, dispatch->pipeline->code.size);
+   if (gem_close(device, program))
+      result = VK_ERROR_DEVICE_LOST;
+   return result;
+}
+
+static VkResult
+dispatch_compute(struct apex_device *device, const struct apex_dispatch *dispatch)
 {
    const VkDescriptorBufferInfo *binding = &dispatch->set->buffer;
    VK_FROM_HANDLE(apex_buffer, buffer, binding->buffer);
@@ -439,6 +504,8 @@ native_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch
    uint64_t bytes = binding->range == VK_WHOLE_SIZE ? buffer->vk.size - binding->offset : binding->range;
    if (!bytes || bytes > buffer->vk.size - binding->offset)
       return VK_ERROR_DEVICE_LOST;
+   if (device->transport == APEX_TRANSPORT_DRM)
+      return drm_dispatch(device, dispatch, buffer->memory, buffer->offset + binding->offset, bytes);
    void *data = (uint8_t *)buffer->memory->data + buffer->offset + binding->offset;
    if (native_command(device, APEX_NATIVE_CREATE))
       return VK_ERROR_DEVICE_LOST;
@@ -448,26 +515,26 @@ native_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch
       .user_ptr = (uintptr_t)dispatch->pipeline->code.data, .bytes = dispatch->pipeline->code.size,
    };
    struct apex_ioctl_native allocation = {.operation = APEX_NATIVE_ALLOC, .bytes = bytes};
-   if (ioctl(device->native_fd, APEX_IOCTL_NATIVE, &program) ||
-       ioctl(device->native_fd, APEX_IOCTL_NATIVE, &allocation))
+   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &program) ||
+       ioctl(device->fd, APEX_IOCTL_NATIVE, &allocation))
       goto out;
    struct apex_ioctl_native transfer = {
       .operation = APEX_NATIVE_UPLOAD, .handle = allocation.handle,
       .user_ptr = (uintptr_t)data, .bytes = bytes,
    };
-   if (ioctl(device->native_fd, APEX_IOCTL_NATIVE, &transfer) || native_command(device, APEX_NATIVE_START))
+   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &transfer) || native_command(device, APEX_NATIVE_START))
       goto out;
    struct apex_ioctl_native submit = {
       .operation = APEX_NATIVE_SUBMIT, .kind = APEX_NATIVE_COMPUTE,
       .handle = program.handle, .data_handle = allocation.handle,
       .workgroups = dispatch->groups == 1 ? 0 : dispatch->groups,
    };
-   if (ioctl(device->native_fd, APEX_IOCTL_NATIVE, &submit))
+   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &submit))
       goto out;
    uint64_t deadline = os_time_get_nano() + 5000000000ull;
    for (;;) {
       struct apex_ioctl_native poll = {.operation = APEX_NATIVE_POLL, .identity = submit.identity};
-      if (ioctl(device->native_fd, APEX_IOCTL_NATIVE, &poll))
+      if (ioctl(device->fd, APEX_IOCTL_NATIVE, &poll))
          goto out;
       if (poll.status) {
          if (poll.status != 1)
@@ -482,7 +549,7 @@ native_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch
    if (native_command(device, APEX_NATIVE_STOP))
       goto out;
    transfer.operation = APEX_NATIVE_DOWNLOAD;
-   if (ioctl(device->native_fd, APEX_IOCTL_NATIVE, &transfer))
+   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &transfer))
       goto out;
    result = VK_SUCCESS;
 out:
@@ -496,12 +563,12 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct apex_device *device = (struct apex_device *)queue->base.device;
    if (submit->wait_count || submit->signal_count || vk_queue_submit_has_bind(submit) || submit->is_protected)
-      return vk_queue_set_lost(queue, "unsupported native qualification submission");
+      return vk_queue_set_lost(queue, "unsupported Apex submission");
    for (unsigned i = 0; i < submit->command_buffer_count; i++) {
       struct apex_command_buffer *cmd = (struct apex_command_buffer *)submit->command_buffers[i];
       list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
-         if (native_dispatch(device, dispatch) != VK_SUCCESS)
-            return vk_queue_set_lost(queue, "native dispatch or allocation release failed");
+         if (dispatch_compute(device, dispatch) != VK_SUCCESS)
+            return vk_queue_set_lost(queue, "Apex dispatch or allocation release failed");
       }
    }
    return VK_SUCCESS;
@@ -516,11 +583,19 @@ apex_QueueWaitIdle(VkQueue handle)
 
 VkResult
 apex_device_init(struct apex_device *device, struct vk_physical_device *physical,
-                  const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int native_fd)
+                  const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int fd,
+                  enum apex_transport transport)
 {
    if (info->queueCreateInfoCount != 1 || info->pQueueCreateInfos[0].queueFamilyIndex ||
        info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (transport == APEX_TRANSPORT_DRM) {
+      struct drm_apex_info caps = {0};
+      if (ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 1 ||
+          (caps.capabilities & (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_EXEC)) !=
+          (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_EXEC))
+         return VK_ERROR_INCOMPATIBLE_DRIVER;
+   }
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,
       .AllocateMemory = apex_AllocateMemory, .FreeMemory = apex_FreeMemory,
@@ -543,7 +618,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    if (result != VK_SUCCESS)
       return result;
    device->vk.command_buffer_ops = &command_ops;
-   device->native_fd = native_fd;
+   device->fd = fd;
+   device->transport = transport;
    result = vk_queue_init(&device->queue, &device->vk, &info->pQueueCreateInfos[0], 0);
    if (result != VK_SUCCESS) {
       vk_device_finish(&device->vk);

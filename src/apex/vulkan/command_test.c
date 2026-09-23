@@ -2,13 +2,17 @@
 #include "apex_device.h"
 #include "apex_pipeline.h"
 #include "apex_native_uapi.h"
+#include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { \
@@ -20,6 +24,10 @@
 static struct {
    int fault;
    unsigned calls[11], step, dispatch;
+   int drm_fd;
+   unsigned objects, live, exec_calls;
+   uint64_t next_offset;
+   struct { uint64_t offset, size; bool live; } gems[8];
    struct apex_pipeline *pipelines[3];
    uint32_t *mapped;
    uint32_t expected[2048], payload[800];
@@ -31,6 +39,72 @@ static const unsigned scales[] = {3, 7, 7};
 int __real_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
 
+static int
+drm_ioctl(unsigned long request, void *arg)
+{
+   if (request == DRM_IOCTL_APEX_INFO) {
+      *(struct drm_apex_info *)arg = (struct drm_apex_info) {
+         .version = mock.fault == 208 ? 2 : 1,
+         .capabilities = APEX_DRM_CAP_SHMEM | (mock.fault == 207 ? 0 : APEX_DRM_CAP_EXEC),
+         .max_buffer_bytes = 64 * 1024 * 1024,
+      };
+   } else if (request == DRM_IOCTL_APEX_GEM_CREATE) {
+      struct drm_apex_gem_create *r = arg;
+      CHECK(!r->flags && !r->handle && r->size);
+      if (mock.objects && mock.fault == 201) { errno = ENOMEM; return -1; }
+      unsigned h = ++mock.objects;
+      CHECK(h < ARRAY_SIZE(mock.gems));
+      r->size = align64(r->size, 4096);
+      r->handle = h;
+      mock.gems[h].size = r->size;
+      mock.gems[h].offset = mock.next_offset;
+      mock.gems[h].live = true;
+      mock.live++;
+      mock.next_offset += r->size + 4096;
+      CHECK(!ftruncate(mock.drm_fd, mock.next_offset));
+   } else if (request == DRM_IOCTL_APEX_GEM_MMAP) {
+      struct drm_apex_gem_mmap *r = arg;
+      CHECK(!r->flags && r->handle <= mock.objects && mock.gems[r->handle].live);
+      if (r->handle > 1 && mock.fault == 202) { errno = EIO; return -1; }
+      r->offset = r->handle > 1 && mock.fault == 203 ? 1 : mock.gems[r->handle].offset;
+   } else if (request == DRM_IOCTL_GEM_CLOSE) {
+      struct drm_gem_close *r = arg;
+      CHECK(r->handle <= mock.objects && mock.gems[r->handle].live);
+      mock.gems[r->handle].live = false;
+      mock.live--;
+   } else {
+      CHECK(request == DRM_IOCTL_APEX_EXEC);
+      struct drm_apex_exec *r = arg;
+      unsigned d = mock.dispatch;
+      mock.exec_calls++;
+      CHECK(d < 3 && r->program_handle == d + 2 && r->data_handle == 1);
+      CHECK(mock.gems[r->program_handle].live && mock.gems[1].live);
+      CHECK(!r->flags && !r->status && !r->reason && !r->timestamp);
+      CHECK(!r->program_offset && r->program_bytes == mock.pipelines[d]->code.size);
+      CHECK(r->data_offset == starts[d] * 4 && r->data_bytes == sizeof(mock.payload));
+      CHECK(r->workgroups == 1);
+      void *code = malloc(r->program_bytes);
+      CHECK(code && pread(mock.drm_fd, code, r->program_bytes,
+                          mock.gems[r->program_handle].offset) == r->program_bytes);
+      CHECK(!memcmp(code, mock.pipelines[d]->code.data, r->program_bytes));
+      free(code);
+      off_t offset = mock.gems[1].offset + r->data_offset;
+      CHECK(pread(mock.drm_fd, mock.payload, r->data_bytes, offset) == r->data_bytes);
+      CHECK(!memcmp(mock.payload, mock.expected + starts[d], r->data_bytes));
+      if (mock.fault == 204) { errno = EINTR; return -1; }
+      if (mock.fault == 205 || mock.fault == 206) {
+         r->status = mock.fault == 205 ? 4 : 5;
+         return 0;
+      }
+      for (unsigned i = 0; i < 16; i++) mock.payload[i] = biases[d] + scales[d] * i;
+      CHECK(pwrite(mock.drm_fd, mock.payload, r->data_bytes, offset) == r->data_bytes);
+      memcpy(mock.expected + starts[d], mock.payload, r->data_bytes);
+      r->status = 1;
+      mock.dispatch++;
+   }
+   return 0;
+}
+
 int
 __wrap_ioctl(int fd, unsigned long request, ...)
 {
@@ -38,6 +112,8 @@ __wrap_ioctl(int fd, unsigned long request, ...)
    va_start(args, request);
    struct apex_ioctl_native *r = va_arg(args, void *);
    va_end(args);
+   if (fd >= 0 && fd == mock.drm_fd)
+      return drm_ioctl(request, r);
    if (fd >= 0)
       return __real_ioctl(fd, request, r);
    CHECK(request == APEX_IOCTL_NATIVE && r->operation <= 10);
@@ -102,10 +178,18 @@ __wrap_ioctl(int fd, unsigned long request, ...)
 }
 
 static void
-run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int fd, int fault)
+run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int fd, int fault,
+    enum apex_transport transport)
 {
    memset(&mock, 0, sizeof(mock));
    mock.fault = fault;
+   mock.drm_fd = -1;
+   bool mocked = fd < 0;
+   if (mocked && transport == APEX_TRANSPORT_DRM) {
+      mock.drm_fd = fd = memfd_create("apex-drm-test", MFD_CLOEXEC);
+      CHECK(fd >= 0);
+      mock.next_offset = 4096;
+   }
    struct apex_device device;
    const float priority = 1.0f;
    const VkDeviceQueueCreateInfo queue_info = {
@@ -121,7 +205,13 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       .pNext = &features,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
    };
-   CHECK(apex_device_init(&device, physical, &device_info, NULL, fd) == VK_SUCCESS);
+   VkResult initialized = apex_device_init(&device, physical, &device_info, NULL, fd, transport);
+   if (fault == 207 || fault == 208) {
+      CHECK(initialized == VK_ERROR_INCOMPATIBLE_DRIVER && !mock.objects && !mock.exec_calls);
+      CHECK(!close(fd));
+      return;
+   }
+   CHECK(initialized == VK_SUCCESS);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkQueue queue;
@@ -269,13 +359,21 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    if (fault >= 0) {
       CHECK(result == VK_ERROR_DEVICE_LOST);
       CHECK(v->QueueWaitIdle(queue) == VK_ERROR_DEVICE_LOST);
-      CHECK(mock.calls[APEX_NATIVE_CREATE] == (fault >= 100 ? 0 : 1));
-      CHECK(mock.calls[APEX_NATIVE_CLOSE] == (fault == APEX_NATIVE_CREATE || fault >= 100 ? 0 : 1));
-      if (fault != APEX_NATIVE_DOWNLOAD && fault != APEX_NATIVE_CLOSE)
-         CHECK(!mock.calls[APEX_NATIVE_DOWNLOAD]);
+      if (transport == APEX_TRANSPORT_DRM) {
+         CHECK(mock.live == 1 && !mock.calls[APEX_NATIVE_CREATE]);
+         CHECK(mock.exec_calls == (fault >= 204 && fault <= 206 ? 1 : 0));
+         CHECK(!memcmp(mock.mapped, mock.expected, sizeof(mock.expected)));
+      } else {
+         CHECK(mock.calls[APEX_NATIVE_CREATE] == (fault >= 100 ? 0 : 1));
+         CHECK(mock.calls[APEX_NATIVE_CLOSE] == (fault == APEX_NATIVE_CREATE || fault >= 100 ? 0 : 1));
+         if (fault != APEX_NATIVE_DOWNLOAD && fault != APEX_NATIVE_CLOSE)
+            CHECK(!mock.calls[APEX_NATIVE_DOWNLOAD]);
+      }
       unsigned calls = mock.calls[APEX_NATIVE_CREATE];
+      unsigned exec_calls = mock.exec_calls;
       CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_ERROR_DEVICE_LOST);
       CHECK(mock.calls[APEX_NATIVE_CREATE] == calls);
+      CHECK(mock.exec_calls == exec_calls);
    } else {
       CHECK(result == VK_SUCCESS && v->QueueWaitIdle(queue) == VK_SUCCESS);
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
@@ -303,7 +401,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          if (i >= 1088 && i < 1104) expected = 101 + 7 * (i - 1088);
          CHECK(mock.mapped[i] == expected);
       }
-      if (fd < 0) CHECK(mock.dispatch == 3 && mock.step == 0);
+      if (mocked) CHECK(mock.dispatch == 3 && mock.step == 0);
    }
    v->DestroyCommandPool(dev, command_pool, NULL);
    CHECK(v->FreeDescriptorSets(dev, pool, 2, sets) == VK_SUCCESS);
@@ -317,11 +415,15 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    v->UnmapMemory(dev, memory);
    v->FreeMemory(dev, memory, NULL);
    apex_device_finish(&device);
+   if (mock.drm_fd >= 0) {
+      CHECK(!mock.live && !close(mock.drm_fd));
+      mock.drm_fd = -1;
+   }
 }
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 2 || argc == 3);
+   CHECK(argc == 2 || argc == 3 || (argc == 4 && !strcmp(argv[2], "--drm")));
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -345,17 +447,39 @@ int main(int argc, char **argv)
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
-   int fd = argc == 3 ? open(argv[2], O_RDWR | O_CLOEXEC) : -1;
-   CHECK(argc != 3 || fd >= 0);
-   run(&physical, spirv, size, fd, -1);
+   int fd = argc > 2 ? open(argv[argc - 1], O_RDWR | O_CLOEXEC) : -1;
+   CHECK(argc == 2 || fd >= 0);
+   enum apex_transport transport = argc == 4 ? APEX_TRANSPORT_DRM : APEX_TRANSPORT_NATIVE;
+   mock.drm_fd = -1;
+   if (transport == APEX_TRANSPORT_DRM) {
+      if (!geteuid()) {
+         CHECK(!setgroups(0, NULL) && !setgid(65534) && !setuid(65534));
+      }
+      CHECK(geteuid() != 0);
+      struct drm_apex_info caps = {0};
+      CHECK(!ioctl(fd, DRM_IOCTL_APEX_INFO, &caps));
+      if (!(caps.capabilities & APEX_DRM_CAP_EXEC)) {
+         fprintf(stderr, "SKIP Apex Mesa DRM execution: kernel/image does not advertise EXEC\n");
+         CHECK(!close(fd));
+         free(spirv);
+         vk_physical_device_finish(&physical);
+         vk_instance_finish(&instance);
+         return 77;
+      }
+   }
+   run(&physical, spirv, size, fd, -1, transport);
    if (fd >= 0) {
       CHECK(close(fd) == 0);
-      puts("PASS Apex Mesa native command submission: 3 dispatches, 2 buffers, 2048 words/guards");
+      printf("PASS Apex Mesa %s command submission: 3 dispatches, 2 buffers, 2048 words/guards\n",
+             transport == APEX_TRANSPORT_DRM ? "DRM" : "native");
    } else {
       const int faults[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 99, 100, 101};
       for (unsigned i = 0; i < ARRAY_SIZE(faults); i++)
-         run(&physical, spirv, size, -1, faults[i]);
-      puts("PASS Apex Mesa command transport: binding, offsets, reset, release, device loss (mock ioctl)");
+         run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE);
+      const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208};
+      for (unsigned i = 0; i < ARRAY_SIZE(drm_faults); i++)
+         run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM);
+      puts("PASS Apex Mesa native/DRM transport: GEM, binding, offsets, reset, cleanup, device loss (mock ioctl)");
    }
    free(spirv);
    vk_physical_device_finish(&physical);
