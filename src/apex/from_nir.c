@@ -64,9 +64,13 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
       replacement = nir_vec3(b, nir_load_local_invocation_index(b),
                             nir_imm_int(b, 0), nir_imm_int(b, 0)); break;
    case nir_intrinsic_load_workgroup_id:
-      /* One native launch is one 16-invocation workgroup. The queue supplies its
+      /* One native launch is one single-wave workgroup. The queue supplies its
        * coarse base; there is no second in-launch workgroup index. */
       replacement = nir_imm_ivec3(b, 0, 0, 0); break;
+   case nir_intrinsic_load_subgroup_id:
+      replacement = nir_imm_int(b, 0); break;
+   case nir_intrinsic_load_num_subgroups:
+      replacement = nir_imm_int(b, 1); break;
    case nir_intrinsic_vulkan_resource_index:
       if (nir_intrinsic_desc_set(i) || nir_intrinsic_binding(i) ||
           !nir_src_is_const(i->src[0]) || nir_src_as_uint(i->src[0])) {
@@ -298,11 +302,11 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    for (unsigned axis = 0; axis < 3; axis++) {
       unsigned size = nir->info.workgroup_size[axis];
       if (!size || size > 16)
-         return fail(output, "native launch requires exactly 16 local invocations");
+         return fail(output, "native launch requires 1 to 16 local invocations");
       invocations *= size;
    }
-   if (nir->info.workgroup_size_variable || invocations != 16)
-      return fail(output, "native launch requires exactly 16 local invocations");
+   if (nir->info.workgroup_size_variable || invocations > 16)
+      return fail(output, "native launch requires 1 to 16 local invocations");
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
@@ -323,10 +327,10 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
     * shapes compile their dimensions into local/global ID expressions. */
    if (nir->info.workgroup_size[0] != 16) {
       NIR_PASS(_, nir, nir_lower_compute_system_values, &geometry);
-      /* Constant dimensions reduce division to shifts/masks before the
-       * general integer-division lowering expands any remaining division. */
+      /* Reduce constant dimensions before expanding general division. */
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_opt_idiv_const, 32);
    }
    bool invalid = false;
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
@@ -393,6 +397,13 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          emit(&ops, 0x54, 0, address, zero, 0, 0);
       }
       emit(&ops, 7, 0, 0, 0, 0, 0);
+   }
+   if (invocations < 16) {
+      /* Cooperative initialization above uses the physical wave. Source
+       * execution begins with only the workgroup's invocations active. */
+      uint32_t mask = temporary++, discarded = temporary++;
+      emit(&ops, 0x10, mask, 0, 0, 0, (1u << invocations) - 1);
+      emit(&ops, 6, discarded, mask, 0, 0, 0);
    }
    struct control_state control = { .ops=&ops, .temporary=&temporary,
                                     .zero=temporary++, .discard=temporary++, .output=output };

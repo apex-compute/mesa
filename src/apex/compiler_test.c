@@ -100,18 +100,18 @@ int main(int argc, char **argv)
    check_binary(&b, 0x2468ace0);
 
    const unsigned invalid_sizes[][3] = {
-      {8, 1, 1}, {16, 2, 1}, {4, 2, 1}, {2, 2, 8}, {0, 1, 16},
+      {17, 1, 1}, {16, 2, 1}, {3, 3, 2}, {2, 2, 8}, {0, 1, 16},
       {UINT16_MAX, UINT16_MAX, 16},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(invalid_sizes); i++) {
       nir = shader(17);
       for (unsigned axis = 0; axis < 3; axis++)
          nir->info.workgroup_size[axis] = invalid_sizes[i][axis];
-      reject(nir, &a, "exactly 16 local invocations");
+      reject(nir, &a, "1 to 16 local invocations");
    }
    nir = shader(17);
    nir->info.workgroup_size_variable = true;
-   reject(nir, &a, "exactly 16 local invocations");
+   reject(nir, &a, "1 to 16 local invocations");
    nir = shader(17);
    nir->info.stage = MESA_SHADER_FRAGMENT;
    reject(nir, &a, "only compute");

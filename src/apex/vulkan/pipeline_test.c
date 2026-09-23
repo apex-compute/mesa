@@ -15,7 +15,7 @@
 
 static void
 write_fixture(const char *directory, const char *name, VkPipeline handle,
-              uint32_t bias, uint32_t scale)
+              uint32_t bias, uint32_t scale, unsigned invocations)
 {
    struct apex_pipeline *p = apex_pipeline_from_handle(handle);
    char path[4096];
@@ -27,7 +27,7 @@ write_fixture(const char *directory, const char *name, VkPipeline handle,
    uint32_t input[800], expected[800];
    for (unsigned i = 0; i < 800; i++) {
       input[i] = util_cpu_to_le32(0xd00d0000 + i);
-      expected[i] = i < 16 ? util_cpu_to_le32(bias + i * scale) : input[i];
+      expected[i] = i < invocations ? util_cpu_to_le32(bias + i * scale) : input[i];
    }
    CHECK(snprintf(path, sizeof(path), "%s/%s.input.bin", directory, name) < sizeof(path));
    f = fopen(path, "wb");
@@ -344,9 +344,9 @@ int main(int argc, char **argv)
    memset(values, 0, sizeof(values));
    const char *output = argc == 6 ? argv[5] : NULL;
    if (output) {
-      write_fixture(output, "mesa-default", pipelines[0], 37, 3);
-      write_fixture(output, "mesa-specialized", pipelines[1], 101, 7);
-      write_fixture(output, "mesa-entrypoint", pipelines[2], 112, 7);
+      write_fixture(output, "mesa-default", pipelines[0], 37, 3, 16);
+      write_fixture(output, "mesa-specialized", pipelines[1], 101, 7, 16);
+      write_fixture(output, "mesa-entrypoint", pipelines[2], 112, 7, 12);
    }
    for (unsigned i = 0; i < 3; i++)
       device.vk.dispatch_table.DestroyPipeline(dev, pipelines[i], NULL);
