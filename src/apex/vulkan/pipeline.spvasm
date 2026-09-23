@@ -1,6 +1,7 @@
 ; SPDX-License-Identifier: MIT
 ; Two accepted entrypoints and nonconsecutive specialization IDs. Each lane stores
 ; bias + lane * scale, or bias + lane * scale + 11 for the second entrypoint.
+; The second entrypoint linearizes a 4x2x2 local workgroup.
 ; The wide entrypoint checks rejection of an unsupported workgroup size.
 OpCapability Shader
 OpMemoryModel Logical GLSL450
@@ -8,7 +9,7 @@ OpEntryPoint GLCompute %main "main" %id
 OpEntryPoint GLCompute %alternate "alternate" %id
 OpEntryPoint GLCompute %wide "wide"
 OpExecutionMode %main LocalSize 16 1 1
-OpExecutionMode %alternate LocalSize 16 1 1
+OpExecutionMode %alternate LocalSize 4 2 2
 OpExecutionMode %wide LocalSize 32 1 1
 OpDecorate %id BuiltIn LocalInvocationId
 OpDecorate %bias SpecId 7
@@ -28,6 +29,8 @@ OpDecorate %buffer Binding 0
 %uniform = OpTypePointer Uniform %block
 %word = OpTypePointer Uniform %uint
 %zero = OpConstant %uint 0
+%four = OpConstant %uint 4
+%eight = OpConstant %uint 8
 %eleven = OpConstant %uint 11
 %bias = OpSpecConstant %uint 37
 %scale = OpSpecConstant %uint 3
@@ -50,7 +53,13 @@ OpFunctionEnd
 %alternate = OpFunction %void None %fn
 %entry2 = OpLabel
 %xyz2 = OpLoad %v3uint %id
-%lane2 = OpCompositeExtract %uint %xyz2 0
+%x2 = OpCompositeExtract %uint %xyz2 0
+%y2 = OpCompositeExtract %uint %xyz2 1
+%z2 = OpCompositeExtract %uint %xyz2 2
+%row2 = OpIMul %uint %y2 %four
+%plane2 = OpIMul %uint %z2 %eight
+%xy2 = OpIAdd %uint %x2 %row2
+%lane2 = OpIAdd %uint %xy2 %plane2
 %product2 = OpIMul %uint %lane2 %scale
 %value2 = OpIAdd %uint %product2 %bias
 %offset2 = OpIAdd %uint %value2 %eleven

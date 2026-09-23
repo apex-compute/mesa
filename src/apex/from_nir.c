@@ -60,11 +60,11 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    case nir_intrinsic_load_base_global_invocation_id:
       replacement = nir_imm_ivec3(b, 0, 0, 0); break;
    case nir_intrinsic_load_local_invocation_id:
-      /* The admitted workgroup size is exactly 16x1x1. */
+      /* Reshaped workgroups have already used NIR's general ID lowering. */
       replacement = nir_vec3(b, nir_load_local_invocation_index(b),
                             nir_imm_int(b, 0), nir_imm_int(b, 0)); break;
    case nir_intrinsic_load_workgroup_id:
-      /* One native launch is one 16x1x1 workgroup. The queue supplies its
+      /* One native launch is one 16-invocation workgroup. The queue supplies its
        * coarse base; there is no second in-launch workgroup index. */
       replacement = nir_imm_ivec3(b, 0, 0, 0); break;
    case nir_intrinsic_vulkan_resource_index:
@@ -294,10 +294,15 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          zero_shared = true;
       }
    }
-   if (nir->info.workgroup_size_variable || nir->info.workgroup_size[0]!=16 ||
-       nir->info.workgroup_size[1]!=1 || nir->info.workgroup_size[2]!=1) {
-      return fail(output, "native launch requires local size 16x1x1");
+   unsigned invocations = 1;
+   for (unsigned axis = 0; axis < 3; axis++) {
+      unsigned size = nir->info.workgroup_size[axis];
+      if (!size || size > 16)
+         return fail(output, "native launch requires exactly 16 local invocations");
+      invocations *= size;
    }
+   if (nir->info.workgroup_size_variable || invocations != 16)
+      return fail(output, "native launch requires exactly 16 local invocations");
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
@@ -310,6 +315,19 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_system_values);
+   const nir_lower_compute_system_values_options geometry = {
+      .lower_cs_local_id_to_index = true,
+      .has_base_workgroup_id = true,
+   };
+   /* Native global IDs already implement 16x1x1 in one instruction. Other
+    * shapes compile their dimensions into local/global ID expressions. */
+   if (nir->info.workgroup_size[0] != 16) {
+      NIR_PASS(_, nir, nir_lower_compute_system_values, &geometry);
+      /* Constant dimensions reduce division to shifts/masks before the
+       * general integer-division lowering expands any remaining division. */
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_algebraic);
+   }
    bool invalid = false;
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
    if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");

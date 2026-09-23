@@ -8,7 +8,7 @@
 #include "vk_pipeline_layout.h"
 #include "util/bitset.h"
 
-/* Local size remains 16x1x1. No API capability advertisement yet. */
+/* Fixed local shapes totaling 16 invocations. No API capability advertisement. */
 struct apex_pipeline {
    struct vk_pipeline vk;
    struct apex_compile_result code;
