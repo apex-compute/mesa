@@ -314,12 +314,11 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
    if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
-   NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_minmax_sign, lower_fp32_minmax_sign, NULL);
-   NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, int32_division, lower_int32_division, NULL);
    const nir_lower_subgroups_options subgroups = {
       .subgroup_size = 16, .ballot_bit_size = 32, .ballot_components = 1,
       .lower_to_scalar = true, .lower_vote = true, .lower_vote_ieq = true,
+      .lower_vote_feq = true,
       .lower_vote_bool_eq = true, .lower_elect = true,
       .lower_first_invocation_to_ballot = true, .lower_read_first_invocation = true,
       .lower_subgroup_masks = true, .lower_inverse_ballot = true,
@@ -331,6 +330,8 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       progress = false;
       NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
+      NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_minmax_sign, lower_fp32_minmax_sign, NULL);
+      NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, uint32_msb, lower_uint32_msb, NULL);
       NIR_PASS(progress, nir, nir_lower_alu);
