@@ -214,6 +214,21 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else if (instr->type == nir_instr_type_alu) {
             nir_alu_instr *a = nir_instr_as_alu(instr);
             unsigned op = alu_op(a->op);
+            if (a->op == nir_op_ilt32 || a->op == nir_op_ige32) {
+               /* Flipping the sign bit maps signed order onto unsigned order. */
+               uint32_t sign = temporary++, lhs = temporary++, rhs = temporary++;
+               uint32_t comparison = a->op == nir_op_ilt32 ? value(&a->def, 0) : temporary++;
+               emit(&ops, 0x20, sign, 0, 0, 0, 0x80000000u);
+               emit(&ops, 0x27, lhs, value(a->src[0].src.ssa, a->src[0].swizzle[0]), sign, 0, 0);
+               emit(&ops, 0x27, rhs, value(a->src[1].src.ssa, a->src[1].swizzle[0]), sign, 0, 0);
+               emit(&ops, 0x2a, comparison, lhs, rhs, 0, 0);
+               if (a->op == nir_op_ige32) {
+                  uint32_t all = temporary++;
+                  emit(&ops, 0x20, all, 0, 0, 0, UINT32_MAX);
+                  emit(&ops, 0x27, value(&a->def, 0), comparison, all, 0, 0);
+               }
+               continue;
+            }
             if (a->op==nir_op_inot || a->op==nir_op_ine32 || a->op==nir_op_uge32) {
                uint32_t all=temporary++, operand=value(a->src[0].src.ssa,a->src[0].swizzle[0]);
                emit(&ops,0x20,all,0,0,0,UINT32_MAX);
