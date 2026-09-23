@@ -746,7 +746,7 @@ vk_queue_submit_thread_func(void *_data)
          if (ret == thrd_error) {
             mtx_unlock(&queue->submit.mutex);
             vk_queue_set_lost(queue, "cnd_wait failed");
-            return 1;
+            goto fail;
          }
          continue;
       }
@@ -763,13 +763,13 @@ vk_queue_submit_thread_func(void *_data)
                                  VK_SYNC_WAIT_PENDING, UINT64_MAX);
       if (unlikely(result != VK_SUCCESS)) {
          vk_queue_set_lost(queue, "Wait for time points failed");
-         return 1;
+         goto fail;
       }
 
       result = vk_queue_submit_final(queue, submit);
       if (unlikely(result != VK_SUCCESS)) {
          vk_queue_set_lost(queue, "queue::driver_submit failed");
-         return 1;
+         goto fail;
       }
 
       /* Do all our cleanup of individual fences etc. outside the lock.
@@ -792,6 +792,15 @@ vk_queue_submit_thread_func(void *_data)
 
    mtx_unlock(&queue->submit.mutex);
    return 0;
+
+fail:
+   /* Wake drains after publishing loss. Keep submit-owned payloads until
+    * vk_queue_finish joins this thread and releases the retained list.
+    */
+   mtx_lock(&queue->submit.mutex);
+   cnd_broadcast(&queue->submit.pop);
+   mtx_unlock(&queue->submit.mutex);
+   return 1;
 }
 
 static VkResult
@@ -825,7 +834,8 @@ vk_queue_stop_submit_thread(struct vk_queue *queue)
 
    thrd_join(queue->submit.thread, NULL);
 
-   assert(list_is_empty(&queue->submit.submits));
+   assert(list_is_empty(&queue->submit.submits) ||
+          vk_device_is_lost_no_report(queue->base.device));
    queue->submit.mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
 }
 

@@ -24,3 +24,10 @@ apex_command_test = executable('apex-command-test', 'command_test.c',
   link_language : 'cpp', install : false,
 )
 test('apex-command', apex_command_test, args : [apex_pipeline_spv], suite : ['apex'])
+apex_sync_test = executable('apex-sync-test', 'sync_test.c',
+  include_directories : [inc_include, inc_src, inc_vulkan_util],
+  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  link_args : ['-Wl,--wrap=cnd_wait'],
+  link_language : 'cpp', install : false,
+)
+test('apex-sync', apex_sync_test, suite : ['apex'])

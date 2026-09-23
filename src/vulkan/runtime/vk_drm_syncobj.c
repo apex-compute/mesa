@@ -252,6 +252,8 @@ spin_wait_for_sync_file(struct vk_device *device,
                return result;
          }
 
+         if (vk_device_is_lost(device))
+            return VK_ERROR_DEVICE_LOST;
          if (os_time_get_nano() >= abs_timeout_ns)
             return VK_TIMEOUT;
 
@@ -267,6 +269,8 @@ spin_wait_for_sync_file(struct vk_device *device,
             if (result != VK_TIMEOUT)
                return result;
 
+            if (vk_device_is_lost(device))
+               return VK_ERROR_DEVICE_LOST;
             if (os_time_get_nano() >= abs_timeout_ns)
                return VK_TIMEOUT;
 
@@ -326,34 +330,42 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
       syncobj_wait_flags |= DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
 
    int err;
-   if (wait_count == 0) {
-      err = 0;
-   } else if (wait_flags & VK_SYNC_WAIT_PENDING) {
-      /* We always use a timeline wait for WAIT_PENDING, even for binary
-       * syncobjs because the non-timeline wait doesn't support
-       * DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE.
+   for (;;) {
+      /* Userspace may lose the device without signaling a kernel fence.
+       * Bound each sleep so an infinite wait observes that loss too.
        */
-      err = device->sync->timeline_wait(device->sync, handles, wait_values,
-                                        wait_count, abs_timeout_ns,
-                                        syncobj_wait_flags |
-                                        DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
-                                        NULL /* first_signaled */);
-   } else if (has_timeline) {
-      err = device->sync->timeline_wait(device->sync, handles, wait_values,
-                                        wait_count, abs_timeout_ns,
-                                        syncobj_wait_flags,
-                                        NULL /* first_signaled */);
-   } else {
-      err = device->sync->wait(device->sync, handles,
-                               wait_count, abs_timeout_ns,
-                               syncobj_wait_flags,
-                               NULL /* first_signaled */);
+      uint64_t timeout = MIN2(abs_timeout_ns, os_time_get_nano() + 100000000ull);
+      if (wait_count == 0) {
+         err = 0;
+      } else if (wait_flags & VK_SYNC_WAIT_PENDING) {
+         /* Binary waits also need the timeline ioctl for WAIT_AVAILABLE. */
+         err = device->sync->timeline_wait(device->sync, handles, wait_values,
+                                           wait_count, timeout,
+                                           syncobj_wait_flags |
+                                           DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+                                           NULL /* first_signaled */);
+      } else if (has_timeline) {
+         err = device->sync->timeline_wait(device->sync, handles, wait_values,
+                                           wait_count, timeout,
+                                           syncobj_wait_flags,
+                                           NULL /* first_signaled */);
+      } else {
+         err = device->sync->wait(device->sync, handles,
+                                  wait_count, timeout,
+                                  syncobj_wait_flags,
+                                  NULL /* first_signaled */);
+      }
+      if (!err || vk_device_is_lost_no_report(device) || errno != ETIME ||
+          os_time_get_nano() >= abs_timeout_ns)
+         break;
    }
 
    STACK_ARRAY_FINISH(handles);
    STACK_ARRAY_FINISH(wait_values);
 
-   if (err && errno == ETIME) {
+   if (err && vk_device_is_lost(device)) {
+      return VK_ERROR_DEVICE_LOST;
+   } else if (err && errno == ETIME) {
       return VK_TIMEOUT;
    } else if (err) {
       return vk_errorf(device, VK_ERROR_UNKNOWN,
