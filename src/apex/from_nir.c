@@ -109,6 +109,49 @@ static nir_def *lower_fp32_comparison(nir_builder *b, nir_instr *instr, void *da
    return nir_iand(b, ordered, a->op == nir_op_flt ? less : nir_inot(b, less));
 }
 
+static bool int32_division(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *a = nir_instr_as_alu(instr);
+   return a->def.bit_size == 32 &&
+          (a->op == nir_op_udiv || a->op == nir_op_umod || a->op == nir_op_idiv ||
+           a->op == nir_op_irem || a->op == nir_op_imod);
+}
+
+static nir_def *lower_int32_division(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_alu_instr *a = nir_instr_as_alu(instr);
+   nir_def *x = nir_ssa_for_alu_src(b, a, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, a, 1);
+   bool is_signed = a->op != nir_op_udiv && a->op != nir_op_umod;
+   bool quotient = a->op == nir_op_udiv || a->op == nir_op_idiv;
+   nir_def *remainder = is_signed ? nir_iabs(b, x) : x;
+   nir_def *divisor = is_signed ? nir_iabs(b, y) : y;
+   nir_def *result = nir_imm_int(b, 0);
+   /* Test before shifting the divisor: a successful subtraction then fits
+    * in 32 bits even when the divisor or dividend has its high bit set. */
+   for (int bit = 31; bit >= 0; bit--) {
+      nir_def *fits = nir_uge(b, nir_ushr_imm(b, remainder, bit), divisor);
+      remainder = nir_bcsel(b, fits,
+         nir_isub(b, remainder, nir_ishl_imm(b, divisor, bit)), remainder);
+      if (quotient)
+         result = nir_ior(b, result, nir_bcsel(b, fits, nir_imm_int(b, 1u << bit), nir_imm_int(b, 0)));
+   }
+   if (!quotient)
+      result = remainder;
+   if (is_signed) {
+      nir_def *negative = nir_ilt_imm(b, quotient ? nir_ixor(b, x, y) : x, 0);
+      result = nir_bcsel(b, negative, nir_ineg(b, result), result);
+      if (a->op == nir_op_imod) {
+         nir_def *adjust = nir_iand(b, nir_ine_imm(b, result, 0),
+                                    nir_ilt_imm(b, nir_ixor(b, result, y), 0));
+         result = nir_bcsel(b, adjust, nir_iadd(b, result, y), result);
+      }
+   }
+   return result;
+}
+
 static int atomic_op(nir_atomic_op op)
 {
    switch (op) {
@@ -180,6 +223,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
+   NIR_PASS(_, nir, nir_shader_lower_instructions, int32_division, lower_int32_division, NULL);
    bool progress;
    do {
       progress = false;
