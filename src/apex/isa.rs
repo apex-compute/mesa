@@ -36,7 +36,7 @@ impl Inst {
         (0x50..=0x59).contains(&self.op)
     }
     pub fn control(self) -> bool {
-        matches!(self.op, 1 | 2 | 4 | 5 | 7)
+        matches!(self.op, 1 | 2 | 4 | 5 | 7 | 8)
     }
     pub fn latency(self) -> usize {
         match self.op {
@@ -53,7 +53,7 @@ impl Inst {
         let sp = Some((S, 2));
         let vp = Some((V, 2));
         Ok(match self.op {
-            0..=4 | 7 => [None; 4],
+            0..=4 | 7 | 8 => [None; 4],
             5 => [None, s, None, None],
             6 => [s, s, None, None],
             0x10 => [s, None, None, None],
@@ -158,6 +158,7 @@ pub const NAMES: &[(u8, &str)] = &[
     (5, "branch_nz"),
     (6, "mask"),
     (7, "barrier"),
+    (8, "fence"),
     (0x10, "s_imm"),
     (0x11, "s_mov"),
     (0x12, "s_add"),

@@ -78,6 +78,51 @@ fn raw_waw_tokens_and_branches() {
     assert_eq!(code[4].imm, 1);
 }
 #[test]
+fn fence_drain() {
+    for boundary in [7, 8] {
+        // A fence cannot pass a live token even when it writes no register.
+        let input = [
+            Inst {
+                a: 2,
+                b: 4,
+                ..Inst::new(0x51)
+            },
+            Inst::new(boundary),
+            Inst::new(1),
+        ];
+        assert!(schedule::validate(&input).is_err());
+        let code = schedule::schedule(&input).unwrap();
+        assert_eq!(
+            code[1],
+            Inst {
+                imm: 1,
+                ..Inst::new(3)
+            }
+        );
+        assert_eq!(code[2], Inst::new(boundary));
+        schedule::validate(&code).unwrap();
+
+        // No operand dependency connects the FP result to the fence.
+        let input = [Inst::new(0x30), Inst::new(boundary), Inst::new(1)];
+        assert!(schedule::validate(&input).is_err());
+        let code = schedule::schedule(&input).unwrap();
+        assert_eq!(code[FP32_LATENCY], Inst::new(boundary));
+        schedule::validate(&code).unwrap();
+        assert!(Inst {
+            imm: 1,
+            ..Inst::new(boundary)
+        }
+        .validate()
+        .is_err());
+        assert!(Inst {
+            a: 1,
+            ..Inst::new(boundary)
+        }
+        .validate()
+        .is_err());
+    }
+}
+#[test]
 fn metadata_and_private_bounds() {
     let p = mir::compile(&[Op::new(0x40, 0, 0, 0, 0, 0)], 0, 0).unwrap();
     let mut bytes = p.bytes().unwrap();

@@ -161,10 +161,27 @@ int main(int argc, char **argv)
       ralloc_free(nir);
       check_binary(&a, 17);
       bool drain = false;
-      for (size_t i = 40; i < a.size; i += 8) drain |= a.data[i] == 7;
+      for (size_t i = 40; i < a.size; i += 8) {
+         CHECK(a.data[i] != 7);
+         drain |= a.data[i] == 8;
+      }
       CHECK(drain);
       apex_compile_result_finish(&a);
    }
+
+   nir = shader(17);
+   builder = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+   nir_barrier(&builder, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared, .memory_semantics = NIR_MEMORY_ACQ_REL);
+   CHECK(apex_from_nir(nir, &a) == 0);
+   ralloc_free(nir);
+   bool rendezvous = false;
+   for (size_t i = 40; i < a.size; i += 8) {
+      CHECK(a.data[i] != 8);
+      rendezvous |= a.data[i] == 7;
+   }
+   CHECK(rendezvous);
+   apex_compile_result_finish(&a);
 
    nir = global_shader(4, 4);
    CHECK(apex_from_nir(nir, &a) == 0);

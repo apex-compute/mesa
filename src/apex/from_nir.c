@@ -583,9 +583,10 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
                       (nir_intrinsic_memory_semantics(i) & ~NIR_MEMORY_ACQ_REL)) goto unsupported;
                } else if (nir_intrinsic_execution_scope(i) != SCOPE_WORKGROUP ||
                           nir_intrinsic_memory_scope(i) > SCOPE_DEVICE) goto unsupported;
-               /* The scheduler drains all memory tokens before this boundary.
-                * One admitted 16-lane workgroup occupies one physical wave. */
-               emit(&ops,7,0,0,0,0,0); break;
+               /* Both boundaries drain this wave's tokens. Only an execution
+                * barrier joins the workgroup's rendezvous. */
+               emit(&ops,nir_intrinsic_execution_scope(i) == SCOPE_NONE ? 8 : 7,
+                    0,0,0,0,0); break;
             case nir_intrinsic_load_scratch:
             case nir_intrinsic_store_scratch: {
                bool store=i->intrinsic==nir_intrinsic_store_scratch;
