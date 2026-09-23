@@ -7,9 +7,12 @@
 #include "vk_buffer.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
+#include "vk_common_entrypoints.h"
 #include "vk_descriptor_set_layout.h"
 #include "vk_device_memory.h"
+#include "vk_drm_syncobj.h"
 #include "vk_log.h"
+#include "vk_physical_device.h"
 #include "util/os_time.h"
 #include <errno.h>
 #include <sys/ioctl.h>
@@ -562,8 +565,11 @@ static VkResult
 submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct apex_device *device = (struct apex_device *)queue->base.device;
-   if (submit->wait_count || submit->signal_count || vk_queue_submit_has_bind(submit) || submit->is_protected)
+   if (vk_queue_submit_has_bind(submit) || submit->is_protected)
       return vk_queue_set_lost(queue, "unsupported Apex submission");
+   if (vk_sync_wait_many(&device->vk, submit->wait_count, submit->waits,
+                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX) != VK_SUCCESS)
+      return vk_queue_set_lost(queue, "Apex dependency wait failed");
    for (unsigned i = 0; i < submit->command_buffer_count; i++) {
       struct apex_command_buffer *cmd = (struct apex_command_buffer *)submit->command_buffers[i];
       list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
@@ -571,6 +577,8 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
             return vk_queue_set_lost(queue, "Apex dispatch or allocation release failed");
       }
    }
+   if (vk_sync_signal_many(&device->vk, submit->signal_count, submit->signals) != VK_SUCCESS)
+      return vk_queue_set_lost(queue, "Apex completion signal failed");
    return VK_SUCCESS;
 }
 
@@ -578,6 +586,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL
 apex_QueueWaitIdle(VkQueue handle)
 {
    VK_FROM_HANDLE(vk_queue, queue, handle);
+   if (queue->base.device->physical->supported_sync_types)
+      return vk_common_QueueWaitIdle(handle);
    return vk_device_is_lost(queue->base.device) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
@@ -620,12 +630,26 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->vk.command_buffer_ops = &command_ops;
    device->fd = fd;
    device->transport = transport;
+   if (transport == APEX_TRANSPORT_DRM)
+      vk_device_set_drm_fd(&device->vk, fd);
+   if (physical->supported_sync_types) {
+      device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+      vk_device_enable_threaded_submit(&device->vk);
+   }
    result = vk_queue_init(&device->queue, &device->vk, &info->pQueueCreateInfos[0], 0);
    if (result != VK_SUCCESS) {
       vk_device_finish(&device->vk);
       return result;
    }
    device->queue.driver_submit = submit_queue;
+   if (physical->supported_sync_types) {
+      result = vk_queue_enable_submit_thread(&device->queue);
+      if (result != VK_SUCCESS) {
+         vk_queue_finish(&device->queue);
+         vk_device_finish(&device->vk);
+         return result;
+      }
+   }
    return VK_SUCCESS;
 }
 

@@ -4,6 +4,7 @@
 #include "apex_native_uapi.h"
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
+#include "vk_drm_syncobj.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
 #include <errno.h>
@@ -35,6 +36,7 @@ static struct {
 static const unsigned starts[] = {48, 1088, 48};
 static const unsigned biases[] = {37, 101, 112};
 static const unsigned scales[] = {3, 7, 7};
+static int sync_fd = -1;
 
 int __real_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
@@ -196,8 +198,13 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
       .queueCount = 1, .pQueuePriorities = &priority,
    };
+   VkPhysicalDeviceTimelineSemaphoreFeatures timeline_feature = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+      .timelineSemaphore = sync_fd >= 0,
+   };
    const VkPhysicalDeviceDescriptorIndexingFeatures features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+      .pNext = &timeline_feature,
       .descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE,
    };
    const VkDeviceCreateInfo device_info = {
@@ -212,6 +219,10 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       return;
    }
    CHECK(initialized == VK_SUCCESS);
+   if (sync_fd >= 0 && (mocked || transport == APEX_TRANSPORT_NATIVE)) {
+      if (device.vk.sync) device.vk.sync->finalize(device.vk.sync);
+      vk_device_set_drm_fd(&device.vk, sync_fd);
+   }
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkQueue queue;
@@ -351,11 +362,53 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    const VkCommandBufferSubmitInfo cb_submit = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd,
    };
-   const VkSubmitInfo2 submit = {
+   VkFence fence = VK_NULL_HANDLE;
+   VkSemaphore timeline = VK_NULL_HANDLE, binary = VK_NULL_HANDLE;
+   VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+      .value = 7, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+   VkSemaphoreSubmitInfo signals[2] = {
+      {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+       .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
+      {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+       .value = 11, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
+   };
+   VkSubmitInfo2 submit = {
       .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
       .commandBufferInfoCount = 1, .pCommandBufferInfos = &cb_submit,
    };
-   VkResult result = v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE);
+   if (sync_fd >= 0) {
+      const VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      CHECK(v->CreateFence(dev, &fence_info, NULL, &fence) == VK_SUCCESS);
+      CHECK(v->GetFenceStatus(dev, fence) == VK_NOT_READY);
+      const VkSemaphoreTypeCreateInfo type = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 5,
+      };
+      VkSemaphoreCreateInfo sem_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+      CHECK(v->CreateSemaphore(dev, &sem_info, NULL, &timeline) == VK_SUCCESS);
+      sem_info.pNext = NULL;
+      CHECK(v->CreateSemaphore(dev, &sem_info, NULL, &binary) == VK_SUCCESS);
+      wait.semaphore = timeline;
+      signals[0].semaphore = binary;
+      signals[1].semaphore = timeline;
+      submit.waitSemaphoreInfoCount = 1;
+      submit.pWaitSemaphoreInfos = &wait;
+      submit.signalSemaphoreInfoCount = 2;
+      submit.pSignalSemaphoreInfos = signals;
+   }
+   VkResult result = v->QueueSubmit2(queue, 1, &submit, fence);
+   if (sync_fd >= 0) {
+      CHECK(result == VK_SUCCESS);
+      CHECK(v->WaitForFences(dev, 1, &fence, VK_TRUE, 1000000) == VK_TIMEOUT);
+      CHECK(!memcmp(mock.mapped, mock.expected, sizeof(mock.expected)));
+      VkSemaphoreSignalInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+         .semaphore = timeline, .value = 6};
+      CHECK(v->SignalSemaphore(dev, &signal) == VK_SUCCESS);
+      CHECK(v->WaitForFences(dev, 1, &fence, VK_TRUE, 1000000) == VK_TIMEOUT);
+      signal.value = 7;
+      CHECK(v->SignalSemaphore(dev, &signal) == VK_SUCCESS);
+      result = v->WaitForFences(dev, 1, &fence, VK_TRUE, 5000000000ull);
+   }
    if (fault >= 0) {
       CHECK(result == VK_ERROR_DEVICE_LOST);
       CHECK(v->QueueWaitIdle(queue) == VK_ERROR_DEVICE_LOST);
@@ -376,6 +429,17 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(mock.exec_calls == exec_calls);
    } else {
       CHECK(result == VK_SUCCESS && v->QueueWaitIdle(queue) == VK_SUCCESS);
+      if (sync_fd >= 0) {
+         uint64_t value;
+         CHECK(v->GetSemaphoreCounterValue(dev, timeline, &value) == VK_SUCCESS && value == 11);
+         CHECK(v->ResetFences(dev, 1, &fence) == VK_SUCCESS);
+         CHECK(v->GetFenceStatus(dev, fence) == VK_NOT_READY);
+         wait.semaphore = binary;
+         wait.value = 0;
+         signals[1].value = 23;
+         submit.signalSemaphoreInfoCount = 1;
+         submit.pSignalSemaphoreInfos = &signals[1];
+      }
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
          uint32_t expected = 0xd00d0000 + i;
          if (i >= 48 && i < 64) expected = 37 + 3 * (i - 48);
@@ -393,8 +457,13 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 0, NULL);
       v->CmdDispatch(cmd, 1, 1, 1);
       CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
-      CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
+      CHECK(v->QueueSubmit2(queue, 1, &submit, fence) == VK_SUCCESS);
       CHECK(v->DeviceWaitIdle(dev) == VK_SUCCESS);
+      if (sync_fd >= 0) {
+         uint64_t value;
+         CHECK(v->GetFenceStatus(dev, fence) == VK_SUCCESS);
+         CHECK(v->GetSemaphoreCounterValue(dev, timeline, &value) == VK_SUCCESS && value == 23);
+      }
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
          uint32_t expected = 0xd00d0000 + i;
          if (i >= 48 && i < 64) expected = 112 + 7 * (i - 48);
@@ -402,6 +471,11 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          CHECK(mock.mapped[i] == expected);
       }
       if (mocked) CHECK(mock.dispatch == 3 && mock.step == 0);
+   }
+   if (sync_fd >= 0) {
+      v->DestroyFence(dev, fence, NULL);
+      v->DestroySemaphore(dev, binary, NULL);
+      v->DestroySemaphore(dev, timeline, NULL);
    }
    v->DestroyCommandPool(dev, command_pool, NULL);
    CHECK(v->FreeDescriptorSets(dev, pool, 2, sets) == VK_SUCCESS);
@@ -423,7 +497,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 2 || argc == 3 || (argc == 4 && !strcmp(argv[2], "--drm")));
+   CHECK(argc == 2 || argc == 3 ||
+         (argc == 4 && (!strcmp(argv[2], "--drm") || !strcmp(argv[2], "--syncobj"))));
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -449,13 +524,23 @@ int main(int argc, char **argv)
    (void)vk_physical_device_to_handle(&physical);
    int fd = argc > 2 ? open(argv[argc - 1], O_RDWR | O_CLOEXEC) : -1;
    CHECK(argc == 2 || fd >= 0);
-   enum apex_transport transport = argc == 4 ? APEX_TRANSPORT_DRM : APEX_TRANSPORT_NATIVE;
+   enum apex_transport transport = argc == 4 && !strcmp(argv[2], "--drm") ?
+      APEX_TRANSPORT_DRM : APEX_TRANSPORT_NATIVE;
    mock.drm_fd = -1;
-   if (transport == APEX_TRANSPORT_DRM) {
+   struct vk_sync_type sync_type;
+   const struct vk_sync_type *sync_types[] = {&sync_type, NULL};
+   if (argc == 4) {
       if (!geteuid()) {
          CHECK(!setgroups(0, NULL) && !setgid(65534) && !setuid(65534));
       }
       CHECK(geteuid() != 0);
+      sync_fd = fd;
+      sync_type = vk_drm_syncobj_get_type(fd);
+      CHECK(sync_type.features & VK_SYNC_FEATURE_TIMELINE);
+      physical.supported_sync_types = sync_types;
+      if (transport == APEX_TRANSPORT_NATIVE) fd = -1;
+   }
+   if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};
       CHECK(!ioctl(fd, DRM_IOCTL_APEX_INFO, &caps));
       if (!(caps.capabilities & APEX_DRM_CAP_EXEC)) {
@@ -480,6 +565,10 @@ int main(int argc, char **argv)
       for (unsigned i = 0; i < ARRAY_SIZE(drm_faults); i++)
          run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM);
       puts("PASS Apex Mesa native/DRM transport: GEM, binding, offsets, reset, cleanup, device loss (mock ioctl)");
+      if (sync_fd >= 0) {
+         CHECK(!close(sync_fd));
+         puts("PASS Apex Mesa DRM syncobjs: timeline wait-before-signal, binary dependency, fence reuse, fault wakeup (mock execution)");
+      }
    }
    free(spirv);
    vk_physical_device_finish(&physical);

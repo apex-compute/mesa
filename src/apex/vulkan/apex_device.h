@@ -6,7 +6,10 @@
 
 enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 
-/* Internal single-queue device. The caller owns fd through device teardown. */
+/* Internal single-queue device. The caller owns fd through device teardown.
+ * DRM callers supply physical->supported_sync_types from vk_drm_syncobj_get_type.
+ * The native qualification path may omit sync types and submit synchronously.
+ */
 struct apex_device {
    struct vk_device vk;
    struct vk_queue queue;
