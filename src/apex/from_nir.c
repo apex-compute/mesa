@@ -214,15 +214,45 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else if (instr->type == nir_instr_type_alu) {
             nir_alu_instr *a = nir_instr_as_alu(instr);
             unsigned op = alu_op(a->op);
-            if (a->op == nir_op_ilt32 || a->op == nir_op_ige32) {
-               /* Flipping the sign bit maps signed order onto unsigned order. */
-               uint32_t sign = temporary++, lhs = temporary++, rhs = temporary++;
+            if (a->op == nir_op_ishr) {
+               /* Complement negative operands before and after the logical
+                * shift so vacated bits receive their original sign. */
+               uint32_t operand = value(a->src[0].src.ssa, a->src[0].swizzle[0]);
+               uint32_t count = value(a->src[1].src.ssa, a->src[1].swizzle[0]);
+               uint32_t top = temporary++, sign = temporary++, zero = temporary++;
+               uint32_t mask = temporary++, biased = temporary++, shifted = temporary++;
+               emit(&ops, 0x20, top, 0, 0, 0, 31);
+               emit(&ops, 0x29, sign, operand, top, 0, 0);
+               emit(&ops, 0x20, zero, 0, 0, 0, 0);
+               emit(&ops, 0x23, mask, zero, sign, 0, 0);
+               emit(&ops, 0x27, biased, operand, mask, 0, 0);
+               emit(&ops, 0x29, shifted, biased, count, 0, 0);
+               emit(&ops, 0x27, value(&a->def, 0), shifted, mask, 0, 0);
+               continue;
+            }
+            bool signed_order = a->op == nir_op_ilt32 || a->op == nir_op_ige32 ||
+                                a->op == nir_op_imin || a->op == nir_op_imax;
+            bool minimum = a->op == nir_op_imin || a->op == nir_op_umin;
+            bool maximum = a->op == nir_op_imax || a->op == nir_op_umax;
+            if (signed_order || minimum || maximum) {
+               uint32_t left = value(a->src[0].src.ssa, a->src[0].swizzle[0]);
+               uint32_t right = value(a->src[1].src.ssa, a->src[1].swizzle[0]);
+               uint32_t lhs = left, rhs = right;
+               if (signed_order) {
+                  /* Flipping the sign bit maps signed order onto unsigned order. */
+                  uint32_t sign = temporary++;
+                  lhs = temporary++;
+                  rhs = temporary++;
+                  emit(&ops, 0x20, sign, 0, 0, 0, 0x80000000u);
+                  emit(&ops, 0x27, lhs, left, sign, 0, 0);
+                  emit(&ops, 0x27, rhs, right, sign, 0, 0);
+               }
                uint32_t comparison = a->op == nir_op_ilt32 ? value(&a->def, 0) : temporary++;
-               emit(&ops, 0x20, sign, 0, 0, 0, 0x80000000u);
-               emit(&ops, 0x27, lhs, value(a->src[0].src.ssa, a->src[0].swizzle[0]), sign, 0, 0);
-               emit(&ops, 0x27, rhs, value(a->src[1].src.ssa, a->src[1].swizzle[0]), sign, 0, 0);
                emit(&ops, 0x2a, comparison, lhs, rhs, 0, 0);
-               if (a->op == nir_op_ige32) {
+               if (minimum || maximum) {
+                  emit(&ops, 0x2e, value(&a->def, 0), comparison,
+                       minimum ? left : right, minimum ? right : left, 0);
+               } else if (a->op == nir_op_ige32) {
                   uint32_t all = temporary++;
                   emit(&ops, 0x20, all, 0, 0, 0, UINT32_MAX);
                   emit(&ops, 0x27, value(&a->def, 0), comparison, all, 0, 0);
