@@ -550,14 +550,23 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
             }
             case nir_intrinsic_ssbo_atomic:
             case nir_intrinsic_ssbo_atomic_swap:
+            case nir_intrinsic_global_atomic_2x32:
+            case nir_intrinsic_global_atomic_swap_2x32:
             case nir_intrinsic_shared_atomic:
             case nir_intrinsic_shared_atomic_swap: {
                bool shared=i->intrinsic==nir_intrinsic_shared_atomic || i->intrinsic==nir_intrinsic_shared_atomic_swap;
+               bool paired=i->intrinsic==nir_intrinsic_global_atomic_2x32 || i->intrinsic==nir_intrinsic_global_atomic_swap_2x32;
                int operation=atomic_op(nir_intrinsic_atomic_op(i));
-               if (operation<0 || i->num_components!=1) goto unsupported;
-               uint32_t addr=value(i->src[shared?0:1].ssa,0);
-               unsigned data=shared?1:2;
+               if (operation<0 || i->num_components!=1 || i->def.bit_size!=32) goto unsupported;
+               uint32_t addr=value(i->src[shared || paired?0:1].ssa,0);
+               unsigned data=shared || paired?1:2;
                if (shared) {if(nir_intrinsic_base(i)) goto unsupported;}
+               else if (paired) {
+                  nir_def *address=i->src[0].ssa;
+                  if(address->bit_size!=32 || address->num_components!=2) goto unsupported;
+                  addr=temporary++;
+                  emit(&ops,0xf1,addr,value(address,0),value(address,1),0,0);
+               }
                else {
                   if(!nir_src_is_const(i->src[0]) || nir_src_as_uint(i->src[0]) || nir_intrinsic_offset_shift(i)) goto unsupported;
                   uint32_t global=temporary++;emit(&ops,0xf0,global,addr,0,0,0);addr=global;

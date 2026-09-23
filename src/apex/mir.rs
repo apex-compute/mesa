@@ -50,8 +50,8 @@ pub fn compile(ops: &[Op], shared: u32, source_private: u32) -> Result<Program, 
     if source_private % 4 != 0 {
         return Err("unaligned source private size".into());
     }
-    // Out-of-SSA phi webs use mutable virtual registers. Preserve their homes
-    // across every mask arm and backedge; linear SSA keeps interval reuse.
+    // Masked vector writes preserve inactive lanes in out-of-SSA phi webs.
+    // Keep their homes across control flow; scalar writes are unconditional.
     let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
     let mut values: BTreeMap<u32, (Class, u8, usize, usize)> = BTreeMap::new();
     for (pc, o) in ops.iter().enumerate() {
@@ -94,14 +94,37 @@ pub fn compile(ops: &[Op], shared: u32, source_private: u32) -> Result<Program, 
                 if (v.0, v.1) != (*cl, *n) || (!control && v.2 >= pc) {
                     return Err("MIR type/order mismatch".into());
                 }
+                v.2 = v.2.min(pc);
                 v.3 = v.3.max(pc);
             }
         }
     }
     if control {
         for v in values.values_mut() {
-            v.2 = 0;
-            v.3 = ops.len();
+            if v.0 == Class::V {
+                v.2 = 0;
+                v.3 = ops.len();
+                continue;
+            }
+            // Enclose every intersecting branch span. In particular, a value
+            // used early in a loop must survive the backedge after its last
+            // textual use. Iterate for nested/overlapping branch spans.
+            loop {
+                let previous = (v.2, v.3);
+                for (pc, o) in ops.iter().enumerate() {
+                    if matches!(o.op, 4 | 5) {
+                        let lo = pc.min(o.imm as usize);
+                        let hi = pc.max(o.imm as usize);
+                        if v.2 <= hi && v.3 >= lo {
+                            v.2 = v.2.min(lo);
+                            v.3 = v.3.max(hi);
+                        }
+                    }
+                }
+                if previous == (v.2, v.3) {
+                    break;
+                }
+            }
         }
     }
     let mut order: Vec<_> = values.iter().collect();

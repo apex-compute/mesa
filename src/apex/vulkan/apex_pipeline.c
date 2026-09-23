@@ -66,18 +66,20 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
    struct descriptor_lowering *ctx = data;
    bool store = i->intrinsic == nir_intrinsic_store_ssbo;
    bool size = i->intrinsic == nir_intrinsic_get_ssbo_size;
-   if (i->intrinsic == nir_intrinsic_ssbo_atomic ||
-       i->intrinsic == nir_intrinsic_ssbo_atomic_swap ||
-       i->intrinsic == nir_intrinsic_vulkan_resource_reindex) {
+   bool swap = i->intrinsic == nir_intrinsic_ssbo_atomic_swap;
+   bool atomic = swap || i->intrinsic == nir_intrinsic_ssbo_atomic;
+   if (i->intrinsic == nir_intrinsic_vulkan_resource_reindex ||
+       (atomic && nir_intrinsic_offset_shift(i))) {
       ctx->invalid = true;
       return false;
    }
-   if (!store && !size && i->intrinsic != nir_intrinsic_load_ssbo &&
+   if (!store && !size && !atomic && i->intrinsic != nir_intrinsic_load_ssbo &&
        i->intrinsic != nir_intrinsic_load_ubo)
       return false;
    if (!size && ((store ? i->src[0].ssa->bit_size : i->def.bit_size) != 32 ||
                  i->num_components > 4 ||
-                 nir_intrinsic_align_mul(i) < 4 || nir_intrinsic_align_offset(i) % 4)) {
+                 (atomic ? i->num_components != 1 :
+                  nir_intrinsic_align_mul(i) < 4 || nir_intrinsic_align_offset(i) % 4))) {
       ctx->invalid = true;
       return false;
    }
@@ -105,6 +107,12 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
          if (store)
             nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), address,
                                  .align_mul = 4, .access = nir_intrinsic_access(i));
+         else if (swap)
+            loaded = nir_global_atomic_swap_2x32(b, 32, address, i->src[2].ssa, i->src[3].ssa,
+               .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
+         else if (atomic)
+            loaded = nir_global_atomic_2x32(b, 32, address, i->src[2].ssa,
+               .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
          else
             loaded = nir_load_global_2x32(b, 1, 32, address,
                                         .align_mul = 4, .access = nir_intrinsic_access(i));

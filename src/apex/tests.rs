@@ -144,6 +144,81 @@ fn pressure_and_long_chain() {
     }
 }
 
+#[test]
+fn scalar_control_lifetimes() {
+    fn evaluate(ops: &[Op]) -> u32 {
+        let program = mir::compile(ops, 0, 0).unwrap();
+        schedule::validate(&program.code).unwrap();
+        let mut s = [0u32; 64];
+        let mut mask = 0xffff;
+        let mut pc = 0;
+        for _ in 0..10000 {
+            let i = program.code[pc];
+            pc += 1;
+            let a = s[i.a as usize];
+            let b = s[i.b as usize];
+            let result = match i.op {
+                0 | 3 => continue,
+                4 => {
+                    pc = i.imm as usize;
+                    continue;
+                }
+                5 => {
+                    if a != 0 {
+                        pc = i.imm as usize;
+                    }
+                    continue;
+                }
+                6 => {
+                    let old = mask;
+                    mask = a & 0xffff;
+                    old
+                }
+                0x10 => i.imm,
+                0x11 => a,
+                0x12 => a.wrapping_add(b),
+                0x13 => a.wrapping_sub(b),
+                0x2d => {
+                    assert_eq!(mask, 0xffff);
+                    return a;
+                }
+                op => panic!("outside scalar allocation slice: {op:x}"),
+            };
+            s[i.d as usize] = result;
+        }
+        panic!("scalar allocation slice did not terminate");
+    }
+    let mut sequential = vec![Op::new(0x10, 0, 0, 0, 0, 0)];
+    for id in 1..=80 {
+        sequential.extend([
+            Op::new(0x10, id, 0, 0, 0, id),
+            Op::new(6, 100 + id, id, 0, 0, 0),
+            Op::new(0x12, 0, 0, id, 0, 0),
+            Op::new(6, 200 + id, 100 + id, 0, 0, 0),
+        ]);
+    }
+    sequential.push(Op::new(0x2d, 999, 0, 0, 0, 0));
+    assert_eq!(evaluate(&sequential), 80 * 81 / 2);
+
+    // The invariant's final textual use precedes later loop temporaries.
+    // Its register must survive both inner and outer backedges.
+    let nested = [
+        Op::new(0x10, 0, 0, 0, 0, 0), // sum
+        Op::new(0x10, 1, 0, 0, 0, 7), // invariant
+        Op::new(0x10, 2, 0, 0, 0, 3), // outer count
+        Op::new(0x10, 3, 0, 0, 0, 1),
+        Op::new(0x12, 0, 0, 1, 0, 0), // outer header
+        Op::new(0x10, 5, 0, 0, 0, 2), // inner count
+        Op::new(0x12, 0, 0, 2, 0, 0), // inner header
+        Op::new(0x13, 5, 5, 3, 0, 0),
+        Op::new(5, 0, 5, 0, 0, 6),
+        Op::new(0x13, 2, 2, 3, 0, 0),
+        Op::new(5, 0, 2, 0, 0, 4),
+        Op::new(0x2d, 999, 0, 0, 0, 0),
+    ];
+    assert_eq!(evaluate(&nested), 3 * 7 + 2 * (3 + 2 + 1));
+}
+
 // Deliberately narrow compiler-only arithmetic/spill evaluator: one lane,
 // straight-line integer code, no queues, MMU, cache, or RTL timing claims.
 fn arithmetic_slice(p: &Program, lane: u32) -> u32 {

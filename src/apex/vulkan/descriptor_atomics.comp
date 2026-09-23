@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: MIT
+#version 450
+layout(local_size_x = 16) in;
+struct Element { uint u; int s; };
+layout(set = 1, binding = 5, std430) buffer Target { Element values[]; } targets[2];
+layout(set = 1, binding = 2, std140) uniform Constants { uvec4 operands; } constants[2];
+layout(set = 0, binding = 3, std430) buffer Output { uint values[]; } destination;
+void main()
+{
+   uint lane = gl_LocalInvocationIndex;
+   uint which = lane & 1u;
+   uint index = lane == 13u ? 0x1fffffffu : lane;
+   uvec4 p = constants[which].operands;
+   destination.values[lane] = atomicAdd(targets[which].values[index].u, p.x);
+   destination.values[16u + lane] = atomicExchange(targets[which].values[index].u, p.y);
+   destination.values[32u + lane] = atomicCompSwap(targets[which].values[index].u, p.y, p.z);
+   destination.values[48u + lane] = atomicCompSwap(targets[which].values[index].u, p.z ^ 1u, p.w);
+   destination.values[64u + lane] = atomicAnd(targets[which].values[index].u, p.w);
+   destination.values[80u + lane] = atomicOr(targets[which].values[index].u, p.x);
+   destination.values[96u + lane] = atomicXor(targets[which].values[index].u, p.y);
+   destination.values[112u + lane] = atomicMin(targets[which].values[index].u, p.z);
+   destination.values[128u + lane] = atomicMax(targets[which].values[index].u, p.w);
+   destination.values[144u + lane] = uint(atomicMin(targets[which].values[index].s, int(p.x)));
+   destination.values[160u + lane] = uint(atomicMax(targets[which].values[index].s, int(p.y)));
+   destination.values[176u + lane] = atomicAdd(targets[which].values[index].u, -p.x);
+   destination.values[192u + lane] = targets[which].values[index].u;
+   destination.values[208u + lane] = uint(targets[which].values[index].s);
+}

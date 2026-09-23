@@ -46,7 +46,8 @@ fail_alloc(void *data, size_t size, size_t alignment, VkSystemAllocationScope sc
 }
 
 static void
-test_descriptors(struct vk_physical_device *physical, const char *path, const char *output)
+test_descriptors(struct vk_physical_device *physical, const char *path,
+                 const char *fixture, const char *output)
 {
    struct apex_device device;
    const float priority = 1;
@@ -166,7 +167,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path, const ch
    CHECK(p->layout->set_count == 2); /* The pipeline retains layout metadata. */
    if (output) {
       char name[4096];
-      CHECK(snprintf(name, sizeof(name), "%s/mesa-descriptors.apx", output) < sizeof(name));
+      CHECK(snprintf(name, sizeof(name), "%s/%s.apx", output, fixture) < sizeof(name));
       f = fopen(name, "wb");
       CHECK(f && fwrite(p->code.data, 1, p->code.size, f) == p->code.size && !fclose(f));
    }
@@ -176,7 +177,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path, const ch
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 3 || argc == 4);
+   CHECK(argc == 4 || argc == 5);
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -313,15 +314,16 @@ int main(int argc, char **argv)
    /* Compiled pipelines survive both the module and specialization storage. */
    device.vk.dispatch_table.DestroyShaderModule(dev, module, NULL);
    memset(values, 0, sizeof(values));
-   if (argc == 4) {
-      write_fixture(argv[3], "mesa-default", pipelines[0], 37, 3);
-      write_fixture(argv[3], "mesa-specialized", pipelines[1], 101, 7);
-      write_fixture(argv[3], "mesa-entrypoint", pipelines[2], 112, 7);
+   if (argc == 5) {
+      write_fixture(argv[4], "mesa-default", pipelines[0], 37, 3);
+      write_fixture(argv[4], "mesa-specialized", pipelines[1], 101, 7);
+      write_fixture(argv[4], "mesa-entrypoint", pipelines[2], 112, 7);
    }
    for (unsigned i = 0; i < 3; i++)
       device.vk.dispatch_table.DestroyPipeline(dev, pipelines[i], NULL);
    vk_device_finish(&device.vk);
-   test_descriptors(&physical, argv[2], argc == 4 ? argv[3] : NULL);
+   test_descriptors(&physical, argv[2], "mesa-descriptors", argc == 5 ? argv[4] : NULL);
+   test_descriptors(&physical, argv[3], "mesa-atomics", argc == 5 ? argv[4] : NULL);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex Mesa compute pipelines: specialization, entrypoints, lifetime, failures");
