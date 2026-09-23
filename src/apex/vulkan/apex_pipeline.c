@@ -239,7 +239,9 @@ create_compute_pipeline(struct vk_device *device,
          goto unsupported_layout;
       for (unsigned r = 0; r < layout->push_range_count; r++) {
          const VkPushConstantRange *range = &layout->push_ranges[r];
-         if (range->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || !range->size ||
+         if (!(range->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT))
+            continue;
+         if (!range->size ||
              range->offset % 4 || range->size % 4 || range->offset >= APEX_MAX_PUSH_CONSTANTS ||
              range->size > APEX_MAX_PUSH_CONSTANTS - range->offset)
             goto unsupported_layout;

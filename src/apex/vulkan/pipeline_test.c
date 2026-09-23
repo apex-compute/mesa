@@ -123,10 +123,13 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    alloc.pSetLayouts = &sets[1];
    CHECK(v->AllocateDescriptorSets(dev, &alloc, &allocated[1]) == VK_SUCCESS);
    v->DestroyDescriptorPool(dev, pool, NULL);
-   const VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 16, 48};
+   const VkPushConstantRange push_ranges[] = {
+      {VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 16, 48},
+      {VK_SHADER_STAGE_VERTEX_BIT, 128, 128},
+   };
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = sets,
-      .pushConstantRangeCount = 1, .pPushConstantRanges = &push_range,
+      .pushConstantRangeCount = 2, .pPushConstantRanges = push_ranges,
    };
    VkPipelineLayout layout;
    CHECK(v->CreatePipelineLayout(dev, &layout_info, NULL, &layout) == VK_SUCCESS);
@@ -174,9 +177,10 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
       {VK_SHADER_STAGE_COMPUTE_BIT, 16, 244},
       {VK_SHADER_STAGE_COMPUTE_BIT, 18, 48},
       {VK_SHADER_STAGE_COMPUTE_BIT, 16, 49},
-      {VK_SHADER_STAGE_FRAGMENT_BIT, 16, 48},
+      {VK_SHADER_STAGE_COMPUTE_BIT, 256, 4},
    };
    wrong_layout_info = layout_info;
+   wrong_layout_info.pushConstantRangeCount = 1;
    for (unsigned r = 0; r < ARRAY_SIZE(rejected_ranges); r++) {
       wrong_layout_info.pPushConstantRanges = &rejected_ranges[r];
       CHECK(v->CreatePipelineLayout(dev, &wrong_layout_info, NULL, &wrong_layout) == VK_SUCCESS);

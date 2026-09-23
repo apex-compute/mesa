@@ -592,12 +592,13 @@ apex_CmdBindPipeline(VkCommandBuffer handle, VkPipelineBindPoint point, VkPipeli
 }
 
 static VKAPI_ATTR void VKAPI_CALL
-apex_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint point,
-                           VkPipelineLayout layout, uint32_t first, uint32_t count,
-                           const VkDescriptorSet *sets, uint32_t dynamic_count, const uint32_t *offsets)
+apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   if (point != VK_PIPELINE_BIND_POINT_COMPUTE || first > MESA_VK_MAX_DESCRIPTOR_SETS ||
+   uint32_t first = info->firstSet, count = info->descriptorSetCount;
+   const VkDescriptorSet *sets = info->pDescriptorSets;
+   const uint32_t *offsets = info->pDynamicOffsets;
+   if (info->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || first > MESA_VK_MAX_DESCRIPTOR_SETS ||
        count > MESA_VK_MAX_DESCRIPTOR_SETS - first) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -605,7 +606,7 @@ apex_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint point,
    unsigned required = 0;
    for (unsigned s = 0; s < count; s++)
       required += apex_descriptor_set_from_handle(sets[s])->layout->vk.dynamic_descriptor_count;
-   if (required != dynamic_count) {
+   if (required != info->dynamicOffsetCount) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -638,8 +639,11 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPushConstants2(VkCommandBuffer handle, const VkPushConstantsInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   /* Push ranges may name stages unsupported by this compute-only queue. */
+   if (!(info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT))
+      return;
    uint32_t offset = info->offset, size = info->size;
-   if (info->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || offset % 4 || size % 4 ||
+   if (offset % 4 || size % 4 ||
        !size || offset >= APEX_MAX_PUSH_CONSTANTS || size > APEX_MAX_PUSH_CONSTANTS - offset) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -894,7 +898,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .ResetDescriptorPool = apex_ResetDescriptorPool, .AllocateDescriptorSets = apex_AllocateDescriptorSets,
       .FreeDescriptorSets = apex_FreeDescriptorSets, .UpdateDescriptorSets = apex_UpdateDescriptorSets,
       .BeginCommandBuffer = apex_BeginCommandBuffer, .EndCommandBuffer = apex_EndCommandBuffer,
-      .CmdBindPipeline = apex_CmdBindPipeline, .CmdBindDescriptorSets = apex_CmdBindDescriptorSets,
+      .CmdBindPipeline = apex_CmdBindPipeline, .CmdBindDescriptorSets2 = apex_CmdBindDescriptorSets2,
       .CmdPushConstants2 = apex_CmdPushConstants2,
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
       .QueueWaitIdle = apex_QueueWaitIdle,

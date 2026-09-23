@@ -356,7 +356,9 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    CHECK(v->CreateDescriptorSetLayout(dev, &set_info, NULL, &set_layout) == VK_SUCCESS);
    VkDescriptorSetLayout layouts[2] = {set_layout, set_layout};
    VkPipelineLayout layout;
-   const VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 16, 240};
+   const VkPushConstantRange push_range = {
+      VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 16, 240,
+   };
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .setLayoutCount = tables ? 2 : 1, .pSetLayouts = layouts,
@@ -508,7 +510,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       for (unsigned i = 0; i < ARRAY_SIZE(values); i++) values[i] = 0xa5100000 + (i + 4) * 37;
       const uint32_t bad_ranges[][2] = {{252, 8}, {UINT32_MAX - 3, 4}, {17, 4}, {16, 5}};
       for (unsigned i = 0; i < ARRAY_SIZE(bad_ranges); i++) {
-         v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT,
+         v->CmdPushConstants(cmd, layout, push_range.stageFlags,
                               bad_ranges[i][0], bad_ranges[i][1], values);
          CHECK(v->EndCommandBuffer(cmd) == VK_ERROR_FEATURE_NOT_PRESENT);
          CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
@@ -524,22 +526,35 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       if (fault == 215) offsets[1] = 196; /* Range ends four bytes beyond the buffer. */
       if (fault == 216) offsets[1] = UINT32_MAX - 3;
       if (fault == 217) offsets[1] = 65;
-      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, sets, 6, offsets);
+      const VkBindDescriptorSetsInfo bind = {
+         .sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO, .layout = layout,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .firstSet = 0,
+         .descriptorSetCount = 2, .pDescriptorSets = sets,
+         .dynamicOffsetCount = 6, .pDynamicOffsets = offsets,
+      };
+      v->CmdBindDescriptorSets2(cmd, &bind);
       memset(offsets, 0xff, sizeof(offsets)); /* Consumed at bind, before dispatch. */
    } else if (tables)
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
    if (tables) {
       uint32_t values[60];
       for (unsigned i = 0; i < ARRAY_SIZE(values); i++) values[i] = 0xa5100000 + (i + 4) * 37;
-      v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 16, sizeof(values), values);
+      v->CmdPushConstants(cmd, layout, push_range.stageFlags, 16, sizeof(values), values);
       memset(values, 0xff, sizeof(values)); /* Consume before dispatch, not submission. */
+      VkPushConstantRange ignored_range = {VK_SHADER_STAGE_FRAGMENT_BIT, 16, 240};
+      VkPipelineLayoutCreateInfo ignored_info = layout_info;
+      ignored_info.pPushConstantRanges = &ignored_range;
+      VkPipelineLayout ignored;
+      CHECK(v->CreatePipelineLayout(dev, &ignored_info, NULL, &ignored) == VK_SUCCESS);
+      v->CmdPushConstants(cmd, ignored, VK_SHADER_STAGE_FRAGMENT_BIT, 16, sizeof(values), values);
+      v->DestroyPipelineLayout(dev, ignored, NULL);
    }
    for (unsigned i = 0; i < 2; i++) {
       if (tables && i) {
          uint32_t values[] = {0xc0ffee00, 0xabad1dea};
          const VkPushConstantsInfo push = {
             .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO, .layout = layout,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 24,
+            .stageFlags = push_range.stageFlags, .offset = 24,
             .size = sizeof(values), .pValues = values,
          };
          v->CmdPushConstants2(cmd, &push);
@@ -568,7 +583,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    }
    if (tables) {
       const uint32_t values[60] = {0};
-      v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 16, sizeof(values), values);
+      v->CmdPushConstants(cmd, layout, push_range.stageFlags, 16, sizeof(values), values);
    }
    if (dynamic) {
       /* Rebinding the same set must not mutate either recorded dispatch. */
@@ -697,7 +712,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
       if (tables) {
          const uint32_t value = 0xdecafbad;
-         v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 252, sizeof(value), &value);
+         v->CmdPushConstants(cmd, layout, push_range.stageFlags, 252, sizeof(value), &value);
       }
       v->CmdDispatch(cmd, 1, 1, 1);
       CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
