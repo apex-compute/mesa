@@ -214,20 +214,42 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else if (instr->type == nir_instr_type_alu) {
             nir_alu_instr *a = nir_instr_as_alu(instr);
             unsigned op = alu_op(a->op);
-            if (a->op == nir_op_ishr) {
-               /* Complement negative operands before and after the logical
-                * shift so vacated bits receive their original sign. */
+            if (a->op == nir_op_ineg) {
+               uint32_t zero = temporary++;
+               emit(&ops, 0x20, zero, 0, 0, 0, 0);
+               emit(&ops, 0x23, value(&a->def, 0), zero,
+                    value(a->src[0].src.ssa, a->src[0].swizzle[0]), 0, 0);
+               continue;
+            }
+            if (a->op == nir_op_ishr || a->op == nir_op_iabs || a->op == nir_op_isign) {
                uint32_t operand = value(a->src[0].src.ssa, a->src[0].swizzle[0]);
-               uint32_t count = value(a->src[1].src.ssa, a->src[1].swizzle[0]);
                uint32_t top = temporary++, sign = temporary++, zero = temporary++;
-               uint32_t mask = temporary++, biased = temporary++, shifted = temporary++;
+               uint32_t mask = temporary++;
                emit(&ops, 0x20, top, 0, 0, 0, 31);
                emit(&ops, 0x29, sign, operand, top, 0, 0);
                emit(&ops, 0x20, zero, 0, 0, 0, 0);
                emit(&ops, 0x23, mask, zero, sign, 0, 0);
-               emit(&ops, 0x27, biased, operand, mask, 0, 0);
-               emit(&ops, 0x29, shifted, biased, count, 0, 0);
-               emit(&ops, 0x27, value(&a->def, 0), shifted, mask, 0, 0);
+               if (a->op == nir_op_isign) {
+                  uint32_t nonzero = temporary++, positive = temporary++;
+                  /* Comparisons produce all-one masks. Negate for 0/1,
+                   * then OR with the negative-operand mask for -1. */
+                  emit(&ops, 0x2a, nonzero, zero, operand, 0, 0);
+                  emit(&ops, 0x23, positive, zero, nonzero, 0, 0);
+                  emit(&ops, 0x26, value(&a->def, 0), positive, mask, 0, 0);
+               } else {
+                  uint32_t biased = temporary++;
+                  emit(&ops, 0x27, biased, operand, mask, 0, 0);
+                  if (a->op == nir_op_iabs) {
+                     emit(&ops, 0x23, value(&a->def, 0), biased, mask, 0, 0);
+                  } else {
+                     /* Complement negative operands around a logical shift
+                      * so vacated bits receive their original sign. */
+                     uint32_t count = value(a->src[1].src.ssa, a->src[1].swizzle[0]);
+                     uint32_t shifted = temporary++;
+                     emit(&ops, 0x29, shifted, biased, count, 0, 0);
+                     emit(&ops, 0x27, value(&a->def, 0), shifted, mask, 0, 0);
+                  }
+               }
                continue;
             }
             bool signed_order = a->op == nir_op_ilt32 || a->op == nir_op_ige32 ||
