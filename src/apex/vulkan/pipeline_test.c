@@ -47,7 +47,7 @@ fail_alloc(void *data, size_t size, size_t alignment, VkSystemAllocationScope sc
 
 static void
 test_descriptors(struct vk_physical_device *physical, const char *path,
-                 const char *fixture, const char *output)
+                 const char *fixture, const char *output, bool dynamic)
 {
    struct apex_device device;
    const float priority = 1;
@@ -80,11 +80,13 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    CHECK(v->CreateShaderModule(dev, &module_info, NULL, &module) == VK_SUCCESS);
    free(spirv);
    VkDescriptorSetLayout sets[2];
+   VkDescriptorType storage = dynamic ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   VkDescriptorType uniform = dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
    for (unsigned s = 0; s < 2; s++) {
       VkDescriptorSetLayoutBinding bindings[] = {
          {.binding = s ? 5 : 3, .descriptorCount = s ? 2 : 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
-         {.binding = 2, .descriptorCount = 2, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .descriptorType = storage, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+         {.binding = 2, .descriptorCount = 2, .descriptorType = uniform,
           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       };
       VkDescriptorSetLayoutCreateInfo info = {
@@ -94,12 +96,15 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
       CHECK(v->CreateDescriptorSetLayout(dev, &info, NULL, &sets[s]) == VK_SUCCESS);
    }
    const VkDescriptorPoolSize sizes[] = {
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+      {storage, 7}, {uniform, 2},
+      /* Static descriptors cannot satisfy a dynamic descriptor budget. */
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dynamic ? 100 : 0},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, dynamic ? 100 : 0},
    };
    const VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-      .maxSets = 4, .poolSizeCount = 2, .pPoolSizes = sizes,
+      .maxSets = 4, .poolSizeCount = dynamic ? 4 : 2, .pPoolSizes = sizes,
    };
    VkDescriptorPool pool;
    CHECK(v->CreateDescriptorPool(dev, &pool_info, NULL, &pool) == VK_SUCCESS);
@@ -132,6 +137,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
    CHECK(p->descriptor_count == 5 && p->set_offsets[0] == 0 && p->set_offsets[1] == 1);
+   CHECK(p->layout->dynamic_descriptor_offset[1] == (dynamic ? 1 : 0));
    VkDescriptorSetLayout swapped[] = {sets[1], sets[0]};
    VkPipelineLayoutCreateInfo wrong_layout_info = layout_info;
    wrong_layout_info.pSetLayouts = swapped;
@@ -322,8 +328,10 @@ int main(int argc, char **argv)
    for (unsigned i = 0; i < 3; i++)
       device.vk.dispatch_table.DestroyPipeline(dev, pipelines[i], NULL);
    vk_device_finish(&device.vk);
-   test_descriptors(&physical, argv[2], "mesa-descriptors", argc == 5 ? argv[4] : NULL);
-   test_descriptors(&physical, argv[3], "mesa-atomics", argc == 5 ? argv[4] : NULL);
+   test_descriptors(&physical, argv[2], "mesa-descriptors", argc == 5 ? argv[4] : NULL, false);
+   test_descriptors(&physical, argv[3], "mesa-atomics", argc == 5 ? argv[4] : NULL, false);
+   test_descriptors(&physical, argv[2], "mesa-descriptors", NULL, true);
+   test_descriptors(&physical, argv[3], "mesa-atomics", NULL, true);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex Mesa compute pipelines: specialization, entrypoints, lifetime, failures");

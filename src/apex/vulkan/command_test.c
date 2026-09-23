@@ -245,7 +245,7 @@ __wrap_ioctl(int fd, unsigned long request, ...)
 
 static void
 run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int fd, int fault,
-    enum apex_transport transport)
+    enum apex_transport transport, bool dynamic)
 {
    memset(&mock, 0, sizeof(mock));
    mock.fault = fault;
@@ -314,12 +314,19 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    };
    CHECK(v->CreateShaderModule(dev, &module_info, NULL, &module) == VK_SUCCESS);
    free(code);
-   const VkDescriptorSetLayoutBinding binding[] = {
+   VkDescriptorSetLayoutBinding binding[] = {
       {.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       {.binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
    };
+   if (dynamic) {
+      binding[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+      binding[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+      VkDescriptorSetLayoutBinding tmp = binding[0];
+      binding[0] = binding[1];
+      binding[1] = tmp; /* Input order must not determine dynamic-offset order. */
+   }
    VkDescriptorSetLayout set_layout;
    const VkDescriptorBindingFlags binding_flags[] = {
       VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
@@ -328,11 +335,16 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
       .bindingCount = tables ? 2 : 1, .pBindingFlags = binding_flags,
    };
-   const VkDescriptorSetLayoutCreateInfo set_info = {
+   VkDescriptorSetLayoutCreateInfo set_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
       .pNext = &binding_info, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
       .bindingCount = tables ? 2 : 1, .pBindings = binding,
    };
+   if (dynamic) {
+      CHECK(v->CreateDescriptorSetLayout(dev, &set_info, NULL, &set_layout) == VK_ERROR_FEATURE_NOT_PRESENT);
+      set_info.pNext = NULL;
+      set_info.flags = 0;
+   }
    CHECK(v->CreateDescriptorSetLayout(dev, &set_info, NULL, &set_layout) == VK_SUCCESS);
    VkDescriptorSetLayout layouts[2] = {set_layout, set_layout};
    VkPipelineLayout layout;
@@ -388,7 +400,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    VkBuffer buffers[2];
    const VkBufferCreateInfo buffer_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 3456,
-      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
    };
    for (unsigned i = 0; i < 2; i++) {
       CHECK(v->CreateBuffer(dev, &buffer_info, NULL, &buffers[i]) == VK_SUCCESS);
@@ -397,11 +409,15 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(req.size == 3456 && req.alignment == 64 && req.memoryTypeBits == 1);
       CHECK(v->BindBufferMemory(dev, buffers[i], memory, i ? 4096 : 64) == VK_SUCCESS);
    }
-   const VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, tables ? 6 : 2};
+   const VkDescriptorPoolSize pool_sizes[] = {
+      {dynamic ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       dynamic ? 4 : tables ? 6 : 2},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2},
+   };
    const VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
-      .maxSets = 3, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+      .maxSets = 3, .poolSizeCount = dynamic ? 2 : 1, .pPoolSizes = pool_sizes,
    };
    VkDescriptorPool pool;
    CHECK(v->CreateDescriptorPool(dev, &pool_info, NULL, &pool) == VK_SUCCESS);
@@ -416,12 +432,19 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    VkDescriptorBufferInfo bindings[] = {
       {buffers[0], 128, 3200}, {buffers[1], 256, VK_WHOLE_SIZE},
    };
+   if (dynamic) {
+      bindings[0].offset = 64;
+      /* The second descriptor retains WHOLE_SIZE and requires offset zero. */
+      if (fault == 214) bindings[0].range = VK_WHOLE_SIZE;
+   }
    if (fault == 100) bindings[0].range = 3329;
    if (fault == 101) bindings[0].offset = 3456;
+   const VkDescriptorBufferInfo unused_uniform = {buffers[0], 0, 64};
    VkWriteDescriptorSet writes[2] = {{
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[0],
-      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      .pBufferInfo = &bindings[1], /* Changed after recording, before submission. */
+      .descriptorCount = 1,
+      .descriptorType = dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .pBufferInfo = dynamic ? &unused_uniform : &bindings[1],
    }};
    writes[1] = writes[0];
    writes[1].dstSet = sets[1];
@@ -430,6 +453,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       VkDescriptorBufferInfo array[] = {bindings[1], bindings[0]};
       VkWriteDescriptorSet extra = writes[0];
       extra.dstBinding = 7;
+      extra.descriptorType = dynamic ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       extra.descriptorCount = 2;
       extra.pBufferInfo = array;
       for (unsigned s = 0; s < 2; s++) {
@@ -449,6 +473,12 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       };
       v->UpdateDescriptorSets(dev, 0, NULL, 1, &copy);
    }
+   if (dynamic) {
+      writes[0].dstBinding = 7;
+      writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+      writes[0].pBufferInfo = &bindings[0];
+      v->UpdateDescriptorSets(dev, 1, writes, 0, NULL);
+   }
    VkCommandPool command_pool;
    const VkCommandPoolCreateInfo command_pool_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -463,11 +493,27 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    CHECK(v->AllocateCommandBuffers(dev, &command_alloc, &cmd) == VK_SUCCESS);
    const VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
    CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
-   if (tables)
+   if (dynamic) {
+      uint32_t offsets[] = {4, 64, 0, 12, 0, 64};
+      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, sets, 5, offsets);
+      CHECK(v->EndCommandBuffer(cmd) == VK_ERROR_FEATURE_NOT_PRESENT);
+      CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+      CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+      if (fault == 215) offsets[1] = 196; /* Range ends four bytes beyond the buffer. */
+      if (fault == 216) offsets[1] = UINT32_MAX - 3;
+      if (fault == 217) offsets[1] = 65;
+      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, sets, 6, offsets);
+      memset(offsets, 0xff, sizeof(offsets)); /* Consumed at bind, before dispatch. */
+   } else if (tables)
       v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
    for (unsigned i = 0; i < 2; i++) {
       v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[i]);
-      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[i], 0, NULL);
+      if (dynamic && i) {
+         uint32_t offsets[] = {20, 0, 64};
+         v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[i], 3, offsets);
+         memset(offsets, 0xff, sizeof(offsets));
+      } else if (!dynamic)
+         v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[i], 0, NULL);
       v->CmdDispatch(cmd, 1, 1, 1);
       const VkMemoryBarrier2 barrier = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -482,12 +528,17 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       };
       v->CmdPipelineBarrier2(cmd, &dependency);
    }
+   if (dynamic) {
+      /* Rebinding the same set must not mutate either recorded dispatch. */
+      const uint32_t offsets[] = {36, 128, 0};
+      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 3, offsets);
+   }
    v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[2]);
    v->CmdDispatch(cmd, 0, 1, 1);
    CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
    writes[0].pBufferInfo = &bindings[0];
    writes[0].dstBinding = tables ? 7 : 0;
-   v->UpdateDescriptorSets(dev, 1, writes, 0, NULL);
+   if (!dynamic) v->UpdateDescriptorSets(dev, 1, writes, 0, NULL);
    const VkCommandBufferSubmitInfo cb_submit = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd,
    };
@@ -542,7 +593,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(result == VK_ERROR_DEVICE_LOST);
       CHECK(v->QueueWaitIdle(queue) == VK_ERROR_DEVICE_LOST);
       if (transport == APEX_TRANSPORT_DRM) {
-         CHECK(mock.live == ((fault >= 204 && fault <= 206) || fault >= 211 ? 2 : 1) && !mock.calls[APEX_NATIVE_CREATE]);
+         CHECK(mock.live == ((fault >= 204 && fault <= 206) || (fault >= 211 && fault <= 213) ? 2 : 1) && !mock.calls[APEX_NATIVE_CREATE]);
          CHECK(mock.exec_calls == (fault >= 204 && fault <= 206 ? 1 : 0));
          CHECK(!memcmp(mock.mapped, mock.expected, sizeof(mock.expected)));
       } else {
@@ -595,8 +646,12 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
       CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
       v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[2]);
-      v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 0, NULL);
-      if (tables)
+      if (dynamic) {
+         const uint32_t offsets[] = {28, 64, 0};
+         v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 3, offsets);
+      } else
+         v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets, 0, NULL);
+      if (tables && !dynamic)
          v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1, &sets[1], 0, NULL);
       v->CmdDispatch(cmd, 1, 1, 1);
       CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
@@ -718,7 +773,7 @@ int main(int argc, char **argv)
          return 77;
       }
    }
-   run(&physical, spirv, size, fd, -1, transport);
+   run(&physical, spirv, size, fd, -1, transport, false);
    if (fd >= 0) {
       CHECK(close(fd) == 0);
       printf("PASS Apex Mesa %s command submission: %u dispatches, 2 buffers, 2048 words/guards\n",
@@ -727,10 +782,13 @@ int main(int argc, char **argv)
    } else {
       const int faults[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 99, 100, 101};
       for (unsigned i = 0; i < ARRAY_SIZE(faults); i++)
-         run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE);
+         run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE, false);
       const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213};
       for (unsigned i = 0; i < ARRAY_SIZE(drm_faults); i++)
-         run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM);
+         run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM, false);
+      const int dynamic_faults[] = {-1, 214, 215, 216, 217};
+      for (unsigned i = 0; i < ARRAY_SIZE(dynamic_faults); i++)
+         run(&physical, spirv, size, -1, dynamic_faults[i], APEX_TRANSPORT_DRM, true);
       puts("PASS Apex Mesa native/DRM transport: persistent GPUVA, explicit ranges, retained data/programs, cleanup, device loss (mock ioctl)");
       if (sync_fd >= 0) {
          CHECK(!close(sync_fd));
