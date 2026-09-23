@@ -535,7 +535,8 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
                if (nir_intrinsic_execution_scope(i) == SCOPE_NONE) {
                   /* Shared storage is workgroup-local even when SPIR-V uses
                    * Device scope, as GLSL memoryBarrierShared does. */
-                  if ((nir_intrinsic_memory_modes(i) & ~nir_var_mem_shared) ||
+                  if ((nir_intrinsic_memory_modes(i) &
+                       ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_mem_global)) ||
                       (nir_intrinsic_memory_semantics(i) & ~NIR_MEMORY_ACQ_REL)) goto unsupported;
                } else if (nir_intrinsic_execution_scope(i) != SCOPE_WORKGROUP ||
                           nir_intrinsic_memory_scope(i) > SCOPE_DEVICE) goto unsupported;
