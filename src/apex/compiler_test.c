@@ -23,6 +23,31 @@ static nir_shader *shader(uint32_t constant)
    return b.shader;
 }
 
+static nir_shader *global_shader(unsigned load_alignment, unsigned store_alignment)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &apex_nir_options,
+                                                "Apex paired global addresses");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *descriptor[4];
+   for (unsigned i = 0; i < 4; i++)
+      descriptor[i] = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0),
+                                    nir_imm_int(&b, 4 * i), .align_mul = 4);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_def *offset = nir_ishl_imm(&b, lane, 2);
+   nir_def *src = nir_build_addr_iadd(&b, nir_vec2(&b, descriptor[0], descriptor[1]),
+                                     nir_address_format_2x32bit_global, nir_var_mem_global,
+                                     nir_iadd_imm(&b, offset, 0x20090));
+   nir_def *dst = nir_build_addr_iadd(&b, nir_vec2(&b, descriptor[2], descriptor[3]),
+                                     nir_address_format_2x32bit_global, nir_var_mem_global,
+                                     nir_iadd_imm(&b, offset, 132));
+   nir_def *input = nir_load_global_2x32(&b, 1, 32, src, .align_mul = load_alignment);
+   nir_def *result = nir_iadd(&b, nir_imul_imm(&b, input, 7), lane);
+   nir_store_global_2x32(&b, result, dst, .align_mul = store_alignment);
+   return b.shader;
+}
+
 static uint32_t word(const uint8_t *bytes)
 {
    uint32_t value;
@@ -55,8 +80,9 @@ static void reject(nir_shader *nir, struct apex_compile_result *result,
    CHECK(!result->data && !result->size && !result->diagnostic[0]);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+   CHECK(argc == 1 || argc == 2);
    glsl_type_singleton_init_or_ref();
    struct apex_compile_result a = {0}, b = {0};
    nir_shader *nir = shader(0x13579bdf);
@@ -94,7 +120,20 @@ int main(void)
    CHECK(word(a.data + 24) == 128 && word(a.data + 28) == 32);
    apex_compile_result_finish(&a);
    apex_compile_result_finish(&b);
+
+   nir = global_shader(4, 4);
+   CHECK(apex_from_nir(nir, &a) == 0);
+   ralloc_free(nir);
+   check_binary(&a, 7);
+   if (argc == 2) {
+      FILE *f = fopen(argv[1], "wb");
+      CHECK(f && fwrite(a.data, 1, a.size, f) == a.size);
+      CHECK(fclose(f) == 0);
+   }
+   apex_compile_result_finish(&a);
+   reject(global_shader(2, 4), &a, "load_global_2x32");
+   reject(global_shader(4, 2), &a, "store_global_2x32");
    glsl_type_singleton_decref();
-   puts("PASS Apex in-process compiler ownership, diagnostics and metadata");
+   puts("PASS Apex in-process compiler ownership, diagnostics, metadata and paired global addresses");
    return 0;
 }

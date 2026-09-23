@@ -577,6 +577,19 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
             case nir_intrinsic_load_vulkan_descriptor:
                for (unsigned j=0;j<i->def.num_components;j++) emit(&ops,0x21,value(&i->def,j),value(i->src[0].ssa,j),0,0,0);
                break;
+            case nir_intrinsic_load_global_2x32:
+            case nir_intrinsic_store_global_2x32: {
+               bool store = i->intrinsic == nir_intrinsic_store_global_2x32;
+               nir_def *address = i->src[store ? 1 : 0].ssa;
+               if (i->num_components != 1 || address->bit_size != 32 || address->num_components != 2 ||
+                   nir_intrinsic_align_mul(i) < 4 || nir_intrinsic_align_offset(i) % 4 ||
+                   (store && nir_intrinsic_write_mask(i) != 1)) goto unsupported;
+               uint32_t pair = temporary++;
+               emit(&ops, 0xf1, pair, value(address, 0), value(address, 1), 0, 0);
+               emit(&ops, store ? 0x51 : 0x50, store ? 0 : value(&i->def, 0), pair,
+                    store ? value(i->src[0].ssa, 0) : 0, 0, 0);
+               break;
+            }
             case nir_intrinsic_load_ssbo:
             case nir_intrinsic_store_ssbo: {
                bool store=i->intrinsic==nir_intrinsic_store_ssbo;
