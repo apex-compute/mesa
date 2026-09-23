@@ -44,16 +44,27 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
       BITSET_SET_COUNT(ctx->pipeline->used_descriptors,
          ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset,
          layout->bindings[binding].count);
-      /* Invalid descriptor indices select the zero-filled sentinel row. */
-      nir_def *slot = nir_bcsel(b, nir_ult_imm(b, index, layout->bindings[binding].count),
-         nir_iadd_imm(b, index, ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset),
+      /* Opaque resource references retain the binding bounds through reindex.
+       * The table is limited to 4096 entries, so base/count fit in 16 bits. */
+      unsigned base = ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset;
+      unsigned packed = base | (layout->bindings[binding].count << 16);
+      replacement = nir_vec2(b, nir_imm_int(b, packed), index);
+      break;
+   }
+   case nir_intrinsic_vulkan_resource_reindex:
+      replacement = nir_vec2(b, nir_channel(b, i->src[0].ssa, 0),
+         nir_iadd(b, nir_channel(b, i->src[0].ssa, 1), i->src[1].ssa));
+      break;
+   case nir_intrinsic_load_vulkan_descriptor: {
+      nir_def *packed = nir_channel(b, i->src[0].ssa, 0);
+      nir_def *index = nir_channel(b, i->src[0].ssa, 1);
+      nir_def *slot = nir_bcsel(b, nir_ult(b, index, nir_ushr_imm(b, packed, 16)),
+         nir_iadd(b, nir_iand_imm(b, packed, 0xffff), index),
          nir_imm_int(b, ctx->pipeline->descriptor_count));
+      /* The descriptor load changes the opaque reference into index/offset. */
       replacement = nir_vec2(b, slot, nir_imm_int(b, 0));
       break;
    }
-   case nir_intrinsic_load_vulkan_descriptor:
-      replacement = i->src[0].ssa;
-      break;
    default:
       return false;
    }
@@ -70,8 +81,7 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
    bool size = i->intrinsic == nir_intrinsic_get_ssbo_size;
    bool swap = i->intrinsic == nir_intrinsic_ssbo_atomic_swap;
    bool atomic = swap || i->intrinsic == nir_intrinsic_ssbo_atomic;
-   if (i->intrinsic == nir_intrinsic_vulkan_resource_reindex ||
-       (atomic && nir_intrinsic_offset_shift(i))) {
+   if (atomic && nir_intrinsic_offset_shift(i)) {
       ctx->invalid = true;
       return false;
    }

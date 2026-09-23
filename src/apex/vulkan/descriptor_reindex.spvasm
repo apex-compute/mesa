@@ -1,0 +1,82 @@
+; SPDX-License-Identifier: MIT
+; Select a pointer to one of two descriptor arrays, then index that array.
+; The access chain must reindex the selected descriptor reference.
+OpCapability Shader
+OpCapability VariablePointersStorageBuffer
+OpCapability StorageBufferArrayDynamicIndexing
+OpCapability ShaderNonUniform
+OpCapability StorageBufferArrayNonUniformIndexing
+OpExtension "SPV_KHR_variable_pointers"
+OpExtension "SPV_EXT_descriptor_indexing"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %lane_id
+OpExecutionMode %main LocalSize 16 1 1
+OpDecorate %lane_id BuiltIn LocalInvocationIndex
+OpDecorate %words ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %sources DescriptorSet 1
+OpDecorate %sources Binding 5
+OpDecorate %alternate DescriptorSet 1
+OpDecorate %alternate Binding 2
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 3
+OpDecorate %row NonUniform
+OpDecorate %other_row NonUniform
+OpDecorate %selected NonUniform
+OpDecorate %other NonUniform
+OpDecorate %a_ptr NonUniform
+OpDecorate %b_ptr NonUniform
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%three = OpConstant %uint 3
+%four = OpConstant %uint 4
+%fifteen = OpConstant %uint 15
+%words = OpTypeRuntimeArray %uint
+%block = OpTypeStruct %words
+%pair = OpTypeArray %block %two
+%ptr_pair = OpTypePointer StorageBuffer %pair
+%ptr_block = OpTypePointer StorageBuffer %block
+%ptr_word = OpTypePointer StorageBuffer %uint
+%ptr_input = OpTypePointer Input %uint
+%sources = OpVariable %ptr_pair StorageBuffer
+%alternate = OpVariable %ptr_pair StorageBuffer
+%output = OpVariable %ptr_block StorageBuffer
+%lane_id = OpVariable %ptr_input Input
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%lane = OpLoad %uint %lane_id
+%row_bit = OpBitwiseAnd %uint %lane %two
+%high = OpINotEqual %bool %row_bit %zero
+%column = OpBitwiseAnd %uint %lane %one
+%opposite = OpBitwiseXor %uint %column %one
+%row = OpSelect %ptr_pair %high %sources %alternate
+%other_row = OpSelect %ptr_pair %high %alternate %sources
+%selected = OpAccessChain %ptr_block %row %column
+%other = OpAccessChain %ptr_block %other_row %opposite
+%reverse = OpISub %uint %fifteen %lane
+%a_ptr = OpAccessChain %ptr_word %selected %zero %lane
+%b_ptr = OpAccessChain %ptr_word %other %zero %reverse
+%a = OpLoad %uint %a_ptr
+%b = OpLoad %uint %b_ptr
+%length = OpArrayLength %uint %selected 0
+%sum = OpIAdd %uint %a %b
+%base = OpIMul %uint %lane %four
+%o1 = OpIAdd %uint %base %one
+%o2 = OpIAdd %uint %base %two
+%o3 = OpIAdd %uint %base %three
+%d0 = OpAccessChain %ptr_word %output %zero %base
+%d1 = OpAccessChain %ptr_word %output %zero %o1
+%d2 = OpAccessChain %ptr_word %output %zero %o2
+%d3 = OpAccessChain %ptr_word %output %zero %o3
+OpStore %d0 %a
+OpStore %d1 %b
+OpStore %d2 %length
+OpStore %d3 %sum
+OpReturn
+OpFunctionEnd

@@ -47,7 +47,7 @@ fail_alloc(void *data, size_t size, size_t alignment, VkSystemAllocationScope sc
 
 static void
 test_descriptors(struct vk_physical_device *physical, const char *path,
-                 const char *fixture, const char *output, bool dynamic)
+                 const char *fixture, const char *output, bool dynamic, bool pointers)
 {
    struct apex_device device;
    const float priority = 1;
@@ -86,7 +86,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
       VkDescriptorSetLayoutBinding bindings[] = {
          {.binding = s ? 5 : 3, .descriptorCount = s ? 2 : 1,
           .descriptorType = storage, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
-         {.binding = 2, .descriptorCount = 2, .descriptorType = uniform,
+         {.binding = 2, .descriptorCount = 2, .descriptorType = pointers ? storage : uniform,
           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       };
       VkDescriptorSetLayoutCreateInfo info = {
@@ -104,7 +104,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    const VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-      .maxSets = 4, .poolSizeCount = dynamic ? 4 : 2, .pPoolSizes = sizes,
+      .maxSets = 4, .poolSizeCount = pointers ? 1 : dynamic ? 4 : 2, .pPoolSizes = sizes,
    };
    VkDescriptorPool pool;
    CHECK(v->CreateDescriptorPool(dev, &pool_info, NULL, &pool) == VK_SUCCESS);
@@ -156,7 +156,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
          VK_ERROR_FEATURE_NOT_PRESENT && !rejected);
    v->DestroyPipelineLayout(dev, wrong_layout, NULL);
    const VkDescriptorSetLayoutBinding wrong_types[] = {
-      {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      {.binding = 2, .descriptorType = pointers ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
        .descriptorCount = 2, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       {.binding = 5, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
        .descriptorCount = 2, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
@@ -205,7 +205,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 4 || argc == 5);
+   CHECK(argc == 5 || argc == 6);
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -342,18 +342,21 @@ int main(int argc, char **argv)
    /* Compiled pipelines survive both the module and specialization storage. */
    device.vk.dispatch_table.DestroyShaderModule(dev, module, NULL);
    memset(values, 0, sizeof(values));
-   if (argc == 5) {
-      write_fixture(argv[4], "mesa-default", pipelines[0], 37, 3);
-      write_fixture(argv[4], "mesa-specialized", pipelines[1], 101, 7);
-      write_fixture(argv[4], "mesa-entrypoint", pipelines[2], 112, 7);
+   const char *output = argc == 6 ? argv[5] : NULL;
+   if (output) {
+      write_fixture(output, "mesa-default", pipelines[0], 37, 3);
+      write_fixture(output, "mesa-specialized", pipelines[1], 101, 7);
+      write_fixture(output, "mesa-entrypoint", pipelines[2], 112, 7);
    }
    for (unsigned i = 0; i < 3; i++)
       device.vk.dispatch_table.DestroyPipeline(dev, pipelines[i], NULL);
    vk_device_finish(&device.vk);
-   test_descriptors(&physical, argv[2], "mesa-descriptors", argc == 5 ? argv[4] : NULL, false);
-   test_descriptors(&physical, argv[3], "mesa-atomics", argc == 5 ? argv[4] : NULL, false);
-   test_descriptors(&physical, argv[2], "mesa-descriptors", NULL, true);
-   test_descriptors(&physical, argv[3], "mesa-atomics", NULL, true);
+   test_descriptors(&physical, argv[2], "mesa-descriptors", output, false, false);
+   test_descriptors(&physical, argv[3], "mesa-atomics", output, false, false);
+   test_descriptors(&physical, argv[4], "mesa-reindex", output, false, true);
+   test_descriptors(&physical, argv[2], "mesa-descriptors", NULL, true, false);
+   test_descriptors(&physical, argv[3], "mesa-atomics", NULL, true, false);
+   test_descriptors(&physical, argv[4], "mesa-reindex", NULL, true, true);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex Mesa compute pipelines: specialization, entrypoints, lifetime, failures");
