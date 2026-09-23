@@ -323,6 +323,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       .lower_vote_bool_eq = true, .lower_elect = true,
       .lower_first_invocation_to_ballot = true, .lower_read_first_invocation = true,
       .lower_subgroup_masks = true, .lower_inverse_ballot = true,
+      .lower_relative_shuffle = true, .lower_quad = true,
    };
    bool progress;
    do {
