@@ -124,11 +124,26 @@ fn fence_drain() {
 }
 #[test]
 fn metadata_and_private_bounds() {
-    let p = mir::compile(&[Op::new(0x40, 0, 0, 0, 0, 0)], 0, 0).unwrap();
+    let p = mir::compile(&[Op::new(0x40, 0, 0, 0, 0, 0)], 0, 0, 16).unwrap();
     let mut bytes = p.bytes().unwrap();
+    assert_eq!(&bytes[..8], &[0x41, 0x50, 0x58, 0x31, 1, 0, 0, 0]);
     assert_eq!(Program::parse(&bytes).unwrap().code, p.code);
     bytes.push(0);
     assert!(Program::parse(&bytes).is_err());
+
+    let wide = mir::compile(&[Op::new(0x40, 0, 0, 0, 0, 1)], 32, 12, 17).unwrap();
+    let bytes = wide.bytes().unwrap();
+    assert_eq!(bytes.len(), 48 + wide.code.len() * 8);
+    assert_eq!(&bytes[..8], &[0x41, 0x50, 0x58, 0x32, 2, 0, 0, 0]);
+    assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 17);
+    assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 0);
+    assert_eq!(Program::parse(&bytes).unwrap().invocations, 17);
+    for (offset, value) in [(0, 0x31585041u32), (4, 1), (40, 16), (40, 257), (44, 1)] {
+        let mut bad = bytes.clone();
+        bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        assert!(Program::parse(&bad).is_err());
+    }
+    assert!(Program::parse(&bytes[..47]).is_err());
     assert_eq!(
         private_address(4096, 2, 80, 1, 2, 15, 10240).unwrap(),
         4096 + (82 * 16 + 15) * 4
@@ -149,7 +164,7 @@ fn pressure_and_long_chain() {
         Op::new(0x20, 500, 0, 0, 0, 0),
         Op::new(0x54, 0, 500, v, 0, 0),
     ]);
-    let p = mir::compile(&chain, 4, 0).unwrap();
+    let p = mir::compile(&chain, 4, 0, 16).unwrap();
     assert_eq!(p.private, 0);
     for lane in 0..16 {
         assert_eq!(arithmetic_slice(&p, lane), lane + 450);
@@ -170,14 +185,14 @@ fn pressure_and_long_chain() {
         Op::new(0x20, 500, 0, 0, 0, 0),
         Op::new(0x54, 0, 500, sum, 0, 0),
     ]);
-    let p = mir::compile(&pressure, 4, 0).unwrap();
+    let p = mir::compile(&pressure, 4, 0, 16).unwrap();
     assert!(p.private > 0);
     assert!(p.vector <= 64);
     schedule::validate(&p.code).unwrap();
     for lane in 0..16 {
         assert_eq!(arithmetic_slice(&p, lane), lane * 2550);
     }
-    let reserved = mir::compile(&pressure, 4, 64).unwrap();
+    let reserved = mir::compile(&pressure, 4, 64, 16).unwrap();
     assert_eq!(reserved.private, p.private + 64);
     assert!(reserved
         .code
@@ -192,7 +207,7 @@ fn pressure_and_long_chain() {
 #[test]
 fn scalar_control_lifetimes() {
     fn evaluate(ops: &[Op]) -> u32 {
-        let program = mir::compile(ops, 0, 0).unwrap();
+        let program = mir::compile(ops, 0, 0, 16).unwrap();
         schedule::validate(&program.code).unwrap();
         let mut s = [0u32; 64];
         let mut mask = 0xffff;
@@ -381,6 +396,7 @@ fn random_async_latency_and_loop_repatch() {
         vector: 17,
         shared: 0,
         private: 0,
+        invocations: 16,
     };
     assert!(Program::parse(&p.bytes().unwrap()).is_ok());
     let mut bad = p.clone();
@@ -424,7 +440,7 @@ fn atomic_pairs_and_bank_repair() {
         Op::new(0x20, 8, 0, 0, 0, 3),
         Op::new(0x32, 12, 0, 4, 8, 0),
     ];
-    let p = mir::compile(&ops, 0, 0).unwrap();
+    let p = mir::compile(&ops, 0, 0, 16).unwrap();
     assert!(p.code.iter().any(|i| i.op == 0x21));
     assert!(p.code.iter().all(|i| i.bank_legal()));
 }

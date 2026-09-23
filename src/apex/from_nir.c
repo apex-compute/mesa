@@ -51,9 +51,14 @@ static unsigned alu_op(nir_op op)
    }
 }
 
+struct launch_lowering {
+   bool invalid;
+   unsigned invocations;
+};
+
 static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
-   bool *invalid = data;
+   struct launch_lowering *ctx = data;
    nir_def *replacement = NULL;
    b->cursor = nir_before_instr(&i->instr);
    switch (i->intrinsic) {
@@ -64,17 +69,19 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
       replacement = nir_vec3(b, nir_load_local_invocation_index(b),
                             nir_imm_int(b, 0), nir_imm_int(b, 0)); break;
    case nir_intrinsic_load_workgroup_id:
-      /* One native launch is one single-wave workgroup. The queue supplies its
-       * coarse base; there is no second in-launch workgroup index. */
+      /* One native launch is one workgroup. The queue supplies its coarse base;
+       * there is no second in-launch workgroup index. */
       replacement = nir_imm_ivec3(b, 0, 0, 0); break;
    case nir_intrinsic_load_subgroup_id:
+      if (ctx->invocations > 16)
+         return false;
       replacement = nir_imm_int(b, 0); break;
    case nir_intrinsic_load_num_subgroups:
-      replacement = nir_imm_int(b, 1); break;
+      replacement = nir_imm_int(b, DIV_ROUND_UP(ctx->invocations, 16)); break;
    case nir_intrinsic_vulkan_resource_index:
       if (nir_intrinsic_desc_set(i) || nir_intrinsic_binding(i) ||
           !nir_src_is_const(i->src[0]) || nir_src_as_uint(i->src[0])) {
-         *invalid = true; return false;
+         ctx->invalid = true; return false;
       }
       replacement = nir_imm_ivec2(b, 0, 0); break;
    case nir_intrinsic_load_vulkan_descriptor:
@@ -299,14 +306,15 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       }
    }
    unsigned invocations = 1;
+   static const unsigned axis_limits[3] = {256, 256, 64};
    for (unsigned axis = 0; axis < 3; axis++) {
       unsigned size = nir->info.workgroup_size[axis];
-      if (!size || size > 16)
-         return fail(output, "native launch requires 1 to 16 local invocations");
+      if (!size || size > axis_limits[axis] || invocations > 256 / size)
+         return fail(output, "native launch requires constant local dimensions within 256x256x64 and at most 256 invocations");
       invocations *= size;
    }
-   if (nir->info.workgroup_size_variable || invocations > 16)
-      return fail(output, "native launch requires 1 to 16 local invocations");
+   if (nir->info.workgroup_size_variable)
+      return fail(output, "native launch requires constant local dimensions within 256x256x64 and at most 256 invocations");
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
@@ -325,16 +333,17 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    };
    /* Native global IDs already implement 16x1x1 in one instruction. Other
     * shapes compile their dimensions into local/global ID expressions. */
-   if (nir->info.workgroup_size[0] != 16) {
+   if (nir->info.workgroup_size[0] != 16 || nir->info.workgroup_size[1] != 1 ||
+       nir->info.workgroup_size[2] != 1) {
       NIR_PASS(_, nir, nir_lower_compute_system_values, &geometry);
       /* Reduce constant dimensions before expanding general division. */
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_algebraic);
       NIR_PASS(_, nir, nir_opt_idiv_const, 32);
    }
-   bool invalid = false;
-   nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &invalid);
-   if (invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
+   struct launch_lowering launch = {.invocations = invocations};
+   nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &launch);
+   if (launch.invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, int32_division, lower_int32_division, NULL);
    const nir_lower_subgroups_options subgroups = {
@@ -384,6 +393,13 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          goto done;
       }
       nir->info.shared_size = (nir->info.shared_size + 63) & ~63u;
+      unsigned skip_clear = UINT_MAX;
+      if (invocations > 16) {
+         uint32_t wave = temporary++;
+         emit(&ops, 0x41, wave, 0, 0, 0, 7);
+         skip_clear = util_dynarray_num_elements(&ops, struct apex_op);
+         emit(&ops, 5, 0, wave, 0, 0, 0);
+      }
       uint32_t lane = temporary++, shift = temporary++, offset = temporary++;
       uint32_t zero = temporary++;
       emit(&ops, 0x40, lane, 0, 0, 0, 1);
@@ -396,6 +412,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          emit(&ops, 0x22, address, offset, chunk, 0, 0);
          emit(&ops, 0x54, 0, address, zero, 0, 0);
       }
+      if (skip_clear != UINT_MAX)
+         util_dynarray_element(&ops, struct apex_op, skip_clear)->imm =
+            util_dynarray_num_elements(&ops, struct apex_op);
       emit(&ops, 7, 0, 0, 0, 0, 0);
    }
    if (invocations < 16) {
@@ -411,7 +430,8 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       emit(&ops, 0x10, control.zero, 0, 0, 0, 0);
    if (!emit_cf(&control, &impl->body)) goto done;
    nir_validate_shader(nir, "Apex backend boundary");
-   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op), nir->info.shared_size, nir->scratch_size, output);
+   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op),
+                      nir->info.shared_size, nir->scratch_size, invocations, output);
 done:
    util_dynarray_fini(&ops);
    return result;
@@ -546,6 +566,12 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
             case nir_intrinsic_load_subgroup_invocation:
             case nir_intrinsic_load_local_invocation_index:
                emit(&ops,0x40,value(&i->def,0),0,0,0,i->intrinsic==nir_intrinsic_load_subgroup_invocation?0:1); break;
+            case nir_intrinsic_load_subgroup_id: {
+               uint32_t scalar=temporary++;
+               emit(&ops,0x41,scalar,0,0,0,7);
+               emit(&ops,0x2d,value(&i->def,0),scalar,0,0,0);
+               break;
+            }
             case nir_intrinsic_load_global_invocation_id:
                for (unsigned j=0;j<3;j++) emit(&ops,0x40,value(&i->def,j),0,0,0,2+j);
                break;

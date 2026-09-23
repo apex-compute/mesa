@@ -110,7 +110,7 @@ impl Inst {
             2 | 4 | 5 | 0x10 | 0x20 | 0x56..=0x59 => true,
             3 => self.imm > 0 && self.imm < 16,
             0x40 => self.imm <= 4,
-            0x41 => self.imm <= 6,
+            0x41 => self.imm <= 7,
             0x42 => self.imm <= 1,
             0x52 | 0x55 => self.imm <= 9,
             _ => self.imm == 0,
@@ -270,6 +270,7 @@ pub struct Program {
     pub vector: u32,
     pub shared: u32,
     pub private: u32,
+    pub invocations: u32,
 }
 impl Program {
     pub fn validate(&self) -> Result<(), String> {
@@ -280,6 +281,7 @@ impl Program {
             || self.vector > 64
             || self.shared > 32768
             || self.private % 4 != 0
+            || !(1..=256).contains(&self.invocations)
         {
             return Err("invalid launch metadata".into());
         }
@@ -310,9 +312,10 @@ impl Program {
     }
     pub fn bytes(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
+        let wide = self.invocations > 16;
         let h = [
-            0x31585041,
-            1,
+            if wide { 0x32585041 } else { 0x31585041 },
+            if wide { 2 } else { 1 },
             self.code.len() as u32,
             self.entry,
             self.scalar,
@@ -321,30 +324,43 @@ impl Program {
             self.private,
             16,
             4,
+            self.invocations,
+            0,
         ];
-        let mut out: Vec<u8> = h.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let words = if wide { &h[..12] } else { &h[..10] };
+        let mut out: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
         for i in &self.code {
             out.extend(i.encode()?.to_le_bytes())
         }
         Ok(out)
     }
     pub fn parse(b: &[u8]) -> Result<Self, String> {
-        if b.len() < 40 {
+        if b.len() < 8 {
             return Err("short header".into());
         }
-        let h: Vec<u32> = b[..40]
+        let magic = u32::from_le_bytes(b[..4].try_into().unwrap());
+        let revision = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let header = match (magic, revision) {
+            (0x31585041, 1) => 40,
+            (0x32585041, 2) => 48,
+            _ => return Err("invalid container".into()),
+        };
+        if b.len() < header {
+            return Err("short header".into());
+        }
+        let h: Vec<u32> = b[..header]
             .chunks_exact(4)
             .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
             .collect();
-        if h[0] != 0x31585041
-            || h[1] != 1
-            || h[8] != 16
+        let invocations = if header == 48 { h[10] } else { 16 };
+        if h[8] != 16
             || h[9] != 4
-            || (h[2] as u64) * 8 + 40 != b.len() as u64
+            || (header == 48 && (!(17..=256).contains(&invocations) || h[11] != 0))
+            || (h[2] as u64) * 8 + header as u64 != b.len() as u64
         {
             return Err("invalid container".into());
         }
-        let code = b[40..]
+        let code = b[header..]
             .chunks_exact(8)
             .map(|v| Inst::decode(u64::from_le_bytes(v.try_into().unwrap())))
             .collect::<Result<_, _>>()?;
@@ -355,6 +371,7 @@ impl Program {
             vector: h[5],
             shared: h[6],
             private: h[7],
+            invocations,
         };
         p.validate()?;
         Ok(p)

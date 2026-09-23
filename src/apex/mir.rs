@@ -46,7 +46,12 @@ fn roles(op: u8, imm: u32) -> Result<[Option<(Class, u8)>; 4], String> {
     }
 }
 
-pub fn compile(ops: &[Op], shared: u32, source_private: u32) -> Result<Program, String> {
+pub fn compile(
+    ops: &[Op],
+    shared: u32,
+    source_private: u32,
+    invocations: u32,
+) -> Result<Program, String> {
     if source_private % 4 != 0 {
         return Err("unaligned source private size".into());
     }
@@ -315,6 +320,7 @@ pub fn compile(ops: &[Op], shared: u32, source_private: u32) -> Result<Program, 
         vector: 0,
         shared,
         private: words.checked_mul(4).ok_or("private bytes overflow")?,
+        invocations,
     };
     for i in &p.code {
         for r in i.regs(false).into_iter().chain(i.regs(true)) {

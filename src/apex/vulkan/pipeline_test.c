@@ -13,6 +13,14 @@
    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); \
 } } while (0)
 
+static uint32_t
+word(const uint8_t *bytes)
+{
+   uint32_t value;
+   memcpy(&value, bytes, sizeof(value));
+   return util_le32_to_cpu(value);
+}
+
 static void
 write_fixture(const char *directory, const char *name, VkPipeline handle,
               uint32_t bias, uint32_t scale, unsigned invocations)
@@ -206,6 +214,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
 int main(int argc, char **argv)
 {
    CHECK(argc == 5 || argc == 6);
+   const char *output = argc == 6 ? argv[5] : NULL;
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -323,9 +332,20 @@ int main(int argc, char **argv)
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) != VK_SUCCESS);
    CHECK(!mixed[0]);
    batch[0].stage.pName = "wide";
-   CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) ==
-         VK_ERROR_FEATURE_NOT_PRESENT);
-   CHECK(!mixed[0]);
+   CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) == VK_SUCCESS);
+   CHECK(mixed[0]);
+   struct apex_pipeline *wide = apex_pipeline_from_handle(mixed[0]);
+   CHECK(wide->code.size >= 48 && word(wide->code.data) == 0x32585041 &&
+         word(wide->code.data + 4) == 2 && word(wide->code.data + 40) == 32 &&
+         !word(wide->code.data + 44));
+   if (output) {
+      char path[4096];
+      CHECK(snprintf(path, sizeof(path), "%s/mesa-wide.apx", output) < sizeof(path));
+      FILE *wide_file = fopen(path, "wb");
+      CHECK(wide_file && fwrite(wide->code.data, 1, wide->code.size, wide_file) ==
+            wide->code.size && !fclose(wide_file));
+   }
+   device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
       .requiredSubgroupSize = 8,
@@ -342,7 +362,6 @@ int main(int argc, char **argv)
    /* Compiled pipelines survive both the module and specialization storage. */
    device.vk.dispatch_table.DestroyShaderModule(dev, module, NULL);
    memset(values, 0, sizeof(values));
-   const char *output = argc == 6 ? argv[5] : NULL;
    if (output) {
       write_fixture(output, "mesa-default", pipelines[0], 37, 3, 16);
       write_fixture(output, "mesa-specialized", pipelines[1], 101, 7, 16);

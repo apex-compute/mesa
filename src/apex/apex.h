@@ -18,6 +18,7 @@ void apex_compile_result_finish(struct apex_compile_result *);
 /* NIR adapter sends source-neutral opcodes and SSA value IDs to Rust MIR. */
 struct apex_op { uint32_t op, d, a, b, c, imm; };
 int apex_emit(const struct apex_op *, size_t, uint32_t shared, uint32_t private_bytes,
+              uint32_t local_invocations,
               struct apex_compile_result *);
 int apex_tool(const char *mode, const char *input, const char *output);
 /* Mutates caller-owned NIR; the caller retains its lifetime and GLSL type ref. */

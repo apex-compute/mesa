@@ -48,6 +48,21 @@ static nir_shader *global_shader(unsigned load_alignment, unsigned store_alignme
    return b.shader;
 }
 
+static nir_shader *geometry_shader(unsigned x, unsigned y, unsigned z)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &apex_nir_options,
+                                                  "Apex multi-wave geometry");
+   b.shader->info.workgroup_size[0] = x;
+   b.shader->info.workgroup_size[1] = y;
+   b.shader->info.workgroup_size[2] = z;
+   nir_def *subgroup = nir_load_subgroup_id(&b);
+   nir_def *count = nir_load_num_subgroups(&b);
+   nir_def *local = nir_load_local_invocation_index(&b);
+   nir_store_ssbo(&b, nir_iadd(&b, local, nir_iadd(&b, subgroup, count)),
+                  nir_imm_int(&b, 0), nir_imm_int(&b, 0), .align_mul = 4);
+   return b.shader;
+}
+
 static uint32_t word(const uint8_t *bytes)
 {
    uint32_t value;
@@ -99,19 +114,35 @@ int main(int argc, char **argv)
    CHECK(!a.data && !a.size && !a.diagnostic[0]);
    check_binary(&b, 0x2468ace0);
 
+   const unsigned valid_wide[][3] = {{17, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16}};
+   for (unsigned i = 0; i < ARRAY_SIZE(valid_wide); i++) {
+      nir = geometry_shader(valid_wide[i][0], valid_wide[i][1], valid_wide[i][2]);
+      CHECK(apex_from_nir(nir, &a) == 0);
+      ralloc_free(nir);
+      unsigned invocations = valid_wide[i][0] * valid_wide[i][1] * valid_wide[i][2];
+      CHECK(word(a.data) == 0x32585041 && word(a.data + 4) == 2);
+      CHECK(word(a.data + 40) == invocations && !word(a.data + 44));
+      CHECK(a.size == 48 + 8 * (size_t)word(a.data + 8));
+      bool wave_slot = false;
+      for (size_t offset = 48; offset < a.size; offset += 8)
+         wave_slot |= a.data[offset] == 0x41 && word(a.data + offset + 4) == 7;
+      CHECK(wave_slot);
+      apex_compile_result_finish(&a);
+   }
+
    const unsigned invalid_sizes[][3] = {
-      {17, 1, 1}, {16, 2, 1}, {3, 3, 2}, {2, 2, 8}, {0, 1, 16},
+      {257, 1, 1}, {1, 257, 1}, {1, 1, 65}, {256, 2, 1}, {0, 1, 16},
       {UINT16_MAX, UINT16_MAX, 16},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(invalid_sizes); i++) {
       nir = shader(17);
       for (unsigned axis = 0; axis < 3; axis++)
          nir->info.workgroup_size[axis] = invalid_sizes[i][axis];
-      reject(nir, &a, "1 to 16 local invocations");
+      reject(nir, &a, "at most 256 invocations");
    }
    nir = shader(17);
    nir->info.workgroup_size_variable = true;
-   reject(nir, &a, "1 to 16 local invocations");
+   reject(nir, &a, "constant local dimensions");
    nir = shader(17);
    nir->info.stage = MESA_SHADER_FRAGMENT;
    reject(nir, &a, "only compute");
@@ -122,10 +153,10 @@ int main(int argc, char **argv)
    reject(nir, &a, "store_ssbo");
 
    const struct apex_op invalid = {.op = 256};
-   CHECK(apex_emit(&invalid, 1, 0, 0, &a) != 0);
+   CHECK(apex_emit(&invalid, 1, 0, 0, 16, &a) != 0);
    CHECK(!a.data && !a.size && !strcmp(a.diagnostic, "opcode overflow"));
    apex_compile_result_finish(&a);
-   CHECK(apex_emit(NULL, 0, 128, 32, &a) == 0);
+   CHECK(apex_emit(NULL, 0, 128, 32, 16, &a) == 0);
    CHECK(a.data && a.size >= 40 && !a.diagnostic[0]);
    CHECK(word(a.data + 24) == 128 && word(a.data + 28) == 32);
    apex_compile_result_finish(&a);

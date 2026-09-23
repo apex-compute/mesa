@@ -52,6 +52,7 @@ pub unsafe extern "C" fn apex_emit(
     count: usize,
     shared: u32,
     private: u32,
+    invocations: u32,
     result: &mut CompileResult,
 ) -> i32 {
     *result = CompileResult::default();
@@ -74,7 +75,7 @@ pub unsafe extern "C" fn apex_emit(
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let p = mir::compile(&ops, shared, private)?;
+        let p = mir::compile(&ops, shared, private, invocations)?;
         p.bytes()
     })
     .unwrap_or_else(|_| Err("compiler panic".into()));
@@ -115,12 +116,17 @@ pub unsafe extern "C" fn apex_tool(
                 schedule::validate(&p.code)?;
                 if mode == "--disassemble" {
                     let text = format!(
-                        "{} {} {} {} {}\n{}",
+                        "{} {} {} {} {}{}\n{}",
                         p.entry,
                         p.scalar,
                         p.vector,
                         p.shared,
                         p.private,
+                        if p.invocations > 16 {
+                            format!(" {}", p.invocations)
+                        } else {
+                            String::new()
+                        },
                         isa::disassemble(&p.code)
                     );
                     std::fs::write(output, text).map_err(|e| e.to_string())?;
@@ -154,7 +160,7 @@ pub unsafe extern "C" fn apex_tool(
                         .map_err(|_| "invalid MIR value")?;
                     ops.push(mir::Op::new(op, p[0], p[1], p[2], p[3], p[4]));
                 }
-                let p = mir::compile(&ops, shared, 0)?;
+                let p = mir::compile(&ops, shared, 0, 16)?;
                 std::fs::write(output, p.bytes()?).map_err(|e| e.to_string())?;
             } else if mode == "--assemble" {
                 // Assembly preserves all variable launch requirements.
@@ -165,8 +171,8 @@ pub unsafe extern "C" fn apex_tool(
                     .map(str::parse)
                     .collect::<Result<_, _>>()
                     .map_err(|_| "bad metadata")?;
-                if h.len() != 5 {
-                    return Err("metadata: entry scalar vector shared private".into());
+                if h.len() != 5 && h.len() != 6 {
+                    return Err("metadata: entry scalar vector shared private [invocations]".into());
                 }
                 let p = isa::Program {
                     code: isa::assemble(body)?,
@@ -175,6 +181,7 @@ pub unsafe extern "C" fn apex_tool(
                     vector: h[2],
                     shared: h[3],
                     private: h[4],
+                    invocations: h.get(5).copied().unwrap_or(16),
                 };
                 schedule::validate(&p.code)?;
                 std::fs::write(output, p.bytes()?).map_err(|e| e.to_string())?;

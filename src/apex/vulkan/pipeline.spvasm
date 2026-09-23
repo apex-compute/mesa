@@ -2,7 +2,7 @@
 ; Two accepted entrypoints and nonconsecutive specialization IDs. Each lane stores
 ; bias + lane * scale, or bias + lane * scale + 11 for the second entrypoint.
 ; The second entrypoint linearizes a partial 3x2x2 local workgroup.
-; The wide entrypoint checks rejection of an unsupported workgroup size.
+; The wide entrypoint checks the APX2 32-invocation container.
 OpCapability Shader
 OpMemoryModel Logical GLSL450
 OpEntryPoint GLCompute %main "main" %id
