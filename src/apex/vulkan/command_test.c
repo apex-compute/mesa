@@ -799,7 +799,7 @@ int main(int argc, char **argv)
 {
    CHECK(argc == 2 || argc == 3 ||
          (argc == 4 && (!strcmp(argv[2], "--drm") || !strcmp(argv[2], "--syncobj") ||
-                       !strcmp(argv[2], "--drm-multiwave"))));
+                       !strcmp(argv[2], "--drm-multiwave") || !strcmp(argv[2], "--drm-async"))));
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -826,7 +826,9 @@ int main(int argc, char **argv)
    int fd = argc > 2 ? open(argv[argc - 1], O_RDWR | O_CLOEXEC) : -1;
    CHECK(argc == 2 || fd >= 0);
    bool multiwave = argc == 4 && !strcmp(argv[2], "--drm-multiwave");
-   enum apex_transport transport = argc == 4 && (!strcmp(argv[2], "--drm") || multiwave) ?
+   bool require_async = argc == 4 && !strcmp(argv[2], "--drm-async");
+   bool async = false;
+   enum apex_transport transport = argc == 4 && (!strcmp(argv[2], "--drm") || multiwave || require_async) ?
       APEX_TRANSPORT_DRM : APEX_TRANSPORT_NATIVE;
    mock.drm_fd = -1;
    struct vk_sync_type sync_type;
@@ -845,8 +847,9 @@ int main(int argc, char **argv)
    if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};
       CHECK(!ioctl(fd, DRM_IOCTL_APEX_INFO, &caps));
-      if (caps.version != 2 || !(caps.capabilities & APEX_DRM_CAP_GPUVM)) {
-         fprintf(stderr, "SKIP Apex Mesa DRM execution: kernel/image does not advertise GPUVM v2\n");
+      async = caps.capabilities & APEX_DRM_CAP_ASYNC;
+      if (caps.version != 2 || !(caps.capabilities & APEX_DRM_CAP_GPUVM) || (require_async && !async)) {
+         fprintf(stderr, "SKIP Apex Mesa DRM execution: missing GPUVM v2 or requested async capability\n");
          CHECK(!close(fd));
          free(spirv);
          vk_physical_device_finish(&physical);
@@ -868,7 +871,7 @@ int main(int argc, char **argv)
    if (fd >= 0) {
       CHECK(close(fd) == 0);
       printf("PASS Apex Mesa %s command submission: %u dispatches, 2 buffers, 2048 words/guards\n",
-             transport == APEX_TRANSPORT_DRM ? "DRM GPUVM" : "native",
+             transport == APEX_TRANSPORT_DRM ? (async ? "DRM async GPUVM" : "DRM GPUVM") : "native",
              transport == APEX_TRANSPORT_DRM ? 4 : 3);
    } else {
       const int faults[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 99, 100, 101};

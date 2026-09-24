@@ -7,6 +7,7 @@
 #define APEX_DRM_CAP_SHMEM (1U << 0)
 #define APEX_DRM_CAP_EXEC (1U << 1)
 #define APEX_DRM_CAP_GPUVM (1U << 2)
+#define APEX_DRM_CAP_ASYNC (1U << 3)
 
 /* Output only. Capabilities describe this DRM interface, not the raw device. */
 struct drm_apex_info {
@@ -106,6 +107,49 @@ struct drm_apex_vm_exec {
 	__u64 timestamp;
 };
 
+#define APEX_DRM_SUBMIT_SYNC_ONLY (1U << 0)
+#define APEX_DRM_MAX_SYNCS 16U
+
+/* A handle belongs to the submitting DRM file. point=0 selects a binary
+ * syncobj; a nonzero point selects a timeline syncobj. flags must be zero.
+ * Input fences must already be published (including timeline points). */
+struct drm_apex_sync {
+	__u32 handle;
+	__u32 flags;
+	__u64 point;
+};
+
+/* Enqueue on the calling file's ordered VM entity. No hardware execution or
+ * dependency wait occurs in the ioctl. The output fences report terminal
+ * errors and are published before return, including on program/data BO
+ * reservations. count is 0..16 for inputs, 1..16 for outputs. A sync-only
+ * submission has flags=SYNC_ONLY and zero program/data/workgroup fields;
+ * otherwise flags=0 and the execution fields match VM_EXEC. Reserved fields
+ * must be zero. An output handle may appear only once in the output array.
+ * Published input fences can wait arbitrarily long while the file is open;
+ * close/unplug cancels waiting jobs with an error fence. */
+struct drm_apex_vm_submit {
+	__u64 program_va;
+	__u64 program_bytes;
+	__u64 data_va;
+	__u64 inputs;  /* userspace array of drm_apex_sync */
+	__u64 outputs; /* userspace array of drm_apex_sync */
+	__u32 workgroups;
+	__u32 flags;
+	__u32 input_count;
+	__u32 output_count;
+	__u64 reserved;
+};
+
+/* Sticky first terminal failure for the calling file's asynchronous queue.
+ * A syncobj wait reports signal, not fence->error; inspect this after a wait
+ * before reporting GPU success. Zero means no failed submission observed.
+ * This query does not clear the error. All fields must be zero on input. */
+struct drm_apex_vm_status {
+	__s32 error;
+	__u32 reserved;
+};
+
 #define DRM_APEX_INFO 0x00
 #define DRM_APEX_GEM_CREATE 0x01
 #define DRM_APEX_GEM_MMAP 0x02
@@ -113,6 +157,8 @@ struct drm_apex_vm_exec {
 #define DRM_APEX_VM_BIND 0x04
 #define DRM_APEX_GEM_TRANSFER 0x05
 #define DRM_APEX_VM_EXEC 0x06
+#define DRM_APEX_VM_SUBMIT 0x07
+#define DRM_APEX_VM_STATUS 0x08
 #define DRM_IOCTL_APEX_INFO DRM_IOR(DRM_COMMAND_BASE + DRM_APEX_INFO, struct drm_apex_info)
 #define DRM_IOCTL_APEX_GEM_CREATE DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_GEM_CREATE, struct drm_apex_gem_create)
 #define DRM_IOCTL_APEX_GEM_MMAP DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_GEM_MMAP, struct drm_apex_gem_mmap)
@@ -120,4 +166,6 @@ struct drm_apex_vm_exec {
 #define DRM_IOCTL_APEX_VM_BIND DRM_IOW(DRM_COMMAND_BASE + DRM_APEX_VM_BIND, struct drm_apex_vm_bind)
 #define DRM_IOCTL_APEX_GEM_TRANSFER DRM_IOW(DRM_COMMAND_BASE + DRM_APEX_GEM_TRANSFER, struct drm_apex_gem_transfer)
 #define DRM_IOCTL_APEX_VM_EXEC DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_VM_EXEC, struct drm_apex_vm_exec)
+#define DRM_IOCTL_APEX_VM_SUBMIT DRM_IOW(DRM_COMMAND_BASE + DRM_APEX_VM_SUBMIT, struct drm_apex_vm_submit)
+#define DRM_IOCTL_APEX_VM_STATUS DRM_IOWR(DRM_COMMAND_BASE + DRM_APEX_VM_STATUS, struct drm_apex_vm_status)
 #endif

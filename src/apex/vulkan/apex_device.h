@@ -43,6 +43,10 @@ struct apex_device {
    enum apex_transport transport;
    struct util_vma_heap va_heap;
    mtx_t va_mutex;
+   /* Submit-thread-owned descriptor retirement and private completion timeline. */
+   uint32_t completion;
+   uint64_t point;
+   struct list_head retired;
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 

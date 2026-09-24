@@ -355,6 +355,13 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
                                   syncobj_wait_flags,
                                   NULL /* first_signaled */);
       }
+      /* Kernel completion failures may not have reached userspace yet. A
+       * driver status callback must also wake waits on unrelated unsignaled
+       * points, including the submit thread's WAIT_AVAILABLE wait. */
+      int wait_errno = errno;
+      if (err && wait_errno == ETIME)
+         vk_device_check_status(device);
+      errno = wait_errno;
       if (!err || vk_device_is_lost_no_report(device) || errno != ETIME ||
           os_time_get_nano() >= abs_timeout_ns)
          break;

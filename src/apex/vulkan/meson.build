@@ -98,6 +98,14 @@ apex_command_test = executable('apex-command-test', 'command_test.c',
   link_language : 'cpp', install : false,
 )
 test('apex-command', apex_command_test, args : [apex_pipeline_spv], suite : ['apex'])
+apex_async_test = executable('apex-async-test', 'async_test.c',
+  include_directories : [inc_include, inc_src, inc_vulkan_util],
+  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  link_with : [apex_pipeline, apex_nir, apex_rs],
+  link_args : ['-Wl,--wrap=ioctl'],
+  link_language : 'cpp', install : false,
+)
+test('apex-async', apex_async_test, args : [apex_pipeline_spv], suite : ['apex'])
 apex_sync_test = executable('apex-sync-test', 'sync_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],

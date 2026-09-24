@@ -55,6 +55,12 @@ struct apex_dispatch {
    uint32_t groups;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
 };
+struct apex_pending_dispatch {
+   struct list_head link;
+   struct apex_bo table;
+   struct drm_apex_vm_submit args;
+   uint64_t point;
+};
 struct apex_command_buffer {
    struct vk_command_buffer vk;
    struct list_head dispatches;
@@ -73,6 +79,16 @@ gem_close(struct apex_device *device, uint32_t handle)
 {
    struct drm_gem_close args = {.handle = handle};
    return ioctl(device->fd, DRM_IOCTL_GEM_CLOSE, &args);
+}
+
+static VkResult
+check_status(struct vk_device *vk)
+{
+   struct apex_device *device = (void *)vk;
+   struct drm_apex_vm_status status = {0};
+   if (ioctl(device->fd, DRM_IOCTL_APEX_VM_STATUS, &status) || status.error)
+      return vk_device_set_lost(vk, "Apex asynchronous terminal failure");
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -849,12 +865,155 @@ out:
    return result;
 }
 
+static void
+free_pending(struct apex_device *device, struct apex_pending_dispatch *pending)
+{
+   list_del(&pending->link);
+   apex_bo_finish(device, &pending->table);
+   free(pending);
+}
+
+static VkResult
+reap_descriptors(struct apex_device *device)
+{
+   uint64_t completed = 0;
+   struct drm_syncobj_timeline_array query = {
+      .handles = (uintptr_t)&device->completion, .points = (uintptr_t)&completed,
+      .count_handles = 1,
+   };
+   if (ioctl(device->fd, DRM_IOCTL_SYNCOBJ_QUERY, &query))
+      return vk_device_set_lost(&device->vk, "Apex completion query failed");
+   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &device->retired, link) {
+      if (pending->point > completed)
+         break;
+      free_pending(device, pending);
+   }
+   return vk_device_check_status(&device->vk);
+}
+
+static VkResult
+enqueue(struct apex_device *device, struct drm_apex_vm_submit *args,
+        const struct drm_apex_sync *inputs, unsigned input_count,
+        const struct drm_apex_sync *outputs, unsigned output_count)
+{
+   args->inputs = input_count ? (uintptr_t)inputs : 0;
+   args->input_count = input_count;
+   args->outputs = (uintptr_t)outputs;
+   args->output_count = output_count;
+   for (;;) {
+      if (vk_device_check_status(&device->vk) != VK_SUCCESS)
+         return VK_ERROR_DEVICE_LOST;
+      if (!ioctl(device->fd, DRM_IOCTL_APEX_VM_SUBMIT, args))
+         return VK_SUCCESS;
+      /* EBUSY means no enqueue or output publication occurred. Other errors
+       * are terminal here; in particular an interrupted ioctl is not retried. */
+      if (errno != EBUSY)
+         return vk_device_set_lost(&device->vk, "Apex asynchronous enqueue failed");
+      os_time_sleep(1000);
+   }
+}
+
+static VkResult
+submit_async(struct apex_device *device, struct vk_queue_submit *submit)
+{
+   struct list_head prepared;
+   list_inithead(&prepared);
+   VkResult result = reap_descriptors(device);
+   if (result != VK_SUCCESS)
+      return result;
+   /* MAP/TRANSFER may wait prior jobs. Prepare every immutable table before
+    * publishing this submission's potentially unsignaled dependencies. */
+   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+      struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
+      list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
+         struct apex_pending_dispatch *pending = calloc(1, sizeof(*pending));
+         if (!pending) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+         }
+         list_addtail(&pending->link, &prepared);
+         result = drm_prepare(device, dispatch, &pending->table);
+         if (result != VK_SUCCESS)
+            goto out;
+         pending->args = (struct drm_apex_vm_submit) {
+            .program_va = dispatch->pipeline->program.va,
+            .program_bytes = dispatch->pipeline->code.size,
+            .data_va = pending->table.va, .workgroups = dispatch->groups,
+         };
+      }
+   }
+   /* The common submit thread already waited for fence publication. Timeline
+    * zero is a no-op, not the binary point-zero interpretation of this UAPI. */
+   for (unsigned i = 0; i < submit->wait_count;) {
+      struct drm_apex_sync inputs[APEX_DRM_MAX_SYNCS];
+      unsigned count = 0;
+      while (i < submit->wait_count && count < ARRAY_SIZE(inputs)) {
+         const struct vk_sync_wait *wait = &submit->waits[i++];
+         if ((wait->sync->flags & VK_SYNC_IS_TIMELINE) && !wait->wait_value)
+            continue;
+         struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(wait->sync);
+         if (!sync) { result = VK_ERROR_FEATURE_NOT_PRESENT; goto out; }
+         inputs[count++] = (struct drm_apex_sync) {
+            .handle = sync->syncobj, .point = wait->wait_value,
+         };
+      }
+      if (!count)
+         continue;
+      struct drm_apex_sync done = {.handle = device->completion, .point = device->point + 1};
+      struct drm_apex_vm_submit args = {.flags = APEX_DRM_SUBMIT_SYNC_ONLY};
+      result = enqueue(device, &args, inputs, count, &done, 1);
+      if (result != VK_SUCCESS)
+         goto out;
+      device->point = done.point;
+   }
+   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &prepared, link) {
+      struct drm_apex_sync done = {.handle = device->completion, .point = device->point + 1};
+      result = enqueue(device, &pending->args, NULL, 0, &done, 1);
+      if (result != VK_SUCCESS)
+         goto out;
+      pending->point = device->point = done.point;
+      list_del(&pending->link);
+      list_addtail(&pending->link, &device->retired);
+   }
+   /* Ordered sync-only jobs join waits and publish all user signals, including
+    * zero-command submissions. Reserve one output for our retirement timeline. */
+   unsigned i = 0;
+   do {
+      struct drm_apex_sync outputs[APEX_DRM_MAX_SYNCS] = {
+         {.handle = device->completion, .point = device->point + 1},
+      };
+      unsigned count = 1;
+      while (i < submit->signal_count && count < ARRAY_SIZE(outputs)) {
+         const struct vk_sync_signal *signal = &submit->signals[i++];
+         struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(signal->sync);
+         if (!sync) { result = VK_ERROR_FEATURE_NOT_PRESENT; goto out; }
+         outputs[count++] = (struct drm_apex_sync) {
+            .handle = sync->syncobj, .point = signal->signal_value,
+         };
+      }
+      struct drm_apex_vm_submit args = {.flags = APEX_DRM_SUBMIT_SYNC_ONLY};
+      result = enqueue(device, &args, NULL, 0, outputs, count);
+      if (result != VK_SUCCESS)
+         goto out;
+      device->point = outputs[0].point;
+   } while (i < submit->signal_count);
+out:
+   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &prepared, link)
+      free_pending(device, pending);
+   return result;
+}
+
 static VkResult
 submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct apex_device *device = (struct apex_device *)queue->base.device;
    if (vk_queue_submit_has_bind(submit) || submit->is_protected)
       return vk_queue_set_lost(queue, "unsupported Apex submission");
+   if (device->completion) {
+      if (submit_async(device, submit) != VK_SUCCESS)
+         return vk_queue_set_lost(queue, "Apex asynchronous submission failed");
+      return VK_SUCCESS;
+   }
    if (vk_sync_wait_many(&device->vk, submit->wait_count, submit->waits,
                         VK_SYNC_WAIT_COMPLETE, UINT64_MAX) != VK_SUCCESS)
       return vk_queue_set_lost(queue, "Apex dependency wait failed");
@@ -879,6 +1038,24 @@ apex_QueueWaitIdle(VkQueue handle)
    return vk_device_is_lost(queue->base.device) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_GetFenceStatus(VkDevice dev, VkFence fence)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   VkResult result = vk_common_GetFenceStatus(dev, fence);
+   VkResult status = vk_device_check_status(&device->vk);
+   return status == VK_SUCCESS ? result : status;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_GetSemaphoreCounterValue(VkDevice dev, VkSemaphore semaphore, uint64_t *value)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   VkResult result = vk_common_GetSemaphoreCounterValue(dev, semaphore, value);
+   VkResult status = vk_device_check_status(&device->vk);
+   return status == VK_SUCCESS ? result : status;
+}
+
 VkResult
 apex_device_init(struct apex_device *device, struct vk_physical_device *physical,
                   const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int fd,
@@ -887,12 +1064,14 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    if (info->queueCreateInfoCount != 1 || info->pQueueCreateInfos[0].queueFamilyIndex ||
        info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   bool async = false;
    if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};
       if (ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 2 ||
           (caps.capabilities & (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM)) !=
           (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM))
          return VK_ERROR_INCOMPATIBLE_DRIVER;
+      async = (caps.capabilities & APEX_DRM_CAP_ASYNC) && physical->supported_sync_types;
    }
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,
@@ -912,6 +1091,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdPushConstants2 = apex_CmdPushConstants2,
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
       .QueueWaitIdle = apex_QueueWaitIdle,
+      .GetFenceStatus = apex_GetFenceStatus,
+      .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
    };
    VkResult result = vk_device_init(&device->vk, physical, &dispatch, info, alloc);
    if (result != VK_SUCCESS)
@@ -919,6 +1100,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->vk.command_buffer_ops = &command_ops;
    device->fd = fd;
    device->transport = transport;
+   device->completion = 0;
+   device->point = 0;
+   list_inithead(&device->retired);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
       vk_device_finish(&device->vk);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -938,13 +1122,19 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       return result;
    }
    device->queue.driver_submit = submit_queue;
+   if (async) {
+      struct drm_syncobj_create create = {0};
+      if (ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &create)) {
+         apex_device_finish(device);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      device->completion = create.handle;
+      device->vk.check_status = check_status;
+   }
    if (physical->supported_sync_types) {
       result = vk_queue_enable_submit_thread(&device->queue);
       if (result != VK_SUCCESS) {
-         vk_queue_finish(&device->queue);
-         util_vma_heap_finish(&device->va_heap);
-         mtx_destroy(&device->va_mutex);
-         vk_device_finish(&device->vk);
+         apex_device_finish(device);
          return result;
       }
    }
@@ -955,6 +1145,13 @@ void
 apex_device_finish(struct apex_device *device)
 {
    vk_queue_finish(&device->queue);
+   /* UNMAP waits queued jobs and retains unsafe backing on a failed drain. */
+   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &device->retired, link)
+      free_pending(device, pending);
+   if (device->completion) {
+      struct drm_syncobj_destroy destroy = {.handle = device->completion};
+      ioctl(device->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+   }
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->va_mutex);
    vk_device_finish(&device->vk);
