@@ -7,6 +7,7 @@
 
 const struct nir_shader_compiler_options apex_nir_options = {
    .lower_fdiv = true, .lower_flrp32 = true,
+   .lower_usub_sat = true,
    .lower_bit_count = true, .lower_bitfield_reverse = true, .lower_mul_high = true,
    .lower_mul_2x32_64 = true,
    .lower_extract_byte = true, .lower_extract_word = true,

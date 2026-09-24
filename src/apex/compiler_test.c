@@ -97,7 +97,7 @@ static void reject(nir_shader *nir, struct apex_compile_result *result,
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 1 || argc == 2);
+   CHECK(argc >= 1 && argc <= 3);
    glsl_type_singleton_init_or_ref();
    struct apex_compile_result a = {0}, b = {0};
    nir_shader *nir = shader(0x13579bdf);
@@ -218,7 +218,7 @@ int main(int argc, char **argv)
    CHECK(apex_from_nir(nir, &a) == 0);
    ralloc_free(nir);
    check_binary(&a, 7);
-   if (argc == 2) {
+   if (argc >= 2) {
       FILE *f = fopen(argv[1], "wb");
       CHECK(f && fwrite(a.data, 1, a.size, f) == a.size);
       CHECK(fclose(f) == 0);
@@ -226,6 +226,25 @@ int main(int argc, char **argv)
    apex_compile_result_finish(&a);
    reject(global_shader(2, 4), &a, "load_global_2x32");
    reject(global_shader(4, 2), &a, "store_global_2x32");
+
+   builder = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &apex_nir_options,
+                                             "Apex unsigned saturating subtraction");
+   builder.shader->info.workgroup_size[0] = 16;
+   builder.shader->info.workgroup_size[1] = builder.shader->info.workgroup_size[2] = 1;
+   nir_def *offset = nir_ishl_imm(&builder, nir_load_local_invocation_index(&builder), 2);
+   nir_def *left = nir_load_ssbo(&builder, 1, 32, nir_imm_int(&builder, 0), offset, .align_mul = 4);
+   nir_def *right = nir_load_ssbo(&builder, 1, 32, nir_imm_int(&builder, 0),
+                                 nir_iadd_imm(&builder, offset, 64), .align_mul = 4);
+   nir_store_ssbo(&builder, nir_usub_sat(&builder, left, right), nir_imm_int(&builder, 0),
+                  nir_iadd_imm(&builder, offset, 128), .align_mul = 4);
+   CHECK(apex_from_nir(builder.shader, &a) == 0);
+   ralloc_free(builder.shader);
+   if (argc == 3) {
+      FILE *f = fopen(argv[2], "wb");
+      CHECK(f && fwrite(a.data, 1, a.size, f) == a.size);
+      CHECK(fclose(f) == 0);
+   }
+   apex_compile_result_finish(&a);
    glsl_type_singleton_decref();
    puts("PASS Apex in-process compiler ownership, diagnostics, metadata and paired global addresses");
    return 0;
