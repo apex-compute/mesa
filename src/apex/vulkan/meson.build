@@ -3,6 +3,50 @@ apex_pipeline = static_library('apex_pipeline', ['apex_pipeline.c', 'apex_device
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_nir],
 )
+apex_entrypoints = custom_target('apex_entrypoints',
+  input : [vk_entrypoints_gen, vk_api_xml],
+  output : ['apex_entrypoints.h', 'apex_entrypoints.c'],
+  command : [prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
+             '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'apex',
+             '--beta', with_vulkan_beta.to_string()],
+  depend_files : vk_entrypoints_gen_depend_files,
+)
+# Uninstalled development driver: instance creation requires APEX_DEVELOPMENT=1.
+apex_instance = static_library('apex_instance', ['apex_instance.c', apex_entrypoints],
+  include_directories : [inc_include, inc_src, inc_vulkan_util],
+  dependencies : [idep_vulkan_runtime_headers, dep_libdrm],
+)
+apex_icd = shared_library('vulkan_apex',
+  link_whole : [apex_instance],
+  link_with : [apex_pipeline, apex_nir, apex_rs],
+  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil, dep_libdrm],
+  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections],
+  link_depends : vulkan_icd_link_depends,
+  link_language : 'cpp', gnu_symbol_visibility : 'hidden', install : false,
+)
+apex_development_icd = custom_target('apex_development_icd',
+  input : [vk_icd_gen, vk_api_xml],
+  output : 'apex_development_icd.@0@.json'.format(host_machine.cpu()),
+  command : [prog_python, '@INPUT0@', '--api-version', '1.4', '--xml', '@INPUT1@',
+             '--sizeof-pointer', sizeof_pointer, '--icd-lib-path', meson.current_build_dir(),
+             '--icd-filename', libname_prefix + 'vulkan_apex.' + libname_suffix,
+             '--out', '@OUTPUT@'],
+  build_by_default : true,
+)
+apex_instance_test = executable('apex-instance-test', ['instance_test.c', apex_entrypoints[0]],
+  include_directories : [inc_include, inc_src, inc_vulkan_util],
+  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil, dep_libdrm, dep_dl],
+  link_with : [apex_instance, apex_pipeline, apex_nir, apex_rs],
+  link_args : ['-Wl,--wrap=drmGetDevices2', '-Wl,--wrap=drmFreeDevices',
+               '-Wl,--wrap=drmGetVersion', '-Wl,--wrap=drmFreeVersion',
+               '-Wl,--wrap=drmGetCap', '-Wl,--wrap=drmSyncobjCreate',
+               '-Wl,--wrap=drmSyncobjDestroy', '-Wl,--wrap=drmSyncobjWait',
+               '-Wl,--wrap=open64', '-Wl,--wrap=ioctl'],
+  link_language : 'cpp', install : false,
+)
+test('apex-instance', apex_instance_test, args : ['--mock'], suite : ['apex'])
+test('apex-loader', apex_instance_test, args : [apex_development_icd],
+  depends : [apex_icd], suite : ['apex'])
 apex_pipeline_spv = custom_target('apex-pipeline-spv',
   input : 'pipeline.spvasm', output : 'pipeline.spv',
   command : [find_program('spirv-as'), '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
