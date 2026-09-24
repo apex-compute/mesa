@@ -16,7 +16,7 @@
    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); \
 } } while (0)
 
-static unsigned calls, input_index, output_index, objects, live, busy, fail;
+static unsigned calls, input_index, output_index, objects, live, fail;
 static uint64_t published, completed;
 static bool terminal, timed_out;
 static struct { uint64_t size, va; bool live; } gems[8];
@@ -82,7 +82,6 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       CHECK(request == DRM_IOCTL_APEX_VM_SUBMIT);
       struct drm_apex_vm_submit *r = arg;
       calls++;
-      if (busy) { busy--; errno = EBUSY; return -1; }
       if (fail) { errno = fail; return -1; }
       CHECK(!r->reserved && r->input_count <= 16 && r->output_count >= 1 && r->output_count <= 16);
       const struct drm_apex_sync *in = (void *)(uintptr_t)r->inputs;
@@ -158,8 +157,8 @@ int main(int argc, char **argv)
    struct vk_sync_type type = vk_drm_syncobj_get_type_from_provider(&provider);
    const struct vk_sync_type *types[] = {&type, NULL};
    physical.supported_sync_types = types;
-   for (unsigned test = 0; test < 8; test++) {
-      calls = input_index = output_index = objects = live = busy = fail = queries = waits = 0;
+   for (unsigned test = 0; test < 9; test++) {
+      calls = input_index = output_index = objects = live = fail = queries = waits = 0;
       published = completed = 0;
       terminal = timed_out = false;
       memset(gems, 0, sizeof(gems));
@@ -177,9 +176,9 @@ int main(int argc, char **argv)
       VkDevice dev = apex_device_to_handle(&device);
       const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
       if (test) {
-         if (test == 1) {
+         if (test == 1 || test == 8) {
             struct vk_queue_submit empty = {0};
-            fail = EINTR;
+            fail = test == 1 ? EINTR : EBUSY;
             CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_ERROR_DEVICE_LOST);
             CHECK(calls == 1 && !published); /* Never duplicate an interrupted enqueue. */
          } else if (test == 2 || test == 3 || test == 5) {
@@ -253,9 +252,8 @@ int main(int argc, char **argv)
          struct vk_command_buffer *command = vk_command_buffer_from_handle(cb);
          struct vk_queue_submit submit = {.wait_count = 19, .waits = in,
             .signal_count = 17, .signals = out, .command_buffer_count = 1, .command_buffers = &command};
-         busy = 1;
          CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_SUCCESS);
-         CHECK(calls == 7 && published == 6 && input_index == 18 && output_index == 17 && live == 3 && !waits);
+         CHECK(calls == 6 && published == 6 && input_index == 18 && output_index == 17 && live == 3 && !waits);
          completed = published;
          struct vk_queue_submit empty = {0};
          CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);

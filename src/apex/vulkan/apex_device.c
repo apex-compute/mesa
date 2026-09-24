@@ -900,17 +900,12 @@ enqueue(struct apex_device *device, struct drm_apex_vm_submit *args,
    args->input_count = input_count;
    args->outputs = (uintptr_t)outputs;
    args->output_count = output_count;
-   for (;;) {
-      if (vk_device_check_status(&device->vk) != VK_SUCCESS)
-         return VK_ERROR_DEVICE_LOST;
-      if (!ioctl(device->fd, DRM_IOCTL_APEX_VM_SUBMIT, args))
-         return VK_SUCCESS;
-      /* EBUSY means no enqueue or output publication occurred. Other errors
-       * are terminal here; in particular an interrupted ioctl is not retried. */
-      if (errno != EBUSY)
-         return vk_device_set_lost(&device->vk, "Apex asynchronous enqueue failed");
-      os_time_sleep(1000);
-   }
+   if (vk_device_check_status(&device->vk) != VK_SUCCESS)
+      return VK_ERROR_DEVICE_LOST;
+   /* Never spin on resource pressure: pending work may depend on this very
+    * submission for progress. An interrupted enqueue is not retried either. */
+   return ioctl(device->fd, DRM_IOCTL_APEX_VM_SUBMIT, args) ?
+      vk_device_set_lost(&device->vk, "Apex asynchronous enqueue failed") : VK_SUCCESS;
 }
 
 static VkResult
