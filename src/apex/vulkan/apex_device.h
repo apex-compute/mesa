@@ -4,6 +4,7 @@
 #include "vk_device.h"
 #include "vk_queue.h"
 #include "vk_descriptor_set_layout.h"
+#include "vk_meta.h"
 #include "util/vma.h"
 
 enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
@@ -45,6 +46,7 @@ struct apex_bo {
 struct apex_device {
    struct vk_device vk;
    struct vk_queue queue;
+   struct vk_meta_device meta;
    int fd;
    enum apex_transport transport;
    struct util_vma_heap va_heap;

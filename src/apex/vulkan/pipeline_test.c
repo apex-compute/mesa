@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_pipeline.h"
 #include "vk_alloc.h"
+#include "vk_buffer.h"
 #include "vk_common_entrypoints.h"
 #include "vk_device.h"
 #include "vk_instance.h"
@@ -292,6 +293,54 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    apex_device_finish(&device);
 }
 
+static void
+test_fill(struct vk_physical_device *physical, const char *output)
+{
+   struct apex_device device;
+   const float priority = 1;
+   VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueCount = 1, .pQueuePriorities = &priority};
+   VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
+   /* Compile/record only. Supply an address without creating a kernel BO. */
+   device.transport = APEX_TRANSPORT_DRM;
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   VkBuffer buffer;
+   VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = 259, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+   CHECK(v->CreateBuffer(dev, &bi, NULL, &buffer) == VK_SUCCESS);
+   vk_buffer_from_handle(buffer)->device_address = 0x1000020200ull;
+   VkCommandPool pool;
+   VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   CHECK(v->CreateCommandPool(dev, &pi, NULL, &pool) == VK_SUCCESS);
+   VkCommandBuffer cmd;
+   VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = pool, .commandBufferCount = 1};
+   CHECK(v->AllocateCommandBuffers(dev, &ai, &cmd) == VK_SUCCESS);
+   VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   v->CmdFillBuffer(cmd, buffer, 4, 196, 0xa5c31e79);
+   v->CmdFillBuffer(cmd, buffer, 256, VK_WHOLE_SIZE, 0xbaadf00d);
+   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+   enum vk_meta_object_key_type key = VK_META_OBJECT_KEY_FILL_BUFFER;
+   VkPipeline handle = vk_meta_lookup_pipeline(&device.meta, &key, sizeof(key));
+   CHECK(handle);
+   struct apex_pipeline *pipeline = apex_pipeline_from_handle(handle);
+   CHECK(!pipeline->descriptor_count && pipeline->push_size == 16);
+   if (output) {
+      char filename[4096];
+      CHECK(snprintf(filename, sizeof(filename), "%s/mesa-fill.apx", output) < sizeof(filename));
+      FILE *f = fopen(filename, "wb");
+      CHECK(f && fwrite(pipeline->code.data, 1, pipeline->code.size, f) == pipeline->code.size && !fclose(f));
+   }
+   v->DestroyCommandPool(dev, pool, NULL);
+   v->DestroyBuffer(dev, buffer, NULL);
+   apex_device_finish(&device);
+}
+
 int main(int argc, char **argv)
 {
    CHECK(argc == 6 || argc == 7);
@@ -319,6 +368,7 @@ int main(int argc, char **argv)
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
    const struct vk_properties properties = {
       .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
+      .maxComputeWorkGroupCount = {1024, 1, 1}, .maxComputeWorkGroupSize = {16, 1, 1},
    };
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
@@ -459,6 +509,7 @@ int main(int argc, char **argv)
    test_descriptors(&physical, argv[4], "mesa-reindex", NULL, true, true);
    test_dispatch(&physical, argv[5], output, false);
    test_dispatch(&physical, argv[5], output, true);
+   test_fill(&physical, output);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex Mesa compute pipelines: specialization, entrypoints, lifetime, failures");

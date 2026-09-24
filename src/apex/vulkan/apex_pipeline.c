@@ -193,16 +193,18 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
    if (i->intrinsic != nir_intrinsic_load_push_constant)
       return false;
    unsigned base = nir_intrinsic_base(i), size = ctx->pipeline->push_size;
-   if (i->def.bit_size != 32 || i->num_components > 4 ||
-       nir_intrinsic_align_mul(i) < 4 || nir_intrinsic_align_offset(i) % 4 ||
+   bool aligned = (nir_intrinsic_align_mul(i) >= 4 && !(nir_intrinsic_align_offset(i) % 4)) ||
+      (nir_src_is_const(i->src[0]) && !(nir_src_as_uint(i->src[0]) % 4));
+   unsigned words = i->def.bit_size / 32;
+   if ((i->def.bit_size != 32 && i->def.bit_size != 64) || i->num_components > 4 || !aligned ||
        base % 4 || base > size) {
       ctx->invalid = true;
       return false;
    }
    unsigned table_bytes = (ctx->pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor);
    b->cursor = nir_before_instr(&i->instr);
-   nir_def *values[4];
-   for (unsigned c = 0; c < i->num_components; c++) {
+   nir_def *values[8];
+   for (unsigned c = 0; c < i->num_components * words; c++) {
       unsigned end = base + c * 4 + 4;
       nir_def *inside = end <= size ? nir_ule_imm(b, i->src[0].ssa, size - end) : nir_imm_false(b);
       nir_push_if(b, inside);
@@ -213,7 +215,44 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
       nir_pop_if(b, NULL);
       values[c] = nir_if_phi(b, value, zero);
    }
+   if (words == 2)
+      for (unsigned c = 0; c < i->num_components; c++)
+         values[c] = nir_pack_64_2x32(b, nir_vec2(b, values[c * 2], values[c * 2 + 1]));
    nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
+static bool
+lower_global(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   bool store = i->intrinsic == nir_intrinsic_store_global;
+   if (!store && i->intrinsic != nir_intrinsic_load_global)
+      return false;
+   struct descriptor_lowering *ctx = data;
+   if ((store ? i->src[0].ssa->bit_size : i->def.bit_size) != 32 ||
+       i->num_components > 4 || nir_intrinsic_align_mul(i) < 4 ||
+       nir_intrinsic_align_offset(i) % 4) {
+      ctx->invalid = true;
+      return false;
+   }
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *address = nir_unpack_64_2x32(b, i->src[store ? 1 : 0].ssa);
+   nir_def *values[4];
+   for (unsigned c = 0; c < i->num_components; c++) {
+      if (store && !(nir_intrinsic_write_mask(i) & (1u << c)))
+         continue;
+      nir_def *component = nir_build_addr_iadd(b, address, nir_address_format_2x32bit_global,
+                                              nir_var_mem_global, nir_imm_int(b, c * 4));
+      if (store)
+         nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), component,
+                               .align_mul = 4, .access = nir_intrinsic_access(i));
+      else
+         values[c] = nir_load_global_2x32(b, 1, 32, component,
+                                         .align_mul = 4, .access = nir_intrinsic_access(i));
+   }
+   if (!store)
+      nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
    nir_instr_remove(&i->instr);
    return true;
 }
@@ -296,6 +335,8 @@ create_compute_pipeline(struct vk_device *device,
       nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
       nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
       nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
+      nir_shader_intrinsics_pass(nir, lower_global, nir_metadata_none, &ctx);
+      NIR_PASS(_, nir, nir_lower_int64);
       NIR_PASS(_, nir, nir_lower_system_values);
       nir_shader_intrinsics_pass(nir, lower_dispatch, nir_metadata_control_flow, &ctx);
       if (ctx.invalid)

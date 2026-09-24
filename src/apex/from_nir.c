@@ -12,6 +12,7 @@ const struct nir_shader_compiler_options apex_nir_options = {
    .lower_extract_byte = true, .lower_extract_word = true,
    .lower_bitfield_extract = true, .lower_bitfield_insert = true,
    .lower_ifind_msb = true, .lower_find_lsb = true,
+   .lower_int64_options = nir_lower_iadd64 | nir_lower_conv64,
 };
 
 static uint32_t value(nir_def *def, unsigned component)

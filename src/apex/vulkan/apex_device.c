@@ -280,7 +280,8 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
    if (info->flags || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
-       (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)))
+       (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
@@ -318,6 +319,7 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       buffer->memory = mem;
       buffer->offset = infos[i].memoryOffset;
+      buffer->vk.device_address = mem->bo.va + buffer->offset;
    }
    return VK_SUCCESS;
 }
@@ -330,7 +332,11 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    *out = VK_NULL_HANDLE;
    const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags =
       vk_find_struct_const(info->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
-   if (info->flags & ~VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
+   /* Buffer meta kernels have an empty push-descriptor layout. */
+   VkDescriptorSetLayoutCreateFlags supported = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+   if (!info->bindingCount)
+      supported |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+   if (info->flags & ~supported)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    unsigned count = 0, descriptors = 0;
    bool dynamic = false, update_after_bind = false;
@@ -705,6 +711,30 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
                   dispatch->sets[s]->refs++;
             list_addtail(&dispatch->link, &cmd->dispatches);
          }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdFillBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                   VkDeviceSize size, uint32_t data)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, dst, buffer);
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   if (device->transport != APEX_TRANSPORT_DRM) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   VkDeviceAddressRangeKHR range = vk_device_address_range(&dst->vk, offset, size);
+   /* VK_WHOLE_SIZE leaves the final incomplete word untouched. */
+   range.size &= ~3ull;
+   if (!range.size)
+      return;
+   struct apex_pipeline *pipeline = cmd->pipeline;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   memcpy(push, cmd->push, sizeof(push));
+   vk_meta_fill_memory(&cmd->vk, &device->meta, &range, dst->vk.address_flags, data);
+   cmd->pipeline = pipeline;
+   memcpy(cmd->push, push, sizeof(push));
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1105,6 +1135,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdBindPipeline = apex_CmdBindPipeline, .CmdBindDescriptorSets2 = apex_CmdBindDescriptorSets2,
       .CmdPushConstants2 = apex_CmdPushConstants2,
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
+      .CmdFillBuffer = apex_CmdFillBuffer,
       .QueueWaitIdle = apex_QueueWaitIdle,
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
@@ -1136,6 +1167,16 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       vk_device_finish(&device->vk);
       return result;
    }
+   result = vk_meta_device_init(&device->vk, &device->meta);
+   if (result != VK_SUCCESS) {
+      vk_queue_finish(&device->queue);
+      util_vma_heap_finish(&device->va_heap);
+      mtx_destroy(&device->va_mutex);
+      vk_device_finish(&device->vk);
+      return result;
+   }
+   for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; i++)
+      device->meta.buffer_access.optimal_wg_size[i] = 16;
    device->queue.driver_submit = submit_queue;
    if (async) {
       struct drm_syncobj_create create = {0};
@@ -1167,6 +1208,7 @@ apex_device_finish(struct apex_device *device)
       struct drm_syncobj_destroy destroy = {.handle = device->completion};
       ioctl(device->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
    }
+   vk_meta_device_finish(&device->vk, &device->meta);
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->va_mutex);
    vk_device_finish(&device->vk);
