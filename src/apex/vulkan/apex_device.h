@@ -20,11 +20,18 @@ struct apex_binding_layout {
 struct apex_set_layout {
    struct vk_descriptor_set_layout vk;
    uint32_t binding_count, descriptor_count;
-   uint32_t counts[4]; /* VkDescriptorType minus UNIFORM_BUFFER */
+   uint32_t counts[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC + 1];
    struct apex_binding_layout bindings[];
 };
 struct apex_buffer_descriptor {
    uint32_t low, high, bytes, reserved;
+};
+struct apex_image_descriptor {
+   uint32_t low, high, width, height, depth, row_stride, slice_stride, reserved;
+};
+union apex_descriptor {
+   struct apex_buffer_descriptor buffer;
+   struct apex_image_descriptor image;
 };
 
 /* Immutable trailer after descriptors and push constants, in little endian. */

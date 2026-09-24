@@ -143,23 +143,25 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(r->data_va == mock.gems[table].va && mock.gems[table].live);
       CHECK(mock.gems[table].uploads == 1);
       const uint32_t *rows = (const void *)mock.gems[table].local;
-      for (unsigned i = 0; i < 4; i++) CHECK(!rows[i]); /* unused binding 0 */
-      const uint32_t *row = rows + 4; /* shader binding 7, element 0 */
+      for (unsigned i = 0; i < 8; i++) CHECK(!rows[i]); /* unused binding 0 */
+      const uint32_t *row = rows + 8; /* shader binding 7, element 0 */
       uint64_t va = (uint64_t)util_le32_to_cpu(row[1]) << 32 | util_le32_to_cpu(row[0]);
       CHECK(va == mock.gems[1].va + starts[d] * 4);
-      CHECK(util_le32_to_cpu(row[2]) == sizeof(mock.payload) && !row[3]);
-      const uint32_t *extra = rows + 8;
+      CHECK(util_le32_to_cpu(row[2]) == sizeof(mock.payload));
+      for (unsigned i = 3; i < 8; i++) CHECK(!row[i]);
+      const uint32_t *extra = rows + 16;
       uint64_t addr = (uint64_t)util_le32_to_cpu(extra[1]) << 32 | util_le32_to_cpu(extra[0]);
       CHECK(addr == mock.gems[1].va + (d == 1 ? 48 : 1088) * 4);
-      CHECK(util_le32_to_cpu(extra[2]) == sizeof(mock.payload) && !extra[3]);
-      for (unsigned i = 12; i < 28; i++) CHECK(!rows[i]); /* unused set + sentinel */
+      CHECK(util_le32_to_cpu(extra[2]) == sizeof(mock.payload));
+      for (unsigned i = 3; i < 8; i++) CHECK(!extra[i]);
+      for (unsigned i = 24; i < 56; i++) CHECK(!rows[i]); /* unused set + sentinel */
       CHECK(mock.pipelines[p]->push_size == 256);
       for (unsigned i = 0; i < 64; i++) {
          uint32_t expected = i < 4 ? 0 : 0xa5100000 + i * 37;
          if (d == 1 && i == 6) expected = 0xc0ffee00;
          if (d == 1 && i == 7) expected = 0xabad1dea;
          if (d >= 2) expected = i == 63 ? 0xdecafbad : 0;
-         CHECK(rows[28 + i] == expected);
+         CHECK(rows[56 + i] == expected);
       }
       CHECK(r->workgroups == 1);
       CHECK(!memcmp(mock.gems[h].local, mock.pipelines[p]->code.data, r->program_bytes));

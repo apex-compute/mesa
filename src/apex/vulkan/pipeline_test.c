@@ -58,6 +58,7 @@ static void
 test_descriptors(struct vk_physical_device *physical, const char *path,
                  const char *fixture, const char *output, bool dynamic, bool pointers)
 {
+   bool images = !strcmp(fixture, "mesa-images");
    struct apex_device device;
    const float priority = 1;
    const VkDeviceQueueCreateInfo queue_info = {
@@ -94,7 +95,8 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    for (unsigned s = 0; s < 2; s++) {
       VkDescriptorSetLayoutBinding bindings[] = {
          {.binding = s ? 5 : 3, .descriptorCount = s ? 2 : 1,
-          .descriptorType = storage, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+          .descriptorType = s && images ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : storage,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
          {.binding = 2, .descriptorCount = 2, .descriptorType = pointers ? storage : uniform,
           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       };
@@ -105,15 +107,16 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
       CHECK(v->CreateDescriptorSetLayout(dev, &info, NULL, &sets[s]) == VK_SUCCESS);
    }
    const VkDescriptorPoolSize sizes[] = {
-      {storage, 7}, {uniform, 2},
+      {storage, 7}, {uniform, images ? 6 : 2},
       /* Static descriptors cannot satisfy a dynamic descriptor budget. */
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dynamic ? 100 : 0},
+      {images ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       images ? 2 : dynamic ? 100 : 0},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, dynamic ? 100 : 0},
    };
    const VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-      .maxSets = 4, .poolSizeCount = pointers ? 1 : dynamic ? 4 : 2, .pPoolSizes = sizes,
+      .maxSets = 4, .poolSizeCount = pointers ? 1 : images ? 3 : dynamic ? 4 : 2, .pPoolSizes = sizes,
    };
    VkDescriptorPool pool;
    CHECK(v->CreateDescriptorPool(dev, &pool_info, NULL, &pool) == VK_SUCCESS);
@@ -364,8 +367,8 @@ test_fill(struct vk_physical_device *physical, const char *output)
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 8 || argc == 9);
-   const char *output = argc == 9 ? argv[8] : NULL;
+   CHECK(argc == 9 || argc == 10);
+   const char *output = argc == 10 ? argv[9] : NULL;
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -530,6 +533,7 @@ int main(int argc, char **argv)
    test_descriptors(&physical, argv[4], "mesa-reindex", NULL, true, true);
    test_descriptors(&physical, argv[7], "mesa-scalar", output, false, false);
    test_descriptors(&physical, argv[7], "mesa-scalar", NULL, true, false);
+   test_descriptors(&physical, argv[8], "mesa-images", output, false, false);
    test_dispatch(&physical, argv[5], output, false, false);
    test_dispatch(&physical, argv[5], output, true, false);
    test_dispatch(&physical, argv[6], output, false, true);

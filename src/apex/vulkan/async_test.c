@@ -116,19 +116,20 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
          CHECK(!r->flags && !r->input_count && r->output_count == 1);
          CHECK(r->program_va == gems[3].va && r->data_va == gems[table].va && r->workgroups == 1);
          CHECK(gems[1].uploads == 1 && gems[2].uploads == 1);
-         uint32_t words[10];
+         uint32_t words[14];
          CHECK(pread(fd, words, sizeof(words), table * 4096) == sizeof(words));
-         for (unsigned i = 0; i < 10; i++) words[i] = util_le32_to_cpu(words[i]);
-         CHECK(((uint64_t)words[5] << 32 | words[4]) == gems[region + 1].va);
-         CHECK(((uint64_t)words[7] << 32 | words[6]) == 0x30000004 + region * 64);
-         CHECK(words[8] == (region ? 60 : 52));
+         for (unsigned i = 0; i < 14; i++) words[i] = util_le32_to_cpu(words[i]);
+         for (unsigned i = 0; i < 8; i++) CHECK(!words[i]);
+         CHECK(((uint64_t)words[9] << 32 | words[8]) == gems[region + 1].va);
+         CHECK(((uint64_t)words[11] << 32 | words[10]) == 0x30000004 + region * 64);
+         CHECK(words[12] == (region ? 60 : 52));
          dispatch_index++;
       } else {
          CHECK(!r->flags && !r->input_count && r->output_count == 1);
          CHECK(objects == (grid_test ? 14 : 3) && live == objects && r->program_va == gems[1].va);
          CHECK(r->data_va == gems[dispatch_index + 2].va);
          uint32_t parameters[6];
-         CHECK(pread(fd, parameters, sizeof(parameters), (dispatch_index + 2) * 4096 + 16) == sizeof(parameters));
+         CHECK(pread(fd, parameters, sizeof(parameters), (dispatch_index + 2) * 4096 + 32) == sizeof(parameters));
          for (unsigned i = 0; i < 6; i++) parameters[i] = util_le32_to_cpu(parameters[i]);
          if (grid_test && dispatch_index < 12) {
             CHECK(r->workgroups == (dispatch_index % 2 ? 1 : grid_limit));

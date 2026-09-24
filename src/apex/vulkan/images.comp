@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: MIT
+#version 450
+layout(local_size_x = 16) in;
+layout(set = 1, binding = 5, r32ui) coherent uniform uimage2DArray images[2];
+layout(set = 0, binding = 3, std430) buffer Output { uint values[]; } result;
+void main()
+{
+   uint lane = gl_LocalInvocationIndex;
+   uint which = lane & 1u;
+   ivec3 coord = ivec3(int(lane / 2u) - 1, int(lane % 3u), int(lane % 2u));
+   uvec4 before = imageLoad(images[which], coord);
+   uint old = imageAtomicAdd(images[which], coord, 19u + lane);
+   uint swapped = imageAtomicCompSwap(images[which], coord,
+                                     before.x + 19u + lane, 1000u + lane);
+   memoryBarrierImage();
+   uvec4 after = imageLoad(images[which], coord);
+   imageStore(images[which], coord, uvec4(after.x + 37u, 91u, 92u, 93u));
+   ivec3 extent = imageSize(images[which]);
+   uint i = lane * 12u;
+   result.values[i + 0u] = before.x;
+   result.values[i + 1u] = before.y;
+   result.values[i + 2u] = before.z;
+   result.values[i + 3u] = before.w;
+   result.values[i + 4u] = old;
+   result.values[i + 5u] = swapped;
+   result.values[i + 6u] = after.x;
+   result.values[i + 7u] = after.w;
+   result.values[i + 8u] = uint(extent.x);
+   result.values[i + 9u] = uint(extent.y);
+   result.values[i + 10u] = uint(extent.z);
+   result.values[i + 11u] = imageLoad(images[which + 2u], coord).x;
+}
