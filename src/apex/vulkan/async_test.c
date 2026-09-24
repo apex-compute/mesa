@@ -254,10 +254,12 @@ int main(int argc, char **argv)
             .signal_count = 17, .signals = out, .command_buffer_count = 1, .command_buffers = &command};
          CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_SUCCESS);
          CHECK(calls == 6 && published == 6 && input_index == 18 && output_index == 17 && live == 3 && !waits);
-         completed = published;
          struct vk_queue_submit empty = {0};
          CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
-         CHECK(live == 1 && published == 7); /* Tables retired, program retained. */
+         CHECK(live == 3 && published == 7); /* Later submissions cannot retire pending tables. */
+         completed = published;
+         CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
+         CHECK(live == 1 && published == 8); /* Tables retired, program retained. */
          completed = published;
          v->DestroyCommandPool(dev, pool, NULL);
          v->DestroyPipeline(dev, pipeline, NULL);
