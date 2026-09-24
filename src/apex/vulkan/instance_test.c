@@ -172,8 +172,40 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(device == VK_NULL_HANDLE && fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
    device_info.pEnabledFeatures = NULL;
+   const char *memory_extensions[] = {
+      VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
+   };
+   device_info.enabledExtensionCount = 2;
+   device_info.ppEnabledExtensionNames = memory_extensions;
    int opens = open_count;
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_SUCCESS);
+   PFN_vkGetBufferMemoryRequirements2KHR get_requirements =
+      (PFN_vkGetBufferMemoryRequirements2KHR)gdpa(device, "vkGetBufferMemoryRequirements2KHR");
+   PFN_vkCreateBuffer create_buffer = (PFN_vkCreateBuffer)gdpa(device, "vkCreateBuffer");
+   PFN_vkDestroyBuffer destroy_buffer = (PFN_vkDestroyBuffer)gdpa(device, "vkDestroyBuffer");
+   CHECK(get_requirements && create_buffer && destroy_buffer);
+   const VkBufferCreateInfo buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 65,
+      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+   };
+   VkBuffer buffer;
+   CHECK(create_buffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
+   const VkBufferMemoryRequirementsInfo2 buffer_req = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2, .buffer = buffer,
+   };
+   VkMemoryDedicatedRequirements dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+      .prefersDedicatedAllocation = VK_TRUE, .requiresDedicatedAllocation = VK_TRUE,
+   };
+   VkMemoryRequirements2 requirements = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dedicated,
+   };
+   get_requirements(device, &buffer_req, &requirements);
+   CHECK(requirements.memoryRequirements.size == 128 &&
+         requirements.memoryRequirements.alignment == 64 &&
+         requirements.memoryRequirements.memoryTypeBits == 1);
+   CHECK(!dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation);
+   destroy_buffer(device, buffer, NULL);
    int fd1 = last_fd;
    VkDevice second;
    CHECK(create_device(physical, &device_info, NULL, &second) == VK_SUCCESS);

@@ -198,8 +198,17 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->memoryTypeIndex || info->pNext)
+   if (info->memoryTypeIndex)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   vk_foreach_struct_const(sType, ext, info->pNext) {
+      if (sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      const VkMemoryDedicatedAllocateInfo *dedicated = ext;
+      if (dedicated->image)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      /* Buffers use the same storage for dedicated and ordinary allocations.
+       * Valid dedicated bindings select this buffer at offset zero. */
+   }
    if (!info->allocationSize || info->allocationSize > 64 * 1024 * 1024)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    struct apex_memory *mem = vk_device_memory_create(&device->vk, info, alloc, sizeof(*mem));
@@ -323,6 +332,12 @@ apex_GetDeviceBufferMemoryRequirements(VkDevice dev,
    out->memoryRequirements = (VkMemoryRequirements) {
       .size = align64(info->pCreateInfo->size, 64), .alignment = 64, .memoryTypeBits = 1,
    };
+   VkMemoryDedicatedRequirements *dedicated =
+      vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
+   if (dedicated) {
+      dedicated->prefersDedicatedAllocation = VK_FALSE;
+      dedicated->requiresDedicatedAllocation = VK_FALSE;
+   }
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL

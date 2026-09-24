@@ -194,6 +194,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    struct vk_physical_device_dispatch_table dispatch;
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &apex_physical_device_entrypoints, true);
    const struct vk_device_extension_table extensions = {
+      .KHR_get_memory_requirements2 = true,
+      .KHR_dedicated_allocation = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
    };

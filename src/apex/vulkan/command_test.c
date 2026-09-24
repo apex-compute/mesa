@@ -774,10 +774,37 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    v->UnmapMemory(dev, memory);
    v->FreeMemory(dev, memory, NULL);
    if (fault < 0 && transport == APEX_TRANSPORT_DRM) {
-      /* Free all objects, then reuse the address with a non-page-sized BO. */
+      /* Free all objects, then reuse the address for a dedicated odd-sized
+       * buffer. Query outputs start true to catch an untouched pNext chain. */
+      VkBufferCreateInfo odd_buffer = buffer_info;
+      odd_buffer.size = 4097;
+      VkBuffer buffer;
+      CHECK(v->CreateBuffer(dev, &odd_buffer, NULL, &buffer) == VK_SUCCESS);
+      VkMemoryDedicatedRequirements dedicated_req = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+         .prefersDedicatedAllocation = VK_TRUE, .requiresDedicatedAllocation = VK_TRUE,
+      };
+      VkMemoryRequirements2 req = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dedicated_req,
+      };
+      const VkBufferMemoryRequirementsInfo2 req_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2, .buffer = buffer,
+      };
+      v->GetBufferMemoryRequirements2(dev, &req_info, &req);
+      CHECK(req.memoryRequirements.size == 4160 && req.memoryRequirements.alignment == 64 &&
+            req.memoryRequirements.memoryTypeBits == 1);
+      CHECK(!dedicated_req.prefersDedicatedAllocation && !dedicated_req.requiresDedicatedAllocation);
+      VkMemoryRequirements legacy_req;
+      v->GetBufferMemoryRequirements(dev, buffer, &legacy_req);
+      CHECK(legacy_req.size == 4160 && legacy_req.alignment == 64 && legacy_req.memoryTypeBits == 1);
+      const VkMemoryDedicatedAllocateInfo dedicated = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buffer,
+      };
       VkMemoryAllocateInfo odd = mem_info;
-      odd.allocationSize = 4097;
+      odd.pNext = &dedicated;
+      odd.allocationSize = 4160;
       CHECK(v->AllocateMemory(dev, &odd, NULL, &memory) == VK_SUCCESS);
+      CHECK(v->BindBufferMemory(dev, buffer, memory, 0) == VK_SUCCESS);
       CHECK(v->MapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mock.mapped) == VK_SUCCESS);
       for (unsigned i = 0; i < odd.allocationSize; i++)
          CHECK(((uint8_t *)mock.mapped)[i] == 0);
@@ -786,6 +813,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          CHECK(mock.gems[9].va == (1ull << 39) - 8192);
       }
       v->UnmapMemory(dev, memory);
+      v->DestroyBuffer(dev, buffer, NULL);
       v->FreeMemory(dev, memory, NULL);
    }
    apex_device_finish(&device);
