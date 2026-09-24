@@ -198,8 +198,13 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_dedicated_allocation = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
+      .EXT_robustness2 = true,
    };
-   const struct vk_features features = {.timelineSemaphore = true};
+   const struct vk_features features = {
+      .timelineSemaphore = true,
+      .robustBufferAccess = true,
+      .robustBufferAccess2 = true,
+   };
    const struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,
       .vendorID = 0x10ee, .deviceID = 0xa15e,
@@ -225,6 +230,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .minUniformBufferOffsetAlignment = 4,
       .minStorageBufferOffsetAlignment = 4,
       .nonCoherentAtomSize = 1,
+      /* Descriptor bounds are checked without rounding, per 32-bit component. */
+      .robustStorageBufferAccessSizeAlignment = 1,
+      .robustUniformBufferAccessSizeAlignment = 1,
       .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
    };

@@ -110,7 +110,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    info.enabledExtensionCount = 1;
    info.ppEnabledExtensionNames = &unsupported;
    CHECK(create(&info, NULL, &instance) == VK_ERROR_EXTENSION_NOT_PRESENT);
-   info.enabledExtensionCount = 0;
+   const char *properties_extension = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+   info.ppEnabledExtensionNames = &properties_extension;
    CHECK(create(&info, NULL, &instance) == VK_SUCCESS);
    PROC(DestroyInstance, destroy);
    PROC(EnumeratePhysicalDevices, enumerate);
@@ -143,6 +144,27 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
          props.limits.maxComputeWorkGroupCount[1] == 1 &&
          props.limits.maxComputeWorkGroupInvocations == 16);
    CHECK(strstr(props.deviceName, "non-conformant"));
+   PROC(GetPhysicalDeviceFeatures2KHR, get_features2);
+   VkPhysicalDeviceRobustness2FeaturesEXT robustness = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+      .robustImageAccess2 = VK_TRUE, .nullDescriptor = VK_TRUE,
+   };
+   VkPhysicalDeviceFeatures2 features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &robustness,
+   };
+   get_features2(physical, &features);
+   CHECK(features.features.robustBufferAccess && robustness.robustBufferAccess2);
+   CHECK(!robustness.robustImageAccess2 && !robustness.nullDescriptor);
+   PROC(GetPhysicalDeviceProperties2KHR, get_properties2);
+   VkPhysicalDeviceRobustness2PropertiesEXT robust_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT,
+   };
+   VkPhysicalDeviceProperties2 properties2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &robust_props,
+   };
+   get_properties2(physical, &properties2);
+   CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 1 &&
+         robust_props.robustUniformBufferAccessSizeAlignment == 1);
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
    get_memory(physical, &mem);
@@ -174,9 +196,15 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    device_info.pEnabledFeatures = NULL;
    const char *memory_extensions[] = {
       VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
+      VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
    };
-   device_info.enabledExtensionCount = 2;
+   device_info.enabledExtensionCount = 3;
    device_info.ppEnabledExtensionNames = memory_extensions;
+   device_info.pNext = &features;
+   robustness.nullDescriptor = VK_TRUE;
+   CHECK(create_device(physical, &device_info, NULL, &device) == VK_ERROR_FEATURE_NOT_PRESENT);
+   CHECK(device == VK_NULL_HANDLE && fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
+   robustness.nullDescriptor = VK_FALSE;
    int opens = open_count;
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_SUCCESS);
    PFN_vkGetBufferMemoryRequirements2KHR get_requirements =
