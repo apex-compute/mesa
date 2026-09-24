@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
+#include "apex_pipeline.h"
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
@@ -18,9 +19,10 @@
 
 static unsigned calls, input_index, output_index, objects, live, fail, fail_at;
 static uint64_t published, completed;
-static bool terminal, timed_out, failed;
-static struct { uint64_t size, va; bool live; } gems[8];
-static unsigned queries, waits;
+static bool terminal, timed_out, failed, grid_test;
+static struct { uint64_t size, va; bool live; } gems[32];
+static unsigned queries, waits, dispatch_index;
+static unsigned grid_limit;
 
 int __wrap_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...)
@@ -49,7 +51,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       errno = EIO; /* A successful status query need not preserve wait errno. */
    } else if (request == DRM_IOCTL_APEX_GEM_CREATE) {
       struct drm_apex_gem_create *r = arg;
-      CHECK(!published && objects < 7); /* All preparation precedes waits. */
+      CHECK(!published && objects < 31); /* All preparation precedes waits. */
       r->handle = ++objects;
       gems[objects].size = r->size;
       gems[objects].live = true;
@@ -100,9 +102,23 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       if (r->flags == APEX_DRM_SUBMIT_SYNC_ONLY) {
          CHECK(!r->program_va && !r->program_bytes && !r->data_va && !r->workgroups);
       } else {
-         CHECK(!r->flags && !r->input_count && r->output_count == 1 && r->workgroups == 1);
-         CHECK(objects == 3 && live == 3 && r->program_va == gems[1].va);
-         CHECK(r->data_va == gems[published == 3 ? 2 : 3].va);
+         CHECK(!r->flags && !r->input_count && r->output_count == 1);
+         CHECK(objects == (grid_test ? 14 : 3) && live == objects && r->program_va == gems[1].va);
+         CHECK(r->data_va == gems[dispatch_index + 2].va);
+         uint32_t parameters[6];
+         CHECK(pread(fd, parameters, sizeof(parameters), (dispatch_index + 2) * 4096 + 16) == sizeof(parameters));
+         for (unsigned i = 0; i < 6; i++) parameters[i] = util_le32_to_cpu(parameters[i]);
+         if (grid_test && dispatch_index < 12) {
+            CHECK(r->workgroups == (dispatch_index % 2 ? 1 : grid_limit));
+            CHECK(parameters[0] == (dispatch_index % 2 ? grid_limit : 0));
+            CHECK(parameters[1] == dispatch_index / 2 % 2 && parameters[2] == dispatch_index / 4);
+            CHECK(parameters[3] == grid_limit + 1 && parameters[4] == 2 && parameters[5] == 3);
+         } else {
+            CHECK(r->workgroups == (grid_test ? 2 : 1));
+            CHECK(!parameters[0] && !parameters[1] && !parameters[2]);
+            CHECK(parameters[3] == (grid_test ? 2 : 1) && parameters[4] == 1 && parameters[5] == 1);
+         }
+         dispatch_index++;
          char magic[4];
          CHECK(pread(fd, magic, 4, 4096) == 4 && !memcmp(magic, "APX2", 4));
       }
@@ -159,10 +175,12 @@ int main(int argc, char **argv)
    struct vk_sync_type type = vk_drm_syncobj_get_type_from_provider(&provider);
    const struct vk_sync_type *types[] = {&type, NULL};
    physical.supported_sync_types = types;
-   for (unsigned test = 0; test < 10; test++) {
-      calls = input_index = output_index = objects = live = fail = fail_at = queries = waits = 0;
+   for (unsigned test = 0; test < 12; test++) {
+      calls = input_index = output_index = objects = live = fail = fail_at = queries = waits = dispatch_index = 0;
       published = completed = 0;
       terminal = timed_out = failed = false;
+      grid_test = test >= 10;
+      grid_limit = test == 11 ? 3 : 1024;
       memset(gems, 0, sizeof(gems));
       int fd = memfd_create("apex-async", MFD_CLOEXEC);
       CHECK(fd >= 0);
@@ -227,18 +245,37 @@ int main(int argc, char **argv)
             .layout = layout, .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "wide"}};
          CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
+         /* Exercise a smaller per-pipeline private-storage capacity. The
+          * compiler fixture separately checks deriving it from padded lanes. */
+         CHECK(apex_pipeline_from_handle(pipeline)->max_workgroups == 1024);
+         apex_pipeline_from_handle(pipeline)->max_workgroups = grid_limit;
          VkCommandPool pool;
-         VkCommandPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+         VkCommandPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT};
          CHECK(v->CreateCommandPool(dev, &ci, NULL, &pool) == VK_SUCCESS);
          VkCommandBuffer cb;
          VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = pool, .commandBufferCount = 1};
          CHECK(v->AllocateCommandBuffers(dev, &ca, &cb) == VK_SUCCESS);
          VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+         if (grid_test) {
+            for (unsigned axis = 0; axis < 3; axis++) {
+               CHECK(v->BeginCommandBuffer(cb, &bi) == VK_SUCCESS);
+               v->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+               v->CmdDispatch(cb, axis == 0 ? 65536 : 1, axis == 1 ? 65536 : 1, axis == 2 ? 65536 : 1);
+               CHECK(v->EndCommandBuffer(cb) == VK_ERROR_FEATURE_NOT_PRESENT);
+               CHECK(v->ResetCommandBuffer(cb, 0) == VK_SUCCESS);
+            }
+         }
          CHECK(v->BeginCommandBuffer(cb, &bi) == VK_SUCCESS);
          v->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-         v->CmdDispatch(cb, 1, 1, 1);
-         v->CmdDispatch(cb, 1, 1, 1);
+         if (grid_test) {
+            v->CmdDispatch(cb, 0, 2, 3);
+            v->CmdDispatch(cb, 5, 0, 3);
+            v->CmdDispatch(cb, 5, 2, 0);
+         }
+         v->CmdDispatch(cb, grid_test ? grid_limit + 1 : 1, grid_test ? 2 : 1, grid_test ? 3 : 1);
+         v->CmdDispatch(cb, grid_test ? 2 : 1, 1, 1);
          CHECK(v->EndCommandBuffer(cb) == VK_SUCCESS);
          struct vk_drm_syncobj syncs[40];
          struct vk_sync_wait in[19];
@@ -261,13 +298,20 @@ int main(int argc, char **argv)
             CHECK(calls == 4 && published == 3 && !completed && live == 2);
          } else {
             CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_SUCCESS);
-            CHECK(calls == 6 && published == 6 && input_index == 18 && output_index == 17 && live == 3 && !waits);
+            unsigned total = grid_test ? 17 : 6;
+            CHECK(calls == total && published == total && input_index == 18 && output_index == 17 &&
+                  live == (grid_test ? 14 : 3) && !waits);
+            /* Reset/reuse cannot change a pending submission's tables. */
+            CHECK(v->ResetCommandBuffer(cb, 0) == VK_SUCCESS);
+            CHECK(v->BeginCommandBuffer(cb, &bi) == VK_SUCCESS);
+            v->CmdDispatch(cb, 0, 1, 1);
+            CHECK(v->EndCommandBuffer(cb) == VK_SUCCESS);
             struct vk_queue_submit empty = {0};
             CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
-            CHECK(live == 3 && published == 7); /* Later submissions cannot retire pending tables. */
+            CHECK(live == (grid_test ? 14 : 3) && published == total + 1);
             completed = published;
             CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
-            CHECK(live == 1 && published == 8); /* Tables retired, program retained. */
+            CHECK(live == 1 && published == total + 2); /* Tables retired, program retained. */
             completed = published;
          }
          v->DestroyCommandPool(dev, pool, NULL);

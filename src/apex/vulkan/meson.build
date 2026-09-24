@@ -74,6 +74,10 @@ apex_reindex_spv = custom_target('apex-reindex-spv',
   input : 'descriptor_reindex.spvasm', output : 'descriptor_reindex.spv',
   command : [find_program('spirv-as'), '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
 )
+apex_dispatch_spv = custom_target('apex-dispatch-spv',
+  input : 'dispatch.comp', output : 'dispatch.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+)
 apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
@@ -88,8 +92,10 @@ test('apex-atomics-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_atomics_spv], suite : ['apex'])
 test('apex-reindex-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_reindex_spv], suite : ['apex'])
+test('apex-dispatch-spirv', find_program('spirv-val'),
+  args : ['--target-env', 'vulkan1.1', apex_dispatch_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
-  args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv], suite : ['apex'])
+  args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv], suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],

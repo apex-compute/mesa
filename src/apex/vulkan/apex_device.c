@@ -53,6 +53,7 @@ struct apex_dispatch {
    struct apex_pipeline *pipeline;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint32_t groups;
+   struct apex_dispatch_parameters parameters;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
 };
 struct apex_pending_dispatch {
@@ -676,24 +677,34 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    if (!x || !y || !z)
       return;
-   if (x > 1024 || y != 1 || z != 1 || !cmd->pipeline ||
-       (!cmd->pipeline->layout && !cmd->sets[0])) {
+   if (x > 65535 || y > 65535 || z > 65535 || !cmd->pipeline ||
+       (!cmd->pipeline->layout && (!cmd->sets[0] || x > 1024 || y != 1 || z != 1))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   struct apex_dispatch *dispatch = vk_alloc(&cmd->vk.pool->alloc, sizeof(*dispatch), 8,
-                                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!dispatch) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-      return;
-   }
-   *dispatch = (struct apex_dispatch) {.pipeline = cmd->pipeline, .groups = x};
-   memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
-   memcpy(dispatch->push, cmd->push, sizeof(dispatch->push));
-   for (unsigned s = 0; s < ARRAY_SIZE(dispatch->sets); s++)
-      if (dispatch->sets[s])
-         dispatch->sets[s]->refs++;
-   list_addtail(&dispatch->link, &cmd->dispatches);
+   /* Bound each row/chunk by queue count and padded private-storage capacity.
+    * Each retains the API grid and its origin. */
+   uint32_t limit = cmd->pipeline->max_workgroups;
+   for (uint32_t gz = 0; gz < z; gz++)
+      for (uint32_t gy = 0; gy < y; gy++)
+         for (uint32_t gx = 0; gx < x; gx += limit) {
+            struct apex_dispatch *dispatch = vk_alloc(&cmd->vk.pool->alloc, sizeof(*dispatch), 8,
+                                                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+            if (!dispatch) {
+               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+               return;
+            }
+            *dispatch = (struct apex_dispatch) {
+               .pipeline = cmd->pipeline, .groups = MIN2(x - gx, limit),
+               .parameters = {.base = {gx, gy, gz}, .groups = {x, y, z}},
+            };
+            memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
+            memcpy(dispatch->push, cmd->push, sizeof(dispatch->push));
+            for (unsigned s = 0; s < ARRAY_SIZE(dispatch->sets); s++)
+               if (dispatch->sets[s])
+                  dispatch->sets[s]->refs++;
+            list_addtail(&dispatch->link, &cmd->dispatches);
+         }
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -721,11 +732,17 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
    if (!pipeline->layout)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    size_t push_offset = (pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor);
-   size_t bytes = push_offset + pipeline->push_size;
+   size_t parameters_offset = push_offset + pipeline->push_size;
+   size_t bytes = parameters_offset + sizeof(struct apex_dispatch_parameters);
    struct apex_buffer_descriptor *rows = calloc(1, bytes);
    if (!rows)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    memcpy((uint8_t *)rows + push_offset, dispatch->push, pipeline->push_size);
+   struct apex_dispatch_parameters *parameters = (void *)((uint8_t *)rows + parameters_offset);
+   for (unsigned axis = 0; axis < 3; axis++) {
+      parameters->base[axis] = util_cpu_to_le32(dispatch->parameters.base[axis]);
+      parameters->groups[axis] = util_cpu_to_le32(dispatch->parameters.groups[axis]);
+   }
    VkResult result = VK_ERROR_DEVICE_LOST;
    for (unsigned s = 0; s < pipeline->layout->set_count; s++) {
       const struct apex_set_layout *layout = (const void *)pipeline->layout->set_layouts[s];

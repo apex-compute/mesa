@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: MIT
+#version 450
+layout(local_size_x = 3, local_size_y = 2, local_size_z = 2) in;
+layout(set = 0, binding = 0, std430) buffer Output { uvec4 values[]; } result;
+layout(constant_id = 0) const bool grid_output = false;
+void main()
+{
+   uint i = gl_LocalInvocationIndex * 4;
+   if (grid_output)
+      i += 48 * (gl_WorkGroupID.x + gl_NumWorkGroups.x *
+                 (gl_WorkGroupID.y + gl_NumWorkGroups.y * gl_WorkGroupID.z));
+   result.values[i] = uvec4(gl_WorkGroupID, gl_LocalInvocationIndex);
+   result.values[i + 1] = uvec4(gl_GlobalInvocationID, 0x12345678u);
+   result.values[i + 2] = uvec4(gl_NumWorkGroups, 0xabcdef01u);
+   result.values[i + 3] = uvec4(gl_LocalInvocationID, gl_WorkGroupSize.x *
+                              gl_WorkGroupSize.y * gl_WorkGroupSize.z);
+}

@@ -26,6 +26,12 @@ struct apex_buffer_descriptor {
    uint32_t low, high, bytes, reserved;
 };
 
+/* Immutable trailer after descriptors and push constants, in little endian. */
+struct apex_dispatch_parameters {
+   uint32_t base[3];
+   uint32_t groups[3];
+};
+
 struct apex_bo {
    void *map;
    uint64_t va, size;

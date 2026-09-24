@@ -155,6 +155,38 @@ apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
 }
 
 static bool
+lower_dispatch(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   struct descriptor_lowering *ctx = data;
+   bool count = i->intrinsic == nir_intrinsic_load_num_workgroups;
+   bool global = i->intrinsic == nir_intrinsic_load_global_invocation_id;
+   if (!count && !global && i->intrinsic != nir_intrinsic_load_workgroup_id)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   unsigned offset = (ctx->pipeline->descriptor_count + 1) * sizeof(struct apex_buffer_descriptor)
+      + ctx->pipeline->push_size;
+   offset += count ? offsetof(struct apex_dispatch_parameters, groups) :
+                     offsetof(struct apex_dispatch_parameters, base);
+   nir_def *words[3];
+   for (unsigned axis = 0; axis < 3; axis++)
+      words[axis] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
+                                nir_imm_int(b, offset + axis * 4), .align_mul = 4);
+   nir_def *replacement = nir_vec(b, words, 3);
+   /* NIR's WorkgroupID system-value lowering already adds the native base
+    * to load_workgroup_id. GlobalInvocationID needs that addition here. */
+   if (global) {
+      replacement = nir_iadd(b, replacement, nir_load_base_workgroup_id(b, 32));
+      nir_def *size = nir_imm_ivec3(b, b->shader->info.workgroup_size[0],
+         b->shader->info.workgroup_size[1], b->shader->info.workgroup_size[2]);
+      replacement = nir_iadd(b, nir_imul(b, replacement, size),
+                            nir_load_local_invocation_id(b));
+   }
+   nir_def_rewrite_uses(&i->def, replacement);
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
+static bool
 lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
    struct descriptor_lowering *ctx = data;
@@ -264,16 +296,30 @@ create_compute_pipeline(struct vk_device *device,
       nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
       nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
       nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
+      NIR_PASS(_, nir, nir_lower_system_values);
+      nir_shader_intrinsics_pass(nir, lower_dispatch, nir_metadata_control_flow, &ctx);
       if (ctx.invalid)
          goto unsupported_layout;
    }
    int failed = apex_from_nir(nir, &pipeline->code);
+   uint64_t invocations = nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
+      nir->info.workgroup_size[2];
    ralloc_free(nir);
    if (failed) {
       result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                         "Apex compute: %s", pipeline->code.diagnostic);
       apex_pipeline_destroy(device, &pipeline->vk, alloc);
       return result;
+   }
+   uint32_t private_bytes;
+   memcpy(&private_bytes, pipeline->code.data + 28, sizeof(private_bytes));
+   uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
+   /* GPUVM reserves the low 2 MiB for this dispatch's padded private data. */
+   pipeline->max_workgroups = pipeline->layout && extent ?
+      MIN2(1024, (2 * 1024 * 1024) / extent) : 1024;
+   if (!pipeline->max_workgroups) {
+      apex_pipeline_destroy(device, &pipeline->vk, alloc);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    *out = apex_pipeline_to_handle(pipeline);
    return VK_SUCCESS;

@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { \
@@ -14,7 +15,9 @@
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 3 && geteuid() != 0);
+   CHECK((argc == 3 || (argc == 4 && !strcmp(argv[3], "--dispatch"))) && geteuid() != 0);
+   const int grid = argc == 4;
+   const unsigned word_count = grid ? 262144 : 1024;
    CHECK(!setenv("VK_DRIVER_FILES", argv[1], 1));
    CHECK(!setenv("APEX_DEVELOPMENT", "1", 1));
    void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -89,7 +92,7 @@ int main(int argc, char **argv)
    VkQueue queue;
    GetDeviceQueue(device, 0, 0, &queue);
    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-      .size = 4096, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+      .size = word_count * 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
    VkBuffer buffer;
    CHECK(CreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
    VkMemoryRequirements requirements;
@@ -102,7 +105,7 @@ int main(int argc, char **argv)
    CHECK(BindBufferMemory(device, buffer, memory, 0) == VK_SUCCESS);
    uint32_t *words;
    CHECK(MapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, (void **)&words) == VK_SUCCESS);
-   for (unsigned i = 0; i < 1024; i++) words[i] = 0xca000000 + i * 37;
+   for (unsigned i = 0; i < word_count; i++) words[i] = 0xca000000 + i * 37;
    VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                 .memory = memory, .size = VK_WHOLE_SIZE};
    CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
@@ -125,7 +128,8 @@ int main(int argc, char **argv)
       .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &set_layout};
    VkDescriptorSet set;
    CHECK(AllocateDescriptorSets(device, &set_allocate, &set) == VK_SUCCESS);
-   VkDescriptorBufferInfo descriptor = {.buffer = buffer, .offset = 256, .range = 128};
+   VkDescriptorBufferInfo descriptor = {.buffer = buffer, .offset = 256,
+      .range = grid ? (word_count - 64) * 4 : 128};
    VkWriteDescriptorSet write = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = set, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
       .pBufferInfo = &descriptor};
@@ -142,17 +146,18 @@ int main(int argc, char **argv)
    VkShaderModule shader;
    CHECK(CreateShaderModule(device, &shader_info, NULL, &shader) == VK_SUCCESS);
    free(spirv);
-   VkSpecializationMapEntry entries[] = {{7, 0, 4}, {29, 4, 4}};
-   const uint32_t constants[] = {101, 7};
-   VkSpecializationInfo specialization = {.mapEntryCount = 2, .pMapEntries = entries,
+   VkSpecializationMapEntry entries[] = {{7, 0, 4}, {29, 4, 4}, {0, 8, 4}};
+   const uint32_t constants[] = {101, 7, 1};
+   VkSpecializationInfo specialization = {.mapEntryCount = grid ? 3 : 2, .pMapEntries = entries,
       .dataSize = sizeof(constants), .pData = constants};
    VkComputePipelineCreateInfo pipeline_info = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main",
+                .pSpecializationInfo = grid ? &specialization : NULL},
       .layout = layout};
    VkPipeline pipelines[2];
    CHECK(CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipelines[0]) == VK_SUCCESS);
-   pipeline_info.stage.pName = "alternate";
+   pipeline_info.stage.pName = grid ? "main" : "alternate";
    pipeline_info.stage.pSpecializationInfo = &specialization;
    CHECK(CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipelines[1]) == VK_SUCCESS);
    DestroyShaderModule(device, shader, NULL);
@@ -168,26 +173,40 @@ int main(int argc, char **argv)
    VkFence fence;
    CHECK(CreateFence(device, &fence_info, NULL, &fence) == VK_SUCCESS);
    for (unsigned pass = 0; pass < 2; pass++) {
+      const unsigned x = grid ? (pass ? 1025 : 2) : 1;
+      const unsigned y = grid && !pass ? 3 : 1;
+      const unsigned z = grid && !pass ? 4 : 1;
       CHECK(BeginCommandBuffer(buffers[pass], &begin) == VK_SUCCESS);
       CmdBindPipeline(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[pass]);
       CmdBindDescriptorSets(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
-      CmdDispatch(buffers[pass], 1, 1, 1);
+      CmdDispatch(buffers[pass], x, y, z);
       CHECK(EndCommandBuffer(buffers[pass]) == VK_SUCCESS);
       VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                              .commandBufferCount = 1, .pCommandBuffers = &buffers[pass]};
       CHECK(QueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
-      CHECK(WaitForFences(device, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS);
+      CHECK(WaitForFences(device, 1, &fence, VK_TRUE, grid ? 120000000000ull : 10000000000ull) == VK_SUCCESS);
       CHECK(InvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
-      for (unsigned i = 0; i < 1024; i++) {
+      for (unsigned i = 0; i < word_count; i++) {
          uint32_t expected = 0xca000000 + i * 37;
-         if (i >= 64 && i < 80) expected = 37 + (i - 64) * 3;
-         if (pass && i >= 64 && i < 76) expected = 112 + (i - 64) * 7;
+         if (grid && i >= 64 && i < 64 + x * y * z * 192) {
+            unsigned group = (i - 64) / 192, lane = (i - 64) / 16 % 12;
+            unsigned gx = group % x, gy = group / x % y, gz = group / (x * y);
+            unsigned lx = lane % 3, ly = lane / 3 % 2, lz = lane / 6;
+            const uint32_t values[] = {gx, gy, gz, lane, gx * 3 + lx, gy * 2 + ly,
+               gz * 2 + lz, 0x12345678, x, y, z, 0xabcdef01, lx, ly, lz, 12};
+            expected = values[(i - 64) % 16];
+         } else if (!grid) {
+            if (i >= 64 && i < 80) expected = 37 + (i - 64) * 3;
+            if (pass && i >= 64 && i < 76) expected = 112 + (i - 64) * 7;
+         }
          if (words[i] != expected)
             fprintf(stderr, "pass %u word %u: 0x%08x != 0x%08x\n", pass, i, words[i], expected);
          CHECK(words[i] == expected);
       }
       /* Without a flush these writes must not replace retained LOCAL results. */
-      for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
+      if (!grid) for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
+      if (grid) printf("PASS Apex loader dispatch: %ux%ux%u groups, local 3x2x2, %u words/guards\n",
+                       x, y, z, word_count);
       CHECK(ResetFences(device, 1, &fence) == VK_SUCCESS);
    }
    CHECK(QueueWaitIdle(queue) == VK_SUCCESS);
@@ -204,6 +223,6 @@ int main(int argc, char **argv)
    DestroyDevice(device, NULL);
    DestroyInstance(instance, NULL);
    CHECK(!dlclose(loader));
-   puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
+   if (!grid) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;
 }
