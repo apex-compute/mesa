@@ -42,7 +42,7 @@ static struct {
 static const unsigned starts[] = {48, 1088, 48, 48};
 static const unsigned biases[] = {37, 101, 112, 112};
 static const unsigned scales[] = {3, 7, 7, 7};
-static const unsigned invocations[] = {16, 16, 12, 12};
+static unsigned invocations[] = {16, 16, 12, 12};
 static int sync_fd = -1;
 
 int __real_ioctl(int fd, unsigned long request, ...);
@@ -307,6 +307,19 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    uint32_t *code = malloc(size);
    CHECK(code);
    memcpy(code, spirv, size);
+   if (invocations[0] != 16) {
+      unsigned changed = 0;
+      for (unsigned pos = 5; pos < size / 4; pos += code[pos] >> 16) {
+         CHECK(code[pos] >> 16);
+         if ((code[pos] & 0xffff) == SpvOpExecutionMode &&
+             code[pos+2] == SpvExecutionModeLocalSize && code[pos+3] == 16) {
+            CHECK(code[pos+4] == 1 && code[pos+5] == 1);
+            code[pos+3] = invocations[0];
+            changed++;
+         }
+      }
+      CHECK(changed == 1);
+   }
    if (tables) {
       unsigned changed = 0;
       for (unsigned pos = 5; pos < size / 4; pos += code[pos] >> 16) {
@@ -383,6 +396,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       if (i == 2) pipeline_info.stage.pName = "alternate";
       CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipelines[i]) == VK_SUCCESS);
       mock.pipelines[i] = apex_pipeline_from_handle(pipelines[i]);
+      if (i < 2 && invocations[0] != 16)
+         CHECK(!memcmp(mock.pipelines[i]->code.data, "APX2", 4));
    }
    v->DestroyShaderModule(dev, module, NULL);
    const VkMemoryAllocateInfo mem_info = {
@@ -690,8 +705,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       for (unsigned i = 0; i < ARRAY_SIZE(mock.expected); i++) {
          uint32_t expected = 0xd00d0000 + i;
          if (i == 2047) expected = 0x12345678;
-         if (i >= 48 && i < 64) expected = 37 + 3 * (i - 48);
-         if (i >= 1088 && i < 1104) expected = 101 + 7 * (i - 1088);
+         if (i >= 48 && i < 48 + invocations[0]) expected = 37 + 3 * (i - 48);
+         if (i >= 1088 && i < 1088 + invocations[1]) expected = 101 + 7 * (i - 1088);
          CHECK(mock.mapped[i] == expected);
       }
       /* An unflushed shadow write must not overwrite retained GPU data. */
@@ -736,8 +751,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
          uint32_t expected = 0xd00d0000 + i;
          if (i == 2047) expected = 0x12345678;
          if (i >= 48 && i < 60) expected = 112 + 7 * (i - 48);
-         if (i >= 60 && i < 64) expected = 37 + 3 * (i - 48);
-         if (i >= 1088 && i < 1104) expected = 101 + 7 * (i - 1088);
+         if (i >= 60 && i < 48 + invocations[0]) expected = 37 + 3 * (i - 48);
+         if (i >= 1088 && i < 1088 + invocations[1]) expected = 101 + 7 * (i - 1088);
          CHECK(mock.mapped[i] == expected);
       }
       if (mocked) CHECK(mock.dispatch == (transport == APEX_TRANSPORT_DRM ? 4 : 3) && mock.step == 0);
@@ -783,7 +798,8 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
 int main(int argc, char **argv)
 {
    CHECK(argc == 2 || argc == 3 ||
-         (argc == 4 && (!strcmp(argv[2], "--drm") || !strcmp(argv[2], "--syncobj"))));
+         (argc == 4 && (!strcmp(argv[2], "--drm") || !strcmp(argv[2], "--syncobj") ||
+                       !strcmp(argv[2], "--drm-multiwave"))));
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -809,7 +825,8 @@ int main(int argc, char **argv)
    (void)vk_physical_device_to_handle(&physical);
    int fd = argc > 2 ? open(argv[argc - 1], O_RDWR | O_CLOEXEC) : -1;
    CHECK(argc == 2 || fd >= 0);
-   enum apex_transport transport = argc == 4 && !strcmp(argv[2], "--drm") ?
+   bool multiwave = argc == 4 && !strcmp(argv[2], "--drm-multiwave");
+   enum apex_transport transport = argc == 4 && (!strcmp(argv[2], "--drm") || multiwave) ?
       APEX_TRANSPORT_DRM : APEX_TRANSPORT_NATIVE;
    mock.drm_fd = -1;
    struct vk_sync_type sync_type;
@@ -838,6 +855,16 @@ int main(int argc, char **argv)
       }
    }
    run(&physical, spirv, size, fd, -1, transport, false);
+   if (multiwave || argc == 2) {
+      const unsigned widths[] = {17, 32, 256};
+      for (unsigned i = 0; i < ARRAY_SIZE(widths); i++) {
+         invocations[0] = invocations[1] = widths[i];
+         run(&physical, spirv, size, fd, -1, APEX_TRANSPORT_DRM, false);
+      }
+      invocations[0] = invocations[1] = 16;
+      printf("PASS Apex Mesa APX2 %s: 17/32/256 invocations, 12 dispatches, later-wave values and retained tails, 2048 words/guards\n",
+             multiwave ? "DRM GPUVM execution" : "mock transport (not GPU execution)");
+   }
    if (fd >= 0) {
       CHECK(close(fd) == 0);
       printf("PASS Apex Mesa %s command submission: %u dispatches, 2 buffers, 2048 words/guards\n",

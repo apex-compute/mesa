@@ -47,6 +47,17 @@ apex_instance_test = executable('apex-instance-test', ['instance_test.c', apex_e
 test('apex-instance', apex_instance_test, args : ['--mock'], suite : ['apex'])
 test('apex-loader', apex_instance_test, args : [apex_development_icd],
   depends : [apex_icd], suite : ['apex'])
+# Hardware execution is explicit, never part of the ordinary host suite.
+apex_application_test = executable('apex-application-test', 'application_test.c',
+  include_directories : inc_include, dependencies : dep_dl, install : false,
+)
+apex_application_spv = custom_target('apex-application-spv',
+  input : 'pipeline.spvasm', output : 'application.spv',
+  command : [find_program('spirv-as'), '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
+  build_by_default : true,
+)
+test('apex-application-spirv', find_program('spirv-val'),
+  args : ['--target-env', 'vulkan1.0', apex_application_spv], suite : ['apex'])
 apex_pipeline_spv = custom_target('apex-pipeline-spv',
   input : 'pipeline.spvasm', output : 'pipeline.spv',
   command : [find_program('spirv-as'), '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
