@@ -8,8 +8,11 @@
 #define APEX_DRM_CAP_EXEC (1U << 1)
 #define APEX_DRM_CAP_GPUVM (1U << 2)
 #define APEX_DRM_CAP_ASYNC (1U << 3)
+#define APEX_DRM_CAP_PRIME_COHERENT (1U << 4)
 
-/* Output only. Capabilities describe this DRM interface, not the raw device. */
+/* Output only. PRIME_COHERENT distinguishes GPUVM implementations that
+ * refresh shared dma-buf backing before execution and copy writable results
+ * back before completion. Capabilities describe this interface, not raw PCI. */
 struct drm_apex_info {
 	__u32 version;
 	__u32 capabilities;
@@ -79,9 +82,11 @@ struct drm_apex_vm_bind {
 #define APEX_DRM_TRANSFER_TO_LOCAL 1U
 #define APEX_DRM_TRANSFER_FROM_LOCAL 2U
 
-/* Explicitly copy one byte range between a GEM object's shmem CPU view and
- * its GEM-owned LOCAL backing. TO_LOCAL is a CPU flush/upload; FROM_LOCAL is
- * a CPU invalidate/download. Bytes outside the range are unchanged. */
+/* Private Apex GEM: explicitly copy one byte range between shmem and LOCAL;
+ * TO_LOCAL uploads and FROM_LOCAL downloads without changing other bytes.
+ * Once exported, shared shmem is canonical and either direction only waits
+ * and rechecks reservation fences (no copy). Foreign imports return
+ * EOPNOTSUPP; use their exporter for CPU access and synchronization. */
 struct drm_apex_gem_transfer {
 	__u32 handle;
 	__u32 direction;
@@ -93,9 +98,11 @@ struct drm_apex_gem_transfer {
 
 /* Synchronous dispatch through the calling DRM file's persistent VM. The
  * exact program extent must be covered by an RX mapping and pass APX
- * admission; data_va must select an RW mapping. This operation performs no
- * implicit shmem/LOCAL transfer. flags and output fields must be zero on
- * entry. Status values match drm_apex_exec. */
+ * admission; data_va must select an RW mapping. Private BOs retain explicit
+ * transfer semantics. Shared BOs refresh whole-object canonical dma-buf
+ * backing into LOCAL before execution and copy writable results back after
+ * drain, before returning. flags and output fields must be zero on entry.
+ * Status values match drm_apex_exec. */
 struct drm_apex_vm_exec {
 	__u64 program_va;
 	__u64 program_bytes;
@@ -122,8 +129,11 @@ struct drm_apex_sync {
 /* Enqueue on the calling file's ordered VM entity. No hardware execution or
  * dependency wait occurs in the ioctl. The output fences report terminal
  * errors and are published before return, including on program/data BO
- * reservations. count is 0..16 for inputs, 1..16 for outputs. A sync-only
- * submission has flags=SYNC_ONLY and zero program/data/workgroup fields;
+ * reservations. Execution refreshes shared canonical backing and copies
+ * writable results back before signaling completion; private BOs keep their
+ * explicit transfer semantics. count is 0..16 for inputs, 1..16 for outputs.
+ * A sync-only submission copies no BO storage; it has flags=SYNC_ONLY and
+ * zero program/data/workgroup fields;
  * otherwise flags=0 and the execution fields match VM_EXEC. Reserved fields
  * must be zero. One underlying output syncobj may appear only once, even
  * through two distinct handles imported from the same opaque syncobj fd.
