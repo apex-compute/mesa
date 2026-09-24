@@ -1226,9 +1226,13 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
                   const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int fd,
                   enum apex_transport transport)
 {
-   if (info->queueCreateInfoCount != 1 || info->pQueueCreateInfos[0].queueFamilyIndex ||
+   if (info->queueCreateInfoCount != 1)
+      return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "Apex requires one queue create info, received %u", info->queueCreateInfoCount);
+   if (info->pQueueCreateInfos[0].queueFamilyIndex ||
        info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "Apex requires one unflagged queue from family 0");
    bool async = false;
    if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};

@@ -210,6 +210,15 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(device == VK_NULL_HANDLE && fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
    robustness.nullDescriptor = VK_FALSE;
+   /* CTS's compute-only robustness helper can duplicate the sole family.
+    * Reject that queue list independently of the supported feature chain. */
+   const VkDeviceQueueCreateInfo duplicate_queues[] = {queue, queue};
+   device_info.queueCreateInfoCount = 2;
+   device_info.pQueueCreateInfos = duplicate_queues;
+   CHECK(create_device(physical, &device_info, NULL, &device) == VK_ERROR_FEATURE_NOT_PRESENT);
+   CHECK(device == VK_NULL_HANDLE && fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
+   device_info.queueCreateInfoCount = 1;
+   device_info.pQueueCreateInfos = &queue;
    int opens = open_count;
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_SUCCESS);
    PFN_vkGetBufferMemoryRequirements2KHR get_requirements =
