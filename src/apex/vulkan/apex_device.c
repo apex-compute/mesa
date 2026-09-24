@@ -5,6 +5,7 @@
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
+#include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
 #include "vk_common_entrypoints.h"
@@ -799,13 +800,15 @@ static const struct vk_command_buffer_ops command_ops = {
 static VkResult
 create_command_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level, struct vk_command_buffer **out)
 {
-   if (level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_command_buffer *cmd = vk_zalloc(&pool->alloc, sizeof(*cmd), 8,
                                               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!cmd)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   VkResult result = vk_command_buffer_init(pool, &cmd->vk, &command_ops, level);
+   VkResult result = vk_command_buffer_init_with_params(&cmd->vk,
+      &(struct vk_command_buffer_init_params) {
+         .pool = pool, .ops = &command_ops, .level = level,
+         .needs_cmd_queue = level == VK_COMMAND_BUFFER_LEVEL_SECONDARY,
+      });
    if (result != VK_SUCCESS) {
       vk_free(&pool->alloc, cmd);
       return result;
@@ -1561,7 +1564,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
          return VK_ERROR_INCOMPATIBLE_DRIVER;
       async = (caps.capabilities & APEX_DRM_CAP_ASYNC) && physical->supported_sync_types;
    }
-   const struct vk_device_dispatch_table dispatch = {
+   const struct vk_device_entrypoint_table entrypoints = {
       .CreateComputePipelines = apex_CreateComputePipelines,
       .AllocateMemory = apex_AllocateMemory, .FreeMemory = apex_FreeMemory,
       .MapMemory2 = apex_MapMemory2, .UnmapMemory2 = apex_UnmapMemory2,
@@ -1593,9 +1596,19 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
    };
+   /* Secondary commands own Mesa's copied argument queue. ExecuteCommands
+    * replays it through the real table into primary dispatch/upload snapshots. */
+   vk_device_dispatch_table_from_entrypoints(&device->cmd_dispatch, &entrypoints, true);
+   vk_device_dispatch_table_from_entrypoints(&device->cmd_dispatch,
+                                             &vk_common_device_entrypoints, false);
+   struct vk_device_dispatch_table dispatch;
+   vk_device_dispatch_table_from_entrypoints(&dispatch,
+      &vk_cmd_enqueue_unless_primary_device_entrypoints, true);
+   vk_device_dispatch_table_from_entrypoints(&dispatch, &entrypoints, false);
    VkResult result = vk_device_init(&device->vk, physical, &dispatch, info, alloc);
    if (result != VK_SUCCESS)
       return result;
+   device->vk.command_dispatch_table = &device->cmd_dispatch;
    device->vk.command_buffer_ops = &command_ops;
    device->fd = fd;
    device->transport = transport;

@@ -52,6 +52,7 @@ struct apex_bo {
  */
 struct apex_device {
    struct vk_device vk;
+   struct vk_device_dispatch_table cmd_dispatch;
    struct vk_queue queue;
    struct vk_meta_device meta;
    int fd;

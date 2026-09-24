@@ -310,7 +310,7 @@ __wrap_ioctl(int fd, unsigned long request, ...)
 
 static void
 run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int fd, int fault,
-    enum apex_transport transport, bool dynamic)
+    enum apex_transport transport, bool dynamic, bool secondary)
 {
    memset(&mock, 0, sizeof(mock));
    mock.fault = fault;
@@ -595,6 +595,23 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->EndCommandBuffer(cmd) == VK_ERROR_FEATURE_NOT_PRESENT);
       CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
       CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   }
+   VkCommandBuffer primary = cmd, secondary_cmd = VK_NULL_HANDLE;
+   const VkCommandBufferInheritanceInfo inheritance = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+   };
+   const VkCommandBufferBeginInfo secondary_begin = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .pInheritanceInfo = &inheritance,
+   };
+   if (secondary) {
+      VkCommandBufferAllocateInfo alloc = command_alloc;
+      alloc.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+      CHECK(v->AllocateCommandBuffers(dev, &alloc, &secondary_cmd) == VK_SUCCESS);
+      cmd = secondary_cmd;
+      CHECK(v->BeginCommandBuffer(cmd, &secondary_begin) == VK_SUCCESS);
+   }
+   if (dynamic) {
+      uint32_t offsets[] = {4, 64, 0, 12, 0, 64};
       if (fault == 215) offsets[1] = 196; /* Range ends four bytes beyond the buffer. */
       if (fault == 216) offsets[1] = UINT32_MAX - 3;
       if (fault == 217) offsets[1] = 65;
@@ -665,6 +682,11 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[2]);
    v->CmdDispatch(cmd, 0, 1, 1);
    CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+   if (secondary) {
+      v->CmdExecuteCommands(primary, 1, &secondary_cmd);
+      CHECK(v->EndCommandBuffer(primary) == VK_SUCCESS);
+      cmd = primary;
+   }
    writes[0].pBufferInfo = &bindings[0];
    writes[0].dstBinding = tables ? 7 : 0;
    if (!dynamic) v->UpdateDescriptorSets(dev, 1, writes, 0, NULL);
@@ -774,6 +796,11 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->EndCommandBuffer(cmd) == VK_ERROR_FEATURE_NOT_PRESENT);
       CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
       CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+      if (secondary) {
+         CHECK(v->ResetCommandBuffer(secondary_cmd, 0) == VK_SUCCESS);
+         cmd = secondary_cmd;
+         CHECK(v->BeginCommandBuffer(cmd, &secondary_begin) == VK_SUCCESS);
+      }
       v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[2]);
       if (dynamic) {
          const uint32_t offsets[] = {28, 64, 0};
@@ -788,6 +815,11 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       }
       v->CmdDispatch(cmd, 1, 1, 1);
       CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+      if (secondary) {
+         v->CmdExecuteCommands(primary, 1, &secondary_cmd);
+         CHECK(v->EndCommandBuffer(primary) == VK_SUCCESS);
+         cmd = primary;
+      }
       CHECK(v->QueueSubmit2(queue, 1, &submit, fence) == VK_SUCCESS);
       CHECK(v->DeviceWaitIdle(dev) == VK_SUCCESS);
       if (sync_fd >= 0) {
@@ -798,6 +830,14 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       if (transport == APEX_TRANSPORT_DRM) {
          VkSubmitInfo2 repeat = submit;
          repeat.waitSemaphoreInfoCount = repeat.signalSemaphoreInfoCount = 0;
+         if (secondary) {
+            /* Replay must leave the secondary queue reusable after the
+             * primary's dispatch snapshots have been discarded. */
+            CHECK(v->ResetCommandBuffer(primary, 0) == VK_SUCCESS);
+            CHECK(v->BeginCommandBuffer(primary, &begin) == VK_SUCCESS);
+            v->CmdExecuteCommands(primary, 1, &secondary_cmd);
+            CHECK(v->EndCommandBuffer(primary) == VK_SUCCESS);
+         }
          CHECK(v->QueueSubmit2(queue, 1, &repeat, VK_NULL_HANDLE) == VK_SUCCESS);
          CHECK(v->DeviceWaitIdle(dev) == VK_SUCCESS);
       }
@@ -1137,12 +1177,12 @@ int main(int argc, char **argv)
          return 77;
       }
    }
-   run(&physical, spirv, size, fd, -1, transport, false);
+   run(&physical, spirv, size, fd, -1, transport, false, false);
    if (multiwave || argc == 2) {
       const unsigned widths[] = {17, 32, 256};
       for (unsigned i = 0; i < ARRAY_SIZE(widths); i++) {
          invocations[0] = invocations[1] = widths[i];
-         run(&physical, spirv, size, fd, -1, APEX_TRANSPORT_DRM, false);
+         run(&physical, spirv, size, fd, -1, APEX_TRANSPORT_DRM, false, false);
       }
       invocations[0] = invocations[1] = 16;
       printf("PASS Apex Mesa APX2 %s: 17/32/256 invocations, 12 dispatches, later-wave values and retained tails, 2048 words/guards\n",
@@ -1156,13 +1196,16 @@ int main(int argc, char **argv)
    } else {
       const int faults[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 99, 100, 101};
       for (unsigned i = 0; i < ARRAY_SIZE(faults); i++)
-         run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE, false);
+         run(&physical, spirv, size, -1, faults[i], APEX_TRANSPORT_NATIVE, false, false);
       const int drm_faults[] = {-1, 100, 101, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213};
       for (unsigned i = 0; i < ARRAY_SIZE(drm_faults); i++)
-         run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM, false);
+         run(&physical, spirv, size, -1, drm_faults[i], APEX_TRANSPORT_DRM, false, false);
       const int dynamic_faults[] = {-1, 214, 215, 216, 217};
       for (unsigned i = 0; i < ARRAY_SIZE(dynamic_faults); i++)
-         run(&physical, spirv, size, -1, dynamic_faults[i], APEX_TRANSPORT_DRM, true);
+         run(&physical, spirv, size, -1, dynamic_faults[i], APEX_TRANSPORT_DRM, true, false);
+      run(&physical, spirv, size, -1, -1, APEX_TRANSPORT_DRM, false, true);
+      run(&physical, spirv, size, -1, -1, APEX_TRANSPORT_DRM, true, true);
+      puts("PASS Apex secondary replay: pipeline, descriptor/dynamic offsets, push snapshots, reset/reuse, 2048 words/guards (mock transport)");
       puts("PASS Apex Mesa native/DRM transport: persistent GPUVA, explicit ranges, retained data/programs, cleanup, device loss (mock ioctl)");
       if (sync_fd >= 0) {
          CHECK(!close(sync_fd));

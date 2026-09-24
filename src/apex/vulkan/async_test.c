@@ -199,7 +199,7 @@ int main(int argc, char **argv)
    struct vk_sync_type type = vk_drm_syncobj_get_type_from_provider(&provider);
    const struct vk_sync_type *types[] = {&type, NULL};
    physical.supported_sync_types = types;
-   for (unsigned test = 0; test < 14; test++) {
+   for (unsigned test = 0; test < 16; test++) {
       calls = input_index = output_index = objects = live = fail = fail_at = queries = waits = dispatch_index = 0;
       published = completed = 0;
       terminal = timed_out = failed = false;
@@ -234,9 +234,19 @@ int main(int argc, char **argv)
          VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = pool, .commandBufferCount = 1};
          CHECK(v->AllocateCommandBuffers(dev, &ca, &cb) == VK_SUCCESS);
+         VkCommandBuffer primary = cb, secondary = VK_NULL_HANDLE;
+         if (test >= 14) {
+            ca.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            CHECK(v->AllocateCommandBuffers(dev, &ca, &secondary) == VK_SUCCESS);
+            cb = secondary;
+         }
          /* First discard an unsubmitted upload, then record immutable sources. */
          for (unsigned record = 0; record < 2; record++) {
-            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            VkCommandBufferInheritanceInfo inheritance = {
+               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+            };
+            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+               .pInheritanceInfo = secondary ? &inheritance : NULL};
             CHECK(v->BeginCommandBuffer(cb, &begin) == VK_SUCCESS);
             uint32_t data[15];
             for (unsigned region = 0; region < 2; region++) {
@@ -247,9 +257,16 @@ int main(int argc, char **argv)
             CHECK(v->EndCommandBuffer(cb) == VK_SUCCESS && !objects);
             if (!record) CHECK(v->ResetCommandBuffer(cb, 0) == VK_SUCCESS);
          }
+         if (secondary) {
+            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHECK(v->BeginCommandBuffer(primary, &begin) == VK_SUCCESS);
+            v->CmdExecuteCommands(primary, 1, &secondary);
+            CHECK(v->EndCommandBuffer(primary) == VK_SUCCESS && !objects);
+            cb = primary;
+         }
          struct vk_command_buffer *command = vk_command_buffer_from_handle(cb);
          struct vk_queue_submit submit = {.command_buffer_count = 1, .command_buffers = &command};
-         if (test == 13) {
+         if (test == 13 || test == 15) {
             fail = ENOMEM;
             fail_at = 2;
             CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_ERROR_DEVICE_LOST);
@@ -397,6 +414,7 @@ int main(int argc, char **argv)
    free(spirv);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
+   puts("PASS Apex secondary updates: copied sources, reset/reuse, async retention and partial-enqueue cleanup (mock only)");
    puts("PASS Apex async transport: batched sync arrays, zero point, pending retention, retirement, backpressure, EINTR, fence/counter/kernel loss (mock only)");
    return 0;
 }
