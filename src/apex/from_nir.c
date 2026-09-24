@@ -12,7 +12,9 @@ const struct nir_shader_compiler_options apex_nir_options = {
    .lower_extract_byte = true, .lower_extract_word = true,
    .lower_bitfield_extract = true, .lower_bitfield_insert = true,
    .lower_ifind_msb = true, .lower_find_lsb = true,
-   .lower_int64_options = nir_lower_iadd64 | nir_lower_conv64,
+   .lower_pack_32_2x16_split = true, .lower_unpack_32_2x16_split = true,
+   .lower_int64_options = nir_lower_iadd64 | nir_lower_conv64 |
+      nir_lower_logic64 | nir_lower_imul64 | nir_lower_shift64,
 };
 
 static uint32_t value(nir_def *def, unsigned component)
@@ -92,6 +94,27 @@ static bool lower_launch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def_rewrite_uses(&i->def, replacement);
    nir_instr_remove(&i->instr);
    return true;
+}
+
+static bool subword_roundtrip(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *a = nir_instr_as_alu(instr);
+   if (a->op != nir_op_u2u32 || a->def.num_components != 1)
+      return false;
+   nir_alu_instr *narrow = nir_def_as_alu_or_null(a->src[0].src.ssa);
+   return narrow && (narrow->op == nir_op_u2u8 || narrow->op == nir_op_u2u16) &&
+      narrow->src[0].src.ssa->bit_size == 32;
+}
+
+static nir_def *lower_subword_roundtrip(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_alu_instr *a = nir_instr_as_alu(instr);
+   nir_alu_instr *narrow = nir_def_as_alu_or_null(a->src[0].src.ssa);
+   nir_def *source = nir_ssa_for_alu_src(b, narrow, 0);
+   source = nir_channel(b, source, a->src[0].swizzle[0]);
+   return nir_iand_imm(b, source, BITFIELD_MASK(narrow->def.bit_size));
 }
 
 static bool fp32_sign_conversion(const nir_instr *instr, const void *data)
@@ -367,7 +390,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, uint32_msb, lower_uint32_msb, NULL);
+      NIR_PASS(progress, nir, nir_lower_pack);
       NIR_PASS(progress, nir, nir_lower_alu);
+      NIR_PASS(progress, nir, nir_shader_lower_instructions, subword_roundtrip, lower_subword_roundtrip, NULL);
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);

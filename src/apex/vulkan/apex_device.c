@@ -738,6 +738,23 @@ apex_CmdFillBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
 }
 
 static VKAPI_ATTR void VKAPI_CALL
+apex_CmdCopyBuffer2(VkCommandBuffer handle, const VkCopyBufferInfo2 *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   if (device->transport != APEX_TRANSPORT_DRM) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   struct apex_pipeline *pipeline = cmd->pipeline;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   memcpy(push, cmd->push, sizeof(push));
+   vk_meta_copy_buffer(&cmd->vk, &device->meta, info);
+   cmd->pipeline = pipeline;
+   memcpy(cmd->push, push, sizeof(push));
+}
+
+static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
@@ -1135,7 +1152,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdBindPipeline = apex_CmdBindPipeline, .CmdBindDescriptorSets2 = apex_CmdBindDescriptorSets2,
       .CmdPushConstants2 = apex_CmdPushConstants2,
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
-      .CmdFillBuffer = apex_CmdFillBuffer,
+      .CmdFillBuffer = apex_CmdFillBuffer, .CmdCopyBuffer2 = apex_CmdCopyBuffer2,
       .QueueWaitIdle = apex_QueueWaitIdle,
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,

@@ -15,11 +15,18 @@
 
 int main(int argc, char **argv)
 {
-   CHECK((argc == 3 || (argc == 4 && (!strcmp(argv[3], "--dispatch") || !strcmp(argv[3], "--fill")))) && geteuid() != 0);
+   CHECK((argc == 3 || (argc == 4 && (!strcmp(argv[3], "--dispatch") ||
+      !strcmp(argv[3], "--fill") || !strcmp(argv[3], "--copy")))) && geteuid() != 0);
    const int grid = argc == 4 && !strcmp(argv[3], "--dispatch");
    const int fill = argc == 4 && !strcmp(argv[3], "--fill");
-   const unsigned word_count = grid ? 262144 : fill ? 32784 : 1024;
-   const unsigned bind_words = fill ? 16 : 0;
+   const int copy = argc == 4 && !strcmp(argv[3], "--copy");
+   const unsigned word_count = grid ? 262144 : fill || copy ? 32784 : 1024;
+   const unsigned bind_words = fill || copy ? 16 : 0;
+   const VkBufferCopy copies[] = {
+      {513, 65539, 16385}, {32770, 98306, 62}, {34052, 99332, 124},
+      {35080, 100360, 248}, {36096, 101392, 496},
+      {38001, 104451, 1}, {38006, 104454, 2}, {38009, 104457, 3},
+   };
    CHECK(!setenv("VK_DRIVER_FILES", argv[1], 1));
    CHECK(!setenv("APEX_DEVELOPMENT", "1", 1));
    void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -86,6 +93,7 @@ int main(int argc, char **argv)
    DEVICE(CmdBindDescriptorSets);
    DEVICE(CmdDispatch);
    DEVICE(CmdFillBuffer);
+   DEVICE(CmdCopyBuffer);
    DEVICE(CmdPipelineBarrier);
    DEVICE(CreateFence);
    DEVICE(DestroyFence);
@@ -98,7 +106,7 @@ int main(int argc, char **argv)
    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = (word_count - bind_words) * 4 - (fill ? 3 : 0),
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-         (fill ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
+         (fill || copy ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
    VkBuffer buffer;
    CHECK(CreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
    VkMemoryRequirements requirements;
@@ -188,6 +196,10 @@ int main(int argc, char **argv)
       if (fill) {
          CmdFillBuffer(buffers[pass], buffer, 4, 65540, 0xa5c31e79);
          CmdFillBuffer(buffers[pass], buffer, (word_count - bind_words - 3) * 4, VK_WHOLE_SIZE, 0x7900beef);
+      }
+      if (copy)
+         CmdCopyBuffer(buffers[pass], buffer, buffer, sizeof(copies) / sizeof(copies[0]), copies);
+      if (fill || copy) {
          VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
@@ -199,12 +211,23 @@ int main(int argc, char **argv)
       VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                              .commandBufferCount = 1, .pCommandBuffers = &buffers[pass]};
       CHECK(QueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
-      CHECK(WaitForFences(device, 1, &fence, VK_TRUE, grid || fill ? 120000000000ull : 10000000000ull) == VK_SUCCESS);
+      CHECK(WaitForFences(device, 1, &fence, VK_TRUE, grid || fill || copy ? 120000000000ull : 10000000000ull) == VK_SUCCESS);
       CHECK(InvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
       for (unsigned i = 0; i < word_count; i++) {
          uint32_t expected = 0xca000000 + i * 37;
          if (fill && i >= bind_words + 1 && i < bind_words + 1 + 16385) expected = 0xa5c31e79;
          if (fill && i >= word_count - 3 && i < word_count - 1) expected = 0x7900beef;
+         if (copy && i >= bind_words)
+            for (unsigned c = 0; c < sizeof(copies) / sizeof(copies[0]); c++)
+               for (unsigned byte = 0; byte < 4; byte++) {
+                  uint64_t target = (i - bind_words) * 4 + byte;
+                  if (target >= copies[c].dstOffset && target - copies[c].dstOffset < copies[c].size) {
+                     uint64_t source = bind_words * 4 + copies[c].srcOffset + target - copies[c].dstOffset;
+                     uint32_t value = 0xca000000 + (source / 4) * 37;
+                     expected = (expected & ~(255u << (byte * 8))) |
+                        ((value >> (source % 4 * 8) & 255) << (byte * 8));
+                  }
+               }
          if (grid && i >= 64 && i < 64 + x * y * z * 192) {
             unsigned group = (i - 64) / 192, lane = (i - 64) / 16 % 12;
             unsigned gx = group % x, gy = group / x % y, gz = group / (x * y);
@@ -223,10 +246,12 @@ int main(int argc, char **argv)
          CHECK(words[i] == expected);
       }
       /* Without a flush these writes must not replace retained LOCAL results. */
-      if (!grid && !fill) for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
+      if (!grid && !fill && !copy) for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
       if (grid) printf("PASS Apex loader dispatch: %ux%ux%u groups, local 3x2x2, %u words/guards\n",
                        x, y, z, word_count);
       if (fill) printf("PASS Apex loader fill: pass %u, 65540-byte range, whole-size tail, suballocation, compute state, %u words/guards\n",
+                       pass, word_count);
+      if (copy) printf("PASS Apex loader copy: pass %u, 8 regions, byte/halfword/vector/chunk tails, suballocation, compute state, %u words/guards\n",
                        pass, word_count);
       CHECK(ResetFences(device, 1, &fence) == VK_SUCCESS);
    }
@@ -244,6 +269,6 @@ int main(int argc, char **argv)
    DestroyDevice(device, NULL);
    DestroyInstance(instance, NULL);
    CHECK(!dlclose(loader));
-   if (!grid && !fill) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
+   if (!grid && !fill && !copy) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;
 }

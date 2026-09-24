@@ -324,7 +324,6 @@ test_fill(struct vk_physical_device *physical, const char *output)
    CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
    v->CmdFillBuffer(cmd, buffer, 4, 196, 0xa5c31e79);
    v->CmdFillBuffer(cmd, buffer, 256, VK_WHOLE_SIZE, 0xbaadf00d);
-   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
    enum vk_meta_object_key_type key = VK_META_OBJECT_KEY_FILL_BUFFER;
    VkPipeline handle = vk_meta_lookup_pipeline(&device.meta, &key, sizeof(key));
    CHECK(handle);
@@ -336,6 +335,24 @@ test_fill(struct vk_physical_device *physical, const char *output)
       FILE *f = fopen(filename, "wb");
       CHECK(f && fwrite(pipeline->code.data, 1, pipeline->code.size, f) == pipeline->code.size && !fclose(f));
    }
+   for (unsigned chunk = 1; chunk <= 16; chunk *= 2) {
+      VkBufferCopy region = {.srcOffset = chunk, .dstOffset = 128 + chunk, .size = chunk * 3};
+      v->CmdCopyBuffer(cmd, buffer, buffer, 1, &region);
+      struct { enum vk_meta_object_key_type type; uint32_t chunk; } copy_key = {
+         VK_META_OBJECT_KEY_COPY_BUFFER, chunk,
+      };
+      handle = vk_meta_lookup_pipeline(&device.meta, &copy_key, sizeof(copy_key));
+      CHECK(handle);
+      pipeline = apex_pipeline_from_handle(handle);
+      CHECK(!pipeline->descriptor_count && pipeline->push_size == 24);
+      if (output) {
+         char filename[4096];
+         CHECK(snprintf(filename, sizeof(filename), "%s/mesa-copy%u.apx", output, chunk) < sizeof(filename));
+         FILE *f = fopen(filename, "wb");
+         CHECK(f && fwrite(pipeline->code.data, 1, pipeline->code.size, f) == pipeline->code.size && !fclose(f));
+      }
+   }
+   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
    v->DestroyCommandPool(dev, pool, NULL);
    v->DestroyBuffer(dev, buffer, NULL);
    apex_device_finish(&device);
