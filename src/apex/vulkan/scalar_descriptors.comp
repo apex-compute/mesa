@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: MIT
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 16) in;
+layout(set = 1, binding = 5, scalar) readonly buffer Input {
+   uint prefix;
+   uvec3 values[];
+} sources[2];
+layout(set = 1, binding = 2, scalar) uniform Constants {
+   uint bias;
+   uvec3 weights[16];
+} constants[2];
+layout(set = 0, binding = 3, scalar) buffer Output {
+   uint prefix;
+   uvec3 values[];
+} destination;
+void main()
+{
+   uint lane = gl_LocalInvocationIndex;
+   uint which = lane & 1u;
+   destination.values[lane] = sources[which].values[lane] +
+      constants[which].weights[lane].zyx + uvec3(constants[which].bias);
+}

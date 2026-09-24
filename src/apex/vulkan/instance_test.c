@@ -149,10 +149,15 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
       .robustImageAccess2 = VK_TRUE, .nullDescriptor = VK_TRUE,
    };
+   VkPhysicalDeviceScalarBlockLayoutFeatures scalar = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
+      .pNext = &robustness,
+   };
    VkPhysicalDeviceFeatures2 features = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &robustness,
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &scalar,
    };
    get_features2(physical, &features);
+   CHECK(scalar.scalarBlockLayout);
    CHECK(features.features.robustBufferAccess && robustness.robustBufferAccess2);
    CHECK(!robustness.robustImageAccess2 && !robustness.nullDescriptor);
    PROC(GetPhysicalDeviceProperties2KHR, get_properties2);
@@ -196,9 +201,9 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    device_info.pEnabledFeatures = NULL;
    const char *memory_extensions[] = {
       VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
-      VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+      VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
    };
-   device_info.enabledExtensionCount = 3;
+   device_info.enabledExtensionCount = 4;
    device_info.ppEnabledExtensionNames = memory_extensions;
    device_info.pNext = &features;
    robustness.nullDescriptor = VK_TRUE;

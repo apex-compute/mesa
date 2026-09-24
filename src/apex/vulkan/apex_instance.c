@@ -199,11 +199,13 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
       .EXT_robustness2 = true,
+      .EXT_scalar_block_layout = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
       .robustBufferAccess = true,
       .robustBufferAccess2 = true,
+      .scalarBlockLayout = true,
    };
    const struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,

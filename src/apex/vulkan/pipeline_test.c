@@ -364,8 +364,8 @@ test_fill(struct vk_physical_device *physical, const char *output)
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 7 || argc == 8);
-   const char *output = argc == 8 ? argv[7] : NULL;
+   CHECK(argc == 8 || argc == 9);
+   const char *output = argc == 9 ? argv[8] : NULL;
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -528,6 +528,8 @@ int main(int argc, char **argv)
    test_descriptors(&physical, argv[2], "mesa-descriptors", NULL, true, false);
    test_descriptors(&physical, argv[3], "mesa-atomics", NULL, true, false);
    test_descriptors(&physical, argv[4], "mesa-reindex", NULL, true, true);
+   test_descriptors(&physical, argv[7], "mesa-scalar", output, false, false);
+   test_descriptors(&physical, argv[7], "mesa-scalar", NULL, true, false);
    test_dispatch(&physical, argv[5], output, false, false);
    test_dispatch(&physical, argv[5], output, true, false);
    test_dispatch(&physical, argv[6], output, false, true);

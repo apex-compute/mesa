@@ -66,6 +66,10 @@ apex_descriptors_spv = custom_target('apex-descriptors-spv',
   input : 'descriptors.comp', output : 'descriptors.spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
 )
+apex_scalar_spv = custom_target('apex-scalar-spv',
+  input : 'scalar_descriptors.comp', output : 'scalar_descriptors.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+)
 apex_atomics_spv = custom_target('apex-atomics-spv',
   input : 'descriptor_atomics.comp', output : 'descriptor_atomics.spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
@@ -92,6 +96,8 @@ test('apex-pipeline-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_pipeline_spv], suite : ['apex'])
 test('apex-descriptors-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_descriptors_spv], suite : ['apex'])
+test('apex-scalar-spirv', find_program('spirv-val'),
+  args : ['--target-env', 'vulkan1.1', '--scalar-block-layout', apex_scalar_spv], suite : ['apex'])
 test('apex-atomics-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_atomics_spv], suite : ['apex'])
 test('apex-reindex-spirv', find_program('spirv-val'),
@@ -101,7 +107,7 @@ test('apex-dispatch-spirv', find_program('spirv-val'),
 test('apex-multiple-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_multiple_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
-  args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv], suite : ['apex'])
+  args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv], suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
