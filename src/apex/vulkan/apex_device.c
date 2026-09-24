@@ -21,10 +21,15 @@
 #include <sys/mman.h>
 #include <time.h>
 
+struct apex_memory_storage {
+   struct list_head link;
+   struct apex_bo bo;
+   unsigned refs;
+};
 struct apex_memory {
    struct vk_device_memory vk;
    void *data;
-   struct apex_bo bo;
+   struct apex_memory_storage *storage;
 };
 struct apex_buffer {
    struct vk_buffer vk;
@@ -228,9 +233,23 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    VkResult result;
    if (device->transport == APEX_TRANSPORT_DRM) {
+      mem->storage = vk_zalloc(&device->vk.alloc, sizeof(*mem->storage), 8,
+                               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      if (!mem->storage) {
+         vk_device_memory_destroy(&device->vk, alloc, &mem->vk);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
       result = bo_create(device, info->allocationSize,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, &mem->bo);
-      mem->data = mem->bo.map;
+                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, &mem->storage->bo);
+      if (result == VK_SUCCESS) {
+         mem->data = mem->storage->bo.map;
+         mem->storage->refs = 1;
+         mtx_lock(&device->memory_mutex);
+         list_addtail(&mem->storage->link, &device->memories);
+         mtx_unlock(&device->memory_mutex);
+      } else {
+         vk_free(&device->vk.alloc, mem->storage);
+      }
    } else {
       mem->data = vk_zalloc2(&device->vk.alloc, alloc, info->allocationSize, 8,
                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -252,7 +271,13 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
    if (!memory)
       return;
    if (device->transport == APEX_TRANSPORT_DRM) {
-      apex_bo_finish(device, &memory->bo);
+      mtx_lock(&device->memory_mutex);
+      if (!--memory->storage->refs) {
+         list_del(&memory->storage->link);
+         apex_bo_finish(device, &memory->storage->bo);
+         vk_free(&device->vk.alloc, memory->storage);
+      }
+      mtx_unlock(&device->memory_mutex);
    } else {
       vk_free2(&device->vk.alloc, alloc, memory->data);
    }
@@ -291,7 +316,7 @@ mapped_memory_ranges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ra
       if (!bytes || bytes > memory->vk.size - ranges[i].offset)
          return VK_ERROR_MEMORY_MAP_FAILED;
       if (device->transport == APEX_TRANSPORT_DRM) {
-         VkResult result = bo_transfer(device, &memory->bo, direction, ranges[i].offset, bytes);
+         VkResult result = bo_transfer(device, &memory->storage->bo, direction, ranges[i].offset, bytes);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -363,7 +388,7 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       buffer->memory = mem;
       buffer->offset = infos[i].memoryOffset;
-      buffer->vk.device_address = mem->bo.va + buffer->offset;
+      buffer->vk.device_address = (mem->storage ? mem->storage->bo.va : 0) + buffer->offset;
    }
    return VK_SUCCESS;
 }
@@ -1003,7 +1028,7 @@ apex_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offse
 static uint64_t
 image_address(const struct apex_image *image, unsigned level, unsigned layer, VkOffset3D offset)
 {
-   return image->memory->bo.va + image->offset + image->levels[level].offset +
+   return image->memory->storage->bo.va + image->offset + image->levels[level].offset +
           (uint64_t)layer * image->levels[level].slice_stride +
           (uint64_t)offset.y * image->levels[level].row_stride + (uint64_t)offset.x * 4;
 }
@@ -1201,7 +1226,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
             if (!image->memory)
                goto out;
             unsigned l = view->base_mip_level;
-            uint64_t va = image->memory->bo.va + image->offset + image->levels[l].offset +
+            uint64_t va = image->memory->storage->bo.va + image->offset + image->levels[l].offset +
                           (uint64_t)view->base_array_layer * image->levels[l].slice_stride;
             rows[pipeline->set_offsets[s] + d].image = (struct apex_image_descriptor) {
                util_cpu_to_le32(va), util_cpu_to_le32(va >> 32),
@@ -1228,7 +1253,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
              dynamic > buffer->vk.size - binding->offset || !range || range > UINT32_MAX ||
              range > buffer->vk.size - binding->offset - dynamic)
             goto out;
-         uint64_t va = buffer->memory->bo.va + buffer->offset + binding->offset + dynamic;
+         uint64_t va = buffer->memory->storage->bo.va + buffer->offset + binding->offset + dynamic;
          rows[pipeline->set_offsets[s] + d].buffer = (struct apex_buffer_descriptor) {
             util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range), 0,
          };
@@ -1615,7 +1640,13 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->completion = 0;
    device->point = 0;
    list_inithead(&device->retired);
+   list_inithead(&device->memories);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
+      vk_device_finish(&device->vk);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (mtx_init(&device->memory_mutex, mtx_plain) != thrd_success) {
+      mtx_destroy(&device->va_mutex);
       vk_device_finish(&device->vk);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
@@ -1629,6 +1660,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    result = vk_queue_init(&device->queue, &device->vk, &info->pQueueCreateInfos[0], 0);
    if (result != VK_SUCCESS) {
       util_vma_heap_finish(&device->va_heap);
+      mtx_destroy(&device->memory_mutex);
       mtx_destroy(&device->va_mutex);
       vk_device_finish(&device->vk);
       return result;
@@ -1637,6 +1669,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    if (result != VK_SUCCESS) {
       vk_queue_finish(&device->queue);
       util_vma_heap_finish(&device->va_heap);
+      mtx_destroy(&device->memory_mutex);
       mtx_destroy(&device->va_mutex);
       vk_device_finish(&device->vk);
       return result;
@@ -1677,6 +1710,7 @@ apex_device_finish(struct apex_device *device)
    }
    vk_meta_device_finish(&device->vk, &device->meta);
    util_vma_heap_finish(&device->va_heap);
+   mtx_destroy(&device->memory_mutex);
    mtx_destroy(&device->va_mutex);
    vk_device_finish(&device->vk);
 }

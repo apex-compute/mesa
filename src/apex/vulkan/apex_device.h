@@ -59,6 +59,9 @@ struct apex_device {
    enum apex_transport transport;
    struct util_vma_heap va_heap;
    mtx_t va_mutex;
+   /* Serializes PRIME handle lookup and final backing destruction. */
+   mtx_t memory_mutex;
+   struct list_head memories;
    /* Submit-thread-owned descriptor retirement and private completion timeline. */
    uint32_t completion;
    uint64_t point;
