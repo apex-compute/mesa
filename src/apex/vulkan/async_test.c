@@ -3,6 +3,7 @@
 #include "apex_pipeline.h"
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
+#include "vk_buffer.h"
 #include "vk_command_buffer.h"
 #include "vk_drm_syncobj.h"
 #include "vk_instance.h"
@@ -19,8 +20,8 @@
 
 static unsigned calls, input_index, output_index, objects, live, fail, fail_at;
 static uint64_t published, completed;
-static bool terminal, timed_out, failed, grid_test;
-static struct { uint64_t size, va; bool live; } gems[32];
+static bool terminal, timed_out, failed, grid_test, update_test;
+static struct { uint64_t size, va; bool live; unsigned uploads; } gems[32];
 static unsigned queries, waits, dispatch_index;
 static unsigned grid_limit;
 
@@ -51,7 +52,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       errno = EIO; /* A successful status query need not preserve wait errno. */
    } else if (request == DRM_IOCTL_APEX_GEM_CREATE) {
       struct drm_apex_gem_create *r = arg;
-      CHECK(!published && objects < 31); /* All preparation precedes waits. */
+      CHECK(completed == published && objects < 31); /* All preparation precedes waits. */
       r->handle = ++objects;
       gems[objects].size = r->size;
       gems[objects].live = true;
@@ -63,7 +64,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
    } else if (request == DRM_IOCTL_APEX_VM_BIND) {
       struct drm_apex_vm_bind *r = arg;
       if (r->operation == APEX_DRM_VM_BIND_MAP) {
-         CHECK(!published && gems[r->handle].live);
+         CHECK(completed == published && gems[r->handle].live);
          gems[r->handle].va = r->va;
       } else {
          /* UNMAP waits the file's tail. After a partial enqueue failure it
@@ -76,7 +77,15 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       }
    } else if (request == DRM_IOCTL_APEX_GEM_TRANSFER) {
       struct drm_apex_gem_transfer *r = arg;
-      CHECK(!published && r->direction == APEX_DRM_TRANSFER_TO_LOCAL && gems[r->handle].live);
+      CHECK(completed == published && r->direction == APEX_DRM_TRANSFER_TO_LOCAL && gems[r->handle].live);
+      gems[r->handle].uploads++;
+      if (update_test && r->handle <= 2) {
+         CHECK(r->bytes == (r->handle == 1 ? 52 : 60));
+         uint32_t words[15];
+         CHECK(pread(fd, words, r->bytes, r->handle * 4096) == r->bytes);
+         for (unsigned i = 0; i < r->bytes / 4; i++)
+            CHECK(words[i] == 0xa7010000 + r->handle * 123 + i * 37);
+      }
    } else if (request == DRM_IOCTL_GEM_CLOSE) {
       struct drm_gem_close *r = arg;
       CHECK(gems[r->handle].live && (!gems[r->handle].va || failed));
@@ -101,6 +110,19 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       }
       if (r->flags == APEX_DRM_SUBMIT_SYNC_ONLY) {
          CHECK(!r->program_va && !r->program_bytes && !r->data_va && !r->workgroups);
+      } else if (update_test) {
+         unsigned region = dispatch_index % 2;
+         unsigned table = 4 + dispatch_index;
+         CHECK(!r->flags && !r->input_count && r->output_count == 1);
+         CHECK(r->program_va == gems[3].va && r->data_va == gems[table].va && r->workgroups == 1);
+         CHECK(gems[1].uploads == 1 && gems[2].uploads == 1);
+         uint32_t words[10];
+         CHECK(pread(fd, words, sizeof(words), table * 4096) == sizeof(words));
+         for (unsigned i = 0; i < 10; i++) words[i] = util_le32_to_cpu(words[i]);
+         CHECK(((uint64_t)words[5] << 32 | words[4]) == gems[region + 1].va);
+         CHECK(((uint64_t)words[7] << 32 | words[6]) == 0x30000004 + region * 64);
+         CHECK(words[8] == (region ? 60 : 52));
+         dispatch_index++;
       } else {
          CHECK(!r->flags && !r->input_count && r->output_count == 1);
          CHECK(objects == (grid_test ? 14 : 3) && live == objects && r->program_va == gems[1].va);
@@ -166,7 +188,8 @@ int main(int argc, char **argv)
    (void)vk_instance_to_handle(&instance);
    struct vk_physical_device physical;
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
-   const struct vk_properties properties = {.subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16};
+   const struct vk_properties properties = {.subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
+      .maxComputeWorkGroupCount = {1024, 1, 1}, .maxComputeWorkGroupSize = {16, 1, 1}};
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL, &properties,
                                 &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
@@ -175,11 +198,12 @@ int main(int argc, char **argv)
    struct vk_sync_type type = vk_drm_syncobj_get_type_from_provider(&provider);
    const struct vk_sync_type *types[] = {&type, NULL};
    physical.supported_sync_types = types;
-   for (unsigned test = 0; test < 12; test++) {
+   for (unsigned test = 0; test < 14; test++) {
       calls = input_index = output_index = objects = live = fail = fail_at = queries = waits = dispatch_index = 0;
       published = completed = 0;
       terminal = timed_out = failed = false;
-      grid_test = test >= 10;
+      grid_test = test == 10 || test == 11;
+      update_test = test >= 12;
       grid_limit = test == 11 ? 3 : 1024;
       memset(gems, 0, sizeof(gems));
       int fd = memfd_create("apex-async", MFD_CLOEXEC);
@@ -195,7 +219,52 @@ int main(int argc, char **argv)
       device.vk.sync = &provider;
       VkDevice dev = apex_device_to_handle(&device);
       const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
-      if (test && test < 9) {
+      if (update_test) {
+         VkBuffer buffer;
+         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = 256, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+         CHECK(v->CreateBuffer(dev, &bi, NULL, &buffer) == VK_SUCCESS);
+         vk_buffer_from_handle(buffer)->device_address = 0x30000000;
+         VkCommandPool pool;
+         VkCommandPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT};
+         CHECK(v->CreateCommandPool(dev, &ci, NULL, &pool) == VK_SUCCESS);
+         VkCommandBuffer cb;
+         VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool, .commandBufferCount = 1};
+         CHECK(v->AllocateCommandBuffers(dev, &ca, &cb) == VK_SUCCESS);
+         /* First discard an unsubmitted upload, then record immutable sources. */
+         for (unsigned record = 0; record < 2; record++) {
+            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHECK(v->BeginCommandBuffer(cb, &begin) == VK_SUCCESS);
+            uint32_t data[15];
+            for (unsigned region = 0; region < 2; region++) {
+               for (unsigned i = 0; i < 15; i++) data[i] = 0xa7010000 + (region + 1) * 123 + i * 37;
+               v->CmdUpdateBuffer(cb, buffer, 4 + region * 64, region ? 60 : 52, data);
+               memset(data, 0xcc, sizeof(data));
+            }
+            CHECK(v->EndCommandBuffer(cb) == VK_SUCCESS && !objects);
+            if (!record) CHECK(v->ResetCommandBuffer(cb, 0) == VK_SUCCESS);
+         }
+         struct vk_command_buffer *command = vk_command_buffer_from_handle(cb);
+         struct vk_queue_submit submit = {.command_buffer_count = 1, .command_buffers = &command};
+         if (test == 13) {
+            fail = ENOMEM;
+            fail_at = 2;
+            CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_ERROR_DEVICE_LOST);
+            CHECK(calls == 2 && published == 1 && live == 4);
+         } else {
+            for (unsigned repeat = 0; repeat < 2; repeat++) {
+               CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_SUCCESS);
+               CHECK(dispatch_index == (repeat + 1) * 2 && calls == (repeat + 1) * 3);
+               completed = published;
+            }
+            CHECK(objects == 7 && gems[1].uploads == 1 && gems[2].uploads == 1);
+         }
+         v->DestroyCommandPool(dev, pool, NULL);
+         CHECK(!gems[1].live && !gems[2].live);
+         v->DestroyBuffer(dev, buffer, NULL);
+      } else if (test && test < 9) {
          if (test == 1 || test == 8) {
             struct vk_queue_submit empty = {0};
             fail = test == 1 ? EINTR : EBUSY;

@@ -62,9 +62,15 @@ struct apex_pending_dispatch {
    struct drm_apex_vm_submit args;
    uint64_t point;
 };
+struct apex_upload {
+   struct list_head link;
+   struct apex_bo bo;
+   uint64_t reserved_va, size;
+   uint8_t data[];
+};
 struct apex_command_buffer {
    struct vk_command_buffer vk;
-   struct list_head dispatches;
+   struct list_head dispatches, uploads;
    struct apex_pipeline *pipeline;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
@@ -137,16 +143,22 @@ apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
    *bo = (struct apex_bo){0};
 }
 
+/* Consumes reserved_va on both success and failure; zero allocates a new VA. */
 static VkResult
-bo_create(struct apex_device *device, uint64_t size, uint32_t flags, struct apex_bo *bo)
+bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
+          uint64_t reserved_va, struct apex_bo *bo)
 {
    bo->size = align64(size, 4096);
+   uint64_t va = reserved_va;
    VkResult result = gem_create(device, bo->size, &bo->handle, &bo->map);
    if (result != VK_SUCCESS)
-      return result;
-   mtx_lock(&device->va_mutex);
-   uint64_t va = util_vma_heap_alloc(&device->va_heap, bo->size, 4096);
-   mtx_unlock(&device->va_mutex);
+      goto fail;
+   if (!va) {
+      mtx_lock(&device->va_mutex);
+      va = util_vma_heap_alloc(&device->va_heap, bo->size, 4096);
+      mtx_unlock(&device->va_mutex);
+   }
+   result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
    if (va) {
       struct drm_apex_vm_bind bind = {
          .operation = APEX_DRM_VM_BIND_MAP, .flags = flags, .handle = bo->handle,
@@ -156,12 +168,15 @@ bo_create(struct apex_device *device, uint64_t size, uint32_t flags, struct apex
          bo->va = va;
          return VK_SUCCESS;
       }
+   }
+fail:
+   if (va) {
       mtx_lock(&device->va_mutex);
       util_vma_heap_free(&device->va_heap, va, bo->size);
       mtx_unlock(&device->va_mutex);
    }
    apex_bo_finish(device, bo);
-   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   return result;
 }
 
 static VkResult
@@ -191,7 +206,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    VkResult result;
    if (device->transport == APEX_TRANSPORT_DRM) {
       result = bo_create(device, info->allocationSize,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, &mem->bo);
+                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, &mem->bo);
       mem->data = mem->bo.map;
    } else {
       mem->data = vk_zalloc2(&device->vk.alloc, alloc, info->allocationSize, 8,
@@ -537,6 +552,17 @@ bound_set_unref(struct apex_command_buffer *cmd, struct apex_bound_set *bound)
 static void
 clear_commands(struct apex_command_buffer *cmd)
 {
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   list_for_each_entry_safe(struct apex_upload, upload, &cmd->uploads, link) {
+      list_del(&upload->link);
+      if (upload->reserved_va) {
+         mtx_lock(&device->va_mutex);
+         util_vma_heap_free(&device->va_heap, upload->reserved_va, align64(upload->size, 4096));
+         mtx_unlock(&device->va_mutex);
+      }
+      apex_bo_finish(device, &upload->bo);
+      vk_free(&cmd->vk.pool->alloc, upload);
+   }
    list_for_each_entry_safe(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
       list_del(&dispatch->link);
       for (unsigned s = 0; s < ARRAY_SIZE(dispatch->sets); s++)
@@ -587,6 +613,7 @@ create_command_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level, 
       return result;
    }
    list_inithead(&cmd->dispatches);
+   list_inithead(&cmd->uploads);
    *out = &cmd->vk;
    return VK_SUCCESS;
 }
@@ -755,6 +782,51 @@ apex_CmdCopyBuffer2(VkCommandBuffer handle, const VkCopyBufferInfo2 *info)
 }
 
 static VKAPI_ATTR void VKAPI_CALL
+apex_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                     VkDeviceSize size, const void *data)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   if (device->transport != APEX_TRANSPORT_DRM) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   struct apex_pipeline *pipeline = cmd->pipeline;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   memcpy(push, cmd->push, sizeof(push));
+   vk_meta_update_buffer(&cmd->vk, &device->meta, buffer, offset, size, data);
+   cmd->pipeline = pipeline;
+   memcpy(cmd->push, push, sizeof(push));
+}
+
+/* Recording snapshots host data and reserves an address without kernel waits.
+ * Submission materializes this immutable source before publishing dependencies. */
+static VkResult
+bind_map_upload(struct vk_command_buffer *vk, struct vk_meta_device *meta,
+                 VkBuffer handle, void **map_out)
+{
+   struct apex_command_buffer *cmd = (void *)vk;
+   struct apex_device *device = (void *)vk->base.device;
+   VK_FROM_HANDLE(vk_buffer, buffer, handle);
+   struct apex_upload *upload = vk_zalloc(&vk->pool->alloc, sizeof(*upload) + buffer->size,
+                                         8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!upload)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   upload->size = buffer->size;
+   mtx_lock(&device->va_mutex);
+   upload->reserved_va = util_vma_heap_alloc(&device->va_heap, align64(upload->size, 4096), 4096);
+   mtx_unlock(&device->va_mutex);
+   if (!upload->reserved_va) {
+      vk_free(&vk->pool->alloc, upload);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   buffer->device_address = upload->reserved_va;
+   *map_out = upload->data;
+   list_addtail(&upload->link, &cmd->uploads);
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
@@ -825,7 +897,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
    }
    if (!pipeline->program.handle) {
       result = bo_create(device, pipeline->code.size,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, &pipeline->program);
+                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, 0, &pipeline->program);
       if (result != VK_SUCCESS)
          goto out;
       memcpy(pipeline->program.map, pipeline->code.data, pipeline->code.size);
@@ -836,7 +908,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
          goto out;
       }
    }
-   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, table);
+   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, table);
    if (result != VK_SUCCESS)
       goto out;
    memcpy(table->map, rows, bytes);
@@ -1071,6 +1143,20 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
    struct apex_device *device = (struct apex_device *)queue->base.device;
    if (vk_queue_submit_has_bind(submit) || submit->is_protected)
       return vk_queue_set_lost(queue, "unsupported Apex submission");
+   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+      struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
+      list_for_each_entry(struct apex_upload, upload, &cmd->uploads, link) {
+         if (upload->bo.handle)
+            continue;
+         uint64_t va = upload->reserved_va;
+         upload->reserved_va = 0;
+         if (bo_create(device, upload->size, APEX_DRM_VM_READ, va, &upload->bo) != VK_SUCCESS)
+            return vk_queue_set_lost(queue, "Apex update allocation failed");
+         memcpy(upload->bo.map, upload->data, upload->size);
+         if (bo_transfer(device, &upload->bo, APEX_DRM_TRANSFER_TO_LOCAL, 0, upload->size) != VK_SUCCESS)
+            return vk_queue_set_lost(queue, "Apex update upload failed");
+      }
+   }
    if (device->completion) {
       if (submit_async(device, submit) != VK_SUCCESS)
          return vk_queue_set_lost(queue, "Apex asynchronous submission failed");
@@ -1153,6 +1239,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdPushConstants2 = apex_CmdPushConstants2,
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
       .CmdFillBuffer = apex_CmdFillBuffer, .CmdCopyBuffer2 = apex_CmdCopyBuffer2,
+      .CmdUpdateBuffer = apex_CmdUpdateBuffer,
       .QueueWaitIdle = apex_QueueWaitIdle,
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
@@ -1194,6 +1281,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    }
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; i++)
       device->meta.buffer_access.optimal_wg_size[i] = 16;
+   device->meta.cmd_bind_map_buffer = bind_map_upload;
    device->queue.driver_submit = submit_queue;
    if (async) {
       struct drm_syncobj_create create = {0};
