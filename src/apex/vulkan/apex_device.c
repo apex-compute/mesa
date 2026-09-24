@@ -695,7 +695,8 @@ native_command(struct apex_device *device, uint32_t operation)
 }
 
 static VkResult
-drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
+drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
+            struct apex_bo *table)
 {
    struct apex_pipeline *pipeline = dispatch->pipeline;
    if (!pipeline->layout)
@@ -707,7 +708,6 @@ drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    memcpy((uint8_t *)rows + push_offset, dispatch->push, pipeline->push_size);
    VkResult result = VK_ERROR_DEVICE_LOST;
-   struct apex_bo table = {0};
    for (unsigned s = 0; s < pipeline->layout->set_count; s++) {
       const struct apex_set_layout *layout = (const void *)pipeline->layout->set_layouts[s];
       if (!layout || !layout->descriptor_count)
@@ -753,15 +753,26 @@ drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
          goto out;
       }
    }
-   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, &table);
+   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, table);
    if (result != VK_SUCCESS)
       goto out;
-   memcpy(table.map, rows, bytes);
-   result = bo_transfer(device, &table, APEX_DRM_TRANSFER_TO_LOCAL, 0, bytes);
+   memcpy(table->map, rows, bytes);
+   result = bo_transfer(device, table, APEX_DRM_TRANSFER_TO_LOCAL, 0, bytes);
+out:
+   free(rows);
+   return result;
+}
+
+static VkResult
+drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
+{
+   struct apex_bo table = {0};
+   VkResult result = drm_prepare(device, dispatch, &table);
    if (result != VK_SUCCESS)
       goto out;
    struct drm_apex_vm_exec args = {
-      .program_va = pipeline->program.va, .program_bytes = pipeline->code.size,
+      .program_va = dispatch->pipeline->program.va,
+      .program_bytes = dispatch->pipeline->code.size,
       .data_va = table.va,
       .workgroups = dispatch->groups,
    };
@@ -771,7 +782,6 @@ drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
       VK_SUCCESS : VK_ERROR_DEVICE_LOST;
 out:
    apex_bo_finish(device, &table);
-   free(rows);
    return result;
 }
 
