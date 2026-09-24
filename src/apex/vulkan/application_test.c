@@ -2,6 +2,8 @@
 /* Real loader/application gate. No Mesa private headers or mocked GPU results. */
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,11 +19,12 @@ int main(int argc, char **argv)
 {
    CHECK((argc == 3 || (argc == 4 && (!strcmp(argv[3], "--dispatch") ||
       !strcmp(argv[3], "--fill") || !strcmp(argv[3], "--copy") ||
-      !strcmp(argv[3], "--update")))) && geteuid() != 0);
+      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--external")))) && geteuid() != 0);
    const int grid = argc == 4 && !strcmp(argv[3], "--dispatch");
    const int fill = argc == 4 && !strcmp(argv[3], "--fill");
    const int copy = argc == 4 && !strcmp(argv[3], "--copy");
    const int update = argc == 4 && !strcmp(argv[3], "--update");
+   const int external = argc == 4 && !strcmp(argv[3], "--external");
    const int transfer = fill || copy || update;
    const unsigned word_count = grid ? 262144 : transfer ? 32784 : 1024;
    const unsigned bind_words = transfer ? 16 : 0;
@@ -39,6 +42,12 @@ int main(int argc, char **argv)
    VkInstance instance = VK_NULL_HANDLE;
    INSTANCE(CreateInstance);
    VkInstanceCreateInfo instance_info = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+   const char *instance_extensions[] = {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME};
+   if (external) {
+      instance_info.enabledExtensionCount = 2;
+      instance_info.ppEnabledExtensionNames = instance_extensions;
+   }
    CHECK(CreateInstance(&instance_info, NULL, &instance) == VK_SUCCESS);
    INSTANCE(DestroyInstance);
    INSTANCE(EnumeratePhysicalDevices);
@@ -61,6 +70,12 @@ int main(int argc, char **argv)
                                         .queueCount = 1, .pQueuePriorities = &priority};
    VkDeviceCreateInfo device_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                      .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info};
+   const char *device_extensions[] = {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME};
+   if (external) {
+      device_info.enabledExtensionCount = 3;
+      device_info.ppEnabledExtensionNames = device_extensions;
+   }
    VkDevice device;
    CHECK(CreateDevice(physical, &device_info, NULL, &device) == VK_SUCCESS);
    DEVICE(DestroyDevice);
@@ -110,7 +125,7 @@ int main(int argc, char **argv)
    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = (word_count - bind_words) * 4 - (fill ? 3 : 0),
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-         (transfer ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
+         (transfer || external ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
    VkBuffer buffer;
    CHECK(CreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
    VkMemoryRequirements requirements;
@@ -127,6 +142,48 @@ int main(int argc, char **argv)
    VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                 .memory = memory, .size = VK_WHOLE_SIZE};
    CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
+   VkBuffer shared_buffer = VK_NULL_HANDLE;
+   VkDeviceMemory shared_memory = VK_NULL_HANDLE;
+   if (external) {
+      DEVICE(GetMemoryFdKHR);
+      DEVICE(GetMemoryFdPropertiesKHR);
+      VkExternalMemoryBufferCreateInfo external_buffer = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      };
+      buffer_info.pNext = &external_buffer;
+      CHECK(CreateBuffer(device, &buffer_info, NULL, &shared_buffer) == VK_SUCCESS);
+      GetBufferMemoryRequirements(device, shared_buffer, &requirements);
+      CHECK(requirements.memoryTypeBits == 2);
+      VkExportMemoryAllocateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .handleTypes = external_buffer.handleTypes};
+      VkMemoryAllocateInfo shared_allocate = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .pNext = &export, .allocationSize = requirements.size, .memoryTypeIndex = 1};
+      VkDeviceMemory original, alias;
+      CHECK(AllocateMemory(device, &shared_allocate, NULL, &original) == VK_SUCCESS);
+      VkMemoryGetFdInfoKHR get = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+         .memory = original, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+      int fd;
+      CHECK(GetMemoryFdKHR(device, &get, &fd) == VK_SUCCESS && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+      VkImportMemoryFdInfoKHR import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+         .pNext = &export, .handleType = get.handleType, .fd = fd};
+      shared_allocate.pNext = &import;
+      CHECK(AllocateMemory(device, &shared_allocate, NULL, &alias) == VK_SUCCESS);
+      CHECK(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+      get.memory = alias;
+      get.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      CHECK(GetMemoryFdKHR(device, &get, &fd) == VK_SUCCESS);
+      VkMemoryFdPropertiesKHR props = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+      CHECK(GetMemoryFdPropertiesKHR(device, get.handleType, fd, &props) == VK_SUCCESS && props.memoryTypeBits == 2);
+      import.handleType = get.handleType;
+      import.fd = fd;
+      CHECK(AllocateMemory(device, &shared_allocate, NULL, &shared_memory) == VK_SUCCESS);
+      CHECK(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+      CHECK(BindBufferMemory(device, shared_buffer, shared_memory, 0) == VK_SUCCESS);
+      FreeMemory(device, original, NULL);
+      FreeMemory(device, alias, NULL);
+   }
    VkDescriptorSetLayoutBinding binding = {.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
    VkDescriptorSetLayoutCreateInfo set_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -146,7 +203,7 @@ int main(int argc, char **argv)
       .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &set_layout};
    VkDescriptorSet set;
    CHECK(AllocateDescriptorSets(device, &set_allocate, &set) == VK_SUCCESS);
-   VkDescriptorBufferInfo descriptor = {.buffer = buffer, .offset = 256,
+   VkDescriptorBufferInfo descriptor = {.buffer = external ? shared_buffer : buffer, .offset = 256,
       .range = grid ? (word_count - 64) * 4 : 128};
    VkWriteDescriptorSet write = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = set, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -195,6 +252,15 @@ int main(int argc, char **argv)
       const unsigned y = grid && !pass ? 3 : 1;
       const unsigned z = grid && !pass ? 4 : 1;
       CHECK(BeginCommandBuffer(buffers[pass], &begin) == VK_SUCCESS);
+      if (external && !pass) {
+         VkBufferCopy region = {.size = word_count * 4};
+         CmdCopyBuffer(buffers[pass], buffer, shared_buffer, 1, &region);
+         VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+         CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+      }
       CmdBindPipeline(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[pass]);
       CmdBindDescriptorSets(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
       if (fill) {
@@ -223,6 +289,19 @@ int main(int argc, char **argv)
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
       }
       CmdDispatch(buffers[pass], x, y, z);
+      if (external) {
+         VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+         CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+         VkBufferCopy region = {.size = word_count * 4};
+         CmdCopyBuffer(buffers[pass], shared_buffer, buffer, 1, &region);
+         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+         barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+         CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+      }
       CHECK(EndCommandBuffer(buffers[pass]) == VK_SUCCESS);
       VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                              .commandBufferCount = 1, .pCommandBuffers = &buffers[pass]};
@@ -294,12 +373,17 @@ int main(int argc, char **argv)
    DestroyDescriptorPool(device, pool, NULL);
    DestroyPipelineLayout(device, layout, NULL);
    DestroyDescriptorSetLayout(device, set_layout, NULL);
+   if (external) {
+      DestroyBuffer(device, shared_buffer, NULL);
+      FreeMemory(device, shared_memory, NULL);
+   }
    UnmapMemory(device, memory);
    DestroyBuffer(device, buffer, NULL);
    FreeMemory(device, memory, NULL);
    DestroyDevice(device, NULL);
    DestroyInstance(instance, NULL);
    CHECK(!dlclose(loader));
-   if (!grid && !transfer) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
+   if (external) puts("PASS Apex loader external memory: OPAQUE_FD/DMA_BUF reimports, freed original/alias, 2 dispatches, 1024 words/guards each");
+   else if (!grid && !transfer) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;
 }

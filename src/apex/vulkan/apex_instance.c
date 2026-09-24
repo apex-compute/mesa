@@ -22,6 +22,7 @@
 struct apex_physical_device {
    struct vk_physical_device vk;
    char *render_node;
+   bool prime_coherent;
    struct vk_sync_type sync_type;
    const struct vk_sync_type *sync_types[2];
 };
@@ -30,6 +31,7 @@ VK_DEFINE_HANDLE_CASTS(apex_physical_device, vk.base, VkPhysicalDevice,
 
 static const struct vk_instance_extension_table instance_extensions = {
    .KHR_get_physical_device_properties2 = true,
+   .KHR_external_memory_capabilities = true,
    .EXT_debug_utils = true,
 };
 
@@ -74,12 +76,34 @@ VKAPI_ATTR void VKAPI_CALL
 apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
                                        VkPhysicalDeviceMemoryProperties2 *properties)
 {
+   VK_FROM_HANDLE(apex_physical_device, device, physical);
    properties->memoryProperties = (VkPhysicalDeviceMemoryProperties) {
-      .memoryTypeCount = 1,
+      .memoryTypeCount = device->prime_coherent ? 2 : 1,
       .memoryTypes[0] = {.propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                         VK_MEMORY_PROPERTY_HOST_CACHED_BIT},
+      .memoryTypes[1] = {.propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT},
       .memoryHeapCount = 1,
-      .memoryHeaps[0] = {.size = 64 * 1024 * 1024},
+      .memoryHeaps[0] = {.size = 64 * 1024 * 1024,
+                        .flags = device->prime_coherent ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0},
+   };
+}
+
+VKAPI_ATTR void VKAPI_CALL
+apex_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physical,
+   const VkPhysicalDeviceExternalBufferInfo *info, VkExternalBufferProperties *properties)
+{
+   VK_FROM_HANDLE(apex_physical_device, device, physical);
+   properties->externalMemoryProperties = (VkExternalMemoryProperties){0};
+   if (!device->prime_coherent || info->flags ||
+       (info->usage & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) ||
+       (info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+        info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
+      return;
+   properties->externalMemoryProperties = (VkExternalMemoryProperties) {
+      .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT,
+      .exportFromImportedHandleTypes = APEX_EXTERNAL_MEMORY_TYPES,
+      .compatibleHandleTypes = APEX_EXTERNAL_MEMORY_TYPES,
    };
 }
 
@@ -202,6 +226,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    const struct vk_device_extension_table extensions = {
       .KHR_get_memory_requirements2 = true,
       .KHR_dedicated_allocation = true,
+      .KHR_external_memory = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .KHR_external_memory_fd = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .EXT_external_memory_dma_buf = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
       .EXT_robustness2 = true,
@@ -213,7 +240,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .robustBufferAccess2 = true,
       .scalarBlockLayout = true,
    };
-   const struct vk_properties properties = {
+   struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,
       .vendorID = 0x10ee, .deviceID = 0xa15e,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
@@ -248,6 +275,15 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
    };
+   /* Opaque-fd compatibility is the flat GEM byte layout, revision 1. */
+   memcpy(properties.driverUUID, "Apex GEM bytes 1", VK_UUID_SIZE);
+   properties.deviceUUID[0] = 0xee; properties.deviceUUID[1] = 0x10;
+   properties.deviceUUID[2] = 0x5e; properties.deviceUUID[3] = 0xa1;
+   properties.deviceUUID[4] = drm->businfo.pci->domain;
+   properties.deviceUUID[5] = drm->businfo.pci->domain >> 8;
+   properties.deviceUUID[6] = drm->businfo.pci->bus;
+   properties.deviceUUID[7] = drm->businfo.pci->dev;
+   properties.deviceUUID[8] = drm->businfo.pci->func;
    VkResult result = vk_physical_device_init(&physical->vk, instance, &extensions,
                                             &features, &properties, &dispatch);
    if (result != VK_SUCCESS) {
@@ -260,6 +296,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    physical->sync_type = sync_type;
+   physical->prime_coherent = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT;
    physical->sync_types[0] = &physical->sync_type;
    physical->vk.supported_sync_types = physical->sync_types;
    *out = &physical->vk;

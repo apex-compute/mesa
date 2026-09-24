@@ -123,6 +123,14 @@ apex_command_test = executable('apex-command-test', 'command_test.c',
 )
 test('apex-command', apex_command_test, args : [apex_pipeline_spv], suite : ['apex'])
 test('apex-image-command', apex_command_test, args : [apex_images_spv, '--images'], suite : ['apex'])
+apex_external_memory_test = executable('apex-external-memory-test', 'external_memory_test.c',
+  include_directories : [inc_include, inc_src, inc_vulkan_util],
+  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  link_with : [apex_pipeline, apex_nir, apex_rs],
+  link_args : ['-Wl,--wrap=ioctl'],
+  link_language : 'cpp', install : false,
+)
+test('apex-external-memory', apex_external_memory_test, suite : ['apex'])
 apex_async_test = executable('apex-async-test', 'async_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],

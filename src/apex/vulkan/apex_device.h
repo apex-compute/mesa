@@ -13,6 +13,8 @@ enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 #define APEX_MAX_DESCRIPTORS 4096
 #define APEX_MAX_BINDINGS 1024
 #define APEX_MAX_PUSH_CONSTANTS 256
+#define APEX_EXTERNAL_MEMORY_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | \
+                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
 struct apex_binding_layout {
    uint32_t offset, count, flags;
    VkDescriptorType type;
@@ -57,6 +59,7 @@ struct apex_device {
    struct vk_meta_device meta;
    int fd;
    enum apex_transport transport;
+   bool prime_coherent;
    struct util_vma_heap va_heap;
    mtx_t va_mutex;
    /* Serializes PRIME handle lookup and final backing destruction. */

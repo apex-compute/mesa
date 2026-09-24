@@ -17,11 +17,12 @@
 #define PROC(type, name) PFN_vk##type name = (PFN_vk##type)gipa(instance, "vk" #type); CHECK(name)
 
 static int fault, open_count, last_fd;
-static bool mock;
+static bool mock, coherent;
 static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_RENDER] = "/apex-test/render"};
 static drmPciDeviceInfo pci = {.vendor_id = 0x10ee, .device_id = 0xa15e};
+static drmPciBusInfo bus = {.domain = 0x1234, .bus = 7, .dev = 3, .func = 1};
 static drmDevice drm = {.nodes = nodes, .available_nodes = 1 << DRM_NODE_RENDER,
-                        .bustype = DRM_BUS_PCI, .deviceinfo.pci = &pci};
+                        .bustype = DRM_BUS_PCI, .deviceinfo.pci = &pci, .businfo.pci = &bus};
 static drmVersion version = {.name = "apex-display"};
 
 int __wrap_drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int count);
@@ -88,7 +89,8 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
    CHECK(!info->version && !info->capabilities && !info->max_buffer_bytes);
    *info = (struct drm_apex_info) {
       .version = fault == 2 ? 1 : 2,
-      .capabilities = APEX_DRM_CAP_SHMEM | (fault == 3 ? 0 : APEX_DRM_CAP_GPUVM),
+      .capabilities = APEX_DRM_CAP_SHMEM | (fault == 3 ? 0 : APEX_DRM_CAP_GPUVM) |
+                      (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0),
       .max_buffer_bytes = 64 * 1024 * 1024,
    };
    return 0;
@@ -110,8 +112,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    info.enabledExtensionCount = 1;
    info.ppEnabledExtensionNames = &unsupported;
    CHECK(create(&info, NULL, &instance) == VK_ERROR_EXTENSION_NOT_PRESENT);
-   const char *properties_extension = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
-   info.ppEnabledExtensionNames = &properties_extension;
+   const char *instance_extensions[] = {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME};
+   info.enabledExtensionCount = 2;
+   info.ppEnabledExtensionNames = instance_extensions;
    CHECK(create(&info, NULL, &instance) == VK_SUCCESS);
    PROC(DestroyInstance, destroy);
    PROC(EnumeratePhysicalDevices, enumerate);
@@ -173,9 +177,32 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
    get_memory(physical, &mem);
-   CHECK(mem.memoryTypeCount == 1 && mem.memoryHeapCount == 1);
+   CHECK(mem.memoryTypeCount == (coherent ? 2 : 1) && mem.memoryHeapCount == 1);
    CHECK(mem.memoryTypes[0].propertyFlags ==
          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
+   if (coherent) CHECK(mem.memoryTypes[1].propertyFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+   PROC(GetPhysicalDeviceExternalBufferPropertiesKHR, get_external);
+   VkPhysicalDeviceExternalBufferInfo external = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   VkExternalBufferProperties external_props = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+   get_external(physical, &external, &external_props);
+   CHECK(external_props.externalMemoryProperties.externalMemoryFeatures == (coherent ?
+      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT : 0));
+   CHECK(external_props.externalMemoryProperties.compatibleHandleTypes == (coherent ?
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : 0));
+   CHECK(external_props.externalMemoryProperties.exportFromImportedHandleTypes ==
+         external_props.externalMemoryProperties.compatibleHandleTypes);
+   external.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+   get_external(physical, &external, &external_props);
+   CHECK(!external_props.externalMemoryProperties.externalMemoryFeatures);
+   VkPhysicalDeviceIDProperties id = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+   properties2.pNext = &id;
+   get_properties2(physical, &properties2);
+   const uint8_t expected_id[VK_UUID_SIZE] = {0xee, 0x10, 0x5e, 0xa1, 0x34, 0x12, 7, 3, 1};
+   CHECK(!memcmp(id.deviceUUID, expected_id, sizeof(expected_id)));
+   CHECK(!memcmp(id.driverUUID, "Apex GEM bytes 1", VK_UUID_SIZE));
    PROC(GetPhysicalDeviceFormatProperties, get_format);
    VkFormatProperties format;
    memset(&format, 0xff, sizeof(format));
@@ -221,8 +248,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    const char *memory_extensions[] = {
       VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
       VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+      VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
    };
-   device_info.enabledExtensionCount = 4;
+   device_info.enabledExtensionCount = coherent ? 7 : 4;
    device_info.ppEnabledExtensionNames = memory_extensions;
    device_info.pNext = &features;
    robustness.nullDescriptor = VK_TRUE;
@@ -264,7 +293,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_requirements(device, &buffer_req, &requirements);
    CHECK(requirements.memoryRequirements.size == 128 &&
          requirements.memoryRequirements.alignment == 64 &&
-         requirements.memoryRequirements.memoryTypeBits == 1);
+         requirements.memoryRequirements.memoryTypeBits == (coherent ? 3 : 1));
    CHECK(!dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation);
    destroy_buffer(device, buffer, NULL);
    int fd1 = last_fd;
@@ -290,6 +319,9 @@ int main(int argc, char **argv)
          version.name = fault == 1 ? "foreign-driver" : "apex-display";
          exercise(apex_GetInstanceProcAddr);
       }
+      fault = 0;
+      coherent = true;
+      exercise(apex_GetInstanceProcAddr);
       puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, cleanup (mock DRM)");
    } else {
       CHECK(!setenv("VK_DRIVER_FILES", argv[1], 1));
