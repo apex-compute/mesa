@@ -125,7 +125,8 @@ struct drm_apex_sync {
  * reservations. count is 0..16 for inputs, 1..16 for outputs. A sync-only
  * submission has flags=SYNC_ONLY and zero program/data/workgroup fields;
  * otherwise flags=0 and the execution fields match VM_EXEC. Reserved fields
- * must be zero. An output handle may appear only once in the output array.
+ * must be zero. One underlying output syncobj may appear only once, even
+ * through two distinct handles imported from the same opaque syncobj fd.
  * Published input fences can wait arbitrarily long while the file is open;
  * close/unplug cancels waiting jobs with an error fence. */
 struct drm_apex_vm_submit {
