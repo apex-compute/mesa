@@ -213,7 +213,8 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
 }
 
 static void
-test_dispatch(struct vk_physical_device *physical, const char *path, const char *output, bool grid)
+test_dispatch(struct vk_physical_device *physical, const char *path, const char *output,
+              bool grid, bool multiple)
 {
    struct apex_device device;
    const float priority = 1;
@@ -242,13 +243,15 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    };
    CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
    free(spirv);
-   const VkDescriptorSetLayoutBinding binding = {
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+   const VkDescriptorSetLayoutBinding bindings[] = {
+      {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
    };
    const VkDescriptorSetLayoutCreateInfo si = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 1, .pBindings = &binding,
+      .bindingCount = multiple ? 2 : 1, .pBindings = bindings,
    };
    VkDescriptorSetLayout set;
    CHECK(v->CreateDescriptorSetLayout(dev, &si, NULL, &set) == VK_SUCCESS);
@@ -257,7 +260,7 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    const VkPipelineLayoutCreateInfo li = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .setLayoutCount = 1, .pSetLayouts = &set,
-      .pushConstantRangeCount = 1, .pPushConstantRanges = &push,
+      .pushConstantRangeCount = multiple ? 0 : 1, .pPushConstantRanges = &push,
    };
    VkPipelineLayout layout;
    CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
@@ -275,14 +278,15 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
-   CHECK(p->descriptor_count == 1 && p->push_size == 20);
+   CHECK(p->descriptor_count == (multiple ? 2 : 1) && p->push_size == (multiple ? 0 : 20));
    uint64_t padded_private = (uint64_t)word(p->code.data + 28) * 16;
-   CHECK(padded_private && p->max_workgroups < 1024);
-   CHECK(padded_private * p->max_workgroups <= 2097152 &&
-         padded_private * (p->max_workgroups + 1) > 2097152);
+   CHECK(p->max_workgroups && p->max_workgroups <= 1024);
+   CHECK(padded_private * p->max_workgroups <= 2097152);
+   CHECK(p->max_workgroups == 1024 || padded_private * (p->max_workgroups + 1) > 2097152);
    if (output) {
       char filename[4096];
-      CHECK(snprintf(filename, sizeof(filename), "%s/mesa-dispatch%s.apx", output, grid ? "-grid" : "") < sizeof(filename));
+      const char *name = multiple ? "mesa-multiple" : grid ? "mesa-dispatch-grid" : "mesa-dispatch";
+      CHECK(snprintf(filename, sizeof(filename), "%s/%s.apx", output, name) < sizeof(filename));
       f = fopen(filename, "wb");
       CHECK(f && fwrite(p->code.data, 1, p->code.size, f) == p->code.size && !fclose(f));
    }
@@ -360,8 +364,8 @@ test_fill(struct vk_physical_device *physical, const char *output)
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 6 || argc == 7);
-   const char *output = argc == 7 ? argv[6] : NULL;
+   CHECK(argc == 7 || argc == 8);
+   const char *output = argc == 8 ? argv[7] : NULL;
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -524,8 +528,9 @@ int main(int argc, char **argv)
    test_descriptors(&physical, argv[2], "mesa-descriptors", NULL, true, false);
    test_descriptors(&physical, argv[3], "mesa-atomics", NULL, true, false);
    test_descriptors(&physical, argv[4], "mesa-reindex", NULL, true, true);
-   test_dispatch(&physical, argv[5], output, false);
-   test_dispatch(&physical, argv[5], output, true);
+   test_dispatch(&physical, argv[5], output, false, false);
+   test_dispatch(&physical, argv[5], output, true, false);
+   test_dispatch(&physical, argv[6], output, false, true);
    test_fill(&physical, output);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);

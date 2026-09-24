@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+// Two independent loops with division and live descriptor addresses.
+#version 450
+layout(local_size_x=1, local_size_y=1, local_size_z=1) in;
+layout(binding=0) writeonly buffer Forward { uint values[256]; } forward_out;
+layout(binding=1) writeonly buffer Reverse { uint values[256]; } reverse_out;
+void main()
+{
+    uvec3 size = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint group = size.x * size.y * gl_GlobalInvocationID.z +
+                 size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x;
+    uint count = uint(forward_out.values.length()) / (size.x * size.y * size.z);
+    uint offset = count * group;
+    for (uint i = 0; i < count; i++)
+        forward_out.values[offset + i] = offset + i;
+    count = uint(reverse_out.values.length()) / (size.x * size.y * size.z);
+    offset = count * group;
+    for (uint i = 0; i < count; i++)
+        reverse_out.values[offset + i] = uint(reverse_out.values.length()) - offset - i;
+}

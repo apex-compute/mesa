@@ -93,8 +93,10 @@ check_status(struct vk_device *vk)
 {
    struct apex_device *device = (void *)vk;
    struct drm_apex_vm_status status = {0};
-   if (ioctl(device->fd, DRM_IOCTL_APEX_VM_STATUS, &status) || status.error)
-      return vk_device_set_lost(vk, "Apex asynchronous terminal failure");
+   int ret = ioctl(device->fd, DRM_IOCTL_APEX_VM_STATUS, &status);
+   if (ret || status.error)
+      return vk_device_set_lost(vk, "Apex asynchronous terminal failure (ioctl errno=%d, VM error=%d)",
+                                ret ? errno : 0, status.error);
    return VK_SUCCESS;
 }
 

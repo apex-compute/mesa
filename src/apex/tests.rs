@@ -279,6 +279,84 @@ fn scalar_control_lifetimes() {
     assert_eq!(evaluate(&nested), 3 * 7 + 2 * (3 + 2 + 1));
 }
 
+#[test]
+fn vector_control_lifetimes() {
+    let mut ops = vec![Op::new(0x40, 0, 0, 0, 0, 0), Op::new(0x20, 1, 0, 0, 0, 3)];
+    for id in 2..82 {
+        ops.push(Op::new(0x22, id, if id == 2 { 0 } else { id - 1 }, 1, 0, 0));
+    }
+    ops.extend([
+        Op::new(0x21, 100, 81, 0, 0, 0),
+        Op::new(0x10, 200, 0, 0, 0, 0x5555),
+        Op::new(6, 201, 200, 0, 0, 0),
+        Op::new(0x20, 101, 0, 0, 0, 7),
+        Op::new(0x22, 100, 100, 101, 0, 0),
+        Op::new(0x10, 202, 0, 0, 0, 0xaaaa),
+        Op::new(6, 203, 202, 0, 0, 0),
+        Op::new(0x20, 102, 0, 0, 0, 19),
+        Op::new(0x22, 100, 100, 102, 0, 0),
+        Op::new(6, 204, 201, 0, 0, 0),
+        Op::new(0x10, 205, 0, 0, 0, 3),
+        Op::new(0x10, 206, 0, 0, 0, 1),
+    ]);
+    let header = ops.len() as u32;
+    ops.extend([
+        Op::new(0x22, 100, 100, 1, 0, 0),
+        Op::new(0x20, 103, 0, 0, 0, 11),
+        Op::new(0x22, 104, 100, 103, 0, 0),
+        Op::new(0x13, 205, 205, 206, 0, 0),
+        Op::new(5, 0, 205, 0, 0, header),
+        Op::new(0x20, 105, 0, 0, 0, 0),
+        Op::new(0x54, 0, 105, 104, 0, 0),
+    ]);
+    let p = mir::compile(&ops, 4, 0, 16).unwrap();
+    assert_eq!(
+        p.private, 0,
+        "dead prelude values must not live through both masks and the loop"
+    );
+    schedule::validate(&p.code).unwrap();
+    for lane in 0..16 {
+        let mut s = [0u32; 64];
+        let mut v = [0u32; 64];
+        let mut mask = 0xffff;
+        let mut pc = 0;
+        let mut output = None;
+        for _ in 0..1000 {
+            let i = p.code[pc];
+            pc += 1;
+            match i.op {
+                0 | 3 => {}
+                5 => {
+                    if s[i.a as usize] != 0 {
+                        pc = i.imm as usize;
+                    }
+                }
+                6 => {
+                    let old = mask;
+                    mask = s[i.a as usize];
+                    s[i.d as usize] = old;
+                }
+                0x10 => s[i.d as usize] = i.imm,
+                0x13 => s[i.d as usize] = s[i.a as usize] - s[i.b as usize],
+                _ if mask & (1 << lane) == 0 => {}
+                0x20 => v[i.d as usize] = i.imm,
+                0x21 => v[i.d as usize] = v[i.a as usize],
+                0x22 => v[i.d as usize] = v[i.a as usize] + v[i.b as usize],
+                0x40 => v[i.d as usize] = lane,
+                0x54 => {
+                    output = Some(v[i.b as usize]);
+                    break;
+                }
+                op => panic!("outside vector allocation slice: {op:x}"),
+            }
+        }
+        assert_eq!(
+            output,
+            Some(lane + 240 + if lane % 2 == 0 { 7 } else { 19 } + 9 + 11)
+        );
+    }
+}
+
 // Deliberately narrow compiler-only arithmetic/spill evaluator: one lane,
 // straight-line integer code, no queues, MMU, cache, or RTL timing claims.
 fn arithmetic_slice(p: &Program, lane: u32) -> u32 {

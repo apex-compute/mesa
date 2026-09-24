@@ -56,7 +56,7 @@ pub fn compile(
         return Err("unaligned source private size".into());
     }
     // Masked vector writes preserve inactive lanes in out-of-SSA phi webs.
-    // Keep their homes across control flow; scalar writes are unconditional.
+    // Include every definition/use and enclose backedges before reusing homes.
     let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
     let mut values: BTreeMap<u32, (Class, u8, usize, usize)> = BTreeMap::new();
     for (pc, o) in ops.iter().enumerate() {
@@ -106,11 +106,6 @@ pub fn compile(
     }
     if control {
         for v in values.values_mut() {
-            if v.0 == Class::V {
-                v.2 = 0;
-                v.3 = ops.len();
-                continue;
-            }
             // Enclose every intersecting branch span. In particular, a value
             // used early in a loop must survive the backedge after its last
             // textual use. Iterate for nested/overlapping branch spans.
