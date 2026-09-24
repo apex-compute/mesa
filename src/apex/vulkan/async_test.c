@@ -16,9 +16,9 @@
    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); \
 } } while (0)
 
-static unsigned calls, input_index, output_index, objects, live, fail;
+static unsigned calls, input_index, output_index, objects, live, fail, fail_at;
 static uint64_t published, completed;
-static bool terminal, timed_out;
+static bool terminal, timed_out, failed;
 static struct { uint64_t size, va; bool live; } gems[8];
 static unsigned queries, waits;
 
@@ -64,7 +64,9 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
          CHECK(!published && gems[r->handle].live);
          gems[r->handle].va = r->va;
       } else {
-         CHECK(r->operation == APEX_DRM_VM_BIND_UNMAP && completed == published);
+         /* UNMAP waits the file's tail. After a partial enqueue failure it
+          * would block cleanup behind an unsignaled dependency. */
+         CHECK(!failed && r->operation == APEX_DRM_VM_BIND_UNMAP && completed == published);
          unsigned h;
          for (h = 1; h <= objects && gems[h].va != r->va; h++);
          CHECK(h <= objects && r->bytes == gems[h].size);
@@ -75,14 +77,14 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       CHECK(!published && r->direction == APEX_DRM_TRANSFER_TO_LOCAL && gems[r->handle].live);
    } else if (request == DRM_IOCTL_GEM_CLOSE) {
       struct drm_gem_close *r = arg;
-      CHECK(gems[r->handle].live && !gems[r->handle].va);
+      CHECK(gems[r->handle].live && (!gems[r->handle].va || failed));
       gems[r->handle].live = false;
       live--;
    } else {
       CHECK(request == DRM_IOCTL_APEX_VM_SUBMIT);
       struct drm_apex_vm_submit *r = arg;
       calls++;
-      if (fail) { errno = fail; return -1; }
+      if (fail && (!fail_at || calls == fail_at)) { failed = true; errno = fail; return -1; }
       CHECK(!r->reserved && r->input_count <= 16 && r->output_count >= 1 && r->output_count <= 16);
       const struct drm_apex_sync *in = (void *)(uintptr_t)r->inputs;
       const struct drm_apex_sync *out = (void *)(uintptr_t)r->outputs;
@@ -157,10 +159,10 @@ int main(int argc, char **argv)
    struct vk_sync_type type = vk_drm_syncobj_get_type_from_provider(&provider);
    const struct vk_sync_type *types[] = {&type, NULL};
    physical.supported_sync_types = types;
-   for (unsigned test = 0; test < 9; test++) {
-      calls = input_index = output_index = objects = live = fail = queries = waits = 0;
+   for (unsigned test = 0; test < 10; test++) {
+      calls = input_index = output_index = objects = live = fail = fail_at = queries = waits = 0;
       published = completed = 0;
-      terminal = timed_out = false;
+      terminal = timed_out = failed = false;
       memset(gems, 0, sizeof(gems));
       int fd = memfd_create("apex-async", MFD_CLOEXEC);
       CHECK(fd >= 0);
@@ -175,7 +177,7 @@ int main(int argc, char **argv)
       device.vk.sync = &provider;
       VkDevice dev = apex_device_to_handle(&device);
       const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
-      if (test) {
+      if (test && test < 9) {
          if (test == 1 || test == 8) {
             struct vk_queue_submit empty = {0};
             fail = test == 1 ? EINTR : EBUSY;
@@ -252,22 +254,30 @@ int main(int argc, char **argv)
          struct vk_command_buffer *command = vk_command_buffer_from_handle(cb);
          struct vk_queue_submit submit = {.wait_count = 19, .waits = in,
             .signal_count = 17, .signals = out, .command_buffer_count = 1, .command_buffers = &command};
-         CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_SUCCESS);
-         CHECK(calls == 6 && published == 6 && input_index == 18 && output_index == 17 && live == 3 && !waits);
-         struct vk_queue_submit empty = {0};
-         CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
-         CHECK(live == 3 && published == 7); /* Later submissions cannot retire pending tables. */
-         completed = published;
-         CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
-         CHECK(live == 1 && published == 8); /* Tables retired, program retained. */
-         completed = published;
+         if (test == 9) {
+            fail = ENOMEM;
+            fail_at = 4; /* Two waits and one shader accepted; next shader fails. */
+            CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_ERROR_DEVICE_LOST);
+            CHECK(calls == 4 && published == 3 && !completed && live == 2);
+         } else {
+            CHECK(device.queue.driver_submit(&device.queue, &submit) == VK_SUCCESS);
+            CHECK(calls == 6 && published == 6 && input_index == 18 && output_index == 17 && live == 3 && !waits);
+            struct vk_queue_submit empty = {0};
+            CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
+            CHECK(live == 3 && published == 7); /* Later submissions cannot retire pending tables. */
+            completed = published;
+            CHECK(device.queue.driver_submit(&device.queue, &empty) == VK_SUCCESS);
+            CHECK(live == 1 && published == 8); /* Tables retired, program retained. */
+            completed = published;
+         }
          v->DestroyCommandPool(dev, pool, NULL);
          v->DestroyPipeline(dev, pipeline, NULL);
          v->DestroyShaderModule(dev, shader, NULL);
          v->DestroyPipelineLayout(dev, layout, NULL);
-         CHECK(!live);
+         CHECK(live == (test == 9 ? 1 : 0));
       }
       apex_device_finish(&device);
+      CHECK(!live);
       CHECK(!close(fd));
    }
    free(spirv);

@@ -113,7 +113,10 @@ gem_create(struct apex_device *device, uint64_t size, uint32_t *handle, void **d
 void
 apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
 {
-   if (bo->va) {
+   /* After async device loss, UNMAP could wait an unsignaled job and prevent file
+    * close from cancelling it. Keep the mapping and VA reserved until close;
+    * the kernel VM retains backing independently of the GEM handle. */
+   if (bo->va && !(device->completion && vk_device_is_lost(&device->vk))) {
       struct drm_apex_vm_bind bind = {
          .operation = APEX_DRM_VM_BIND_UNMAP, .va = bo->va, .bytes = bo->size,
       };
