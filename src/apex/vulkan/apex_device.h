@@ -67,6 +67,9 @@ VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
 void apex_bo_finish(struct apex_device *device, struct apex_bo *bo);
 
+VkResult apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
+                                      VkImageFormatProperties2 *properties);
+
 VkResult apex_device_init(struct apex_device *device,
                           struct vk_physical_device *physical,
                           const VkDeviceCreateInfo *info,

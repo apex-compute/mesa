@@ -181,6 +181,25 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    memset(&format, 0xff, sizeof(format));
    get_format(physical, VK_FORMAT_R8G8B8A8_UNORM, &format);
    CHECK(!format.linearTilingFeatures && !format.optimalTilingFeatures && !format.bufferFeatures);
+   get_format(physical, VK_FORMAT_R32_UINT, &format);
+   VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+      VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features && !format.bufferFeatures);
+   CHECK(props.limits.maxImageDimension2D == 4096 && props.limits.maxImageArrayLayers == 256);
+   PROC(GetPhysicalDeviceImageFormatProperties, get_image_format);
+   VkImageFormatProperties image_props;
+   CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &image_props) == VK_SUCCESS);
+   CHECK(image_props.maxExtent.width == 4096 && image_props.maxExtent.height == 4096 && image_props.maxExtent.depth == 1);
+   CHECK(image_props.maxMipLevels == 13 && image_props.maxArrayLayers == 256 &&
+         image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT && image_props.maxResourceSize == 64 * 1024 * 1024);
+   CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   CHECK(!image_props.maxExtent.width && !image_props.sampleCounts && !image_props.maxResourceSize);
+   CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
+      VK_IMAGE_USAGE_SAMPLED_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   CHECK(get_image_format(physical, VK_FORMAT_R32_SINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
+      VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    PROC(GetPhysicalDeviceQueueFamilyProperties, get_queues);
    VkQueueFamilyProperties queue_props;
    count = 1;

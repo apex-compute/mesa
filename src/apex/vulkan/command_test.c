@@ -28,13 +28,14 @@ static struct {
    unsigned calls[11], step, dispatch;
    int drm_fd;
    unsigned objects, live, exec_calls;
+   bool images;
    uint64_t next_offset;
    struct {
       uint64_t offset, size, va;
       uint32_t flags, uploads;
       uint8_t *local;
       bool live;
-   } gems[16];
+   } gems[128];
    struct apex_pipeline *pipelines[3];
    uint32_t *mapped;
    uint32_t expected[2048], payload[800];
@@ -47,6 +48,55 @@ static int sync_fd = -1;
 
 int __real_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
+
+static int
+image_exec(struct drm_apex_vm_exec *r)
+{
+   unsigned table, program;
+   for (table = 1; table <= mock.objects && mock.gems[table].va != r->data_va; table++);
+   for (program = 1; program <= mock.objects && mock.gems[program].va != r->program_va; program++);
+   CHECK(table <= mock.objects && program <= mock.objects);
+   CHECK(mock.gems[program].flags == (APEX_DRM_VM_READ | APEX_DRM_VM_EXEC));
+   CHECK(mock.gems[table].uploads == 1 && mock.gems[program].uploads == 1);
+   const uint32_t *words = (void *)mock.gems[table].local;
+   unsigned d = mock.dispatch++;
+   uint64_t base = mock.gems[1].va;
+   if (d == 0 || d == 14) {
+      CHECK(r->program_bytes == mock.pipelines[0]->code.size && r->workgroups == 1);
+      /* The descriptor update after recording swaps views: mip0/layer2 first,
+       * mip1/layer1 second. Offsets include the nonzero image memory binding. */
+      const uint64_t addresses[] = {base + 4224, base + 1152, base + 2240};
+      const uint32_t tails[][6] = {{768, 0, 0, 0, 0, 0}, {11, 7, 2, 64, 448, 0}, {5, 3, 2, 64, 192, 0}};
+      for (unsigned row = 0; row < 3; row++) {
+         CHECK(((uint64_t)util_le32_to_cpu(words[row * 8 + 1]) << 32 |
+                util_le32_to_cpu(words[row * 8])) == addresses[row]);
+         for (unsigned i = 0; i < 6; i++) CHECK(util_le32_to_cpu(words[row * 8 + 2 + i]) == tails[row][i]);
+      }
+      for (unsigned i = 24; i < 32; i++) CHECK(!words[i]);
+      for (unsigned i = 0; i < 4; i++) CHECK(words[32 + i] == 0xc0010000 + i);
+   } else if (d == 1) {
+      const uint32_t *push = words + 8;
+      CHECK(((uint64_t)push[1] << 32 | push[0]) == base + 9280);
+      CHECK(push[2] == 0x5a17c0de && push[3] == 256);
+      for (unsigned i = 9280 / 4; i < (9280 + 256) / 4; i++)
+         ((uint32_t *)mock.gems[1].local)[i] = 0x5a17c0de;
+   } else {
+      CHECK(d >= 2 && d <= 13);
+      unsigned phase = (d - 2) / 4, layer = ((d - 2) % 4) / 2, y = (d - 2) % 2;
+      const unsigned from[] = {12316 + layer * 60 + y * 20, 2308 + layer * 192 + y * 64,
+                               8648 + layer * 320 + y * 64};
+      const unsigned to[] = {2308 + layer * 192 + y * 64, 8648 + layer * 320 + y * 64,
+                             12800 + layer * 112 + y * 28};
+      const uint32_t *push = words + 8;
+      CHECK(((uint64_t)push[1] << 32 | push[0]) == base + from[phase]);
+      CHECK(((uint64_t)push[3] << 32 | push[2]) == base + to[phase]);
+      CHECK(push[4] == 12);
+      /* Model the already-qualified meta copy only; this is transport evidence. */
+      memcpy(mock.gems[1].local + to[phase], mock.gems[1].local + from[phase], 12);
+   }
+   r->status = 1;
+   return 0;
+}
 
 static int
 drm_ioctl(unsigned long request, void *arg)
@@ -89,7 +139,8 @@ drm_ioctl(unsigned long request, void *arg)
          unsigned h = r->handle;
          CHECK(h && h <= mock.objects && mock.gems[h].live && !mock.gems[h].va);
          CHECK(r->bytes == mock.gems[h].size);
-         CHECK(r->flags == (APEX_DRM_VM_READ | (h == 2 || h == 4 || h == 6 ? APEX_DRM_VM_EXEC : APEX_DRM_VM_WRITE)));
+         if (!mock.images)
+            CHECK(r->flags == (APEX_DRM_VM_READ | (h == 2 || h == 4 || h == 6 ? APEX_DRM_VM_EXEC : APEX_DRM_VM_WRITE)));
          if (h > 1 && mock.fault == 209) { errno = ENOMEM; return -1; }
          if (h == 3 && mock.fault == 211) { errno = ENOMEM; return -1; }
          for (unsigned i = 1; i <= mock.objects; i++)
@@ -131,6 +182,8 @@ drm_ioctl(unsigned long request, void *arg)
    } else {
       CHECK(request == DRM_IOCTL_APEX_VM_EXEC);
       struct drm_apex_vm_exec *r = arg;
+      if (mock.images)
+         return image_exec(r);
       unsigned d = mock.dispatch;
       unsigned p = MIN2(d, 2), h = 2 * p + 2;
       mock.exec_calls++;
@@ -825,6 +878,196 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
    }
 }
 
+static void
+run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t size)
+{
+   mock.images = true;
+   mock.fault = -1;
+   mock.next_offset = 4096;
+   mock.drm_fd = memfd_create("apex-image-test", MFD_CLOEXEC);
+   CHECK(mock.drm_fd >= 0);
+   physical->properties.maxComputeWorkGroupCount[0] = 1024;
+   physical->properties.maxComputeWorkGroupSize[0] = 16;
+   const float priority = 1;
+   const VkDeviceQueueCreateInfo qi = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1, .pQueuePriorities = &priority,
+   };
+   const VkDeviceCreateInfo di = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+   };
+   struct apex_device device;
+   CHECK(apex_device_init(&device, physical, &di, NULL, mock.drm_fd, APEX_TRANSPORT_DRM) == VK_SUCCESS);
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   VkDeviceMemory memory;
+   VkMemoryAllocateInfo mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = 16384};
+   CHECK(v->AllocateMemory(dev, &mi, NULL, &memory) == VK_SUCCESS);
+   uint32_t *mapped, expected[4096];
+   CHECK(v->MapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mapped) == VK_SUCCESS);
+   for (unsigned i = 0; i < ARRAY_SIZE(expected); i++) mapped[i] = expected[i] = 0x81230000 + 13 * i;
+   VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = memory, .size = VK_WHOLE_SIZE};
+   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+   VkImage images[2];
+   VkImageCreateInfo ii = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R32_UINT, .extent = {11, 7, 1}, .mipLevels = 3, .arrayLayers = 4,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   for (unsigned i = 0; i < 2; i++) {
+      if (i) { ii.extent = (VkExtent3D){9, 5, 1}; ii.mipLevels = 2; ii.arrayLayers = 3; ii.tiling = VK_IMAGE_TILING_OPTIMAL; }
+      CHECK(v->CreateImage(dev, &ii, NULL, &images[i]) == VK_SUCCESS);
+      VkMemoryRequirements req;
+      v->GetImageMemoryRequirements(dev, images[i], &req);
+      CHECK(req.size == (i ? 1344 : 2816) && req.alignment == 64 && req.memoryTypeBits == 1);
+      VkMemoryDedicatedRequirements dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+         .prefersDedicatedAllocation = VK_TRUE, .requiresDedicatedAllocation = VK_TRUE};
+      VkMemoryRequirements2 req2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dedicated};
+      VkDeviceImageMemoryRequirements dri = {.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, .pCreateInfo = &ii};
+      v->GetDeviceImageMemoryRequirements(dev, &dri, &req2);
+      CHECK(req.size == req2.memoryRequirements.size && req.alignment == req2.memoryRequirements.alignment &&
+            req.memoryTypeBits == req2.memoryRequirements.memoryTypeBits);
+      CHECK(!dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation);
+      CHECK(v->BindImageMemory(dev, images[i], memory, 1) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      CHECK(v->BindImageMemory(dev, images[i], memory, 16320) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      CHECK(v->BindImageMemory(dev, images[i], memory, i ? 8192 : 256) == VK_SUCCESS);
+   }
+   VkImage rejected;
+   ii.format = VK_FORMAT_R32_SINT;
+   CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_ERROR_FORMAT_NOT_SUPPORTED && !rejected);
+   VkImageSubresource sub = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 1, .arrayLayer = 1};
+   VkSubresourceLayout sublayout;
+   v->GetImageSubresourceLayout(dev, images[0], &sub, &sublayout);
+   CHECK(sublayout.offset == 1984 && sublayout.rowPitch == 64 && sublayout.arrayPitch == 192 && sublayout.size == 192);
+   VkImageView views[2];
+   VkImageViewCreateInfo vi = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = images[0],
+      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, .format = VK_FORMAT_R32_UINT,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, 2},
+   };
+   CHECK(v->CreateImageView(dev, &vi, NULL, &views[0]) == VK_SUCCESS);
+   vi.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 2, VK_REMAINING_ARRAY_LAYERS};
+   CHECK(v->CreateImageView(dev, &vi, NULL, &views[1]) == VK_SUCCESS);
+   VkBuffer buffers[2];
+   VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 2048,
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+   for (unsigned i = 0; i < 2; i++) {
+      CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[i]) == VK_SUCCESS);
+      CHECK(v->BindBufferMemory(dev, buffers[i], memory, i ? 12288 : 4096) == VK_SUCCESS);
+   }
+   VkDescriptorSetLayout layouts[2];
+   for (unsigned i = 0; i < 2; i++) {
+      VkDescriptorSetLayoutBinding binding = {.binding = i ? 5 : 3, .descriptorCount = i ? 2 : 1,
+         .descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+      VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .bindingCount = 1, .pBindings = &binding};
+      CHECK(v->CreateDescriptorSetLayout(dev, &li, NULL, &layouts[i]) == VK_SUCCESS);
+   }
+   VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}};
+   VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = 2, .poolSizeCount = 2, .pPoolSizes = sizes};
+   VkDescriptorPool pool;
+   CHECK(v->CreateDescriptorPool(dev, &pi, NULL, &pool) == VK_SUCCESS);
+   VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = pool, .descriptorSetCount = 2, .pSetLayouts = layouts};
+   VkDescriptorSet sets[2];
+   CHECK(v->AllocateDescriptorSets(dev, &ai, sets) == VK_SUCCESS);
+   VkDescriptorBufferInfo db = {.buffer = buffers[0], .offset = 128, .range = 768};
+   VkDescriptorImageInfo images_info[] = {{.imageView = views[0], .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                                        {.imageView = views[1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL}};
+   VkWriteDescriptorSet writes[] = {
+      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[0], .dstBinding = 3,
+       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db},
+      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[1], .dstBinding = 5,
+       .descriptorCount = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = images_info},
+   };
+   v->UpdateDescriptorSets(dev, 2, writes, 0, NULL);
+   VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+   VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 2, .pSetLayouts = layouts, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   VkShaderModuleCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = spirv};
+   VkShaderModule module;
+   CHECK(v->CreateShaderModule(dev, &si, NULL, &module) == VK_SUCCESS);
+   VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = layout,
+      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
+   VkPipeline pipeline;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipeline) == VK_SUCCESS);
+   mock.pipelines[0] = apex_pipeline_from_handle(pipeline);
+   VkCommandPool cp;
+   VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   CHECK(v->CreateCommandPool(dev, &cpi, NULL, &cp) == VK_SUCCESS);
+   VkCommandBuffer cmd;
+   VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = cp, .commandBufferCount = 1};
+   CHECK(v->AllocateCommandBuffers(dev, &cai, &cmd) == VK_SUCCESS);
+   VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   v->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, sets, 0, NULL);
+   const uint32_t push[] = {0xc0010000, 0xc0010001, 0xc0010002, 0xc0010003};
+   v->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+   v->CmdDispatch(cmd, 1, 1, 1);
+   VkClearColorValue color = {.uint32 = {0x5a17c0de}};
+   VkImageSubresourceRange clear = {VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_REMAINING_MIP_LEVELS, 1, VK_REMAINING_ARRAY_LAYERS};
+   v->CmdClearColorImage(cmd, images[1], VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear);
+   VkBufferImageCopy2 copy = {.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+      .bufferOffset = 28, .bufferRowLength = 5, .bufferImageHeight = 3,
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 2}, .imageOffset = {1, 1, 0}, .imageExtent = {3, 2, 1}};
+   VkCopyBufferToImageInfo2 to = {.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
+      .srcBuffer = buffers[1], .dstImage = images[0], .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .regionCount = 1, .pRegions = &copy};
+   v->CmdCopyBufferToImage2(cmd, &to);
+   VkImageMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = images[0], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, 2}};
+   v->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, NULL, 0, NULL, 1, &barrier);
+   VkImageCopy region = {.srcSubresource = copy.imageSubresource, .srcOffset = copy.imageOffset,
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 2}, .dstOffset = {2, 2, 0}, .extent = copy.imageExtent};
+   v->CmdCopyImage(cmd, images[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[1], VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+   copy.bufferOffset = 512; copy.bufferRowLength = 7; copy.bufferImageHeight = 4;
+   copy.imageSubresource = region.dstSubresource; copy.imageOffset = region.dstOffset;
+   VkCopyImageToBufferInfo2 from = {.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+      .srcImage = images[1], .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL, .dstBuffer = buffers[1],
+      .regionCount = 1, .pRegions = &copy};
+   v->CmdCopyImageToBuffer2(cmd, &from);
+   v->CmdDispatch(cmd, 1, 1, 1); /* Meta commands must restore pipeline/push/descriptors. */
+   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+   images_info[0].imageView = views[1]; images_info[1].imageView = views[0];
+   v->UpdateDescriptorSets(dev, 1, &writes[1], 0, NULL);
+   VkCommandBufferSubmitInfo cb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd};
+   VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cb};
+   CHECK(v->QueueSubmit2(vk_queue_to_handle(&device.queue), 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
+   CHECK(v->QueueWaitIdle(vk_queue_to_handle(&device.queue)) == VK_SUCCESS && mock.dispatch == 15);
+   CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+   for (unsigned i = 2320; i < 2384; i++) expected[i] = 0x5a17c0de;
+   for (unsigned z = 0; z < 2; z++) for (unsigned y = 0; y < 2; y++) for (unsigned x = 0; x < 3; x++) {
+      uint32_t value = 0x81230000 + 13 * (3079 + z * 15 + y * 5 + x);
+      expected[577 + z * 48 + y * 16 + x] = value;
+      expected[2162 + z * 80 + y * 16 + x] = value;
+      expected[3200 + z * 28 + y * 7 + x] = value;
+   }
+   CHECK(!memcmp(mapped, expected, sizeof(expected)));
+   v->DestroyCommandPool(dev, cp, NULL);
+   v->DestroyPipeline(dev, pipeline, NULL); v->DestroyPipelineLayout(dev, layout, NULL);
+   v->DestroyShaderModule(dev, module, NULL); v->DestroyDescriptorPool(dev, pool, NULL);
+   for (unsigned i = 0; i < 2; i++) {
+      v->DestroyDescriptorSetLayout(dev, layouts[i], NULL);
+      v->DestroyImageView(dev, views[i], NULL); v->DestroyImage(dev, images[i], NULL);
+      v->DestroyBuffer(dev, buffers[i], NULL);
+   }
+   v->UnmapMemory(dev, memory); v->FreeMemory(dev, memory, NULL);
+   apex_device_finish(&device);
+   CHECK(!mock.live && !close(mock.drm_fd));
+   puts("PASS Apex image resources: mip/layer views, descriptor updates, transfer pitches, clear ranges, meta state, 4096 words/guards (mock transport)");
+}
+
 int main(int argc, char **argv)
 {
    CHECK(argc == 2 || argc == 3 ||
@@ -853,6 +1096,13 @@ int main(int argc, char **argv)
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
+   if (argc == 3 && !strcmp(argv[2], "--images")) {
+      run_images(&physical, spirv, size);
+      free(spirv);
+      vk_physical_device_finish(&physical);
+      vk_instance_finish(&instance);
+      return 0;
+   }
    int fd = argc > 2 ? open(argv[argc - 1], O_RDWR | O_CLOEXEC) : -1;
    CHECK(argc == 2 || fd >= 0);
    bool multiwave = argc == 4 && !strcmp(argv[2], "--drm-multiwave");

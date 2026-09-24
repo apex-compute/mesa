@@ -87,10 +87,17 @@ VKAPI_ATTR void VKAPI_CALL
 apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat format,
                                        VkFormatProperties2 *properties)
 {
-   properties->formatProperties = (VkFormatProperties){0};
+   VkFormatFeatureFlags features = format == VK_FORMAT_R32_UINT ?
+      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT |
+      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT : 0;
+   properties->formatProperties = (VkFormatProperties) {
+      .linearTilingFeatures = features, .optimalTilingFeatures = features,
+   };
    VkFormatProperties3 *props3 = vk_find_struct(properties->pNext, FORMAT_PROPERTIES_3);
-   if (props3)
-      props3->linearTilingFeatures = props3->optimalTilingFeatures = props3->bufferFeatures = 0;
+   if (props3) {
+      props3->linearTilingFeatures = props3->optimalTilingFeatures = features;
+      props3->bufferFeatures = 0;
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -98,8 +105,7 @@ apex_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physical,
                                             const VkPhysicalDeviceImageFormatInfo2 *info,
                                             VkImageFormatProperties2 *properties)
 {
-   properties->imageFormatProperties = (VkImageFormatProperties){0};
-   return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   return apex_image_format_properties(info, properties);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -216,9 +222,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxBoundDescriptorSets = MESA_VK_MAX_DESCRIPTOR_SETS,
       .maxPerStageDescriptorUniformBuffers = APEX_MAX_DESCRIPTORS,
       .maxPerStageDescriptorStorageBuffers = APEX_MAX_DESCRIPTORS,
+      .maxPerStageDescriptorStorageImages = APEX_MAX_DESCRIPTORS,
       .maxPerStageResources = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetUniformBuffers = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetStorageBuffers = APEX_MAX_DESCRIPTORS,
+      .maxDescriptorSetStorageImages = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetUniformBuffersDynamic = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetStorageBuffersDynamic = APEX_MAX_DESCRIPTORS,
       .maxUniformBufferRange = 64 * 1024 * 1024,
@@ -228,6 +236,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxComputeWorkGroupCount = {1024, 1, 1},
       .maxComputeWorkGroupInvocations = 16,
       .maxComputeWorkGroupSize = {16, 16, 16},
+      .maxImageDimension2D = 4096, .maxImageArrayLayers = 256,
+      .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .minMemoryMapAlignment = 4096,
       .minUniformBufferOffsetAlignment = 4,
       .minStorageBufferOffsetAlignment = 4,

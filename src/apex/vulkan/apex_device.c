@@ -11,6 +11,7 @@
 #include "vk_descriptor_set_layout.h"
 #include "vk_device_memory.h"
 #include "vk_drm_syncobj.h"
+#include "vk_image.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "util/os_time.h"
@@ -28,6 +29,15 @@ struct apex_buffer {
    struct vk_buffer vk;
    struct apex_memory *memory;
    VkDeviceSize offset;
+};
+struct apex_image {
+   struct vk_image vk;
+   struct apex_memory *memory;
+   VkDeviceSize offset, size;
+   struct {
+      VkDeviceSize offset;
+      uint32_t row_stride, slice_stride;
+   } levels[13];
 };
 struct apex_descriptor_pool {
    struct vk_object_base base;
@@ -81,6 +91,7 @@ struct apex_command_buffer {
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_memory, vk.base, VkDeviceMemory, VK_OBJECT_TYPE_DEVICE_MEMORY);
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_buffer, vk.base, VkBuffer, VK_OBJECT_TYPE_BUFFER);
+VK_DEFINE_NONDISP_HANDLE_CASTS(apex_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE);
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_descriptor_pool, base, VkDescriptorPool, VK_OBJECT_TYPE_DESCRIPTOR_POOL);
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_descriptor_set, base, VkDescriptorSet, VK_OBJECT_TYPE_DESCRIPTOR_SET);
 VK_DEFINE_HANDLE_CASTS(apex_command_buffer, vk.base, VkCommandBuffer, VK_OBJECT_TYPE_COMMAND_BUFFER);
@@ -207,11 +218,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    vk_foreach_struct_const(sType, ext, info->pNext) {
       if (sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
          return VK_ERROR_FEATURE_NOT_PRESENT;
-      const VkMemoryDedicatedAllocateInfo *dedicated = ext;
-      if (dedicated->image)
-         return VK_ERROR_FEATURE_NOT_PRESENT;
-      /* Buffers use the same storage for dedicated and ordinary allocations.
-       * Valid dedicated bindings select this buffer at offset zero. */
+      /* Dedicated resources use ordinary storage with a zero binding offset. */
    }
    if (!info->allocationSize || info->allocationSize > 64 * 1024 * 1024)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -358,6 +365,169 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
       buffer->vk.device_address = mem->bo.va + buffer->offset;
    }
    return VK_SUCCESS;
+}
+
+VkResult
+apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
+                              VkImageFormatProperties2 *properties)
+{
+   properties->imageFormatProperties = (VkImageFormatProperties){0};
+   if (info->format != VK_FORMAT_R32_UINT || info->type != VK_IMAGE_TYPE_2D ||
+       (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
+       info->flags || (info->usage & ~(VK_IMAGE_USAGE_STORAGE_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   const VkPhysicalDeviceExternalImageFormatInfo *external =
+      vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+   if (external && external->handleType)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   properties->imageFormatProperties = (VkImageFormatProperties) {
+      .maxExtent = {4096, 4096, 1}, .maxMipLevels = 13, .maxArrayLayers = 256,
+      .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = 64 * 1024 * 1024,
+   };
+   return VK_SUCCESS;
+}
+
+/* Both API tilings currently use this linear, mip-major allocation. Optimal
+ * tiling keeps its layout private; linear subresources expose the same strides. */
+static VkDeviceSize
+image_layout(const VkImageCreateInfo *info, struct apex_image *image)
+{
+   VkDeviceSize size = 0;
+   for (unsigned l = 0; l < info->mipLevels; l++) {
+      uint32_t row = align(u_minify(info->extent.width, l) * 4, 64);
+      uint32_t slice = row * u_minify(info->extent.height, l);
+      if (image) {
+         image->levels[l].offset = size;
+         image->levels[l].row_stride = row;
+         image->levels[l].slice_stride = slice;
+      }
+      size += (uint64_t)slice * info->arrayLayers;
+   }
+   return size;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_CreateImage(VkDevice dev, const VkImageCreateInfo *info,
+                  const VkAllocationCallbacks *alloc, VkImage *out)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   *out = VK_NULL_HANDLE;
+   VkPhysicalDeviceImageFormatInfo2 format = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = info->format, .type = info->imageType, .tiling = info->tiling,
+      .usage = info->usage, .flags = info->flags,
+   };
+   VkImageFormatProperties2 props = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+   if (device->transport != APEX_TRANSPORT_DRM ||
+       apex_image_format_properties(&format, &props) != VK_SUCCESS ||
+       info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       info->samples != VK_SAMPLE_COUNT_1_BIT || !info->extent.width || !info->extent.height ||
+       info->extent.width > 4096 || info->extent.height > 4096 || info->extent.depth != 1 ||
+       !info->arrayLayers || info->arrayLayers > 256 || !info->mipLevels ||
+       info->mipLevels > util_logbase2(MAX2(info->extent.width, info->extent.height)) + 1)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   VkDeviceSize size = image_layout(info, NULL);
+   if (size > props.imageFormatProperties.maxResourceSize)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct apex_image *image = vk_image_create(&device->vk, info, alloc, sizeof(*image));
+   if (!image)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   image->size = image_layout(info, image);
+   *out = apex_image_to_handle(image);
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_DestroyImage(VkDevice dev, VkImage handle, const VkAllocationCallbacks *alloc)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   VK_FROM_HANDLE(apex_image, image, handle);
+   if (image)
+      vk_image_destroy(&device->vk, alloc, &image->vk);
+}
+
+static void
+image_memory_requirements(VkDeviceSize size, VkMemoryRequirements2 *out)
+{
+   out->memoryRequirements = (VkMemoryRequirements) {
+      .size = size, .alignment = 64, .memoryTypeBits = 1,
+   };
+   VkMemoryDedicatedRequirements *dedicated = vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
+   if (dedicated) {
+      dedicated->prefersDedicatedAllocation = VK_FALSE;
+      dedicated->requiresDedicatedAllocation = VK_FALSE;
+   }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_GetDeviceImageMemoryRequirements(VkDevice dev,
+   const VkDeviceImageMemoryRequirements *info, VkMemoryRequirements2 *out)
+{
+   image_memory_requirements(image_layout(info->pCreateInfo, NULL), out);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_GetImageMemoryRequirements2(VkDevice dev,
+   const VkImageMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *out)
+{
+   VK_FROM_HANDLE(apex_image, image, info->image);
+   image_memory_requirements(image->size, out);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo *infos)
+{
+   for (unsigned i = 0; i < count; i++) {
+      VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
+      VK_FROM_HANDLE(apex_image, image, infos[i].image);
+      if (infos[i].memoryOffset % 64 || infos[i].memoryOffset > mem->vk.size ||
+          image->size > mem->vk.size - infos[i].memoryOffset)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      image->memory = mem;
+      image->offset = infos[i].memoryOffset;
+   }
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_GetImageSubresourceLayout(VkDevice dev, VkImage handle,
+   const VkImageSubresource *subresource, VkSubresourceLayout *out)
+{
+   VK_FROM_HANDLE(apex_image, image, handle);
+   unsigned l = subresource->mipLevel;
+   *out = (VkSubresourceLayout) {
+      .offset = image->levels[l].offset + (uint64_t)image->levels[l].slice_stride * subresource->arrayLayer,
+      .size = image->levels[l].slice_stride,
+      .rowPitch = image->levels[l].row_stride,
+      .arrayPitch = image->levels[l].slice_stride,
+      .depthPitch = image->levels[l].slice_stride,
+   };
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_CreateImageView(VkDevice dev, const VkImageViewCreateInfo *info,
+                      const VkAllocationCallbacks *alloc, VkImageView *out)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   *out = VK_NULL_HANDLE;
+   if (info->flags || info->format != VK_FORMAT_R32_UINT ||
+       (info->viewType != VK_IMAGE_VIEW_TYPE_2D && info->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   struct vk_image_view *view = vk_image_view_create(&device->vk, info, alloc, sizeof(*view));
+   if (!view)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   *out = vk_image_view_to_handle(view);
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_DestroyImageView(VkDevice dev, VkImageView handle, const VkAllocationCallbacks *alloc)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   VK_FROM_HANDLE(vk_image_view, view, handle);
+   if (view)
+      vk_image_view_destroy(&device->vk, alloc, view);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -827,6 +997,124 @@ apex_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offse
    memcpy(cmd->push, push, sizeof(push));
 }
 
+static uint64_t
+image_address(const struct apex_image *image, unsigned level, unsigned layer, VkOffset3D offset)
+{
+   return image->memory->bo.va + image->offset + image->levels[level].offset +
+          (uint64_t)layer * image->levels[level].slice_stride +
+          (uint64_t)offset.y * image->levels[level].row_stride + (uint64_t)offset.x * 4;
+}
+
+/* Linear image rows use the ordinary cached buffer meta kernels. Neither path
+ * binds descriptor sets; preserve the application's pipeline and push image. */
+static void
+copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row, uint64_t src_slice,
+                uint64_t dst, uint32_t dst_row, uint64_t dst_slice, VkExtent3D extent, uint32_t layers)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   struct apex_pipeline *pipeline = cmd->pipeline;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   memcpy(push, cmd->push, sizeof(push));
+   for (unsigned z = 0; z < layers; z++) {
+      for (unsigned y = 0; y < extent.height; y++) {
+         VkDeviceMemoryCopyKHR region = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
+            .srcRange = {.address = src + z * src_slice + (uint64_t)y * src_row, .size = extent.width * 4ull},
+            .dstRange = {.address = dst + z * dst_slice + (uint64_t)y * dst_row, .size = extent.width * 4ull},
+         };
+         VkCopyDeviceMemoryInfoKHR info = {
+            .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR, .regionCount = 1, .pRegions = &region,
+         };
+         vk_meta_copy_memory(&cmd->vk, &device->meta, &info);
+      }
+   }
+   cmd->pipeline = pipeline;
+   memcpy(cmd->push, push, sizeof(push));
+}
+
+static void
+copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
+                   struct apex_image *image, unsigned count, const VkBufferImageCopy2 *regions,
+                   bool to_image)
+{
+   for (unsigned i = 0; i < count; i++) {
+      const VkBufferImageCopy2 *r = &regions[i];
+      struct vk_image_buffer_layout layout = vk_image_buffer_copy_layout(&image->vk, r);
+      unsigned l = r->imageSubresource.mipLevel;
+      uint64_t image_va = image_address(image, l, r->imageSubresource.baseArrayLayer, r->imageOffset);
+      uint64_t buffer_va = buffer->vk.device_address + r->bufferOffset;
+      if (to_image)
+         copy_image_rows(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B,
+                         image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
+                         r->imageExtent, r->imageSubresource.layerCount);
+      else
+         copy_image_rows(cmd, image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
+                         buffer_va, layout.row_stride_B, layout.image_stride_B,
+                         r->imageExtent, r->imageSubresource.layerCount);
+   }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdCopyBufferToImage2(VkCommandBuffer handle, const VkCopyBufferToImageInfo2 *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, buffer, info->srcBuffer);
+   VK_FROM_HANDLE(apex_image, image, info->dstImage);
+   copy_buffer_image(cmd, buffer, image, info->regionCount, info->pRegions, true);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdCopyImageToBuffer2(VkCommandBuffer handle, const VkCopyImageToBufferInfo2 *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_image, image, info->srcImage);
+   VK_FROM_HANDLE(apex_buffer, buffer, info->dstBuffer);
+   copy_buffer_image(cmd, buffer, image, info->regionCount, info->pRegions, false);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_image, src, info->srcImage);
+   VK_FROM_HANDLE(apex_image, dst, info->dstImage);
+   for (unsigned i = 0; i < info->regionCount; i++) {
+      const VkImageCopy2 *r = &info->pRegions[i];
+      unsigned sl = r->srcSubresource.mipLevel, dl = r->dstSubresource.mipLevel;
+      copy_image_rows(cmd, image_address(src, sl, r->srcSubresource.baseArrayLayer, r->srcOffset),
+                      src->levels[sl].row_stride, src->levels[sl].slice_stride,
+                      image_address(dst, dl, r->dstSubresource.baseArrayLayer, r->dstOffset),
+                      dst->levels[dl].row_stride, dst->levels[dl].slice_stride,
+                      r->extent, r->srcSubresource.layerCount);
+   }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdClearColorImage(VkCommandBuffer handle, VkImage img, VkImageLayout layout,
+                       const VkClearColorValue *color, uint32_t count, const VkImageSubresourceRange *ranges)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_image, image, img);
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   struct apex_pipeline *pipeline = cmd->pipeline;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   memcpy(push, cmd->push, sizeof(push));
+   for (unsigned i = 0; i < count; i++) {
+      unsigned levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
+      unsigned layers = vk_image_subresource_layer_count(&image->vk, &ranges[i]);
+      for (unsigned l = ranges[i].baseMipLevel; l < ranges[i].baseMipLevel + levels; l++) {
+         /* Padding belongs to this subresource and may be cleared with it. */
+         VkDeviceAddressRangeKHR range = {
+            .address = image_address(image, l, ranges[i].baseArrayLayer, (VkOffset3D){0}),
+            .size = (uint64_t)layers * image->levels[l].slice_stride,
+         };
+         vk_meta_fill_memory(&cmd->vk, &device->meta, &range, 0, color->uint32[0]);
+      }
+   }
+   cmd->pipeline = pipeline;
+   memcpy(cmd->push, push, sizeof(push));
+}
+
 /* Recording snapshots host data and reserves an address without kernel waits.
  * Submission materializes this immutable source before publishing dependencies. */
 static VkResult
@@ -857,11 +1145,9 @@ bind_map_upload(struct vk_command_buffer *vk, struct vk_meta_device *meta,
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 {
-   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   if (info->imageMemoryBarrierCount)
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
    /* Every native dispatch below completes allocation release before the next
-    * dispatch acquires its input. Buffer barriers need no additional operation. */
+    * dispatch acquires its input. Images retain the same linear layout across
+    * layout transitions; buffer and image barriers need no extra operation. */
 }
 
 static int
@@ -904,11 +1190,25 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
             continue;
          if (!set || memcmp(set->layout->vk.blake3, layout->vk.blake3, BLAKE3_OUT_LEN))
             goto out;
-         /* Image lowering has compiler/RTL ingress. Image allocation and
-          * view-backed submission are not implemented yet. */
          if (layout->bindings[b].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
-            result = VK_ERROR_FEATURE_NOT_PRESENT;
-            goto out;
+            VK_FROM_HANDLE(vk_image_view, view, set->descriptors[d].image.imageView);
+            if (!view)
+               continue;
+            struct apex_image *image = (void *)view->image;
+            if (!image->memory)
+               goto out;
+            unsigned l = view->base_mip_level;
+            uint64_t va = image->memory->bo.va + image->offset + image->levels[l].offset +
+                          (uint64_t)view->base_array_layer * image->levels[l].slice_stride;
+            rows[pipeline->set_offsets[s] + d].image = (struct apex_image_descriptor) {
+               util_cpu_to_le32(va), util_cpu_to_le32(va >> 32),
+               util_cpu_to_le32(u_minify(image->vk.extent.width, l)),
+               util_cpu_to_le32(u_minify(image->vk.extent.height, l)),
+               util_cpu_to_le32(view->layer_count),
+               util_cpu_to_le32(image->levels[l].row_stride),
+               util_cpu_to_le32(image->levels[l].slice_stride), 0,
+            };
+            continue;
          }
          const VkDescriptorBufferInfo *binding = &set->descriptors[d].buffer;
          VK_FROM_HANDLE(apex_buffer, buffer, binding->buffer);
@@ -1270,6 +1570,12 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CreateBuffer = apex_CreateBuffer, .DestroyBuffer = apex_DestroyBuffer,
       .GetDeviceBufferMemoryRequirements = apex_GetDeviceBufferMemoryRequirements,
       .BindBufferMemory2 = apex_BindBufferMemory2,
+      .CreateImage = apex_CreateImage, .DestroyImage = apex_DestroyImage,
+      .GetDeviceImageMemoryRequirements = apex_GetDeviceImageMemoryRequirements,
+      .GetImageMemoryRequirements2 = apex_GetImageMemoryRequirements2,
+      .BindImageMemory2 = apex_BindImageMemory2,
+      .GetImageSubresourceLayout = apex_GetImageSubresourceLayout,
+      .CreateImageView = apex_CreateImageView, .DestroyImageView = apex_DestroyImageView,
       .CreateDescriptorSetLayout = apex_CreateDescriptorSetLayout,
       .CreateDescriptorPool = apex_CreateDescriptorPool, .DestroyDescriptorPool = apex_DestroyDescriptorPool,
       .ResetDescriptorPool = apex_ResetDescriptorPool, .AllocateDescriptorSets = apex_AllocateDescriptorSets,
@@ -1280,6 +1586,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
       .CmdFillBuffer = apex_CmdFillBuffer, .CmdCopyBuffer2 = apex_CmdCopyBuffer2,
       .CmdUpdateBuffer = apex_CmdUpdateBuffer,
+      .CmdCopyBufferToImage2 = apex_CmdCopyBufferToImage2,
+      .CmdCopyImageToBuffer2 = apex_CmdCopyImageToBuffer2,
+      .CmdCopyImage2 = apex_CmdCopyImage2, .CmdClearColorImage = apex_CmdClearColorImage,
       .QueueWaitIdle = apex_QueueWaitIdle,
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
