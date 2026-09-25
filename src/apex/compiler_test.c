@@ -114,6 +114,29 @@ int main(int argc, char **argv)
    CHECK(!a.data && !a.size && !a.diagnostic[0]);
    check_binary(&b, 0x2468ace0);
 
+   {
+      nir_builder init = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         &apex_nir_options, "Apex private global initializer");
+      init.shader->info.workgroup_size[0] = 16;
+      init.shader->info.workgroup_size[1] = init.shader->info.workgroup_size[2] = 1;
+      nir_variable *var = nir_variable_create(init.shader, nir_var_shader_temp,
+                                             glsl_uint_type(), "initialized");
+      var->constant_initializer = rzalloc(init.shader, nir_constant);
+      var->constant_initializer->values[0].u32 = 0x2468ace0;
+      nir_store_ssbo(&init, nir_load_var(&init, var), nir_imm_int(&init, 0),
+                     nir_imm_int(&init, 12), .align_mul = 4);
+      CHECK(apex_from_nir(init.shader, &a) == 0);
+      nir_intrinsic_instr *store = nir_instr_as_intrinsic(nir_block_last_instr(
+         nir_start_block(nir_shader_get_entrypoint(init.shader))));
+      CHECK(store->intrinsic == nir_intrinsic_store_ssbo);
+      CHECK(nir_src_is_const(store->src[0]) &&
+            nir_src_as_uint(store->src[0]) == 0x2468ace0);
+      CHECK(nir_src_as_uint(store->src[2]) == 12);
+      ralloc_free(init.shader);
+      check_binary(&a, 0x2468ace0);
+      apex_compile_result_finish(&a);
+   }
+
    const unsigned valid_wide[][3] = {{17, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16}};
    for (unsigned i = 0; i < ARRAY_SIZE(valid_wide); i++) {
       nir = geometry_shader(valid_wide[i][0], valid_wide[i][1], valid_wide[i][2]);

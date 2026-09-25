@@ -344,6 +344,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
    NIR_PASS(_, nir, nir_opt_deref);
+   nir_remove_non_entrypoints(nir);
+   NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_shader_temp);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_function_temp, glsl_get_natural_size_align_bytes);
