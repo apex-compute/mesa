@@ -176,7 +176,10 @@ int main(int argc, char **argv)
       apex_compile_result_finish(&a);
    }
 
-   const unsigned valid_wide[][3] = {{17, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16}};
+   const unsigned valid_wide[][3] = {
+      {17, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16},
+      {256, 1, 1}, {1, 256, 1}, {1, 1, 64},
+   };
    for (unsigned i = 0; i < ARRAY_SIZE(valid_wide); i++) {
       nir = geometry_shader(valid_wide[i][0], valid_wide[i][1], valid_wide[i][2]);
       CHECK(apex_from_nir(nir, &a) == 0);

@@ -9,10 +9,12 @@
 #define APEX_DRM_CAP_GPUVM (1U << 2)
 #define APEX_DRM_CAP_ASYNC (1U << 3)
 #define APEX_DRM_CAP_PRIME_COHERENT (1U << 4)
+#define APEX_DRM_CAP_MULTIWAVE (1U << 5)
 
 /* Output only. PRIME_COHERENT distinguishes GPUVM implementations that
  * refresh shared dma-buf backing before execution and copy writable results
- * back before completion. Capabilities describe this interface, not raw PCI. */
+ * back before completion. MULTIWAVE admits APX2 groups of up to 256 invocations
+ * on the bound image. Capabilities describe this interface, not raw PCI. */
 struct drm_apex_info {
 	__u32 version;
 	__u32 capabilities;

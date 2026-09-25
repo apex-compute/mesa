@@ -18,7 +18,7 @@
 #define PROC(type, name) PFN_vk##type name = (PFN_vk##type)gipa(instance, "vk" #type); CHECK(name)
 
 static int fault, open_count, last_fd;
-static bool mock, coherent;
+static bool mock, coherent, multiwave;
 static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_RENDER] = "/apex-test/render"};
 static drmPciDeviceInfo pci = {.vendor_id = 0x10ee, .device_id = 0xa15e};
 static drmPciBusInfo bus = {.domain = 0x1234, .bus = 7, .dev = 3, .func = 1};
@@ -91,7 +91,8 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
    *info = (struct drm_apex_info) {
       .version = fault == 2 ? 1 : 2,
       .capabilities = APEX_DRM_CAP_SHMEM | (fault == 3 ? 0 : APEX_DRM_CAP_GPUVM) |
-                      (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0),
+                      (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0) |
+                      (multiwave ? APEX_DRM_CAP_MULTIWAVE : 0),
       .max_buffer_bytes = 64 * 1024 * 1024,
    };
    return 0;
@@ -149,7 +150,11 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_properties(physical, &props);
    CHECK(props.limits.maxComputeWorkGroupCount[0] == 1024 &&
          props.limits.maxComputeWorkGroupCount[1] == 1 &&
-         props.limits.maxComputeWorkGroupInvocations == 16);
+         props.limits.maxComputeWorkGroupCount[2] == 1 &&
+         props.limits.maxComputeWorkGroupInvocations == (multiwave ? 256 : 16) &&
+         props.limits.maxComputeWorkGroupSize[0] == (multiwave ? 256 : 16) &&
+         props.limits.maxComputeWorkGroupSize[1] == (multiwave ? 256 : 16) &&
+         props.limits.maxComputeWorkGroupSize[2] == (multiwave ? 64 : 16));
    CHECK(strstr(props.deviceName, "non-conformant"));
    PROC(GetPhysicalDeviceFeatures2KHR, get_features2);
    VkPhysicalDeviceRobustness2FeaturesEXT robustness = {
@@ -355,8 +360,11 @@ int main(int argc, char **argv)
          exercise(apex_GetInstanceProcAddr);
       }
       fault = 0;
-      coherent = true;
-      exercise(apex_GetInstanceProcAddr);
+      for (unsigned capabilities = 0; capabilities < 4; capabilities++) {
+         coherent = capabilities & 1;
+         multiwave = capabilities & 2;
+         exercise(apex_GetInstanceProcAddr);
+      }
       puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, cleanup (mock DRM)");
    } else {
       CHECK(!setenv("VK_DRIVER_FILES", argv[1], 1));
