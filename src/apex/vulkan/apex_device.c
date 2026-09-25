@@ -15,6 +15,7 @@
 #include "vk_image.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
+#include "vk_sampler.h"
 #include "util/os_time.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -710,6 +711,28 @@ apex_DestroyImageView(VkDevice dev, VkImageView handle, const VkAllocationCallba
    VK_FROM_HANDLE(vk_image_view, view, handle);
    if (view)
       vk_image_view_destroy(&device->vk, alloc, view);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_CreateSampler(VkDevice dev, const VkSamplerCreateInfo *info,
+                   const VkAllocationCallbacks *alloc, VkSampler *out)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   *out = VK_NULL_HANDLE;
+   struct vk_sampler *sampler = vk_sampler_create(&device->vk, info, alloc, sizeof(*sampler));
+   if (!sampler)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   *out = vk_sampler_to_handle(sampler);
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_DestroySampler(VkDevice dev, VkSampler handle, const VkAllocationCallbacks *alloc)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   VK_FROM_HANDLE(vk_sampler, sampler, handle);
+   if (sampler)
+      vk_sampler_destroy(&device->vk, alloc, sampler);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -1762,6 +1785,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .BindImageMemory2 = apex_BindImageMemory2,
       .GetImageSubresourceLayout = apex_GetImageSubresourceLayout,
       .CreateImageView = apex_CreateImageView, .DestroyImageView = apex_DestroyImageView,
+      .CreateSampler = apex_CreateSampler, .DestroySampler = apex_DestroySampler,
       .CreateDescriptorSetLayout = apex_CreateDescriptorSetLayout,
       .CreateDescriptorPool = apex_CreateDescriptorPool, .DestroyDescriptorPool = apex_DestroyDescriptorPool,
       .ResetDescriptorPool = apex_ResetDescriptorPool, .AllocateDescriptorSets = apex_AllocateDescriptorSets,

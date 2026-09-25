@@ -6,6 +6,7 @@
 #include "vk_device.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
+#include "vk_sampler.h"
 #include "util/u_math.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,10 +73,37 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    CHECK(apex_device_init(&device, physical, &device_info, NULL, -1,
                           APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
    /* Compiler/layout test only: choose the DRM descriptor ABI without a fd.
-    * No memory allocation, submission or ioctl occurs in this test. */
+    * No device-memory allocation, submission or ioctl occurs in this test. */
    device.transport = APEX_TRANSPORT_DRM;
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   if (images) {
+      CHECK(v->CreateSampler && v->DestroySampler);
+      VkSamplerCreateInfo sampler_info = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+         .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+         .addressModeV = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+         .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+         .borderColor = VK_BORDER_COLOR_INT_OPAQUE_WHITE};
+      VkSampler samplers[2];
+      for (unsigned i = 0; i < 2; i++) {
+         CHECK(v->CreateSampler(dev, &sampler_info, NULL, &samplers[i]) == VK_SUCCESS);
+         struct vk_sampler *s = vk_sampler_from_handle(samplers[i]);
+         CHECK(s && s->address_mode_u == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
+               s->address_mode_v == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
+               s->address_mode_w == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+         CHECK(s->border_color == VK_BORDER_COLOR_INT_OPAQUE_WHITE &&
+               s->border_color_value.uint32[0] == 1 && s->border_color_value.uint32[3] == 1);
+      }
+      CHECK(samplers[0] != samplers[1]);
+      VkAllocationCallbacks allocation = *vk_default_allocator();
+      allocation.pfnAllocation = fail_alloc;
+      VkSampler failed_sampler = samplers[0];
+      CHECK(v->CreateSampler(dev, &sampler_info, &allocation, &failed_sampler) ==
+            VK_ERROR_OUT_OF_HOST_MEMORY && !failed_sampler);
+      for (unsigned i = 0; i < 2; i++)
+         v->DestroySampler(dev, samplers[i], NULL);
+      v->DestroySampler(dev, VK_NULL_HANDLE, NULL);
+   }
    FILE *f = fopen(path, "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
