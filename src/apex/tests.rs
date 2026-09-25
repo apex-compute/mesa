@@ -260,6 +260,21 @@ fn scalar_control_lifetimes() {
     sequential.push(Op::new(0x2d, 999, 0, 0, 0, 0));
     assert_eq!(evaluate(&sequential), 80 * 81 / 2);
 
+    // These temporaries are redefined on each iteration, so their registers
+    // can be reused inside the loop. The accumulator/count remain live.
+    let mut looped = vec![
+        Op::new(0x10, 0, 0, 0, 0, 0),
+        Op::new(0x10, 900, 0, 0, 0, 3),
+        Op::new(0x10, 901, 0, 0, 0, 1),
+    ];
+    looped.extend_from_slice(&sequential[1..sequential.len() - 1]);
+    looped.extend([
+        Op::new(0x13, 900, 900, 901, 0, 0),
+        Op::new(5, 0, 900, 0, 0, 3),
+        Op::new(0x2d, 999, 0, 0, 0, 0),
+    ]);
+    assert_eq!(evaluate(&looped), 3 * 80 * 81 / 2);
+
     // The invariant's final textual use precedes later loop temporaries.
     // Its register must survive both inner and outer backedges.
     let nested = [

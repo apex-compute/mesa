@@ -105,8 +105,44 @@ pub fn compile(
         }
     }
     if control {
-        for v in values.values_mut() {
-            // Enclose every intersecting branch span. In particular, a value
+        for (&id, v) in values.iter_mut() {
+            if v.0 == Class::S {
+                // Scalar writes are unmasked. A definition kills the old
+                // value, allowing iteration-local masks to reuse registers.
+                let mut uses = Vec::with_capacity(ops.len());
+                let mut defs = Vec::with_capacity(ops.len());
+                for o in ops {
+                    let r = roles(o.op, o.imm)?;
+                    defs.push(r[0].is_some() && o.args[0] == id);
+                    uses.push((1..4).any(|f| r[f].is_some() && o.args[f] == id));
+                }
+                let mut live = vec![false; ops.len() + 1];
+                loop {
+                    let mut changed = false;
+                    for (pc, o) in ops.iter().enumerate().rev() {
+                        let out = match o.op {
+                            1 | 2 => false,
+                            4 => live[o.imm as usize],
+                            5 => live[o.imm as usize] || live[pc + 1],
+                            _ => live[pc + 1],
+                        };
+                        let input = uses[pc] || (!defs[pc] && out);
+                        changed |= input != live[pc];
+                        live[pc] = input;
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+                for (pc, &input) in live[..ops.len()].iter().enumerate() {
+                    if input {
+                        v.2 = v.2.min(pc);
+                        v.3 = v.3.max(pc);
+                    }
+                }
+                continue;
+            }
+            // Enclose every intersecting vector branch span. A masked value
             // used early in a loop must survive the backedge after its last
             // textual use. Iterate for nested/overlapping branch spans.
             loop {
