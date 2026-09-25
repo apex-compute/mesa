@@ -61,7 +61,7 @@ image_exec(struct drm_apex_vm_exec *r)
    const uint32_t *words = (void *)mock.gems[table].local;
    unsigned d = mock.dispatch++;
    uint64_t base = mock.gems[1].va;
-   if (d == 0 || d == 14) {
+   if (d == 0 || d == 15) {
       CHECK(r->program_bytes == mock.pipelines[0]->code.size && r->workgroups == 1);
       /* The descriptor update after recording swaps views: mip0/layer2 first,
        * mip1/layer1 second. Offsets include the nonzero image memory binding. */
@@ -74,12 +74,14 @@ image_exec(struct drm_apex_vm_exec *r)
       }
       for (unsigned i = 24; i < 32; i++) CHECK(!words[i]);
       for (unsigned i = 0; i < 4; i++) CHECK(words[32 + i] == 0xc0010000 + i);
-   } else if (d == 1) {
+   } else if (d == 1 || d == 14) {
       const uint32_t *push = words + 8;
-      CHECK(((uint64_t)push[1] << 32 | push[0]) == base + 9280);
-      CHECK(push[2] == 0x5a17c0de && push[3] == 256);
-      for (unsigned i = 9280 / 4; i < (9280 + 256) / 4; i++)
-         ((uint32_t *)mock.gems[1].local)[i] = 0x5a17c0de;
+      unsigned offset = d == 1 ? 9280 : 14592;
+      uint32_t color = d == 1 ? 0x5a17c0de : 0xff80ff00;
+      CHECK(((uint64_t)push[1] << 32 | push[0]) == base + offset);
+      CHECK(push[2] == color && push[3] == (d == 1 ? 256 : 128));
+      for (unsigned i = offset / 4; i < (offset + push[3]) / 4; i++)
+         ((uint32_t *)mock.gems[1].local)[i] = color;
    } else {
       CHECK(d >= 2 && d <= 13);
       unsigned phase = (d - 2) / 4, layer = ((d - 2) % 4) / 2, y = (d - 2) % 2;
@@ -975,6 +977,20 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    VkImage rejected;
    ii.format = VK_FORMAT_R32_SINT;
    CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_ERROR_FORMAT_NOT_SUPPORTED && !rejected);
+   ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+   CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_ERROR_FORMAT_NOT_SUPPORTED && !rejected);
+   ii.extent = (VkExtent3D){2, 2, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+   ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   VkImage rgba;
+   CHECK(v->CreateImage(dev, &ii, NULL, &rgba) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, rgba, memory, 14592) == VK_SUCCESS);
+   VkPhysicalDeviceImageFormatInfo2 format = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = ii.format, .type = ii.imageType, .tiling = ii.tiling, .usage = ii.usage};
+   VkImageFormatProperties2 props = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+   CHECK(apex_image_format_properties(&format, &props) == VK_SUCCESS &&
+         props.imageFormatProperties.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
+   format.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(apex_image_format_properties(&format, &props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    VkImageSubresource sub = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 1, .arrayLayer = 1};
    VkSubresourceLayout sublayout;
    v->GetImageSubresourceLayout(dev, images[0], &sub, &sublayout);
@@ -1095,6 +1111,9 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
       .srcImage = images[1], .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL, .dstBuffer = buffers[1],
       .regionCount = 1, .pRegions = &copy};
    v->CmdCopyImageToBuffer2(cmd, &from);
+   VkClearColorValue rgba_color = {.float32 = {0.0f, 1.0f, 0.5f, 1.0f}};
+   VkImageSubresourceRange rgba_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+   v->CmdClearColorImage(cmd, rgba, VK_IMAGE_LAYOUT_GENERAL, &rgba_color, 1, &rgba_range);
    v->CmdDispatch(cmd, 1, 1, 1); /* Meta commands must restore pipeline/push/descriptors. */
    CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
    images_info[0].imageView = views[1]; images_info[1].imageView = views[0];
@@ -1102,9 +1121,10 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    VkCommandBufferSubmitInfo cb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd};
    VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cb};
    CHECK(v->QueueSubmit2(vk_queue_to_handle(&device.queue), 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
-   CHECK(v->QueueWaitIdle(vk_queue_to_handle(&device.queue)) == VK_SUCCESS && mock.dispatch == 15);
+   CHECK(v->QueueWaitIdle(vk_queue_to_handle(&device.queue)) == VK_SUCCESS && mock.dispatch == 16);
    CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
    for (unsigned i = 2320; i < 2384; i++) expected[i] = 0x5a17c0de;
+   for (unsigned i = 3648; i < 3680; i++) expected[i] = 0xff80ff00;
    for (unsigned z = 0; z < 2; z++) for (unsigned y = 0; y < 2; y++) for (unsigned x = 0; x < 3; x++) {
       uint32_t value = 0x81230000 + 13 * (3079 + z * 15 + y * 5 + x);
       expected[577 + z * 48 + y * 16 + x] = value;
@@ -1115,6 +1135,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    v->DestroyCommandPool(dev, cp, NULL);
    v->DestroyPipeline(dev, pipeline, NULL); v->DestroyPipelineLayout(dev, layout, NULL);
    v->DestroyShaderModule(dev, module, NULL); v->DestroyDescriptorPool(dev, pool, NULL);
+   v->DestroyImage(dev, rgba, NULL);
    for (unsigned i = 0; i < 2; i++) {
       v->DestroyDescriptorSetLayout(dev, layouts[i], NULL);
       v->DestroyImageView(dev, views[i], NULL); v->DestroyImage(dev, images[i], NULL);

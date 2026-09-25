@@ -17,6 +17,7 @@
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "vk_sampler.h"
+#include "util/format/u_format.h"
 #include "util/os_time.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -577,10 +578,12 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
                               VkImageFormatProperties2 *properties)
 {
    properties->imageFormatProperties = (VkImageFormatProperties){0};
-   if (info->format != VK_FORMAT_R32_UINT || info->type != VK_IMAGE_TYPE_2D ||
+   if ((info->format != VK_FORMAT_R32_UINT && info->format != VK_FORMAT_R8G8B8A8_UNORM) ||
+       info->type != VK_IMAGE_TYPE_2D ||
        (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
        info->flags || (info->usage & ~(VK_IMAGE_USAGE_STORAGE_BIT |
-                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) ||
+       (info->format == VK_FORMAT_R8G8B8A8_UNORM && (info->usage & VK_IMAGE_USAGE_STORAGE_BIT)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
@@ -1328,6 +1331,9 @@ apex_CmdClearColorImage(VkCommandBuffer handle, VkImage img, VkImageLayout layou
    struct apex_device *device = (void *)cmd->vk.base.device;
    struct apex_pipeline *pipeline = cmd->pipeline;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   uint32_t value = count ? color->uint32[0] : 0;
+   if (count && image->vk.format == VK_FORMAT_R8G8B8A8_UNORM)
+      util_format_pack_rgba(PIPE_FORMAT_R8G8B8A8_UNORM, &value, color->float32, 1);
    memcpy(push, cmd->push, sizeof(push));
    for (unsigned i = 0; i < count; i++) {
       unsigned levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
@@ -1338,7 +1344,7 @@ apex_CmdClearColorImage(VkCommandBuffer handle, VkImage img, VkImageLayout layou
             .address = image_address(image, l, ranges[i].baseArrayLayer, (VkOffset3D){0}),
             .size = (uint64_t)layers * image->levels[l].slice_stride,
          };
-         vk_meta_fill_memory(&cmd->vk, &device->meta, &range, 0, color->uint32[0]);
+         vk_meta_fill_memory(&cmd->vk, &device->meta, &range, 0, value);
       }
    }
    cmd->pipeline = pipeline;

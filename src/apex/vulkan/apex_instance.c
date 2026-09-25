@@ -124,9 +124,12 @@ VKAPI_ATTR void VKAPI_CALL
 apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat format,
                                        VkFormatProperties2 *properties)
 {
-   VkFormatFeatureFlags features = format == VK_FORMAT_R32_UINT ?
-      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT |
-      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT : 0;
+   VkFormatFeatureFlags features = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   if (format == VK_FORMAT_R32_UINT)
+      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
+   else if (format != VK_FORMAT_R8G8B8A8_UNORM)
+      features = 0;
    properties->formatProperties = (VkFormatProperties) {
       .linearTilingFeatures = features, .optimalTilingFeatures = features,
    };
