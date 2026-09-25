@@ -49,7 +49,7 @@ test('apex-loader', apex_instance_test, args : [apex_development_icd],
   depends : [apex_icd], suite : ['apex'])
 # Hardware execution is explicit, never part of the ordinary host suite.
 apex_application_test = executable('apex-application-test', 'application_test.c',
-  include_directories : inc_include, dependencies : dep_dl, install : false,
+  include_directories : inc_include, dependencies : [dep_dl, dep_libdrm], install : false,
 )
 apex_external_sync_application = executable('apex-external-sync-application', 'external_sync_application.c',
   include_directories : inc_include, dependencies : dep_dl, install : false,

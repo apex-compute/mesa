@@ -4,10 +4,14 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <xf86drm.h>
 
 #define CHECK(x) do { if (!(x)) { \
    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); \
@@ -15,16 +19,46 @@
 #define INSTANCE(name) PFN_vk##name name = (PFN_vk##name)gipa(instance, "vk" #name); CHECK(name)
 #define DEVICE(name) PFN_vk##name name = (PFN_vk##name)gdpa(device, "vk" #name); CHECK(name)
 
+static int
+create_vgem_buffer(const char *path, uint32_t **words)
+{
+   int vgem = open(path, O_RDWR | O_CLOEXEC);
+   CHECK(vgem >= 0);
+   drmVersionPtr version = drmGetVersion(vgem);
+   CHECK(version && !strcmp(version->name, "vgem"));
+   drmFreeVersion(version);
+   struct drm_mode_create_dumb create = {.width = 1024, .height = 1, .bpp = 32};
+   CHECK(!ioctl(vgem, DRM_IOCTL_MODE_CREATE_DUMB, &create) && create.size == 4096);
+   struct drm_mode_map_dumb map = {.handle = create.handle};
+   CHECK(!ioctl(vgem, DRM_IOCTL_MODE_MAP_DUMB, &map));
+   *words = mmap(NULL, create.size, PROT_READ | PROT_WRITE, MAP_SHARED, vgem, map.offset);
+   CHECK(*words != MAP_FAILED);
+   struct drm_prime_handle prime = {.handle = create.handle, .flags = DRM_CLOEXEC | DRM_RDWR};
+   CHECK(!ioctl(vgem, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime));
+   struct drm_gem_close close_gem = {.handle = create.handle};
+   CHECK(!ioctl(vgem, DRM_IOCTL_GEM_CLOSE, &close_gem) && !close(vgem));
+   return prime.fd;
+}
+
+static void
+cpu_access(int fd, uint64_t flags)
+{
+   struct dma_buf_sync sync = {.flags = flags};
+   CHECK(!ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync));
+}
+
 int main(int argc, char **argv)
 {
    CHECK((argc == 3 || (argc == 4 && (!strcmp(argv[3], "--dispatch") ||
       !strcmp(argv[3], "--fill") || !strcmp(argv[3], "--copy") ||
-      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--external")))) && geteuid() != 0);
+      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--external"))) ||
+      (argc == 5 && !strcmp(argv[3], "--foreign"))) && geteuid() != 0);
    const int grid = argc == 4 && !strcmp(argv[3], "--dispatch");
    const int fill = argc == 4 && !strcmp(argv[3], "--fill");
    const int copy = argc == 4 && !strcmp(argv[3], "--copy");
    const int update = argc == 4 && !strcmp(argv[3], "--update");
-   const int external = argc == 4 && !strcmp(argv[3], "--external");
+   const int foreign = argc == 5;
+   const int external = foreign || (argc == 4 && !strcmp(argv[3], "--external"));
    const int transfer = fill || copy || update;
    const unsigned word_count = grid ? 262144 : transfer ? 32784 : 1024;
    const unsigned bind_words = transfer ? 16 : 0;
@@ -144,6 +178,8 @@ int main(int argc, char **argv)
    CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
    VkBuffer shared_buffer = VK_NULL_HANDLE;
    VkDeviceMemory shared_memory = VK_NULL_HANDLE;
+   int foreign_fd = -1;
+   uint32_t *foreign_words = NULL;
    if (external) {
       DEVICE(GetMemoryFdKHR);
       DEVICE(GetMemoryFdPropertiesKHR);
@@ -160,12 +196,23 @@ int main(int argc, char **argv)
          .handleTypes = external_buffer.handleTypes};
       VkMemoryAllocateInfo shared_allocate = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
          .pNext = &export, .allocationSize = requirements.size, .memoryTypeIndex = 1};
-      VkDeviceMemory original, alias;
-      CHECK(AllocateMemory(device, &shared_allocate, NULL, &original) == VK_SUCCESS);
+      VkDeviceMemory original = VK_NULL_HANDLE, alias;
       VkMemoryGetFdInfoKHR get = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-         .memory = original, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
       int fd;
-      CHECK(GetMemoryFdKHR(device, &get, &fd) == VK_SUCCESS && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+      if (foreign) {
+         foreign_fd = create_vgem_buffer(argv[4], &foreign_words);
+         cpu_access(foreign_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+         for (unsigned i = 0; i < word_count; i++) foreign_words[i] = 0xca000000 + i * 37;
+         cpu_access(foreign_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+         get.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         fd = fcntl(foreign_fd, F_DUPFD_CLOEXEC, 0);
+         CHECK(fd >= 0);
+      } else {
+         CHECK(AllocateMemory(device, &shared_allocate, NULL, &original) == VK_SUCCESS);
+         get.memory = original;
+         CHECK(GetMemoryFdKHR(device, &get, &fd) == VK_SUCCESS && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+      }
       VkImportMemoryFdInfoKHR import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
          .pNext = &export, .handleType = get.handleType, .fd = fd};
       shared_allocate.pNext = &import;
@@ -252,7 +299,7 @@ int main(int argc, char **argv)
       const unsigned y = grid && !pass ? 3 : 1;
       const unsigned z = grid && !pass ? 4 : 1;
       CHECK(BeginCommandBuffer(buffers[pass], &begin) == VK_SUCCESS);
-      if (external && !pass) {
+      if (external && !foreign && !pass) {
          VkBufferCopy region = {.size = word_count * 4};
          CmdCopyBuffer(buffers[pass], buffer, shared_buffer, 1, &region);
          VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -316,6 +363,7 @@ int main(int argc, char **argv)
       CHECK(QueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
       CHECK(WaitForFences(device, 1, &fence, VK_TRUE, grid || transfer ? 120000000000ull : 10000000000ull) == VK_SUCCESS);
       CHECK(InvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
+      if (foreign) cpu_access(foreign_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
       for (unsigned i = 0; i < word_count; i++) {
          uint32_t expected = 0xca000000 + i * 37;
          if (fill && i >= bind_words + 1 && i < bind_words + 1 + 16385) expected = 0xa5c31e79;
@@ -349,9 +397,20 @@ int main(int argc, char **argv)
             if (pass && i >= bind_words + 64 && i < bind_words + 76)
                expected = 112 + (i - bind_words - 64) * 7;
          }
+         if (foreign && pass && ((i >= 76 && i < 80) || i == 901)) expected = 0xfb000000 + i * 53;
          if (words[i] != expected)
             fprintf(stderr, "pass %u word %u: 0x%08x != 0x%08x\n", pass, i, words[i], expected);
          CHECK(words[i] == expected);
+         if (foreign) CHECK(foreign_words[i] == expected);
+      }
+      if (foreign) {
+         cpu_access(foreign_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+         if (!pass) {
+            cpu_access(foreign_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+            for (unsigned i = 76; i < 80; i++) foreign_words[i] = 0xfb000000 + i * 53;
+            foreign_words[901] = 0xfb000000 + 901 * 53;
+            cpu_access(foreign_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+         }
       }
       /* Without a flush these writes must not replace retained LOCAL results. */
       if (!grid && !transfer) for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
@@ -377,13 +436,15 @@ int main(int argc, char **argv)
       DestroyBuffer(device, shared_buffer, NULL);
       FreeMemory(device, shared_memory, NULL);
    }
+   if (foreign) CHECK(!munmap(foreign_words, 4096) && !close(foreign_fd));
    UnmapMemory(device, memory);
    DestroyBuffer(device, buffer, NULL);
    FreeMemory(device, memory, NULL);
    DestroyDevice(device, NULL);
    DestroyInstance(instance, NULL);
    CHECK(!dlclose(loader));
-   if (external) puts("PASS Apex loader external memory: OPAQUE_FD/DMA_BUF reimports, freed original/alias, 2 dispatches, 1024 words/guards each");
+   if (foreign) puts("PASS Apex loader foreign memory: vgem DMA_BUF import/reimport, exporter CPU SYNC, refresh/copyback, 2 dispatches, 1024 canonical/staging words/guards each");
+   else if (external) puts("PASS Apex loader external memory: OPAQUE_FD/DMA_BUF reimports, freed original/alias, 2 dispatches, 1024 words/guards each");
    else if (!grid && !transfer) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;
 }
