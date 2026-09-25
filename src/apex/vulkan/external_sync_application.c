@@ -36,13 +36,14 @@ int main(int argc, char **argv)
    LOAD(DestroyInstance);
    LOAD(EnumeratePhysicalDevices);
    uint32_t count = 0;
-   CHECK(EnumeratePhysicalDevices(instance, &count, NULL) == VK_SUCCESS);
-   if (!count) {
+   VkResult result = EnumeratePhysicalDevices(instance, &count, NULL);
+   if (!count && (result == VK_SUCCESS || result == VK_ERROR_INITIALIZATION_FAILED)) {
       DestroyInstance(instance, NULL);
       dlclose(loader);
       puts("SKIP Apex external sync: no compatible render device");
       return 77;
    }
+   CHECK(result == VK_SUCCESS);
    VkPhysicalDevice physical;
    CHECK(count == 1 && EnumeratePhysicalDevices(instance, &count, &physical) == VK_SUCCESS);
    LOAD(CreateDevice);
@@ -123,12 +124,15 @@ int main(int argc, char **argv)
       VkSubmitInfo consumer = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
          .waitSemaphoreCount = 1, .pWaitSemaphores = &binary[0], .pWaitDstStageMask = &stage};
       CHECK(QueueSubmit(queue[1], 1, &producer, fence[1]) == VK_SUCCESS);
-      if (pass != 1) CHECK(QueueSubmit(queue[0], 1, &consumer, fence[0]) == VK_SUCCESS);
       CHECK(WaitForFences(device[1], 1, &fence[1], VK_TRUE, 1000000) == VK_TIMEOUT);
       CHECK(GetFenceStatus(device[0], fence[0]) == VK_NOT_READY);
       VkSemaphoreSignalInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
          .semaphore = timeline[0], .value = values[pass]};
       CHECK(SignalSemaphoreKHR(device[0], &signal) == VK_SUCCESS);
+      /* VUID-vkQueueSubmit-pWaitSemaphores-03238 requires every signal on
+       * which a binary wait depends to be submitted. Mesa may wait for that
+       * publication inside QueueSubmit before copying the shared payload. */
+      if (pass != 1) CHECK(QueueSubmit(queue[0], 1, &consumer, fence[0]) == VK_SUCCESS);
       CHECK(WaitForFences(device[1], 1, &fence[1], VK_TRUE, 10000000000ull) == VK_SUCCESS);
       if (pass == 1) {
          get_sem.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
@@ -143,6 +147,8 @@ int main(int argc, char **argv)
       CHECK(WaitForFences(device[0], 1, &fence[0], VK_TRUE, 10000000000ull) == VK_SUCCESS);
       uint64_t actual;
       CHECK(GetSemaphoreCounterValueKHR(device[1], timeline[1], &actual) == VK_SUCCESS && actual == values[pass]);
+      printf("external sync: completed timeline %llu and binary pass %u\n", (unsigned long long)actual, pass);
+      fflush(stdout);
       if (pass != 2)
          for (unsigned i = 0; i < 2; i++) CHECK(ResetFences(device[i], 1, &fence[i]) == VK_SUCCESS);
    }
