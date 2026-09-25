@@ -5,6 +5,7 @@
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
+#include "vk_buffer_view.h"
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
@@ -512,6 +513,15 @@ apex_DestroyBuffer(VkDevice dev, VkBuffer handle, const VkAllocationCallbacks *a
    VK_FROM_HANDLE(apex_buffer, buffer, handle);
    if (buffer)
       vk_buffer_destroy(&device->vk, alloc, &buffer->vk);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_DestroyBufferView(VkDevice dev, VkBufferView handle, const VkAllocationCallbacks *alloc)
+{
+   VK_FROM_HANDLE(apex_device, device, dev);
+   VK_FROM_HANDLE(vk_buffer_view, view, handle);
+   if (view)
+      vk_buffer_view_destroy(&device->vk, alloc, view);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1791,6 +1801,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .FlushMappedMemoryRanges = apex_FlushMappedMemoryRanges,
       .InvalidateMappedMemoryRanges = apex_InvalidateMappedMemoryRanges,
       .CreateBuffer = apex_CreateBuffer, .DestroyBuffer = apex_DestroyBuffer,
+      .DestroyBufferView = apex_DestroyBufferView,
       .GetDeviceBufferMemoryRequirements = apex_GetDeviceBufferMemoryRequirements,
       .GetBufferMemoryRequirements2 = apex_GetBufferMemoryRequirements2,
       .BindBufferMemory2 = apex_BindBufferMemory2,

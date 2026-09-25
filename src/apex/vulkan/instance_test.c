@@ -318,6 +318,14 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    device_info.pQueueCreateInfos = &queue;
    int opens = open_count;
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_SUCCESS);
+   /* Compute-only clients may destroy an unused null buffer view. Exercise
+    * both direct lookup and the instance trampoline used by Amber cleanup. */
+   PFN_vkDestroyBufferView destroy_view =
+      (PFN_vkDestroyBufferView)gdpa(device, "vkDestroyBufferView");
+   CHECK(destroy_view);
+   destroy_view(device, VK_NULL_HANDLE, NULL);
+   PROC(DestroyBufferView, destroy_view_instance);
+   destroy_view_instance(device, VK_NULL_HANDLE, NULL);
    PFN_vkGetBufferMemoryRequirements2KHR get_requirements =
       (PFN_vkGetBufferMemoryRequirements2KHR)gdpa(device, "vkGetBufferMemoryRequirements2KHR");
    PFN_vkCreateBuffer create_buffer = (PFN_vkCreateBuffer)gdpa(device, "vkCreateBuffer");
