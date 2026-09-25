@@ -98,8 +98,11 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
    b->cursor = nir_before_instr(&i->instr);
    nir_def *row = nir_imul_imm(b, i->src[store ? 1 : 0].ssa, sizeof(union apex_descriptor));
    nir_def *words[3];
+   /* Submission metadata is immutable; every slot, including the null
+    * sentinel, has backing independent of the application's resource range. */
    for (unsigned c = 0; c < 3; c++)
-      words[c] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_iadd_imm(b, row, c * 4), .align_mul = 4);
+      words[c] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_iadd_imm(b, row, c * 4),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
    if (size) {
       nir_def_rewrite_uses(&i->def, words[2]);
    } else {
@@ -204,7 +207,8 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def *words[7];
    for (unsigned c = 0; c < ARRAY_SIZE(words); c++)
       words[c] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-                              nir_iadd_imm(b, row, c * 4), .align_mul = 4);
+         nir_iadd_imm(b, row, c * 4), .align_mul = 4,
+         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
    if (size) {
       nir_def_rewrite_uses(&i->def, nir_vec(b, &words[2], i->def.num_components));
    } else {
@@ -275,7 +279,8 @@ lower_dispatch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def *words[3];
    for (unsigned axis = 0; axis < 3; axis++)
       words[axis] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-                                nir_imm_int(b, offset + axis * 4), .align_mul = 4);
+         nir_imm_int(b, offset + axis * 4), .align_mul = 4,
+         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
    nir_def *replacement = nir_vec(b, words, 3);
    /* NIR's WorkgroupID system-value lowering already adds the native base
     * to load_workgroup_id. GlobalInvocationID needs that addition here. */
@@ -314,7 +319,8 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
       nir_def *inside = end <= size ? nir_ule_imm(b, i->src[0].ssa, size - end) : nir_imm_false(b);
       nir_push_if(b, inside);
       nir_def *value = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-         nir_iadd_imm(b, i->src[0].ssa, table_bytes + base + c * 4), .align_mul = 4);
+         nir_iadd_imm(b, i->src[0].ssa, table_bytes + base + c * 4), .align_mul = 4,
+         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
       nir_push_else(b, NULL);
       nir_def *zero = nir_imm_int(b, 0);
       nir_pop_if(b, NULL);

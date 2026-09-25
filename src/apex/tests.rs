@@ -315,8 +315,20 @@ fn vector_control_lifetimes() {
         Op::new(0x10, 206, 0, 0, 0, 1),
     ]);
     let header = ops.len() as u32;
+    // Single-definition temporaries stay inside one unchanged-mask block.
+    // They can reuse registers even when that block is inside a loop.
+    for id in 300..380 {
+        ops.push(Op::new(
+            0x22,
+            id,
+            if id == 300 { 100 } else { id - 1 },
+            1,
+            0,
+            0,
+        ));
+    }
     ops.extend([
-        Op::new(0x22, 100, 100, 1, 0, 0),
+        Op::new(0x21, 100, 379, 0, 0, 0),
         Op::new(0x20, 103, 0, 0, 0, 11),
         Op::new(0x22, 104, 100, 103, 0, 0),
         Op::new(0x13, 205, 205, 206, 0, 0),
@@ -327,7 +339,7 @@ fn vector_control_lifetimes() {
     let p = mir::compile(&ops, 4, 0, 16).unwrap();
     assert_eq!(
         p.private, 0,
-        "dead prelude values must not live through both masks and the loop"
+        "dead prelude and block-local loop values must not spill"
     );
     schedule::validate(&p.code).unwrap();
     for lane in 0..16 {
@@ -367,7 +379,7 @@ fn vector_control_lifetimes() {
         }
         assert_eq!(
             output,
-            Some(lane + 240 + if lane % 2 == 0 { 7 } else { 19 } + 9 + 11)
+            Some(lane + 240 + if lane % 2 == 0 { 7 } else { 19 } + 3 * 240 + 11)
         );
     }
 }

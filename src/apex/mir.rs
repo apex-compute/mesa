@@ -58,7 +58,8 @@ pub fn compile(
     // Masked vector writes preserve inactive lanes in out-of-SSA phi webs.
     // Include every definition/use and enclose backedges before reusing homes.
     let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
-    let mut values: BTreeMap<u32, (Class, u8, usize, usize)> = BTreeMap::new();
+    // Class, width, interval start/end, and the unique definition (if any).
+    let mut values: BTreeMap<u32, (Class, u8, usize, usize, Option<usize>)> = BTreeMap::new();
     for (pc, o) in ops.iter().enumerate() {
         if o.op == 3 {
             return Err("MIR scheduler owns waits".into());
@@ -87,8 +88,9 @@ pub fn compile(
                     return Err("MIR redefinition/type mismatch".into());
                 }
                 v.3 = pc;
+                v.4 = None;
             } else {
-                values.insert(o.args[0], (cl, n, pc, pc));
+                values.insert(o.args[0], (cl, n, pc, pc, Some(pc)));
             }
         }
     }
@@ -142,6 +144,17 @@ pub fn compile(
                 }
                 continue;
             }
+            // A single definition and all its uses in one unchanged-mask
+            // block need no retention across iterations. Reject incoming
+            // edges into the interval as well as branches/mask writes in it.
+            if v.4 == Some(v.2)
+                && !ops[v.2..=v.3].iter().any(|o| matches!(o.op, 4 | 5 | 6))
+                && !ops
+                    .iter()
+                    .any(|o| matches!(o.op, 4 | 5) && o.imm as usize > v.2 && o.imm as usize <= v.3)
+            {
+                continue;
+            }
             // Enclose every intersecting vector branch span. A masked value
             // used early in a loop must survive the backedge after its last
             // textual use. Iterate for nested/overlapping branch spans.
@@ -168,7 +181,7 @@ pub fn compile(
     let mut homes = BTreeMap::new();
     let mut occupied: Vec<(Class, u8, u8, usize)> = Vec::new();
     let mut words = source_private / 4;
-    for (&id, &(cl, n, start, end)) in order {
+    for (&id, &(cl, n, start, end, _)) in order {
         occupied.retain(|v| v.3 >= start);
         let first = if cl == Class::S { 4 } else { 0 };
         // Rotate preferred bank with SSA identity; reserve 52..63 for reloads and bank repair.

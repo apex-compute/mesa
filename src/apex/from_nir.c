@@ -390,6 +390,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       progress = false;
       NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
+      NIR_PASS(progress, nir, nir_lower_phis_to_scalar, NULL, NULL);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_minmax_sign, lower_fp32_minmax_sign, NULL);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
@@ -401,9 +402,10 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_licm, NULL);
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &(nir_opt_peephole_select_options){0});
    } while (progress);
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_sign_conversion, lower_fp32_sign_conversion, NULL);
-   NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_continue_constructs);
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
@@ -760,6 +762,17 @@ static void restore_mask(struct control_state *c, uint32_t mask)
    emit(c->ops,6,c->discard,mask,0,0,0);
 }
 
+static bool emit_masked_cf(struct control_state *c, struct exec_list *list, uint32_t mask)
+{
+   unsigned branch = util_dynarray_num_elements(c->ops, struct apex_op);
+   emit(c->ops,5,0,mask,0,0,branch + 2);
+   emit(c->ops,4,0,0,0,0,0);
+   if (!emit_cf(c,list)) return false;
+   util_dynarray_element(c->ops, struct apex_op, branch + 1)->imm =
+      util_dynarray_num_elements(c->ops, struct apex_op);
+   return true;
+}
+
 static bool emit_cf(struct control_state *c, struct exec_list *list)
 {
    foreach_list_typed(nir_cf_node,node,node,list) {
@@ -770,10 +783,10 @@ static bool emit_cf(struct control_state *c, struct exec_list *list)
          uint32_t condition=(*c->temporary)++, saved=(*c->temporary)++, otherwise=(*c->temporary)++;
          emit(c->ops,0x43,condition,value(nif->condition.ssa,0),0,0,0);
          emit(c->ops,6,saved,condition,0,0,0);
-         if (!emit_cf(c,&nif->then_list)) return false;
+         if (!emit_masked_cf(c,&nif->then_list,condition)) return false;
          emit(c->ops,0x17,otherwise,saved,condition,0,0);
          restore_mask(c,otherwise);
-         if (!emit_cf(c,&nif->else_list)) return false;
+         if (!emit_masked_cf(c,&nif->else_list,otherwise)) return false;
          restore_mask(c,saved);
       } else if (node->type==nir_cf_node_loop) {
          nir_loop *loop=nir_cf_node_as_loop(node);
