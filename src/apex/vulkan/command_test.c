@@ -999,20 +999,38 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    for (unsigned i = 0; i < 2; i++) {
       VkDescriptorSetLayoutBinding binding = {.binding = i ? 5 : 3, .descriptorCount = i ? 2 : 1,
          .descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+         .stageFlags = VK_SHADER_STAGE_ALL};
       VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
          .bindingCount = 1, .pBindings = &binding};
       CHECK(v->CreateDescriptorSetLayout(dev, &li, NULL, &layouts[i]) == VK_SUCCESS);
+      const VkShaderStageFlags stages[] = {VK_SHADER_STAGE_COMPUTE_BIT,
+         VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
+      for (unsigned s = 0; s < ARRAY_SIZE(stages); s++) {
+         binding.stageFlags = stages[s];
+         VkDescriptorSetLayout other;
+         CHECK(v->CreateDescriptorSetLayout(dev, &li, NULL, &other) == VK_SUCCESS);
+         CHECK(memcmp(vk_descriptor_set_layout_from_handle(layouts[i])->blake3,
+                      vk_descriptor_set_layout_from_handle(other)->blake3, BLAKE3_OUT_LEN));
+         v->DestroyDescriptorSetLayout(dev, other, NULL);
+      }
+      binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      VkDescriptorSetLayout unsupported;
+      CHECK(v->CreateDescriptorSetLayout(dev, &li, NULL, &unsupported) == VK_ERROR_FEATURE_NOT_PRESENT && !unsupported);
    }
-   VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}};
+   VkDescriptorPoolSize sizes[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
+   for (unsigned type = 0; type < ARRAY_SIZE(sizes); type++)
+      sizes[type] = (VkDescriptorPoolSize){type, type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? 2 : 1};
    VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 2, .poolSizeCount = 2, .pPoolSizes = sizes};
+      .maxSets = 3, .poolSizeCount = ARRAY_SIZE(sizes), .pPoolSizes = sizes};
    VkDescriptorPool pool;
    CHECK(v->CreateDescriptorPool(dev, &pi, NULL, &pool) == VK_SUCCESS);
    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = pool, .descriptorSetCount = 2, .pSetLayouts = layouts};
    VkDescriptorSet sets[2];
    CHECK(v->AllocateDescriptorSets(dev, &ai, sets) == VK_SUCCESS);
+   ai.descriptorSetCount = 1;
+   VkDescriptorSet extra;
+   CHECK(v->AllocateDescriptorSets(dev, &ai, &extra) == VK_ERROR_OUT_OF_POOL_MEMORY && !extra);
    VkDescriptorBufferInfo db = {.buffer = buffers[0], .offset = 128, .range = 768};
    VkDescriptorImageInfo images_info[] = {{.imageView = views[0], .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
                                         {.imageView = views[1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL}};

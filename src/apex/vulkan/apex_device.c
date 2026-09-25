@@ -52,8 +52,8 @@ struct apex_descriptor_pool {
    struct vk_object_base base;
    struct list_head sets;
    uint32_t capacity, allocated;
-   uint64_t descriptors[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC + 1];
-   uint64_t used[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC + 1];
+   uint64_t descriptors[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
+   uint64_t used[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
 };
 struct apex_descriptor_set {
    struct vk_object_base base;
@@ -737,8 +737,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
           (b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
            (b->descriptorType < VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
             b->descriptorType > VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)) ||
-          (device->transport == APEX_TRANSPORT_NATIVE && b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) ||
-          b->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+          (device->transport == APEX_TRANSPORT_NATIVE && b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))
          return VK_ERROR_FEATURE_NOT_PRESENT;
       descriptors += b->descriptorCount;
       count = MAX2(count, b->binding + 1);
@@ -760,6 +759,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       unsigned b = info->pBindings[i].binding;
       layout->bindings[b].count = info->pBindings[i].descriptorCount;
       layout->bindings[b].type = info->pBindings[i].descriptorType;
+      layout->bindings[b].stages = info->pBindings[i].stageFlags;
       layout->counts[layout->bindings[b].type] +=
          layout->bindings[b].count;
       layout->bindings[b].flags = binding_flags && binding_flags->bindingCount ?
@@ -790,11 +790,10 @@ apex_CreateDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo *info,
    if (info->flags & ~(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT |
                         VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT))
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   uint64_t descriptors[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC + 1] = {0};
+   uint64_t descriptors[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1] = {0};
    for (unsigned i = 0; i < info->poolSizeCount; i++) {
       VkDescriptorType type = info->pPoolSizes[i].type;
-      if (type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-          (type < VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || type > VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC))
+      if ((unsigned)type >= ARRAY_SIZE(descriptors))
          return VK_ERROR_FEATURE_NOT_PRESENT;
       descriptors[type] += info->pPoolSizes[i].descriptorCount;
    }
@@ -860,7 +859,7 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
    VK_FROM_HANDLE(apex_descriptor_pool, pool, info->descriptorPool);
    for (unsigned i = 0; i < info->descriptorSetCount; i++)
       out[i] = VK_NULL_HANDLE;
-   uint64_t descriptors[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC + 1] = {0};
+   uint64_t descriptors[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1] = {0};
    for (unsigned i = 0; i < info->descriptorSetCount; i++) {
       const struct apex_set_layout *layout =
          (const void *)vk_descriptor_set_layout_from_handle(info->pSetLayouts[i]);

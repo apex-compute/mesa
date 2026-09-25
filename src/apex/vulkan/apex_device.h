@@ -18,11 +18,12 @@ enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 struct apex_binding_layout {
    uint32_t offset, count, flags;
    VkDescriptorType type;
+   VkShaderStageFlags stages;
 };
 struct apex_set_layout {
    struct vk_descriptor_set_layout vk;
    uint32_t binding_count, descriptor_count;
-   uint32_t counts[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC + 1];
+   uint32_t counts[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
    struct apex_binding_layout bindings[];
 };
 struct apex_buffer_descriptor {
