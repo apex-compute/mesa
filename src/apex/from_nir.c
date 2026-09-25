@@ -315,6 +315,11 @@ static int fail(struct apex_compile_result *output, const char *message)
    return 1;
 }
 
+static bool licm_filter(nir_instr *instr, nir_loop *loop, bool dominates_exit)
+{
+   return dominates_exit || nir_instr_can_speculate(instr);
+}
+
 int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
 {
    *output = (struct apex_compile_result){0};
@@ -402,7 +407,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_cse);
-      NIR_PASS(progress, nir, nir_opt_licm, NULL);
+      NIR_PASS(progress, nir, nir_opt_licm, licm_filter);
       NIR_PASS(progress, nir, nir_opt_peephole_select, &(nir_opt_peephole_select_options){0});
    } while (progress);
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_sign_conversion, lower_fp32_sign_conversion, NULL);

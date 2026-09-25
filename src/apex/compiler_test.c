@@ -137,6 +137,45 @@ int main(int argc, char **argv)
       apex_compile_result_finish(&a);
    }
 
+   for (unsigned speculate = 0; speculate < 2; speculate++) {
+      nir_builder loop = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         &apex_nir_options, "Apex conditional invariant load");
+      loop.shader->info.workgroup_size[0] = 16;
+      loop.shader->info.workgroup_size[1] = loop.shader->info.workgroup_size[2] = 1;
+      nir_variable *index = nir_local_variable_create(loop.impl, glsl_uint_type(), "index");
+      nir_def *zero = nir_imm_int(&loop, 0);
+      nir_def *lane = nir_load_local_invocation_index(&loop);
+      nir_store_var(&loop, index, zero, 1);
+      nir_push_loop(&loop);
+      nir_def *iteration = nir_load_var(&loop, index);
+      nir_push_if(&loop, nir_uge_imm(&loop, iteration, 3));
+      nir_jump(&loop, nir_jump_break);
+      nir_pop_if(&loop, NULL);
+      nir_push_if(&loop, nir_ult(&loop, lane, iteration));
+      nir_def *loaded = nir_load_ssbo(&loop, 1, 32, zero, zero, .align_mul = 4,
+         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER |
+                   (speculate ? ACCESS_CAN_SPECULATE : 0));
+      nir_store_ssbo(&loop, nir_iadd(&loop, loaded, iteration), zero,
+         nir_iadd_imm(&loop, nir_ishl_imm(&loop, lane, 2), 64), .align_mul = 4);
+      nir_pop_if(&loop, NULL);
+      nir_store_var(&loop, index, nir_iadd_imm(&loop, iteration, 1), 1);
+      nir_pop_loop(&loop, NULL);
+      CHECK(apex_from_nir(loop.shader, &a) == 0);
+      unsigned loads = 0;
+      nir_foreach_block(block, loop.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_load_ssbo)
+               continue;
+            loads++;
+            CHECK((block == nir_start_block(loop.impl)) == (speculate != 0));
+         }
+      }
+      CHECK(loads == 1);
+      ralloc_free(loop.shader);
+      apex_compile_result_finish(&a);
+   }
+
    const unsigned valid_wide[][3] = {{17, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16}};
    for (unsigned i = 0; i < ARRAY_SIZE(valid_wide); i++) {
       nir = geometry_shader(valid_wide[i][0], valid_wide[i][1], valid_wide[i][2]);
