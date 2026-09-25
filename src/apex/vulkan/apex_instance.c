@@ -23,6 +23,7 @@ struct apex_physical_device {
    struct vk_physical_device vk;
    char *render_node;
    bool prime_coherent;
+   bool host_coherent;
    struct vk_sync_type sync_type;
    const struct vk_sync_type *sync_types[2];
 };
@@ -88,6 +89,16 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
       .memoryHeaps[0] = {.size = 64 * 1024 * 1024,
                         .flags = device->prime_coherent ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0},
    };
+   if (device->host_coherent) {
+      VkPhysicalDeviceMemoryProperties *mem = &properties->memoryProperties;
+      mem->memoryTypes[mem->memoryTypeCount++] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         .heapIndex = mem->memoryHeapCount++,
+      };
+      mem->memoryHeaps[1] = (VkMemoryHeap) {.size = 64 * 1024 * 1024};
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -307,6 +318,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    }
    physical->sync_type = sync_type;
    physical->prime_coherent = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT;
+   physical->host_coherent = caps.capabilities & APEX_DRM_CAP_HOST_COHERENT;
    physical->sync_types[0] = &physical->sync_type;
    physical->vk.supported_sync_types = physical->sync_types;
    *out = &physical->vk;

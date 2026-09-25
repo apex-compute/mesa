@@ -51,16 +51,18 @@ int main(int argc, char **argv)
 {
    CHECK((argc == 3 || (argc == 4 && (!strcmp(argv[3], "--dispatch") ||
       !strcmp(argv[3], "--fill") || !strcmp(argv[3], "--copy") ||
-      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--external"))) ||
+      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--external") ||
+      !strcmp(argv[3], "--coherent"))) ||
       (argc == 5 && !strcmp(argv[3], "--foreign"))) && geteuid() != 0);
    const int grid = argc == 4 && !strcmp(argv[3], "--dispatch");
    const int fill = argc == 4 && !strcmp(argv[3], "--fill");
    const int copy = argc == 4 && !strcmp(argv[3], "--copy");
    const int update = argc == 4 && !strcmp(argv[3], "--update");
+   const int coherent = argc == 4 && !strcmp(argv[3], "--coherent");
    const int foreign = argc == 5;
    const int external = foreign || (argc == 4 && !strcmp(argv[3], "--external"));
    const int transfer = fill || copy || update;
-   const unsigned word_count = grid ? 262144 : transfer ? 32784 : 1024;
+   const unsigned word_count = grid ? 262144 : transfer ? 32784 : coherent ? 2048 : 1024;
    const unsigned bind_words = transfer ? 16 : 0;
    const VkBufferCopy copies[] = {
       {513, 65539, 16385}, {32770, 98306, 62}, {34052, 99332, 124},
@@ -159,7 +161,7 @@ int main(int argc, char **argv)
    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = (word_count - bind_words) * 4 - (fill ? 3 : 0),
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-         (transfer || external ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
+         (transfer || external || coherent ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
    VkBuffer buffer;
    CHECK(CreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
    VkMemoryRequirements requirements;
@@ -167,6 +169,27 @@ int main(int argc, char **argv)
    CHECK(requirements.memoryTypeBits & 1);
    VkMemoryAllocateInfo allocate = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                     .allocationSize = requirements.size + bind_words * 4};
+   if (coherent) {
+      INSTANCE(GetPhysicalDeviceMemoryProperties);
+      VkPhysicalDeviceMemoryProperties properties;
+      GetPhysicalDeviceMemoryProperties(physical, &properties);
+      for (allocate.memoryTypeIndex = 0; allocate.memoryTypeIndex < properties.memoryTypeCount;
+           allocate.memoryTypeIndex++) {
+         const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+         if ((requirements.memoryTypeBits & (1u << allocate.memoryTypeIndex)) &&
+             (properties.memoryTypes[allocate.memoryTypeIndex].propertyFlags & required) == required)
+            break;
+      }
+      if (allocate.memoryTypeIndex == properties.memoryTypeCount) {
+         DestroyBuffer(device, buffer, NULL);
+         DestroyDevice(device, NULL);
+         DestroyInstance(instance, NULL);
+         CHECK(!dlclose(loader));
+         puts("SKIP Apex application: HOST_COHERENT memory unavailable");
+         return 77;
+      }
+   }
    VkDeviceMemory memory;
    CHECK(AllocateMemory(device, &allocate, NULL, &memory) == VK_SUCCESS);
    CHECK(BindBufferMemory(device, buffer, memory, bind_words * 4) == VK_SUCCESS);
@@ -175,7 +198,7 @@ int main(int argc, char **argv)
    for (unsigned i = 0; i < word_count; i++) words[i] = 0xca000000 + i * 37;
    VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                 .memory = memory, .size = VK_WHOLE_SIZE};
-   CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
+   if (!coherent) CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
    VkBuffer shared_buffer = VK_NULL_HANDLE;
    VkDeviceMemory shared_memory = VK_NULL_HANDLE;
    int foreign_fd = -1;
@@ -316,6 +339,12 @@ int main(int argc, char **argv)
       }
       if (copy)
          CmdCopyBuffer(buffers[pass], buffer, buffer, sizeof(copies) / sizeof(copies[0]), copies);
+      if (coherent) {
+         /* Unaligned subword stores use SYSTEM AND/OR atomics. CPU edits
+          * between passes must feed the copy and preserve neighboring bytes. */
+         const VkBufferCopy region = {.srcOffset = 401, .dstOffset = 481, .size = 2};
+         CmdCopyBuffer(buffers[pass], buffer, buffer, 1, &region);
+      }
       if (update) {
          uint32_t *data = malloc(65536);
          CHECK(data);
@@ -328,7 +357,7 @@ int main(int argc, char **argv)
          memset(data, 0xcc, 65536);
          free(data);
       }
-      if (transfer) {
+      if (transfer || coherent) {
          VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
@@ -349,6 +378,14 @@ int main(int argc, char **argv)
          CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
       }
+      if (coherent) {
+         VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+         CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+      }
       CHECK(EndCommandBuffer(buffers[pass]) == VK_SUCCESS);
       VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                              .commandBufferCount = 1, .pCommandBuffers = &buffers[pass]};
@@ -361,8 +398,11 @@ int main(int argc, char **argv)
          CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
       }
       CHECK(QueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
+      /* This disjoint page edit is post-submit, with no claim of execution
+       * overlap. No transfer or whole-allocation copyback may overwrite it. */
+      if (coherent) words[1901] = 0x9ace0000 + pass;
       CHECK(WaitForFences(device, 1, &fence, VK_TRUE, grid || transfer ? 120000000000ull : 10000000000ull) == VK_SUCCESS);
-      CHECK(InvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
+      if (!coherent) CHECK(InvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
       if (foreign) cpu_access(foreign_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
       for (unsigned i = 0; i < word_count; i++) {
          uint32_t expected = 0xca000000 + i * 37;
@@ -398,6 +438,13 @@ int main(int argc, char **argv)
                expected = 112 + (i - bind_words - 64) * 7;
          }
          if (foreign && pass && ((i >= 76 && i < 80) || i == 901)) expected = 0xfb000000 + i * 53;
+         if (coherent) {
+            if (pass && i >= 76 && i < 80) expected = 0xdead0000 + i;
+            if (pass && i == 100) expected = 0x81c35a27;
+            if (i == 120) expected = (expected & 0xff0000ff) |
+               ((pass ? 0x81c35a27 : 0xca000000 + 100 * 37) & 0x00ffff00);
+            if (i == 1901) expected = 0x9ace0000 + pass;
+         }
          if (words[i] != expected)
             fprintf(stderr, "pass %u word %u: 0x%08x != 0x%08x\n", pass, i, words[i], expected);
          CHECK(words[i] == expected);
@@ -412,8 +459,9 @@ int main(int argc, char **argv)
             cpu_access(foreign_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
          }
       }
-      /* Without a flush these writes must not replace retained LOCAL results. */
+      /* Only the coherent type exposes these unflushed edits to the GPU. */
       if (!grid && !transfer) for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
+      if (coherent) words[100] = 0x81c35a27;
       if (grid) printf("PASS Apex loader dispatch: %ux%ux%u groups, local 3x2x2, %u words/guards\n",
                        x, y, z, word_count);
       if (fill) printf("PASS Apex loader fill: pass %u, 65540-byte range, whole-size tail, suballocation, compute state, %u words/guards\n",
@@ -445,6 +493,7 @@ int main(int argc, char **argv)
    CHECK(!dlclose(loader));
    if (foreign) puts("PASS Apex loader foreign memory: vgem DMA_BUF import/reimport, exporter CPU SYNC, refresh/copyback, 2 dispatches, 1024 canonical/staging words/guards each");
    else if (external) puts("PASS Apex loader external memory: OPAQUE_FD/DMA_BUF reimports, freed original/alias, 2 dispatches, 1024 words/guards each");
+   else if (coherent) puts("PASS Apex loader host-coherent SYSTEM: no flush/invalidate, 2 dispatches, subword copies, CPU edits, 2048 words/guards each");
    else if (!grid && !transfer) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;
 }

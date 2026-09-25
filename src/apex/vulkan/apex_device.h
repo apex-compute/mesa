@@ -61,6 +61,7 @@ struct apex_device {
    int fd;
    enum apex_transport transport;
    bool prime_coherent;
+   bool host_coherent;
    struct util_vma_heap va_heap;
    mtx_t va_mutex;
    /* Serializes PRIME handle lookup and final backing destruction. */

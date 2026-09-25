@@ -10,19 +10,26 @@
 #define APEX_DRM_CAP_ASYNC (1U << 3)
 #define APEX_DRM_CAP_PRIME_COHERENT (1U << 4)
 #define APEX_DRM_CAP_MULTIWAVE (1U << 5)
+#define APEX_DRM_CAP_HOST_COHERENT (1U << 6)
 
 /* Output only. PRIME_COHERENT distinguishes GPUVM implementations that
  * refresh shared dma-buf backing before execution and copy writable results
  * back before completion. MULTIWAVE admits APX2 groups of up to 256 invocations
- * on the bound image. Capabilities describe this interface, not raw PCI. */
+ * on the bound image. HOST_COHERENT requires the image's SYSTEM atomic feature
+ * and a coherent DMA mapping; every allocation is checked again. Capabilities
+ * describe this interface, not raw PCI. */
 struct drm_apex_info {
 	__u32 version;
 	__u32 capabilities;
 	__u64 max_buffer_bytes;
 };
 
-/* Host-coherent shmem. size returns the page-rounded extent. flags and handle
- * must be zero on input. Handles belong to the calling DRM file. */
+#define APEX_DRM_GEM_HOST_COHERENT (1U << 0)
+
+/* Opt-in HOST_COHERENT uses pinned, bidirectionally DMA-mapped shmem as the
+ * GPU's SYSTEM backing; CPU and GPU share its bytes without GEM_TRANSFER.
+ * size returns the page-rounded extent; handle must be zero on input.
+ * Handles belong to the calling DRM file. Other flags are invalid. */
 struct drm_apex_gem_create {
 	__u64 size;
 	__u32 flags;
@@ -87,8 +94,9 @@ struct drm_apex_vm_bind {
 /* Private Apex GEM: explicitly copy one byte range between shmem and LOCAL;
  * TO_LOCAL uploads and FROM_LOCAL downloads without changing other bytes.
  * Once exported, shared shmem is canonical and either direction only waits
- * and rechecks reservation fences (no copy). Foreign imports return
- * EOPNOTSUPP; use their exporter for CPU access and synchronization. */
+ * and rechecks reservation fences (no copy). HOST_COHERENT also only waits:
+ * its shmem is the GPU's SYSTEM backing. Foreign imports return EOPNOTSUPP;
+ * use their exporter for CPU access and synchronization. */
 struct drm_apex_gem_transfer {
 	__u32 handle;
 	__u32 direction;
@@ -103,7 +111,10 @@ struct drm_apex_gem_transfer {
  * admission; data_va must select an RW mapping. Private BOs retain explicit
  * transfer semantics. Shared BOs refresh whole-object canonical dma-buf
  * backing into LOCAL before execution and copy writable results back after
- * drain, before returning. flags and output fields must be zero on entry.
+ * drain, before returning. HOST_COHERENT uses pinned SYSTEM backing directly,
+ * with no LOCAL shadow or transfer. Coherent PRIME export is unsupported;
+ * foreign imported PRIME retains the noncoherent LOCAL shadow semantics.
+ * flags and output fields must be zero on entry.
  * Status values match drm_apex_exec. */
 struct drm_apex_vm_exec {
 	__u64 program_va;

@@ -18,7 +18,7 @@
 #define PROC(type, name) PFN_vk##type name = (PFN_vk##type)gipa(instance, "vk" #type); CHECK(name)
 
 static int fault, open_count, last_fd;
-static bool mock, coherent, multiwave;
+static bool mock, coherent, multiwave, host_coherent;
 static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_RENDER] = "/apex-test/render"};
 static drmPciDeviceInfo pci = {.vendor_id = 0x10ee, .device_id = 0xa15e};
 static drmPciBusInfo bus = {.domain = 0x1234, .bus = 7, .dev = 3, .func = 1};
@@ -92,6 +92,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       .version = fault == 2 ? 1 : 2,
       .capabilities = APEX_DRM_CAP_SHMEM | (fault == 3 ? 0 : APEX_DRM_CAP_GPUVM) |
                       (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0) |
+                      (host_coherent ? APEX_DRM_CAP_HOST_COHERENT : 0) |
                       (multiwave ? APEX_DRM_CAP_MULTIWAVE : 0),
       .max_buffer_bytes = 64 * 1024 * 1024,
    };
@@ -185,10 +186,18 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
    get_memory(physical, &mem);
-   CHECK(mem.memoryTypeCount == (coherent ? 2 : 1) && mem.memoryHeapCount == 1);
+   CHECK(mem.memoryTypeCount == 1u + coherent + host_coherent &&
+         mem.memoryHeapCount == 1u + host_coherent);
    CHECK(mem.memoryTypes[0].propertyFlags ==
          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
    if (coherent) CHECK(mem.memoryTypes[1].propertyFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+   if (host_coherent) {
+      CHECK(mem.memoryTypes[1 + coherent].propertyFlags ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+      CHECK(mem.memoryTypes[1 + coherent].heapIndex == 1 &&
+            !mem.memoryHeaps[1].flags && mem.memoryHeaps[1].size == 64 * 1024 * 1024);
+   }
    PROC(GetPhysicalDeviceExternalBufferPropertiesKHR, get_external);
    VkPhysicalDeviceExternalBufferInfo external = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
@@ -333,7 +342,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_requirements(device, &buffer_req, &requirements);
    CHECK(requirements.memoryRequirements.size == 128 &&
          requirements.memoryRequirements.alignment == 64 &&
-         requirements.memoryRequirements.memoryTypeBits == (coherent ? 3 : 1));
+         requirements.memoryRequirements.memoryTypeBits ==
+            (host_coherent ? (coherent ? 7 : 3) : (coherent ? 3 : 1)));
    CHECK(!dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation);
    destroy_buffer(device, buffer, NULL);
    int fd1 = last_fd;
@@ -360,9 +370,10 @@ int main(int argc, char **argv)
          exercise(apex_GetInstanceProcAddr);
       }
       fault = 0;
-      for (unsigned capabilities = 0; capabilities < 4; capabilities++) {
+      for (unsigned capabilities = 0; capabilities < 8; capabilities++) {
          coherent = capabilities & 1;
          multiwave = capabilities & 2;
+         host_coherent = capabilities & 4;
          exercise(apex_GetInstanceProcAddr);
       }
       puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, cleanup (mock DRM)");

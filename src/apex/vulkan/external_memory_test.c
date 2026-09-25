@@ -21,7 +21,9 @@
  * acquire no additional kernel handle reference. No shader execution is mocked. */
 static int objects[8];
 static unsigned object_count, handle_count, live, closes, maps, binds;
-static bool coherent = true, fail_bind;
+static bool coherent = true, host_coherent, fail_bind, fail_create;
+static uint32_t expected_create_flags;
+static unsigned creates;
 static struct { unsigned object; bool live; uint64_t va, size; } handles[64];
 
 static unsigned
@@ -49,10 +51,14 @@ __wrap_ioctl(int fd, unsigned long request, ...)
    if (request == DRM_IOCTL_APEX_INFO) {
       *(struct drm_apex_info *)arg = (struct drm_apex_info) {
          .version = 2, .capabilities = APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM |
-                                      (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0),
+                                      (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0) |
+                                      (host_coherent ? APEX_DRM_CAP_HOST_COHERENT : 0),
       };
    } else if (request == DRM_IOCTL_APEX_GEM_CREATE) {
       struct drm_apex_gem_create *r = arg;
+      creates++;
+      CHECK(r->flags == expected_create_flags && !r->handle);
+      if (fail_create) { errno = EOPNOTSUPP; return -1; }
       CHECK(object_count < ARRAY_SIZE(objects));
       objects[object_count] = memfd_create("apex-owned", MFD_CLOEXEC);
       CHECK(objects[object_count] >= 0 && !ftruncate(objects[object_count], r->size));
@@ -248,6 +254,79 @@ int main(void)
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[0]) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
    apex_device_finish(&device);
+   /* Host coherence is independent of PRIME. Check both type orderings and
+    * never turn a failed coherent GEM request into a shadow allocation. */
+   for (unsigned caps = 0; caps < 4; caps++) {
+      coherent = caps & 1;
+      host_coherent = caps & 2;
+      CHECK(apex_device_init(&device, &physical, &di, NULL, fd, APEX_TRANSPORT_DRM) == VK_SUCCESS);
+      ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = 8192, .memoryTypeIndex = coherent ? 2 : 1};
+      before = creates;
+      if (!host_coherent) {
+         CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_FEATURE_NOT_PRESENT);
+         CHECK(!memory[0] && creates == before);
+         apex_device_finish(&device);
+         continue;
+      }
+      expected_create_flags = APEX_DRM_GEM_HOST_COHERENT;
+      fail_create = true;
+      CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      CHECK(!memory[0] && !live && creates == before + 1);
+      fail_create = false;
+      fail_bind = true;
+      CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      CHECK(!memory[0] && !live);
+      fail_bind = false;
+      CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
+      CHECK(v->MapMemory(dev, memory[0], 4096, 4096, 0, &map) == VK_SUCCESS);
+      uint32_t *words = map;
+      for (unsigned i = 0; i < 1024; i++) words[i] = 0x59f10000 + i * 37;
+      VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = memory[0], .offset = 4096, .size = VK_WHOLE_SIZE};
+      /* The mock rejects every GEM_TRANSFER. Coherent flush/invalidate are
+       * valid no-ops, including subranges, without touching adjacent bytes. */
+      CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+      range.size = 64;
+      CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+      for (unsigned i = 0; i < 1024; i++) CHECK(words[i] == 0x59f10000 + i * 37);
+      range.size = 4097;
+      CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_ERROR_MEMORY_MAP_FAILED);
+      void *invalid = (void *)1;
+      CHECK(v->MapMemory(dev, memory[0], 8192, 1, 0, &invalid) == VK_ERROR_MEMORY_MAP_FAILED && !invalid);
+      bi.pNext = NULL;
+      CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[0]) == VK_SUCCESS);
+      VkMemoryRequirements req;
+      v->GetBufferMemoryRequirements(dev, buffers[0], &req);
+      CHECK(req.memoryTypeBits == (coherent ? 7 : 3));
+      CHECK(v->BindBufferMemory(dev, buffers[0], memory[0], 4096) == VK_SUCCESS);
+      VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R32_UINT,
+         .extent = {7, 3, 1}, .mipLevels = 1, .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+         .usage = VK_IMAGE_USAGE_STORAGE_BIT};
+      VkImage image;
+      CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
+      v->GetImageMemoryRequirements(dev, image, &req);
+      CHECK(req.memoryTypeBits == (coherent ? 5 : 3));
+      CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
+      ai.pNext = &export;
+      CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      import.fd = objects[0];
+      ai.pNext = &import;
+      CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      CHECK(fcntl(import.fd, F_GETFD) >= 0);
+      get.memory = memory[0];
+      CHECK(v->GetMemoryFdKHR(dev, &get, &exported) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      v->DestroyImage(dev, image, NULL);
+      v->DestroyBuffer(dev, buffers[0], NULL);
+      v->UnmapMemory(dev, memory[0]);
+      v->FreeMemory(dev, memory[0], NULL);
+      CHECK(!live);
+      apex_device_finish(&device);
+   }
+   puts("PASS Apex host-coherent memory: independent capability, GEM flag/no fallback, range no-ops, buffer/image types, external rejection, cleanup (mock DRM)");
    CHECK(!close(fd));
    for (unsigned i = 0; i < object_count; i++) CHECK(!close(objects[i]));
    vk_physical_device_finish(&physical);

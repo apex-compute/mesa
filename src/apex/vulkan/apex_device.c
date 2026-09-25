@@ -126,9 +126,10 @@ check_status(struct vk_device *vk)
 }
 
 static VkResult
-gem_create(struct apex_device *device, uint64_t size, uint32_t *handle, void **data)
+gem_create(struct apex_device *device, uint64_t size, uint32_t flags,
+           uint32_t *handle, void **data)
 {
-   struct drm_apex_gem_create create = {.size = size};
+   struct drm_apex_gem_create create = {.size = size, .flags = flags};
    if (ioctl(device->fd, DRM_IOCTL_APEX_GEM_CREATE, &create))
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    struct drm_apex_gem_mmap map = {.handle = create.handle};
@@ -173,11 +174,11 @@ apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
 /* Consumes reserved_va on both success and failure; zero allocates a new VA. */
 static VkResult
 bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
-          uint64_t reserved_va, struct apex_bo *bo)
+          uint32_t gem_flags, uint64_t reserved_va, struct apex_bo *bo)
 {
    bo->size = align64(size, 4096);
    uint64_t va = reserved_va;
-   VkResult result = gem_create(device, bo->size, &bo->handle, &bo->map);
+   VkResult result = gem_create(device, bo->size, gem_flags, &bo->handle, &bo->map);
    if (result != VK_SUCCESS)
       goto fail;
    if (!va) {
@@ -331,13 +332,19 @@ apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits t
    return VK_SUCCESS;
 }
 
+static uint32_t
+host_memory_types(const struct apex_device *device)
+{
+   return 1 | (device->host_coherent ? 1u << (1 + device->prime_coherent) : 0);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
                     const VkAllocationCallbacks *alloc, VkDeviceMemory *out)
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->memoryTypeIndex > (device->prime_coherent ? 1u : 0u))
+   if (info->memoryTypeIndex > (unsigned)(device->prime_coherent + device->host_coherent))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    const VkImportMemoryFdInfoKHR *import = vk_find_struct_const(info->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    if (import && !import->handleType)
@@ -372,7 +379,9 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
       result = bo_create(device, info->allocationSize,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, &mem->storage->bo);
+                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE,
+                         device->host_coherent && info->memoryTypeIndex == 1u + device->prime_coherent ?
+                            APEX_DRM_GEM_HOST_COHERENT : 0, 0, &mem->storage->bo);
       if (result == VK_SUCCESS) {
          mem->data = mem->storage->bo.map;
          mem->storage->refs = 1;
@@ -421,9 +430,11 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_MapMemory2(VkDevice dev, const VkMemoryMapInfo *info, void **out)
 {
+   VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_memory, memory, info->memory);
    *out = NULL;
-   if (memory->vk.memory_type_index || info->flags || info->offset >= memory->vk.size ||
+   if (!(host_memory_types(device) & (1u << memory->vk.memory_type_index)) ||
+       info->flags || info->offset >= memory->vk.size ||
        (info->size != VK_WHOLE_SIZE && info->size > memory->vk.size - info->offset))
       return VK_ERROR_MEMORY_MAP_FAILED;
    *out = (uint8_t *)memory->data + info->offset;
@@ -443,13 +454,14 @@ mapped_memory_ranges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ra
    VK_FROM_HANDLE(apex_device, device, dev);
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, memory, ranges[i].memory);
-      if (memory->vk.memory_type_index || ranges[i].offset >= memory->vk.size)
+      if (!(host_memory_types(device) & (1u << memory->vk.memory_type_index)) ||
+          ranges[i].offset >= memory->vk.size)
          return VK_ERROR_MEMORY_MAP_FAILED;
       uint64_t bytes = ranges[i].size == VK_WHOLE_SIZE ?
          memory->vk.size - ranges[i].offset : ranges[i].size;
       if (!bytes || bytes > memory->vk.size - ranges[i].offset)
          return VK_ERROR_MEMORY_MAP_FAILED;
-      if (device->transport == APEX_TRANSPORT_DRM) {
+      if (device->transport == APEX_TRANSPORT_DRM && !memory->vk.memory_type_index) {
          VkResult result = bo_transfer(device, &memory->storage->bo, direction, ranges[i].offset, bytes);
          if (result != VK_SUCCESS)
             return result;
@@ -512,7 +524,7 @@ apex_GetDeviceBufferMemoryRequirements(VkDevice dev,
    out->memoryRequirements = (VkMemoryRequirements) {
       .size = align64(info->pCreateInfo->size, 64), .alignment = 64,
       .memoryTypeBits = external && external->handleTypes ? (device->prime_coherent ? 2 : 0) :
-                         (device->prime_coherent ? 3 : 1),
+                         host_memory_types(device) | (device->prime_coherent ? 2 : 0),
    };
    VkMemoryDedicatedRequirements *dedicated =
       vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
@@ -631,10 +643,10 @@ apex_DestroyImage(VkDevice dev, VkImage handle, const VkAllocationCallbacks *all
 }
 
 static void
-image_memory_requirements(VkDeviceSize size, VkMemoryRequirements2 *out)
+image_memory_requirements(struct apex_device *device, VkDeviceSize size, VkMemoryRequirements2 *out)
 {
    out->memoryRequirements = (VkMemoryRequirements) {
-      .size = size, .alignment = 64, .memoryTypeBits = 1,
+      .size = size, .alignment = 64, .memoryTypeBits = host_memory_types(device),
    };
    VkMemoryDedicatedRequirements *dedicated = vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
    if (dedicated) {
@@ -647,15 +659,17 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_GetDeviceImageMemoryRequirements(VkDevice dev,
    const VkDeviceImageMemoryRequirements *info, VkMemoryRequirements2 *out)
 {
-   image_memory_requirements(image_layout(info->pCreateInfo, NULL), out);
+   VK_FROM_HANDLE(apex_device, device, dev);
+   image_memory_requirements(device, image_layout(info->pCreateInfo, NULL), out);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_GetImageMemoryRequirements2(VkDevice dev,
    const VkImageMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *out)
 {
+   VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_image, image, info->image);
-   image_memory_requirements(image->size, out);
+   image_memory_requirements(device, image->size, out);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -1439,7 +1453,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
    }
    if (!pipeline->program.handle) {
       result = bo_create(device, pipeline->code.size,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, 0, &pipeline->program);
+                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, 0, 0, &pipeline->program);
       if (result != VK_SUCCESS)
          goto out;
       memcpy(pipeline->program.map, pipeline->code.data, pipeline->code.size);
@@ -1450,7 +1464,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
          goto out;
       }
    }
-   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, table);
+   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, 0, table);
    if (result != VK_SUCCESS)
       goto out;
    memcpy(table->map, rows, bytes);
@@ -1692,7 +1706,7 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
             continue;
          uint64_t va = upload->reserved_va;
          upload->reserved_va = 0;
-         if (bo_create(device, upload->size, APEX_DRM_VM_READ, va, &upload->bo) != VK_SUCCESS)
+         if (bo_create(device, upload->size, APEX_DRM_VM_READ, 0, va, &upload->bo) != VK_SUCCESS)
             return vk_queue_set_lost(queue, "Apex update allocation failed");
          memcpy(upload->bo.map, upload->data, upload->size);
          if (bo_transfer(device, &upload->bo, APEX_DRM_TRANSFER_TO_LOCAL, 0, upload->size) != VK_SUCCESS)
@@ -1758,7 +1772,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
        info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
       return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex requires one unflagged queue from family 0");
-   bool async = false, prime_coherent = false;
+   bool async = false, prime_coherent = false, host_coherent = false;
    if (transport == APEX_TRANSPORT_DRM) {
       struct drm_apex_info caps = {0};
       if (ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 2 ||
@@ -1767,6 +1781,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
          return VK_ERROR_INCOMPATIBLE_DRIVER;
       async = (caps.capabilities & APEX_DRM_CAP_ASYNC) && physical->supported_sync_types;
       prime_coherent = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT;
+      host_coherent = caps.capabilities & APEX_DRM_CAP_HOST_COHERENT;
    }
    const struct vk_device_entrypoint_table entrypoints = {
       .CreateComputePipelines = apex_CreateComputePipelines,
@@ -1820,6 +1835,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->fd = fd;
    device->transport = transport;
    device->prime_coherent = prime_coherent;
+   device->host_coherent = host_coherent;
    device->completion = 0;
    device->point = 0;
    list_inithead(&device->retired);
