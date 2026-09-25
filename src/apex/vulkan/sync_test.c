@@ -6,11 +6,16 @@
 #include "vk_instance.h"
 #include "vk_physical_device.h"
 #include "vk_queue.h"
+#include "vk_fence.h"
+#include "vk_semaphore.h"
 #include "util/os_time.h"
 #include "drm-uapi/drm.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <semaphore.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { \
    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); \
@@ -22,6 +27,8 @@ static struct vk_device *waiting_device;
 static bool wait_success, inject_loss;
 static unsigned wait_flags, wait_calls;
 static int64_t last_timeout;
+static unsigned reset_calls;
+static bool reject_fd, checking_external;
 
 static int
 create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
@@ -38,6 +45,102 @@ destroy(struct util_sync_provider *p, uint32_t handle)
 }
 
 static void finalize(struct util_sync_provider *p) { }
+
+static int
+export_fd(struct util_sync_provider *p, uint32_t handle, int *fd)
+{
+   CHECK(handle == 19);
+   *fd = memfd_create("mock-sync-payload", MFD_CLOEXEC);
+   CHECK(*fd >= 0);
+   return 0;
+}
+
+static int
+import_fd(struct util_sync_provider *p, int fd, uint32_t *handle)
+{
+   CHECK(fcntl(fd, F_GETFD) >= 0);
+   if (reject_fd) { errno = EINVAL; return -1; }
+   *handle = 19;
+   return 0;
+}
+
+static int
+import_file(struct util_sync_provider *p, uint32_t handle, int fd)
+{
+   CHECK(handle == 19);
+   return import_fd(p, fd, &handle);
+}
+
+static int
+reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t count)
+{
+   CHECK(count == 1 && handles[0] == 19);
+   reset_calls++;
+   return 0;
+}
+
+/* FD ownership and copy/reference transference use the real runtime. The
+ * provider only records API operations; it supplies no completion evidence. */
+static void
+external_sync(VkDevice device)
+{
+   VkExportFenceCreateInfo export_fence = {.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = &export_fence,
+      .flags = VK_FENCE_CREATE_SIGNALED_BIT};
+   VkFence fence;
+   CHECK(vk_common_CreateFence(device, &fi, NULL, &fence) == VK_SUCCESS);
+   VkFenceGetFdInfoKHR get_fence = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+      .fence = fence, .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT};
+   int fd;
+   CHECK(vk_common_GetFenceFdKHR(device, &get_fence, &fd) == VK_SUCCESS);
+   CHECK(!reset_calls && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+   VkImportFenceFdInfoKHR import_fence = {.sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR,
+      .fence = fence, .handleType = get_fence.handleType, .fd = fd};
+   reject_fd = true;
+   CHECK(vk_common_ImportFenceFdKHR(device, &import_fence) != VK_SUCCESS && fcntl(fd, F_GETFD) >= 0);
+   reject_fd = false;
+   CHECK(vk_common_ImportFenceFdKHR(device, &import_fence) == VK_SUCCESS);
+   CHECK(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+   get_fence.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+   CHECK(vk_common_GetFenceFdKHR(device, &get_fence, &fd) == VK_SUCCESS && reset_calls == 1);
+   import_fence.handleType = get_fence.handleType;
+   import_fence.flags = VK_FENCE_IMPORT_TEMPORARY_BIT;
+   import_fence.fd = fd;
+   CHECK(vk_common_ImportFenceFdKHR(device, &import_fence) == VK_SUCCESS);
+   CHECK(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+   CHECK(vk_fence_from_handle(fence)->temporary);
+   CHECK(vk_common_ResetFences(device, 1, &fence) == VK_SUCCESS && reset_calls == 2);
+   CHECK(!vk_fence_from_handle(fence)->temporary);
+   vk_common_DestroyFence(device, fence, NULL);
+
+   VkExportSemaphoreCreateInfo export_sem = {.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+   VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export_sem};
+   VkSemaphore semaphore;
+   CHECK(vk_common_CreateSemaphore(device, &si, NULL, &semaphore) == VK_SUCCESS);
+   VkSemaphoreGetFdInfoKHR get_sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+      .semaphore = semaphore, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT};
+   CHECK(vk_common_GetSemaphoreFdKHR(device, &get_sem, &fd) == VK_SUCCESS && reset_calls == 2);
+   VkImportSemaphoreFdInfoKHR import_sem = {.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+      .semaphore = semaphore, .handleType = get_sem.handleType, .fd = fd};
+   reject_fd = true;
+   CHECK(vk_common_ImportSemaphoreFdKHR(device, &import_sem) != VK_SUCCESS && fcntl(fd, F_GETFD) >= 0);
+   reject_fd = false;
+   CHECK(vk_common_ImportSemaphoreFdKHR(device, &import_sem) == VK_SUCCESS);
+   CHECK(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+   get_sem.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+   CHECK(vk_common_GetSemaphoreFdKHR(device, &get_sem, &fd) == VK_SUCCESS && reset_calls == 3);
+   import_sem.handleType = get_sem.handleType;
+   import_sem.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+   import_sem.fd = fd;
+   CHECK(vk_common_ImportSemaphoreFdKHR(device, &import_sem) == VK_SUCCESS);
+   CHECK(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+   CHECK(vk_semaphore_from_handle(semaphore)->temporary);
+   CHECK(vk_common_GetSemaphoreFdKHR(device, &get_sem, &fd) == VK_SUCCESS && reset_calls == 3);
+   CHECK(!vk_semaphore_from_handle(semaphore)->temporary && !close(fd));
+   vk_common_DestroySemaphore(device, semaphore, NULL);
+}
 
 static int
 wait_sync(struct util_sync_provider *p, uint32_t *handles, unsigned count,
@@ -66,8 +169,12 @@ static int
 wait_timeline(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
               unsigned count, int64_t timeout, unsigned flags, uint32_t *first)
 {
-   CHECK(points[0] == 73);
-   if (count == 2) CHECK(points[1] == 91);
+   if (checking_external) {
+      CHECK(count == 1 && points[0] == 0 && (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE));
+   } else {
+      CHECK(points[0] == 73);
+      if (count == 2) CHECK(points[1] == 91);
+   }
    return wait_sync(p, handles, count, timeout, flags, first);
 }
 
@@ -117,6 +224,8 @@ int main(void)
    struct util_sync_provider provider = {
       .create = create, .destroy = destroy, .wait = wait_sync,
       .timeline_wait = wait_timeline, .finalize = finalize,
+      .handle_to_fd = export_fd, .fd_to_handle = import_fd,
+      .export_sync_file = export_fd, .import_sync_file = import_file, .reset = reset,
    };
    wait_success = true;
    struct vk_sync_type type = vk_drm_syncobj_get_type_from_provider(&provider);
@@ -129,6 +238,9 @@ int main(void)
    (void)vk_device_to_handle(&device);
    device.sync = &provider;
    waiting_device = &device;
+   checking_external = true;
+   external_sync(vk_device_to_handle(&device));
+   checking_external = false;
    struct vk_sync *sync;
    CHECK(vk_sync_create(&device, &type, VK_SYNC_IS_TIMELINE, 0, &sync) == VK_SUCCESS);
    struct vk_sync_wait wait = {.sync = sync, .wait_value = 73};
@@ -186,6 +298,6 @@ int main(void)
    vk_device_finish(&device);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
-   puts("PASS Mesa sync recovery: deadlines, ANY/ALL, pending, loss, zero probe, sleeping drain, retained submits");
+   puts("PASS Mesa sync: FD ownership/transference, temporary restoration, deadlines, ANY/ALL, pending, loss, sleeping drain (mock provider)");
    return 0;
 }

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_entrypoints.h"
 #include "drm-uapi/apex_drm.h"
+#include "util/macros.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -113,8 +114,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    info.ppEnabledExtensionNames = &unsupported;
    CHECK(create(&info, NULL, &instance) == VK_ERROR_EXTENSION_NOT_PRESENT);
    const char *instance_extensions[] = {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-      VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME};
-   info.enabledExtensionCount = 2;
+      VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME};
+   info.enabledExtensionCount = ARRAY_SIZE(instance_extensions);
    info.ppEnabledExtensionNames = instance_extensions;
    CHECK(create(&info, NULL, &instance) == VK_SUCCESS);
    PROC(DestroyInstance, destroy);
@@ -203,6 +206,36 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    const uint8_t expected_id[VK_UUID_SIZE] = {0xee, 0x10, 0x5e, 0xa1, 0x34, 0x12, 7, 3, 1};
    CHECK(!memcmp(id.deviceUUID, expected_id, sizeof(expected_id)));
    CHECK(!memcmp(id.driverUUID, "Apex GEM bytes 1", VK_UUID_SIZE));
+   PROC(GetPhysicalDeviceExternalSemaphorePropertiesKHR, get_external_semaphore);
+   PROC(GetPhysicalDeviceExternalFencePropertiesKHR, get_external_fence);
+   const uint32_t fd_types[] = {VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+      VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+   for (unsigned i = 0; i < ARRAY_SIZE(fd_types); i++) {
+      VkPhysicalDeviceExternalSemaphoreInfo sem_info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+         .handleType = fd_types[i]};
+      VkExternalSemaphoreProperties sem_props = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+      get_external_semaphore(physical, &sem_info, &sem_props);
+      CHECK(sem_props.externalSemaphoreFeatures ==
+         (VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT));
+      CHECK(sem_props.compatibleHandleTypes == (fd_types[0] | fd_types[1]));
+      VkSemaphoreTypeCreateInfo timeline = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+      sem_info.pNext = &timeline;
+      get_external_semaphore(physical, &sem_info, &sem_props);
+      CHECK(sem_props.externalSemaphoreFeatures == (i ? 0 :
+         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT));
+      CHECK(sem_props.compatibleHandleTypes == (i ? 0 : fd_types[0]));
+      VkPhysicalDeviceExternalFenceInfo fence_info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+         .handleType = i ? VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT : VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT};
+      VkExternalFenceProperties fence_props = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES};
+      get_external_fence(physical, &fence_info, &fence_props);
+      CHECK(fence_props.externalFenceFeatures ==
+         (VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT));
+      CHECK(fence_props.compatibleHandleTypes ==
+         (VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT));
+   }
    PROC(GetPhysicalDeviceFormatProperties, get_format);
    VkFormatProperties format;
    memset(&format, 0xff, sizeof(format));
@@ -248,10 +281,12 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    const char *memory_extensions[] = {
       VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
       VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME, VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,
       VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
       VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
    };
-   device_info.enabledExtensionCount = coherent ? 7 : 4;
+   device_info.enabledExtensionCount = coherent ? 11 : 8;
    device_info.ppEnabledExtensionNames = memory_extensions;
    device_info.pNext = &features;
    robustness.nullDescriptor = VK_TRUE;

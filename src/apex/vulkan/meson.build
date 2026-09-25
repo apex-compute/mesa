@@ -51,6 +51,9 @@ test('apex-loader', apex_instance_test, args : [apex_development_icd],
 apex_application_test = executable('apex-application-test', 'application_test.c',
   include_directories : inc_include, dependencies : dep_dl, install : false,
 )
+apex_external_sync_application = executable('apex-external-sync-application', 'external_sync_application.c',
+  include_directories : inc_include, dependencies : dep_dl, install : false,
+)
 apex_application_spv = custom_target('apex-application-spv',
   input : 'pipeline.spvasm', output : 'application.spv',
   command : [find_program('spirv-as'), '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],

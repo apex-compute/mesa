@@ -32,6 +32,8 @@ VK_DEFINE_HANDLE_CASTS(apex_physical_device, vk.base, VkPhysicalDevice,
 static const struct vk_instance_extension_table instance_extensions = {
    .KHR_get_physical_device_properties2 = true,
    .KHR_external_memory_capabilities = true,
+   .KHR_external_semaphore_capabilities = true,
+   .KHR_external_fence_capabilities = true,
    .EXT_debug_utils = true,
 };
 
@@ -214,7 +216,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    struct vk_sync_type sync_type = vk_drm_syncobj_get_type(fd);
    close(fd);
    const uint32_t required_sync = VK_SYNC_FEATURE_BINARY | VK_SYNC_FEATURE_TIMELINE |
-                                  VK_SYNC_FEATURE_CPU_WAIT | VK_SYNC_FEATURE_WAIT_PENDING;
+                                  VK_SYNC_FEATURE_CPU_WAIT | VK_SYNC_FEATURE_CPU_RESET |
+                                  VK_SYNC_FEATURE_GPU_WAIT | VK_SYNC_FEATURE_WAIT_PENDING;
    if ((sync_type.features & required_sync) != required_sync)
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    struct apex_physical_device *physical = vk_zalloc(&instance->alloc,
@@ -229,6 +232,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_external_memory = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .KHR_external_memory_fd = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .EXT_external_memory_dma_buf = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      /* Mesa's DRM syncobj type supplies opaque-FD and sync-file payloads. */
+      .KHR_external_semaphore = true,
+      .KHR_external_semaphore_fd = true,
+      .KHR_external_fence = true,
+      .KHR_external_fence_fd = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
       .EXT_robustness2 = true,
