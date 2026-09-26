@@ -978,7 +978,8 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    ii.format = VK_FORMAT_R32_SINT;
    CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_ERROR_FORMAT_NOT_SUPPORTED && !rejected);
    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
-   CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_ERROR_FORMAT_NOT_SUPPORTED && !rejected);
+   CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_SUCCESS);
+   v->DestroyImage(dev, rejected, NULL);
    ii.extent = (VkExtent3D){2, 2, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
    ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    VkImage rgba;

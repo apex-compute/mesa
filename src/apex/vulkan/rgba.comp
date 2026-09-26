@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+#version 450
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, rgba8) uniform image2D pixels;
+layout(set = 0, binding = 1, std430) buffer Output { uint words[]; } output_data;
+
+void main()
+{
+   uint lane = gl_LocalInvocationIndex;
+   if (lane >= 4u)
+      return;
+   ivec2 pos = ivec2(int(lane & 1u), int(lane >> 1u));
+   // Distinct channels, clamping and half-way round-to-even (127.5 -> 128).
+   vec4 color = vec4(-0.2, 0.5, 1.2, float(lane) / 3.0);
+   imageStore(pixels, pos, color);
+   memoryBarrierImage();
+   vec4 readback = imageLoad(pixels, pos);
+   for (uint c = 0u; c < 4u; c++)
+      output_data.words[4u * lane + c] = floatBitsToUint(readback[c]);
+}

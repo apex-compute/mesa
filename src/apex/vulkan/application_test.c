@@ -54,14 +54,16 @@ int main(int argc, char **argv)
       !strcmp(argv[3], "--update") || !strcmp(argv[3], "--rgba") ||
       !strcmp(argv[3], "--external") ||
       !strcmp(argv[3], "--coherent"))) ||
-      (argc == 5 && !strcmp(argv[3], "--foreign"))) && geteuid() != 0);
+      (argc == 5 && (!strcmp(argv[3], "--foreign") ||
+                     !strcmp(argv[3], "--rgba-storage")))) && geteuid() != 0);
    const int grid = argc == 4 && !strcmp(argv[3], "--dispatch");
    const int fill = argc == 4 && !strcmp(argv[3], "--fill");
    const int copy = argc == 4 && !strcmp(argv[3], "--copy");
    const int update = argc == 4 && !strcmp(argv[3], "--update");
-   const int rgba = argc == 4 && !strcmp(argv[3], "--rgba");
+   const int rgba_storage = argc == 5 && !strcmp(argv[3], "--rgba-storage");
+   const int rgba = (argc == 4 && !strcmp(argv[3], "--rgba")) || rgba_storage;
    const int coherent = argc == 4 && !strcmp(argv[3], "--coherent");
-   const int foreign = argc == 5;
+   const int foreign = argc == 5 && !rgba_storage;
    const int external = foreign || (argc == 4 && !strcmp(argv[3], "--external"));
    const int transfer = fill || copy || update;
    const unsigned word_count = grid ? 262144 : transfer ? 32784 : coherent ? 2048 : 1024;
@@ -151,6 +153,8 @@ int main(int argc, char **argv)
    DEVICE(CmdFillBuffer);
    DEVICE(CmdCopyBuffer);
    DEVICE(CreateImage);
+   DEVICE(CreateImageView);
+   DEVICE(DestroyImageView);
    DEVICE(DestroyImage);
    DEVICE(GetImageMemoryRequirements);
    DEVICE(BindImageMemory);
@@ -215,14 +219,16 @@ int main(int argc, char **argv)
       VkFormatProperties features;
       GetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R8G8B8A8_UNORM, &features);
       const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-                                            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+                                            VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
       CHECK((features.optimalTilingFeatures & required) == required &&
             !(features.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
       VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
          .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
          .extent = {2, 2, 1}, .mipLevels = 1, .arrayLayers = 1,
          .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                  VK_IMAGE_USAGE_STORAGE_BIT};
       CHECK(CreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
       VkMemoryRequirements image_requirements;
       GetImageMemoryRequirements(device, image, &image_requirements);
@@ -339,6 +345,67 @@ int main(int argc, char **argv)
    pipeline_info.stage.pSpecializationInfo = &specialization;
    CHECK(CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipelines[1]) == VK_SUCCESS);
    DestroyShaderModule(device, shader, NULL);
+   VkImageView storage_view = VK_NULL_HANDLE;
+   VkDescriptorSetLayout storage_set_layout = VK_NULL_HANDLE;
+   VkPipelineLayout storage_layout = VK_NULL_HANDLE;
+   VkDescriptorPool storage_pool = VK_NULL_HANDLE;
+   VkDescriptorSet storage_set = VK_NULL_HANDLE;
+   VkPipeline storage_pipeline = VK_NULL_HANDLE;
+   if (rgba_storage) {
+      VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+      CHECK(CreateImageView(device, &vi, NULL, &storage_view) == VK_SUCCESS);
+      VkDescriptorSetLayoutBinding bindings[] = {
+         {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+         {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      };
+      set_info.pBindings = bindings;
+      set_info.bindingCount = 2;
+      CHECK(CreateDescriptorSetLayout(device, &set_info, NULL, &storage_set_layout) == VK_SUCCESS);
+      layout_info.pSetLayouts = &storage_set_layout;
+      CHECK(CreatePipelineLayout(device, &layout_info, NULL, &storage_layout) == VK_SUCCESS);
+      VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+                                      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+      pool_info.poolSizeCount = 2;
+      pool_info.pPoolSizes = sizes;
+      CHECK(CreateDescriptorPool(device, &pool_info, NULL, &storage_pool) == VK_SUCCESS);
+      set_allocate.descriptorPool = storage_pool;
+      set_allocate.pSetLayouts = &storage_set_layout;
+      CHECK(AllocateDescriptorSets(device, &set_allocate, &storage_set) == VK_SUCCESS);
+      VkDescriptorImageInfo image_descriptor = {.imageView = storage_view,
+                                                .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorBufferInfo output_descriptor = {.buffer = buffer, .offset = 896 * 4, .range = 64};
+      VkWriteDescriptorSet storage_writes[] = {
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = storage_set,
+          .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+          .pImageInfo = &image_descriptor},
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = storage_set,
+          .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &output_descriptor},
+      };
+      UpdateDescriptorSets(device, 2, storage_writes, 0, NULL);
+      file = fopen(argv[4], "rb");
+      CHECK(file && !fseek(file, 0, SEEK_END));
+      bytes = ftell(file);
+      CHECK(bytes > 0 && bytes % 4 == 0);
+      rewind(file);
+      spirv = malloc(bytes);
+      CHECK(spirv && fread(spirv, 1, bytes, file) == (size_t)bytes && !fclose(file));
+      shader_info.codeSize = bytes;
+      shader_info.pCode = spirv;
+      CHECK(CreateShaderModule(device, &shader_info, NULL, &shader) == VK_SUCCESS);
+      free(spirv);
+      pipeline_info.stage.module = shader;
+      pipeline_info.stage.pName = "main";
+      pipeline_info.stage.pSpecializationInfo = NULL;
+      pipeline_info.layout = storage_layout;
+      CHECK(CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL,
+                                   &storage_pipeline) == VK_SUCCESS);
+      DestroyShaderModule(device, shader, NULL);
+   }
    VkCommandPoolCreateInfo commands_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
    VkCommandPool commands;
    CHECK(CreateCommandPool(device, &commands_info, NULL, &commands) == VK_SUCCESS);
@@ -385,8 +452,28 @@ int main(int argc, char **argv)
          transition.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
          transition.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
          transition.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+         if (rgba_storage) {
+            transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            transition.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+         }
          CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &transition);
+            rgba_storage ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, NULL, 0, NULL, 1, &transition);
+         if (rgba_storage) {
+            CmdBindPipeline(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, storage_pipeline);
+            CmdBindDescriptorSets(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  storage_layout, 0, 1, &storage_set, 0, NULL);
+            CmdDispatch(buffers[pass], 1, 1, 1);
+            transition.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            transition.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            transition.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            transition.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &transition);
+            CmdBindPipeline(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[pass]);
+            CmdBindDescriptorSets(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  layout, 0, 1, &set, 0, NULL);
+         }
          VkBufferImageCopy region = {.bufferOffset = 960 * 4,
             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {2, 2, 1}};
          CmdCopyImageToBuffer(buffers[pass], image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -497,6 +584,14 @@ int main(int argc, char **argv)
                expected = 112 + (i - bind_words - 64) * 7;
          }
          if (rgba && i >= 960 && i < 964) expected = 0xff80ff00;
+         if (rgba_storage && i >= 960 && i < 964)
+            expected = ((i - 960) * 85u << 24) | 0x00ff8000u;
+         if (rgba_storage && i >= 896 && i < 912) {
+            const unsigned lane = (i - 896) / 4, channel = (i - 896) % 4;
+            const unsigned bytes[] = {0, 128, 255, lane * 85};
+            float normalized = (float)bytes[channel] / 255.0f;
+            memcpy(&expected, &normalized, sizeof(expected));
+         }
          if (foreign && pass && ((i >= 76 && i < 80) || i == 901)) expected = 0xfb000000 + i * 53;
          if (coherent) {
             if (pass && i >= 76 && i < 80) expected = 0xdead0000 + i;
@@ -537,6 +632,13 @@ int main(int argc, char **argv)
    DestroyCommandPool(device, commands, NULL);
    DestroyPipeline(device, pipelines[1], NULL);
    DestroyPipeline(device, pipelines[0], NULL);
+   if (rgba_storage) {
+      DestroyPipeline(device, storage_pipeline, NULL);
+      DestroyDescriptorPool(device, storage_pool, NULL);
+      DestroyPipelineLayout(device, storage_layout, NULL);
+      DestroyDescriptorSetLayout(device, storage_set_layout, NULL);
+      DestroyImageView(device, storage_view, NULL);
+   }
    DestroyDescriptorPool(device, pool, NULL);
    DestroyPipelineLayout(device, layout, NULL);
    DestroyDescriptorSetLayout(device, set_layout, NULL);
@@ -558,6 +660,7 @@ int main(int argc, char **argv)
    if (foreign) puts("PASS Apex loader foreign memory: vgem DMA_BUF import/reimport, exporter CPU SYNC, refresh/copyback, 2 dispatches, 1024 canonical/staging words/guards each");
    else if (external) puts("PASS Apex loader external memory: OPAQUE_FD/DMA_BUF reimports, freed original/alias, 2 dispatches, 1024 words/guards each");
    else if (coherent) puts("PASS Apex loader host-coherent SYSTEM: no flush/invalidate, 2 dispatches, subword copies, CPU edits, 2048 words/guards each");
+   else if (rgba_storage) puts("PASS Apex loader RGBA8 storage: shader stores, float loads, four pixels/16 channels, compute retained, 2 passes, 1024 words/guards each");
    else if (rgba) puts("PASS Apex loader RGBA8 transfer: float clear, four pixels read back, compute retained, 2 passes, 1024 words/guards each");
    else if (!grid && !transfer) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;

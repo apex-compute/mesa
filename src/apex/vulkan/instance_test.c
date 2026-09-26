@@ -256,8 +256,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_format(physical, VK_FORMAT_R8G8B8A8_UNORM, &format);
    const VkFormatFeatureFlags transfer_features = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-   CHECK(format.linearTilingFeatures == transfer_features &&
-         format.optimalTilingFeatures == transfer_features && !format.bufferFeatures);
+   CHECK(format.linearTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+         format.optimalTilingFeatures == format.linearTilingFeatures && !format.bufferFeatures);
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | transfer_features;
@@ -277,6 +277,9 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_IMAGE_USAGE_SAMPLED_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    CHECK(get_image_format(physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
       VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      0, &image_props) == VK_SUCCESS);
+   CHECK(get_image_format(physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
+      VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
       0, &image_props) == VK_SUCCESS);
    CHECK(get_image_format(physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
       VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0,

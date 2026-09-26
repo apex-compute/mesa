@@ -128,7 +128,9 @@ apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat form
                                    VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
    if (format == VK_FORMAT_R32_UINT)
       features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
-   else if (format != VK_FORMAT_R8G8B8A8_UNORM)
+   else if (format == VK_FORMAT_R8G8B8A8_UNORM)
+      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+   else
       features = 0;
    properties->formatProperties = (VkFormatProperties) {
       .linearTilingFeatures = features, .optimalTilingFeatures = features,

@@ -164,9 +164,11 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
       return false;
    nir_deref_instr *deref = nir_src_as_deref(i->src[0]);
    nir_variable *var = nir_deref_instr_get_variable(deref);
+   bool rgba = var && var->data.image.format == PIPE_FORMAT_R8G8B8A8_UNORM;
    if (!var || var->data.descriptor_set >= ctx->pipeline->layout->set_count ||
        nir_intrinsic_image_dim(i) != GLSL_SAMPLER_DIM_2D ||
-       var->data.image.format != PIPE_FORMAT_R32_UINT ||
+       (var->data.image.format != PIPE_FORMAT_R32_UINT && !rgba) ||
+       (rgba && atomic) ||
        (!store && i->def.bit_size != 32) ||
        (load && i->def.num_components != 4) ||
        (atomic && i->def.num_components != 1) ||
@@ -226,9 +228,26 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
       nir_def *address = nir_build_addr_iadd(b, nir_vec2(b, words[0], words[1]),
          nir_address_format_2x32bit_global, nir_var_mem_global, offset);
       nir_def *value = NULL;
-      if (store)
-         nir_store_global_2x32(b, nir_channel(b, i->src[3].ssa, 0), address,
-                              .align_mul = 4, .access = access);
+      if (store) {
+         nir_def *pixel = nir_channel(b, i->src[3].ssa, 0);
+         if (rgba) {
+            pixel = nir_imm_int(b, 0);
+            for (unsigned c = 0; c < 4; c++) {
+               nir_def *channel = nir_channel(b, i->src[3].ssa, c);
+               channel = nir_fmin(b, nir_fmax(b, channel, nir_imm_float(b, 0.0f)),
+                                  nir_imm_float(b, 1.0f));
+               nir_def *scaled = nir_fmul_imm(b, channel, 255.0f);
+               nir_def *integer = nir_f2u32(b, scaled);
+               nir_def *fraction = nir_fsub(b, scaled, nir_u2f32(b, integer));
+               nir_def *round_up = nir_ior(b, nir_flt(b, nir_imm_float(b, 0.5f), fraction),
+                  nir_iand(b, nir_feq_imm(b, fraction, 0.5f),
+                           nir_ine_imm(b, nir_iand_imm(b, integer, 1), 0)));
+               pixel = nir_ior(b, pixel,
+                  nir_ishl_imm(b, nir_iadd(b, integer, nir_b2i32(b, round_up)), c * 8));
+            }
+         }
+         nir_store_global_2x32(b, pixel, address, .align_mul = 4, .access = access);
+      }
       else if (swap)
          value = nir_global_atomic_swap_2x32(b, 32, address, i->src[3].ssa, i->src[4].ssa,
             .atomic_op = nir_intrinsic_atomic_op(i), .access = access);
@@ -238,7 +257,16 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
       else {
          value = nir_load_global_2x32(b, 1, 32, address,
                                     .align_mul = 4, .access = access);
-         value = nir_vec4(b, value, nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 1));
+         if (rgba) {
+            nir_def *channels[4];
+            for (unsigned c = 0; c < 4; c++)
+               channels[c] = nir_fmul_imm(b,
+                  nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, value, c * 8), 0xff)),
+                  1.0f / 255.0f);
+            value = nir_vec(b, channels, 4);
+         } else {
+            value = nir_vec4(b, value, nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 1));
+         }
       }
       nir_push_else(b, NULL);
       nir_def *zero = nir_imm_zero(b, store ? 1 : i->def.num_components, 32);

@@ -244,6 +244,62 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
 }
 
 static void
+test_rgba(struct vk_physical_device *physical, const char *path)
+{
+   struct apex_device device;
+   const float priority = 1;
+   const VkDeviceQueueCreateInfo qi = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
+      .pQueuePriorities = &priority,
+   };
+   const VkDeviceCreateInfo di = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+   };
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
+   device.transport = APEX_TRANSPORT_DRM;
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   FILE *f = fopen(path, "rb");
+   CHECK(f && !fseek(f, 0, SEEK_END));
+   long bytes = ftell(f);
+   CHECK(bytes > 0 && bytes % 4 == 0);
+   rewind(f);
+   uint32_t *spirv = malloc(bytes);
+   CHECK(spirv && fread(spirv, 1, bytes, f) == bytes && !fclose(f));
+   VkShaderModule module;
+   VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                  .codeSize = bytes, .pCode = spirv};
+   CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
+   free(spirv);
+   VkDescriptorSetLayoutBinding bindings[] = {
+      {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+   };
+   VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                         .bindingCount = 2, .pBindings = bindings};
+   VkDescriptorSetLayout set;
+   CHECK(v->CreateDescriptorSetLayout(dev, &si, NULL, &set) == VK_SUCCESS);
+   VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                    .setLayoutCount = 1, .pSetLayouts = &set};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   VkComputePipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .layout = layout, .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
+   VkPipeline pipeline;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
+   CHECK(apex_pipeline_from_handle(pipeline)->descriptor_count == 2);
+   v->DestroyPipeline(dev, pipeline, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   v->DestroyDescriptorSetLayout(dev, set, NULL);
+   v->DestroyShaderModule(dev, module, NULL);
+   apex_device_finish(&device);
+}
+
+static void
 test_dispatch(struct vk_physical_device *physical, const char *path, const char *output,
               bool grid, bool multiple)
 {
@@ -395,8 +451,8 @@ test_fill(struct vk_physical_device *physical, const char *output)
 
 int main(int argc, char **argv)
 {
-   CHECK(argc == 9 || argc == 10);
-   const char *output = argc == 10 ? argv[9] : NULL;
+   CHECK(argc == 10 || argc == 11);
+   const char *output = argc == 11 ? argv[10] : NULL;
    FILE *f = fopen(argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -562,6 +618,7 @@ int main(int argc, char **argv)
    test_descriptors(&physical, argv[7], "mesa-scalar", output, false, false);
    test_descriptors(&physical, argv[7], "mesa-scalar", NULL, true, false);
    test_descriptors(&physical, argv[8], "mesa-images", output, false, false);
+   test_rgba(&physical, argv[9]);
    test_dispatch(&physical, argv[5], output, false, false);
    test_dispatch(&physical, argv[5], output, true, false);
    test_dispatch(&physical, argv[6], output, false, true);
