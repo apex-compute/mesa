@@ -51,13 +51,15 @@ int main(int argc, char **argv)
 {
    CHECK((argc == 3 || (argc == 4 && (!strcmp(argv[3], "--dispatch") ||
       !strcmp(argv[3], "--fill") || !strcmp(argv[3], "--copy") ||
-      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--external") ||
+      !strcmp(argv[3], "--update") || !strcmp(argv[3], "--rgba") ||
+      !strcmp(argv[3], "--external") ||
       !strcmp(argv[3], "--coherent"))) ||
       (argc == 5 && !strcmp(argv[3], "--foreign"))) && geteuid() != 0);
    const int grid = argc == 4 && !strcmp(argv[3], "--dispatch");
    const int fill = argc == 4 && !strcmp(argv[3], "--fill");
    const int copy = argc == 4 && !strcmp(argv[3], "--copy");
    const int update = argc == 4 && !strcmp(argv[3], "--update");
+   const int rgba = argc == 4 && !strcmp(argv[3], "--rgba");
    const int coherent = argc == 4 && !strcmp(argv[3], "--coherent");
    const int foreign = argc == 5;
    const int external = foreign || (argc == 4 && !strcmp(argv[3], "--external"));
@@ -148,6 +150,12 @@ int main(int argc, char **argv)
    DEVICE(CmdDispatch);
    DEVICE(CmdFillBuffer);
    DEVICE(CmdCopyBuffer);
+   DEVICE(CreateImage);
+   DEVICE(DestroyImage);
+   DEVICE(GetImageMemoryRequirements);
+   DEVICE(BindImageMemory);
+   DEVICE(CmdClearColorImage);
+   DEVICE(CmdCopyImageToBuffer);
    DEVICE(CmdUpdateBuffer);
    DEVICE(CmdPipelineBarrier);
    DEVICE(CreateFence);
@@ -161,7 +169,8 @@ int main(int argc, char **argv)
    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = (word_count - bind_words) * 4 - (fill ? 3 : 0),
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-         (transfer || external || coherent ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
+         (transfer || external || coherent || rgba ?
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0)};
    VkBuffer buffer;
    CHECK(CreateBuffer(device, &buffer_info, NULL, &buffer) == VK_SUCCESS);
    VkMemoryRequirements requirements;
@@ -199,6 +208,30 @@ int main(int argc, char **argv)
    VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                 .memory = memory, .size = VK_WHOLE_SIZE};
    if (!coherent) CHECK(FlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS);
+   VkImage image = VK_NULL_HANDLE;
+   VkDeviceMemory image_memory = VK_NULL_HANDLE;
+   if (rgba) {
+      INSTANCE(GetPhysicalDeviceFormatProperties);
+      VkFormatProperties features;
+      GetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R8G8B8A8_UNORM, &features);
+      const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      CHECK((features.optimalTilingFeatures & required) == required &&
+            !(features.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+      VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .extent = {2, 2, 1}, .mipLevels = 1, .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+      CHECK(CreateImage(device, &image_info, NULL, &image) == VK_SUCCESS);
+      VkMemoryRequirements image_requirements;
+      GetImageMemoryRequirements(device, image, &image_requirements);
+      CHECK(image_requirements.memoryTypeBits & 1);
+      VkMemoryAllocateInfo image_allocate = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = image_requirements.size};
+      CHECK(AllocateMemory(device, &image_allocate, NULL, &image_memory) == VK_SUCCESS);
+      CHECK(BindImageMemory(device, image, image_memory, 0) == VK_SUCCESS);
+   }
    VkBuffer shared_buffer = VK_NULL_HANDLE;
    VkDeviceMemory shared_memory = VK_NULL_HANDLE;
    int foreign_fd = -1;
@@ -333,6 +366,32 @@ int main(int argc, char **argv)
       }
       CmdBindPipeline(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[pass]);
       CmdBindDescriptorSets(buffers[pass], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+      if (rgba) {
+         VkClearColorValue color = {.float32 = {0.0f, 1.0f, 0.5f, 1.0f}};
+         VkImageSubresourceRange subresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+         VkImageMemoryBarrier transition = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = pass ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcAccessMask = pass ? VK_ACCESS_TRANSFER_READ_BIT : 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image, .subresourceRange = subresource};
+         CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &transition);
+         CmdClearColorImage(buffers[pass], image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            &color, 1, &subresource);
+         transition.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         transition.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+         transition.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+         transition.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+         CmdPipelineBarrier(buffers[pass], VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &transition);
+         VkBufferImageCopy region = {.bufferOffset = 960 * 4,
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {2, 2, 1}};
+         CmdCopyImageToBuffer(buffers[pass], image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            buffer, 1, &region);
+      }
       if (fill) {
          CmdFillBuffer(buffers[pass], buffer, 4, 65540, 0xa5c31e79);
          CmdFillBuffer(buffers[pass], buffer, (word_count - bind_words - 3) * 4, VK_WHOLE_SIZE, 0x7900beef);
@@ -437,6 +496,7 @@ int main(int argc, char **argv)
             if (pass && i >= bind_words + 64 && i < bind_words + 76)
                expected = 112 + (i - bind_words - 64) * 7;
          }
+         if (rgba && i >= 960 && i < 964) expected = 0xff80ff00;
          if (foreign && pass && ((i >= 76 && i < 80) || i == 901)) expected = 0xfb000000 + i * 53;
          if (coherent) {
             if (pass && i >= 76 && i < 80) expected = 0xdead0000 + i;
@@ -486,6 +546,10 @@ int main(int argc, char **argv)
    }
    if (foreign) CHECK(!munmap(foreign_words, 4096) && !close(foreign_fd));
    UnmapMemory(device, memory);
+   if (rgba) {
+      DestroyImage(device, image, NULL);
+      FreeMemory(device, image_memory, NULL);
+   }
    DestroyBuffer(device, buffer, NULL);
    FreeMemory(device, memory, NULL);
    DestroyDevice(device, NULL);
@@ -494,6 +558,7 @@ int main(int argc, char **argv)
    if (foreign) puts("PASS Apex loader foreign memory: vgem DMA_BUF import/reimport, exporter CPU SYNC, refresh/copyback, 2 dispatches, 1024 canonical/staging words/guards each");
    else if (external) puts("PASS Apex loader external memory: OPAQUE_FD/DMA_BUF reimports, freed original/alias, 2 dispatches, 1024 words/guards each");
    else if (coherent) puts("PASS Apex loader host-coherent SYSTEM: no flush/invalidate, 2 dispatches, subword copies, CPU edits, 2048 words/guards each");
+   else if (rgba) puts("PASS Apex loader RGBA8 transfer: float clear, four pixels read back, compute retained, 2 passes, 1024 words/guards each");
    else if (!grid && !transfer) puts("PASS Apex loader compute: 2 dispatches, main/partial specialization, retained LOCAL, 1024 words/guards each");
    return 0;
 }
