@@ -536,7 +536,10 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
    if (info->flags || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
        (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT)))
+                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
@@ -1317,6 +1320,27 @@ apex_CmdPushConstants2(VkCommandBuffer handle, const VkPushConstantsInfo *info)
       memcpy(cmd->graphics_push + offset, info->pValues, size);
 }
 
+static void
+push_compute(struct apex_command_buffer *cmd, struct apex_dispatch_parameters parameters,
+             uint32_t groups)
+{
+   struct apex_dispatch *dispatch = vk_alloc(&cmd->vk.pool->alloc, sizeof(*dispatch), 8,
+                                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!dispatch) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   *dispatch = (struct apex_dispatch) {
+      .program = &cmd->pipeline->program, .groups = groups, .parameters = parameters,
+   };
+   memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
+   memcpy(dispatch->push, cmd->push, sizeof(dispatch->push));
+   for (unsigned s = 0; s < ARRAY_SIZE(dispatch->sets); s++)
+      if (dispatch->sets[s])
+         dispatch->sets[s]->refs++;
+   list_addtail(&dispatch->link, &cmd->dispatches);
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
 {
@@ -1328,29 +1352,36 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   /* Bound each row/chunk by queue count and padded private-storage capacity.
-    * Each retains the API grid and its origin. */
+   /* Jobs cover linear workgroup ranges bounded by the queue count and the
+    * padded private-storage capacity; each workgroup runs once. */
+   uint64_t total = (uint64_t)x * y * z;
+   if (total > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
    uint32_t limit = cmd->pipeline->program.max_workgroups;
-   for (uint32_t gz = 0; gz < z; gz++)
-      for (uint32_t gy = 0; gy < y; gy++)
-         for (uint32_t gx = 0; gx < x; gx += limit) {
-            struct apex_dispatch *dispatch = vk_alloc(&cmd->vk.pool->alloc, sizeof(*dispatch), 8,
-                                                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-            if (!dispatch) {
-               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-               return;
-            }
-            *dispatch = (struct apex_dispatch) {
-               .program = &cmd->pipeline->program, .groups = MIN2(x - gx, limit),
-               .parameters = {.base = {gx, gy, gz}, .groups = {x, y, z}},
-            };
-            memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
-            memcpy(dispatch->push, cmd->push, sizeof(dispatch->push));
-            for (unsigned s = 0; s < ARRAY_SIZE(dispatch->sets); s++)
-               if (dispatch->sets[s])
-                  dispatch->sets[s]->refs++;
-            list_addtail(&dispatch->link, &cmd->dispatches);
-         }
+   for (uint32_t first = 0; first < total; first += limit) {
+      uint32_t count = MIN2(total - first, limit);
+      push_compute(cmd, (struct apex_dispatch_parameters) {
+         .base = {first, first + count, count}, .groups = {x, y, z}}, count);
+   }
+}
+
+/* The grid comes from the buffer when the job runs: a bounded launch strides
+ * through every workgroup. */
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDispatchIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, args, buffer);
+   if (!cmd->pipeline || !cmd->pipeline->program.table) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint64_t va = args->vk.device_address + offset;
+   uint32_t count = MIN2(cmd->pipeline->program.max_workgroups, 1024);
+   push_compute(cmd, (struct apex_dispatch_parameters) {
+      .base = {0, 0, count}, .indirect = {va, va >> 32}}, count);
 }
 
 void
@@ -2629,6 +2660,8 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
       parameters->base[axis] = util_cpu_to_le32(dispatch->parameters.base[axis]);
       parameters->groups[axis] = util_cpu_to_le32(dispatch->parameters.groups[axis]);
    }
+   for (unsigned w = 0; w < 2; w++)
+      parameters->indirect[w] = util_cpu_to_le32(dispatch->parameters.indirect[w]);
    if (dispatch->graphics) {
       uint32_t *draw = (void *)(parameters + 1);
       for (unsigned i = 0; i < APEX_DRAW_WORDS; i++)
@@ -3050,7 +3083,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .BeginCommandBuffer = apex_BeginCommandBuffer, .EndCommandBuffer = apex_EndCommandBuffer,
       .CmdBindPipeline = apex_CmdBindPipeline, .CmdBindDescriptorSets2 = apex_CmdBindDescriptorSets2,
       .CmdPushConstants2 = apex_CmdPushConstants2,
-      .CmdDispatch = apex_CmdDispatch, .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
+      .CmdDispatch = apex_CmdDispatch, .CmdDispatchIndirect = apex_CmdDispatchIndirect,
+      .CmdPipelineBarrier2 = apex_CmdPipelineBarrier2,
       .CmdFillBuffer = apex_CmdFillBuffer, .CmdCopyBuffer2 = apex_CmdCopyBuffer2,
       .CmdUpdateBuffer = apex_CmdUpdateBuffer,
       .CmdCopyBufferToImage2 = apex_CmdCopyBufferToImage2,

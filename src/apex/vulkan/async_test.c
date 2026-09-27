@@ -24,6 +24,8 @@ static bool terminal, timed_out, failed, grid_test, update_test;
 static struct { uint64_t size, va; bool live; unsigned uploads; } gems[32];
 static unsigned queries, waits, dispatch_index;
 static unsigned grid_limit;
+/* Each mock object owns one fixed file slot. */
+#define SLOT (64 * 1024)
 
 int __wrap_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...)
@@ -57,10 +59,10 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       gems[objects].size = r->size;
       gems[objects].live = true;
       live++;
-      CHECK(!ftruncate(fd, (objects + 1) * 4096));
+      CHECK(!ftruncate(fd, (objects + 1) * SLOT));
    } else if (request == DRM_IOCTL_APEX_GEM_MMAP) {
       struct drm_apex_gem_mmap *r = arg;
-      r->offset = r->handle * 4096;
+      r->offset = r->handle * SLOT;
    } else if (request == DRM_IOCTL_APEX_VM_BIND) {
       struct drm_apex_vm_bind *r = arg;
       if (r->operation == APEX_DRM_VM_BIND_MAP) {
@@ -82,7 +84,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
       if (update_test && r->handle <= 2) {
          CHECK(r->bytes == (r->handle == 1 ? 52 : 60));
          uint32_t words[15];
-         CHECK(pread(fd, words, r->bytes, r->handle * 4096) == r->bytes);
+         CHECK(pread(fd, words, r->bytes, r->handle * SLOT) == r->bytes);
          for (unsigned i = 0; i < r->bytes / 4; i++)
             CHECK(words[i] == 0xa7010000 + r->handle * 123 + i * 37);
       }
@@ -117,7 +119,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
          CHECK(r->program_va == gems[3].va && r->data_va == gems[table].va && r->workgroups == 1);
          CHECK(gems[1].uploads == 1 && gems[2].uploads == 1);
          uint32_t words[14];
-         CHECK(pread(fd, words, sizeof(words), table * 4096) == sizeof(words));
+         CHECK(pread(fd, words, sizeof(words), table * SLOT) == sizeof(words));
          for (unsigned i = 0; i < 14; i++) words[i] = util_le32_to_cpu(words[i]);
          for (unsigned i = 0; i < 8; i++) CHECK(!words[i]);
          CHECK(((uint64_t)words[9] << 32 | words[8]) == gems[region + 1].va);
@@ -129,21 +131,23 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
          CHECK(objects == (grid_test ? 14 : 3) && live == objects && r->program_va == gems[1].va);
          CHECK(r->data_va == gems[dispatch_index + 2].va);
          uint32_t parameters[6];
-         CHECK(pread(fd, parameters, sizeof(parameters), (dispatch_index + 2) * 4096 + 32) == sizeof(parameters));
+         CHECK(pread(fd, parameters, sizeof(parameters), (dispatch_index + 2) * SLOT + 32) == sizeof(parameters));
          for (unsigned i = 0; i < 6; i++) parameters[i] = util_le32_to_cpu(parameters[i]);
+         /* Jobs cover linear workgroup ranges: first, end and launch stride. */
          if (grid_test && dispatch_index < 12) {
-            CHECK(r->workgroups == (dispatch_index % 2 ? 1 : grid_limit));
-            CHECK(parameters[0] == (dispatch_index % 2 ? grid_limit : 0));
-            CHECK(parameters[1] == dispatch_index / 2 % 2 && parameters[2] == dispatch_index / 4);
-            CHECK(parameters[3] == grid_limit + 1 && parameters[4] == 2 && parameters[5] == 3);
+            CHECK(r->workgroups == grid_limit);
+            CHECK(parameters[0] == dispatch_index * grid_limit &&
+                  parameters[1] == (dispatch_index + 1) * grid_limit && parameters[2] == grid_limit);
+            CHECK(parameters[3] == grid_limit && parameters[4] == 2 && parameters[5] == 6);
          } else {
-            CHECK(r->workgroups == (grid_test ? 2 : 1));
-            CHECK(!parameters[0] && !parameters[1] && !parameters[2]);
-            CHECK(parameters[3] == (grid_test ? 2 : 1) && parameters[4] == 1 && parameters[5] == 1);
+            unsigned groups = grid_test ? 2 : 1;
+            CHECK(r->workgroups == groups);
+            CHECK(!parameters[0] && parameters[1] == groups && parameters[2] == groups);
+            CHECK(parameters[3] == groups && parameters[4] == 1 && parameters[5] == 1);
          }
          dispatch_index++;
          char magic[4];
-         CHECK(pread(fd, magic, 4, 4096) == 4 && !memcmp(magic, "APX2", 4));
+         CHECK(pread(fd, magic, 4, SLOT) == 4 && !memcmp(magic, "APX2", 4));
       }
    }
    return 0;
@@ -361,7 +365,7 @@ int main(int argc, char **argv)
             v->CmdDispatch(cb, 5, 0, 3);
             v->CmdDispatch(cb, 5, 2, 0);
          }
-         v->CmdDispatch(cb, grid_test ? grid_limit + 1 : 1, grid_test ? 2 : 1, grid_test ? 3 : 1);
+         v->CmdDispatch(cb, grid_test ? grid_limit : 1, grid_test ? 2 : 1, grid_test ? 6 : 1);
          v->CmdDispatch(cb, grid_test ? 2 : 1, 1, 1);
          CHECK(v->EndCommandBuffer(cb) == VK_SUCCESS);
          struct vk_drm_syncobj syncs[40];

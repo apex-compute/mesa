@@ -53,9 +53,14 @@ union apex_descriptor {
 };
 
 /* Immutable trailer after descriptors and push constants, in little endian. */
+/* Compute jobs: base = first and end linear workgroup and the launch stride,
+ * groups = API grid, indirect = VkDispatchIndirectCommand address supplying
+ * the grid (zero for direct jobs). Graphics jobs use base[0] and groups[0..1]
+ * as their launch range. */
 struct apex_dispatch_parameters {
    uint32_t base[3];
    uint32_t groups[3];
+   uint32_t indirect[2];
 };
 
 struct apex_bo {
