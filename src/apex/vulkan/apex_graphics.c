@@ -171,8 +171,7 @@ fetch_channel(nir_builder *b, const struct util_format_description *desc, unsign
    }
    switch (ch->type) {
    case UTIL_FORMAT_TYPE_FLOAT:
-      /* The vertex format table admits only 32-bit float channels. */
-      return value;
+      return bits == 16 ? apex_half_to_float(b, value) : value;
    case UTIL_FORMAT_TYPE_UNSIGNED:
       if (ch->normalized)
          return nir_fmul_imm(b, nir_u2f32(b, value), 1.0 / BITFIELD_MASK(bits));

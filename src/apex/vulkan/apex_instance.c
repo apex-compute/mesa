@@ -19,7 +19,7 @@
 
 /* Development protocol only. This compute subset is not a conformant Vulkan
  * device. The library/manifest are uninstalled and instance creation is opt-in. */
-#define APEX_DEVELOPMENT_API VK_API_VERSION_1_1
+#define APEX_DEVELOPMENT_API VK_API_VERSION_1_2
 
 struct apex_physical_device {
    struct vk_physical_device vk;
@@ -310,6 +310,27 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .shaderStorageImageWriteWithoutFormat = true,
       .fragmentStoresAndAtomics = true,
       .vertexPipelineStoresAndAtomics = true,
+      /* Implemented 1.0 features. */
+      .fullDrawIndexUint32 = true,
+      .imageCubeArray = true,
+      .independentBlend = true,
+      .depthBiasClamp = true,
+      .occlusionQueryPrecise = true,
+      .shaderImageGatherExtended = true,
+      .shaderInt64 = true,
+      .shaderUniformBufferArrayDynamicIndexing = true,
+      .shaderSampledImageArrayDynamicIndexing = true,
+      .shaderStorageBufferArrayDynamicIndexing = true,
+      .shaderStorageImageArrayDynamicIndexing = true,
+      /* Vulkan 1.2. */
+      .uniformBufferStandardLayout = true,
+      .shaderSubgroupExtendedTypes = true,
+      .separateDepthStencilLayouts = true,
+      .hostQueryReset = true,
+      .imagelessFramebuffer = true,
+      .subgroupBroadcastDynamicId = true,
+      .samplerFilterMinmax = true,
+      .bufferDeviceAddress = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
@@ -329,7 +350,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxDescriptorSetUniformBuffersDynamic = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetStorageBuffersDynamic = APEX_MAX_DESCRIPTORS,
       .maxUniformBufferRange = 64 * 1024 * 1024,
-      .maxStorageBufferRange = 64 * 1024 * 1024,
+      .maxStorageBufferRange = APEX_MAX_ALLOCATION,
       .maxPushConstantsSize = APEX_MAX_PUSH_CONSTANTS,
       .maxComputeSharedMemorySize = 32768,
       /* Recording splits dispatches into native chunks. */
@@ -397,6 +418,16 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxPerSetDescriptors = APEX_MAX_DESCRIPTORS,
       .maxMemoryAllocationSize = APEX_MAX_ALLOCATION,
+      /* Vulkan 1.2: depth/stencil resolves take sample 0. */
+      .driverID = VK_DRIVER_ID_MESA_LLVMPIPE,
+      .driverName = "Apex", .driverInfo = "Mesa development driver (non-conformant)",
+      .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .independentResolveNone = true, .independentResolve = true,
+      .filterMinmaxSingleComponentFormats = true, .filterMinmaxImageComponentMapping = true,
+      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+      .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
    };
    /* Opaque-fd compatibility is the flat GEM byte layout, revision 1. */

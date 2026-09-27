@@ -625,7 +625,9 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
 VkFormatFeatureFlags2
 apex_format_features(VkFormat format, bool buffer)
 {
-   if (format == VK_FORMAT_UNDEFINED)
+   /* Subsampled and multi-planar YCbCr formats are unsupported. */
+   if (format == VK_FORMAT_UNDEFINED || vk_format_get_ycbcr_info(format) ||
+       (format >= VK_FORMAT_G8B8G8R8_422_UNORM && format <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM))
       return 0;
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
                                           VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
@@ -638,25 +640,26 @@ apex_format_features(VkFormat format, bool buffer)
    bool storage_atomic = format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
    if (buffer) {
       const struct util_format_description *desc = util_format_description(pformat);
-      if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.bits > 128 ||
-          util_format_is_srgb(pformat))
-         return 0;
       uint32_t encoded[3];
       VkFormatFeatureFlags2 features = 0;
-      if (apex_format_encode(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, encoded))
+      if (!util_format_is_srgb(pformat) &&
+          apex_format_encode(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, encoded))
          features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
+      if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.bits > 128 ||
+          util_format_is_srgb(pformat))
+         return features;
       if (storage)
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
                      VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                      VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
       if (storage_atomic)
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
-      /* Vertex fetch reads 8, 16 and 32-bit integer or FP32 channels. */
+      /* Vertex fetch reads integer channels up to 32 bits and FP16/FP32. */
       bool vertex = true;
       for (unsigned c = 0; c < desc->nr_channels; c++) {
          const struct util_format_channel_description *ch = &desc->channel[c];
-         if (ch->size % 8 || ch->size > 32 || ch->type == UTIL_FORMAT_TYPE_FIXED ||
-             (ch->type == UTIL_FORMAT_TYPE_FLOAT && ch->size != 32))
+         if (ch->size > 32 || ch->type == UTIL_FORMAT_TYPE_FIXED ||
+             (ch->type == UTIL_FORMAT_TYPE_FLOAT && ch->size != 32 && ch->size != 16))
             vertex = false;
       }
       return features | (vertex ? VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT : 0);
@@ -736,7 +739,7 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
    properties->imageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = {4096, info->type == VK_IMAGE_TYPE_1D ? 1 : 4096, three_d ? 2048 : 1},
       .maxMipLevels = 13, .maxArrayLayers = three_d ? 1 : 256,
-      .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = APEX_MAX_ALLOCATION,
+      .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = 1ull << 31,
    };
    /* 4x multisampling: single-level 2D optimal attachments. */
    if (info->type == VK_IMAGE_TYPE_2D && info->tiling == VK_IMAGE_TILING_OPTIMAL &&
@@ -1189,6 +1192,20 @@ write_template(struct apex_descriptor_set *set, const struct vk_descriptor_updat
       write_set(set, entry->binding, entry->array_element, entry->array_count, entry->type,
                 (const uint8_t *)data + entry->offset, entry->stride);
    }
+}
+
+/* Capture/replay addresses are unsupported: bufferDeviceAddressCaptureReplay
+ * is not advertised, so opaque addresses are zero. */
+static VKAPI_ATTR uint64_t VKAPI_CALL
+apex_GetBufferOpaqueCaptureAddress(VkDevice dev, const VkBufferDeviceAddressInfo *info)
+{
+   return 0;
+}
+
+static VKAPI_ATTR uint64_t VKAPI_CALL
+apex_GetDeviceMemoryOpaqueCaptureAddress(VkDevice dev, const VkDeviceMemoryOpaqueCaptureAddressInfo *info)
+{
+   return 0;
 }
 
 /* Support is exactly successful layout creation. */
@@ -3539,6 +3556,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .FreeDescriptorSets = apex_FreeDescriptorSets, .UpdateDescriptorSets = apex_UpdateDescriptorSets,
       .UpdateDescriptorSetWithTemplate = apex_UpdateDescriptorSetWithTemplate,
       .GetDescriptorSetLayoutSupport = apex_GetDescriptorSetLayoutSupport,
+      .GetBufferOpaqueCaptureAddress = apex_GetBufferOpaqueCaptureAddress,
+      .GetDeviceMemoryOpaqueCaptureAddress = apex_GetDeviceMemoryOpaqueCaptureAddress,
       .CmdPushDescriptorSet2 = apex_CmdPushDescriptorSet2,
       .CmdPushDescriptorSetWithTemplate2 = apex_CmdPushDescriptorSetWithTemplate2,
       .BeginCommandBuffer = apex_BeginCommandBuffer, .EndCommandBuffer = apex_EndCommandBuffer,

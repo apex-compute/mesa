@@ -279,7 +279,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &image_props) == VK_SUCCESS);
    CHECK(image_props.maxExtent.width == 4096 && image_props.maxExtent.height == 4096 && image_props.maxExtent.depth == 1);
    CHECK(image_props.maxMipLevels == 13 && image_props.maxArrayLayers == 256 &&
-         image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT && image_props.maxResourceSize == 1024ull * 1024 * 1024);
+         image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT && image_props.maxResourceSize == (1ull << 31));
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
       VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_SUCCESS);
    CHECK(image_props.maxExtent.depth == 2048 && image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT);

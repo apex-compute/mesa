@@ -9,7 +9,9 @@
 struct vk_sampler;
 
 /* Format word 0: texel bytes [4:0], sRGB [5], output swizzle [19:8] (3 bits
- * per RGBA output: stored channel 0-3, 4 zero, 5 one), pure integer [20].
+ * per RGBA output: stored channel 0-3, 4 zero, 5 one), pure integer [20],
+ * packed RGB9E5 [21], packed R11G11B10 unsigned floats [22]; the packed
+ * formats have no channel fields.
  * Words 1-2: stored channels 0-3 as 16-bit fields: bit offset [6:0], bit size
  * [12:7], channel type [15:13]. */
 enum apex_channel_type {
@@ -18,6 +20,8 @@ enum apex_channel_type {
 };
 #define APEX_SWIZZLE_0 4
 #define APEX_SWIZZLE_1 5
+#define APEX_FORMAT_RGB9E5 (1u << 21)
+#define APEX_FORMAT_R11G11B10 (1u << 22)
 
 /* Sampled image descriptor: two 32-byte table rows. The view selects levels
  * and layers of the image's mip-major linear allocation; the shader derives

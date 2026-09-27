@@ -30,6 +30,25 @@ apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponent
                    uint32_t out[3])
 {
    enum pipe_format pformat = vk_format_to_pipe_format(format);
+   /* Shared-exponent and small-float RGB formats decode as whole words. */
+   if (pformat == PIPE_FORMAT_R9G9B9E5_FLOAT || pformat == PIPE_FORMAT_R11G11B10_FLOAT) {
+      out[0] = 4 | (pformat == PIPE_FORMAT_R9G9B9E5_FLOAT ? APEX_FORMAT_RGB9E5 : APEX_FORMAT_R11G11B10);
+      const VkComponentSwizzle view[4] = {
+         mapping ? mapping->r : VK_COMPONENT_SWIZZLE_IDENTITY,
+         mapping ? mapping->g : VK_COMPONENT_SWIZZLE_IDENTITY,
+         mapping ? mapping->b : VK_COMPONENT_SWIZZLE_IDENTITY,
+         mapping ? mapping->a : VK_COMPONENT_SWIZZLE_IDENTITY,
+      };
+      for (unsigned c = 0; c < 4; c++) {
+         VkComponentSwizzle s = view[c] == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_R + c : view[c];
+         uint32_t stored = s == VK_COMPONENT_SWIZZLE_ZERO ? APEX_SWIZZLE_0 :
+                           s == VK_COMPONENT_SWIZZLE_ONE || s == VK_COMPONENT_SWIZZLE_A ? APEX_SWIZZLE_1 :
+                           s - VK_COMPONENT_SWIZZLE_R;
+         out[0] |= stored << (8 + 3 * c);
+      }
+      out[1] = out[2] = 0;
+      return true;
+   }
    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT)
       pformat = util_format_stencil_only(pformat);
    else if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && util_format_is_depth_and_stencil(pformat))

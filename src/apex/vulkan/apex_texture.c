@@ -132,6 +132,18 @@ level_offset(nir_builder *b, const struct image_info *i, nir_def *level)
    return nir_load_var(b, offset);
 }
 
+/* Unsigned float with a 5-bit exponent (bias 15) and `mantissa` bits. */
+nir_def *
+apex_small_float_to_float(nir_builder *b, nir_def *v, unsigned mantissa)
+{
+   nir_def *e = nir_ushr_imm(b, v, mantissa);
+   nir_def *m = nir_iand_imm(b, v, BITFIELD_MASK(mantissa));
+   nir_def *normal = nir_ior(b, nir_ishl_imm(b, nir_iadd_imm(b, e, 112), 23), nir_ishl_imm(b, m, 23 - mantissa));
+   nir_def *special = nir_ior(b, nir_imm_int(b, 0x7f800000), nir_ishl_imm(b, m, 23 - mantissa));
+   nir_def *denormal = nir_fmul_imm(b, nir_u2f32(b, m), 1.0 / (1 << 14) / (1 << mantissa));
+   return nir_bcsel(b, nir_ieq_imm(b, e, 0), denormal, nir_bcsel(b, nir_ieq_imm(b, e, 31), special, normal));
+}
+
 nir_def *
 apex_half_to_float(nir_builder *b, nir_def *h)
 {
@@ -224,6 +236,19 @@ decode_texel(nir_builder *b, const struct image_info *i, nir_def *address)
       value = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_USCALED), nir_u2f32(b, raw), value);
       value = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_SSCALED), nir_i2f32(b, extended), value);
       channels[k] = value;
+   }
+   /* Packed RGB formats replace channels 0..2. */
+   nir_def *e5 = nir_ushr_imm(b, words[0], 27);
+   nir_def *scale = nir_ishl_imm(b, nir_iadd_imm(b, e5, 127 - 24), 23); /* 2^(E - 15 - 9) */
+   nir_def *packed9 = nir_ine_imm(b, nir_iand_imm(b, i->format[0], APEX_FORMAT_RGB9E5), 0);
+   nir_def *packed11 = nir_ine_imm(b, nir_iand_imm(b, i->format[0], APEX_FORMAT_R11G11B10), 0);
+   const unsigned small_shift[3] = {0, 11, 22}, small_bits[3] = {11, 11, 10};
+   for (unsigned k = 0; k < 3; k++) {
+      nir_def *m9 = nir_iand_imm(b, nir_ushr_imm(b, words[0], 9 * k), 0x1ff);
+      nir_def *rgb9 = nir_fmul(b, nir_u2f32(b, m9), scale);
+      nir_def *small = apex_small_float_to_float(b, nir_iand_imm(b,
+         nir_ushr_imm(b, words[0], small_shift[k]), BITFIELD_MASK(small_bits[k])), small_bits[k] - 5);
+      channels[k] = nir_bcsel(b, packed9, rgb9, nir_bcsel(b, packed11, small, channels[k]));
    }
    nir_def *integer = nir_ine_imm(b, nir_iand_imm(b, i->format[0], 1u << 20), 0);
    nir_def *srgb = nir_ine_imm(b, nir_iand_imm(b, i->format[0], 1u << 5), 0);
