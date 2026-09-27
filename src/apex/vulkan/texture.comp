@@ -1,0 +1,15 @@
+#version 450
+// Samples a 4x4 RGBA8 texture: words 0..63 texelFetch, 64..127 nearest
+// texture() at texel centers, 128..191 linear texture() between texels.
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) buffer Out { vec4 result[]; };
+layout(set = 0, binding = 1) uniform sampler2D nearest_tex;
+layout(set = 0, binding = 2) uniform sampler2D linear_tex;
+void main()
+{
+   uint i = gl_LocalInvocationIndex;
+   ivec2 p = ivec2(i & 3u, i >> 2);
+   result[i] = texelFetch(nearest_tex, p, 0);
+   result[16u + i] = textureLod(nearest_tex, (vec2(p) + 0.5) / 4.0, 0.0);
+   result[32u + i] = textureLod(linear_tex, (vec2(p) + 1.0) / 4.0, 0.0);
+}

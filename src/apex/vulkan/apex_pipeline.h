@@ -53,6 +53,8 @@ bool apex_program_lower_resources(struct apex_program *program, struct nir_shade
 VkResult apex_program_compile(struct vk_device *device, struct apex_program *program,
                               struct nir_shader *nir);
 void apex_program_finish(struct apex_device *device, struct apex_program *program);
+/* Lowers texture instructions to the software sampler (apex_texture.c). */
+bool apex_lower_textures(struct apex_program *program, struct nir_shader *nir);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 apex_CreateComputePipelines(VkDevice device, VkPipelineCache cache,

@@ -75,13 +75,18 @@ image_exec(struct drm_apex_vm_exec *r)
       for (unsigned i = 24; i < 32; i++) CHECK(!words[i]);
       for (unsigned i = 0; i < 4; i++) CHECK(words[32 + i] == 0xc0010000 + i);
    } else if (d == 1 || d == 5) {
-      const uint32_t *push = words + 8;
+      /* Internal clear job: texels only, row padding untouched. */
+      const uint32_t *clear = words + 8 + 6;
       unsigned offset = d == 1 ? 9280 : 14592;
       uint32_t color = d == 1 ? 0x5a17c0de : 0xff80ff00;
-      CHECK(((uint64_t)push[1] << 32 | push[0]) == base + offset);
-      CHECK(push[2] == color && push[3] == (d == 1 ? 256 : 128));
-      for (unsigned i = offset / 4; i < (offset + push[3]) / 4; i++)
-         ((uint32_t *)mock.gems[1].local)[i] = color;
+      CHECK(((uint64_t)clear[1] << 32 | clear[0]) == base + offset);
+      CHECK(clear[7] == 4 && clear[8] == color);
+      CHECK(d == 1 ? clear[4] == 4 && clear[5] == 2 && clear[6] == 2 && clear[2] == 64 && clear[3] == 128 :
+                     clear[4] == 2 && clear[5] == 2 && clear[6] == 1 && clear[2] == 64);
+      for (unsigned layer = 0; layer < clear[6]; layer++)
+         for (unsigned y = 0; y < clear[5]; y++)
+            for (unsigned x = 0; x < clear[4]; x++)
+               ((uint32_t *)mock.gems[1].local)[(offset + layer * clear[3] + y * clear[2]) / 4 + x] = color;
    } else {
       /* One internal pitched-copy job per region covers both layers and rows. */
       CHECK(d >= 2 && d <= 4);
@@ -497,7 +502,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->CreateBuffer(dev, &buffer_info, NULL, &buffers[i]) == VK_SUCCESS);
       VkMemoryRequirements req;
       v->GetBufferMemoryRequirements(dev, buffers[i], &req);
-      CHECK(req.size == 3456 && req.alignment == 64 && req.memoryTypeBits == 1);
+      CHECK(req.size == 3456 && req.alignment == 64 && (req.memoryTypeBits & 1));
       CHECK(v->BindBufferMemory(dev, buffers[i], memory, i ? 4096 : 64) == VK_SUCCESS);
    }
    const VkDescriptorPoolSize pool_sizes[] = {
@@ -894,11 +899,11 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       };
       v->GetBufferMemoryRequirements2(dev, &req_info, &req);
       CHECK(req.memoryRequirements.size == 4160 && req.memoryRequirements.alignment == 64 &&
-            req.memoryRequirements.memoryTypeBits == 1);
+            (req.memoryRequirements.memoryTypeBits & 1));
       CHECK(!dedicated_req.prefersDedicatedAllocation && !dedicated_req.requiresDedicatedAllocation);
       VkMemoryRequirements legacy_req;
       v->GetBufferMemoryRequirements(dev, buffer, &legacy_req);
-      CHECK(legacy_req.size == 4160 && legacy_req.alignment == 64 && legacy_req.memoryTypeBits == 1);
+      CHECK(legacy_req.size == 4160 && legacy_req.alignment == 64 && (legacy_req.memoryTypeBits & 1));
       const VkMemoryDedicatedAllocateInfo dedicated = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buffer,
       };
@@ -966,7 +971,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
       CHECK(v->CreateImage(dev, &ii, NULL, &images[i]) == VK_SUCCESS);
       VkMemoryRequirements req;
       v->GetImageMemoryRequirements(dev, images[i], &req);
-      CHECK(req.size == (i ? 1344 : 2816) && req.alignment == 64 && req.memoryTypeBits == 1);
+      CHECK(req.size == (i ? 1344 : 2816) && req.alignment == 64 && (req.memoryTypeBits & 1));
       VkMemoryDedicatedRequirements dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
          .prefersDedicatedAllocation = VK_TRUE, .requiresDedicatedAllocation = VK_TRUE};
       VkMemoryRequirements2 req2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dedicated};
@@ -980,7 +985,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
       CHECK(v->BindImageMemory(dev, images[i], memory, i ? 8192 : 256) == VK_SUCCESS);
    }
    VkImage rejected;
-   ii.format = VK_FORMAT_R32_SINT;
+   ii.format = VK_FORMAT_BC1_RGB_UNORM_BLOCK;
    CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_ERROR_FORMAT_NOT_SUPPORTED && !rejected);
    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
    CHECK(v->CreateImage(dev, &ii, NULL, &rejected) == VK_SUCCESS);
@@ -1035,7 +1040,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
                       vk_descriptor_set_layout_from_handle(other)->blake3, BLAKE3_OUT_LEN));
          v->DestroyDescriptorSetLayout(dev, other, NULL);
       }
-      binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      binding.descriptorType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
       VkDescriptorSetLayout unsupported;
       CHECK(v->CreateDescriptorSetLayout(dev, &li, NULL, &unsupported) == VK_ERROR_FEATURE_NOT_PRESENT && !unsupported);
    }
@@ -1129,8 +1134,11 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    CHECK(v->QueueSubmit2(vk_queue_to_handle(&device.queue), 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
    CHECK(v->QueueWaitIdle(vk_queue_to_handle(&device.queue)) == VK_SUCCESS && mock.dispatch == 7);
    CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
-   for (unsigned i = 2320; i < 2384; i++) expected[i] = 0x5a17c0de;
-   for (unsigned i = 3648; i < 3680; i++) expected[i] = 0xff80ff00;
+   for (unsigned layer = 0; layer < 2; layer++)
+      for (unsigned y = 0; y < 2; y++)
+         for (unsigned x = 0; x < 4; x++) expected[2320 + layer * 32 + y * 16 + x] = 0x5a17c0de;
+   for (unsigned y = 0; y < 2; y++)
+      for (unsigned x = 0; x < 2; x++) expected[3648 + y * 16 + x] = 0xff80ff00;
    for (unsigned z = 0; z < 2; z++) for (unsigned y = 0; y < 2; y++) for (unsigned x = 0; x < 3; x++) {
       uint32_t value = 0x81230000 + 13 * (3079 + z * 15 + y * 5 + x);
       expected[577 + z * 48 + y * 16 + x] = value;

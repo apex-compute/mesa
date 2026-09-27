@@ -9,7 +9,11 @@
 #include "apex_graphics.h"
 #include "apex_draw.h"
 #include "apex_setup_spv.h"
+#include "apex_bin_spv.h"
 #include "apex_copy_spv.h"
+#include "apex_clear_spv.h"
+#include "apex_timestamp_spv.h"
+#include "apex_querycopy_spv.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
@@ -778,13 +782,30 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    if (depth_target)
       nir_store_var(b, stored_depth, merged_depth, 1);
 
-   nir_variable *p_var = nir_local_variable_create(impl, glsl_uint_type(), "primitive_index");
+   /* The tile lies in one bin; walk that bin's ordered list segments. */
+   nir_def *shift = draw_word(b, program, APEX_DRAW_BIN_SHIFT);
+   nir_def *columns = draw_word(b, program, APEX_DRAW_BIN_COLUMNS);
+   nir_def *bin = nir_iadd(b, nir_imul(b, nir_isub(b, nir_ushr(b, tile_y, shift),
+                                                    draw_word(b, program, APEX_DRAW_BIN_Y0)), columns),
+                           nir_isub(b, nir_ushr(b, tile_x, shift), draw_word(b, program, APEX_DRAW_BIN_X0)));
+   nir_variable *c_var = nir_local_variable_create(impl, glsl_uint_type(), "chunk");
+   nir_store_var(b, c_var, nir_imm_int(b, 0), 1);
+   nir_loop *chunk_loop = nir_push_loop(b);
+   nir_def *chunks = draw_word(b, program, APEX_DRAW_BIN_CHUNKS);
+   nir_def *chunk = loop_counter(b, c_var, chunks);
+   nir_def *entries = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_BIN_COUNTS),
+      nir_ishl_imm(b, nir_iadd(b, nir_imul(b, bin, chunks), chunk), 2)));
+   nir_def *segment = nir_iadd(b, nir_imul(b, bin, nir_imul(b, draw_word(b, program, APEX_DRAW_PRIM_COUNT),
+                                                           draw_word(b, program, APEX_DRAW_INSTANCE_COUNT))),
+                               nir_imul_imm(b, chunk, APEX_BIN_CHUNK));
+   nir_variable *p_var = nir_local_variable_create(impl, glsl_uint_type(), "entry");
    nir_store_var(b, p_var, nir_imm_int(b, 0), 1);
    nir_loop *prim_loop = nir_push_loop(b);
-   nir_def *prims = nir_imul(b, draw_word(b, program, APEX_DRAW_PRIM_COUNT),
-                             draw_word(b, program, APEX_DRAW_INSTANCE_COUNT));
-   nir_def *p = loop_counter(b, p_var, prims);
-   nir_def *first = address_add(b, draw_address(b, program, APEX_DRAW_PRIM_LO), nir_imul_imm(b, p, APEX_SUBPRIMS * APEX_PRIM_WORDS * 4));
+   nir_def *entry = loop_counter(b, p_var, entries);
+   nir_def *p = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_BIN_LISTS),
+                                         nir_ishl_imm(b, nir_iadd(b, segment, entry), 2)));
+   nir_def *first = address_add(b, draw_address(b, program, APEX_DRAW_PRIM_LO),
+                                nir_imul_imm(b, p, APEX_SUBPRIMS * APEX_PRIM_WORDS * 4));
    nir_def *count = load_word(b, address_add(b, first, nir_imm_int(b, APEX_PRIM_COUNT * 4)));
    nir_variable *s_var = nir_local_variable_create(impl, glsl_uint_type(), "subprimitive");
    nir_store_var(b, s_var, nir_imm_int(b, 0), 1);
@@ -917,13 +938,23 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
       }
       nir_store_var(b, stored[k], nir_bcsel(b, live, nir_vec(b, merged, 4), old), 0xf);
    }
+   /* Occlusion queries count live samples: one atomic per wave. */
+   nir_def *occlusion = draw_address(b, program, APEX_DRAW_OCCLUSION);
+   nir_push_if(b, nir_ine_imm(b, nir_ior(b, nir_channel(b, occlusion, 0), nir_channel(b, occlusion, 1)), 0));
+   nir_def *passed = nir_bit_count(b, nir_ballot(b, 1, 32, live));
+   nir_push_if(b, nir_elect(b, 1));
+   nir_global_atomic_2x32(b, 32, occlusion, passed, .atomic_op = nir_atomic_op_iadd);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL); /* any covered */
    nir_pop_if(b, NULL); /* box overlap */
 #undef FIELD
    nir_store_var(b, s_var, nir_iadd_imm(b, s, 1), 1);
    nir_pop_loop(b, sub_loop);
-   nir_store_var(b, p_var, nir_iadd_imm(b, p, 1), 1);
+   nir_store_var(b, p_var, nir_iadd_imm(b, entry, 1), 1);
    nir_pop_loop(b, prim_loop);
+   nir_store_var(b, c_var, nir_iadd_imm(b, chunk, 1), 1);
+   nir_pop_loop(b, chunk_loop);
 
    nir_push_if(b, inside);
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
@@ -1134,7 +1165,11 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
    }
    static const struct { const uint32_t *code; size_t words; } sources[] = {
       [APEX_INTERNAL_SETUP] = {apex_setup_spv, ARRAY_SIZE(apex_setup_spv)},
+      [APEX_INTERNAL_BIN] = {apex_bin_spv, ARRAY_SIZE(apex_bin_spv)},
       [APEX_INTERNAL_COPY] = {apex_copy_spv, ARRAY_SIZE(apex_copy_spv)},
+      [APEX_INTERNAL_CLEAR] = {apex_clear_spv, ARRAY_SIZE(apex_clear_spv)},
+      [APEX_INTERNAL_TIMESTAMP] = {apex_timestamp_spv, ARRAY_SIZE(apex_timestamp_spv)},
+      [APEX_INTERNAL_QUERY_COPY] = {apex_querycopy_spv, ARRAY_SIZE(apex_querycopy_spv)},
    };
    struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
                                             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -1144,6 +1179,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
    program->table = true;
    struct spirv_capabilities caps = {
       .Shader = true, .Int64 = true, .PhysicalStorageBufferAddresses = true,
+      .ShaderClockKHR = true,
    };
    struct spirv_to_nir_options options = apex_get_spirv_options(device->vk.physical,
                                                                 MESA_SHADER_COMPUTE, NULL);

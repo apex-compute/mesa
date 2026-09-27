@@ -46,11 +46,11 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
       }
       nir_def *index = i->src[0].ssa;
       BITSET_SET_COUNT(ctx->program->used_descriptors,
-         ctx->program->set_offsets[set] + layout->bindings[binding].offset,
+         ctx->program->set_offsets[set] + layout->bindings[binding].slot,
          layout->bindings[binding].count);
       /* Opaque resource references retain the binding bounds through reindex.
        * The table is limited to 4096 entries, so base/count fit in 16 bits. */
-      unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].offset;
+      unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].slot;
       unsigned packed = base | (layout->bindings[binding].count << 16);
       replacement = nir_vec2(b, nir_imm_int(b, packed), index);
       break;
@@ -205,7 +205,7 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
       ctx->invalid = true;
       return false;
    }
-   unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].offset;
+   unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].slot;
    BITSET_SET_COUNT(ctx->program->used_descriptors, base, layout->bindings[binding].count);
    nir_def *slot = nir_bcsel(b, nir_ult_imm(b, index, layout->bindings[binding].count),
       nir_iadd_imm(b, index, base), nir_imm_int(b, ctx->program->descriptor_count));
@@ -383,7 +383,7 @@ apex_program_layout(struct apex_program *program, uint32_t set_count,
       const struct apex_set_layout *set = (const void *)sets[s];
       program->set_layouts[s] = set;
       program->set_offsets[s] = program->descriptor_count;
-      if (set) program->descriptor_count += set->descriptor_count;
+      if (set) program->descriptor_count += set->slot_count;
    }
    if (program->descriptor_count > APEX_MAX_DESCRIPTORS)
       return false;
@@ -403,6 +403,8 @@ apex_program_layout(struct apex_program *program, uint32_t set_count,
 bool
 apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
 {
+   const nir_lower_tex_options tex = {.lower_txp = ~0u, .lower_tg4_offsets = true};
+   NIR_PASS(_, nir, nir_lower_tex, &tex);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
@@ -411,8 +413,11 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
    nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
    nir_shader_intrinsics_pass(nir, lower_image, nir_metadata_none, &ctx);
    nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
+   /* Texture lowering reads table rows directly, so it follows buffer lowering. */
+   if (ctx.invalid || !apex_lower_textures(program, nir))
+      return false;
    NIR_PASS(_, nir, nir_lower_system_values);
-   return !ctx.invalid;
+   return true;
 }
 
 VkResult

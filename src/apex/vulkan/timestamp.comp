@@ -1,0 +1,25 @@
+#version 450
+// Writes the 64-bit device timebase and availability to one query slot.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_realtime_clock : require
+#include "apex_draw.h"
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint QUERY = 8u + 6u;
+
+void main()
+{
+   if (gl_LocalInvocationIndex != 0u)
+      return;
+   Words slot = Words(uint64_t(root[QUERY + APEX_QUERY_SLOT]) |
+                      (uint64_t(root[QUERY + APEX_QUERY_SLOT + 1u]) << 32));
+   uvec2 time = clockRealtime2x32EXT();
+   slot.w[0] = time.x;
+   slot.w[1] = time.y;
+   memoryBarrierBuffer();
+   slot.w[2] = 1u;
+}

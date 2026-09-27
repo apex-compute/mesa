@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: MIT
-# The internal triangle setup kernel is SPIR-V embedded as a C array.
-apex_setup_spv_h = custom_target('apex_setup_spv',
-  input : 'setup.comp', output : 'apex_setup_spv.h',
-  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
-             '-I' + meson.current_source_dir(), '--vn', 'apex_setup_spv', '@INPUT@', '-o', '@OUTPUT@'],
-  depend_files : files('apex_draw.h'),
-)
-apex_copy_spv_h = custom_target('apex_copy_spv',
-  input : 'copy.comp', output : 'apex_copy_spv.h',
-  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
-             '-I' + meson.current_source_dir(), '--vn', 'apex_copy_spv', '@INPUT@', '-o', '@OUTPUT@'],
-  depend_files : files('apex_draw.h'),
-)
+# Internal kernels are SPIR-V embedded as C arrays.
+apex_internal_spv = []
+foreach kernel : ['setup', 'bin', 'copy', 'clear', 'timestamp', 'querycopy']
+  apex_internal_spv += custom_target('apex_' + kernel + '_spv',
+    input : kernel + '.comp', output : 'apex_' + kernel + '_spv.h',
+    command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
+               '-I' + meson.current_source_dir(), '--vn', 'apex_' + kernel + '_spv',
+               '@INPUT@', '-o', '@OUTPUT@'],
+    depend_files : files('apex_draw.h'),
+  )
+endforeach
 apex_pipeline = static_library('apex_pipeline',
-  ['apex_pipeline.c', 'apex_device.c', 'apex_graphics.c', apex_setup_spv_h, apex_copy_spv_h],
+  ['apex_pipeline.c', 'apex_device.c', 'apex_graphics.c', 'apex_format.c', 'apex_texture.c', apex_internal_spv],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, idep_nir],
 )
@@ -186,4 +184,12 @@ foreach stage : ['vert', 'frag']
 endforeach
 apex_present_test = executable('apex-present-test', 'present_test.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
+)
+apex_texture_test = executable('apex-texture-test', 'texture_test.c',
+  include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
+)
+custom_target('apex-texture-spv',
+  input : 'texture.comp', output : 'texture.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+  build_by_default : true,
 )

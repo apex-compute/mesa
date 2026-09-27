@@ -98,6 +98,7 @@ void main()
    Words records = Words(address(APEX_DRAW_PRIM_LO));
    uint record = g * APEX_SUBPRIMS * APEX_PRIM_WORDS;
    uint count = 0u;
+   ivec2 union_first = ivec2(0x7fffffff), union_last = ivec2(-0x7fffffff - 1);
    uint cull = draw(APEX_DRAW_CULL);
    bool ccw = draw(APEX_DRAW_FRONT_FACE) == 0u;
    ivec4 scissor = ivec4(draw(APEX_DRAW_SCISSOR), draw(APEX_DRAW_SCISSOR + 1u),
@@ -134,6 +135,8 @@ void main()
          records.w[r + APEX_PRIM_EDGE + e * 4u + 2u] = uint(c);
          records.w[r + APEX_PRIM_EDGE + e * 4u + 3u] = uint(c >> 32);
       }
+      union_first = min(union_first, first);
+      union_last = max(union_last, last);
       records.w[r + APEX_PRIM_BOX] = uint(first.x);
       records.w[r + APEX_PRIM_BOX + 1u] = uint(first.y);
       records.w[r + APEX_PRIM_BOX + 2u] = uint(last.x);
@@ -151,4 +154,9 @@ void main()
       count++;
    }
    records.w[record + APEX_PRIM_COUNT] = count;
+   bool empty = count == 0u;
+   records.w[record + APEX_PRIM_UNION_BOX] = empty ? 0u : uint(union_first.x);
+   records.w[record + APEX_PRIM_UNION_BOX + 1u] = empty ? 0u : uint(union_first.y);
+   records.w[record + APEX_PRIM_UNION_BOX + 2u] = empty ? 0u : uint(union_last.x);
+   records.w[record + APEX_PRIM_UNION_BOX + 3u] = empty ? 0u : uint(union_last.y);
 }

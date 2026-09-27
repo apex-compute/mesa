@@ -1,0 +1,46 @@
+#version 450
+// Fills a rectangle of texels with one packed texel pattern: one invocation
+// per 64-texel chunk of a row. Texels of 1 or 2 bytes update their word with
+// masked atomics so neighboring lanes never overwrite each other.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_draw.h"
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint TRAILER = 8u;
+const uint CLEAR = TRAILER + 6u;
+uint word(uint i) { return root[CLEAR + i]; }
+
+void main()
+{
+   uint width = word(APEX_CLEAR_WIDTH), chunks = (width + 63u) / 64u;
+   uint rows = word(APEX_CLEAR_ROWS);
+   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
+   if (item >= chunks * rows * word(APEX_CLEAR_LAYERS))
+      return;
+   uint row = item / chunks, chunk = item - row * chunks;
+   uint layer = row / rows;
+   row -= layer * rows;
+   uint bytes = word(APEX_CLEAR_BYTES);
+   uint64_t base = (uint64_t(word(APEX_CLEAR_DST)) | (uint64_t(word(APEX_CLEAR_DST + 1u)) << 32)) +
+                   uint64_t(layer) * word(APEX_CLEAR_SLICE) + uint64_t(row) * word(APEX_CLEAR_ROW);
+   uint end = min(width, chunk * 64u + 64u);
+   for (uint x = chunk * 64u; x < end; x++) {
+      uint64_t address = base + uint64_t(x) * bytes;
+      if (bytes >= 4u) {
+         Words texel = Words(address);
+         for (uint k = 0u; k < bytes / 4u; k++)
+            texel.w[k] = word(APEX_CLEAR_PATTERN + k);
+      } else {
+         Words aligned = Words(address & ~uint64_t(3));
+         uint shift = uint(address & 3u) * 8u;
+         uint mask = (bytes == 1u ? 0xffu : 0xffffu) << shift;
+         uint value = (word(APEX_CLEAR_PATTERN) << shift) & mask;
+         atomicAnd(aligned.w[0], ~mask);
+         atomicOr(aligned.w[0], value);
+      }
+   }
+}

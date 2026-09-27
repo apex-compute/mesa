@@ -149,9 +149,9 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    PROC(GetPhysicalDeviceProperties, get_properties);
    VkPhysicalDeviceProperties props;
    get_properties(physical, &props);
-   CHECK(props.limits.maxComputeWorkGroupCount[0] == 1024 &&
-         props.limits.maxComputeWorkGroupCount[1] == 1 &&
-         props.limits.maxComputeWorkGroupCount[2] == 1 &&
+   CHECK(props.limits.maxComputeWorkGroupCount[0] == 65535 &&
+         props.limits.maxComputeWorkGroupCount[1] == 65535 &&
+         props.limits.maxComputeWorkGroupCount[2] == 65535 &&
          props.limits.maxComputeWorkGroupInvocations == (multiwave ? 256 : 16) &&
          props.limits.maxComputeWorkGroupSize[0] == (multiwave ? 256 : 16) &&
          props.limits.maxComputeWorkGroupSize[1] == (multiwave ? 256 : 16) &&
@@ -256,16 +256,20 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_format(physical, VK_FORMAT_R8G8B8A8_UNORM, &format);
    const VkFormatFeatureFlags transfer_features = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   const VkFormatFeatureFlags sampled = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+   const VkFormatFeatureFlags texel = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT |
+                                      VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
    CHECK(format.linearTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) &&
-         format.optimalTilingFeatures == format.linearTilingFeatures &&
-         format.bufferFeatures == VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+            sampled | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) &&
+         format.optimalTilingFeatures == format.linearTilingFeatures && format.bufferFeatures == texel);
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-      transfer_features;
+      transfer_features | sampled;
    CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features &&
-         format.bufferFeatures == VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+         format.bufferFeatures == texel);
    CHECK(props.limits.maxImageDimension2D == 4096 && props.limits.maxImageArrayLayers == 256);
    PROC(GetPhysicalDeviceImageFormatProperties, get_image_format);
    VkImageFormatProperties image_props;
@@ -278,6 +282,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    CHECK(!image_props.maxExtent.width && !image_props.sampleCounts && !image_props.maxResourceSize);
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
+      VK_IMAGE_USAGE_SAMPLED_BIT, 0, &image_props) == VK_SUCCESS);
+   CHECK(get_image_format(physical, VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
       VK_IMAGE_USAGE_SAMPLED_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    CHECK(get_image_format(physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
       VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,

@@ -5,11 +5,16 @@
 #include "vk_queue.h"
 #include "vk_descriptor_set_layout.h"
 #include "vk_meta.h"
+#include "vk_sampler.h"
+#include "apex_format.h"
 #include "util/vma.h"
 
 enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 
-enum apex_internal { APEX_INTERNAL_SETUP, APEX_INTERNAL_COPY, APEX_INTERNAL_COUNT };
+enum apex_internal {
+   APEX_INTERNAL_SETUP, APEX_INTERNAL_BIN, APEX_INTERNAL_COPY, APEX_INTERNAL_CLEAR, APEX_INTERNAL_TIMESTAMP, APEX_INTERNAL_QUERY_COPY,
+   APEX_INTERNAL_COUNT
+};
 
 /* Host table limits; descriptors are ordinary LOCAL memory. */
 #define APEX_MAX_DESCRIPTORS 4096
@@ -17,16 +22,24 @@ enum apex_internal { APEX_INTERNAL_SETUP, APEX_INTERNAL_COPY, APEX_INTERNAL_COUN
 #define APEX_MAX_PUSH_CONSTANTS 256
 #define APEX_EXTERNAL_MEMORY_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | \
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+/* `offset` indexes set storage by array element; `slot` indexes table rows,
+ * apex_descriptor_slots() per element. Immutable sampler rows start at
+ * `immutable` in the layout's sampler array (~0 when absent). */
 struct apex_binding_layout {
-   uint32_t offset, count, flags;
+   uint32_t offset, slot, count, flags, immutable;
    VkDescriptorType type;
    VkShaderStageFlags stages;
 };
 struct apex_set_layout {
    struct vk_descriptor_set_layout vk;
-   uint32_t binding_count, descriptor_count;
+   uint32_t binding_count, descriptor_count, slot_count;
    uint32_t counts[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
+   uint32_t (*samplers)[8];
    struct apex_binding_layout bindings[];
+};
+struct apex_sampler {
+   struct vk_sampler vk;
+   uint32_t row[8];
 };
 struct apex_buffer_descriptor {
    uint32_t low, high, bytes, reserved;

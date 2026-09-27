@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
+#include "apex_draw.h"
 #include "apex_entrypoints.h"
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
@@ -78,6 +79,7 @@ apex_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical, uint32_t
    vk_outarray_append_typed(VkQueueFamilyProperties2, &out, prop) {
       prop->queueFamilyProperties = (VkQueueFamilyProperties) {
          .queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT,
+         .timestampValidBits = 64,
          .queueCount = 1,
       };
    }
@@ -304,17 +306,56 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxStorageBufferRange = 64 * 1024 * 1024,
       .maxPushConstantsSize = APEX_MAX_PUSH_CONSTANTS,
       .maxComputeSharedMemorySize = 32768,
-      .maxComputeWorkGroupCount = {1024, 1, 1},
+      /* Recording splits dispatches into native chunks. */
+      .maxComputeWorkGroupCount = {65535, 65535, 65535},
       .maxComputeWorkGroupInvocations = multiwave ? 256 : 16,
       .maxComputeWorkGroupSize = {multiwave ? 256 : 16,
                                   multiwave ? 256 : 16, multiwave ? 64 : 16},
-      .maxImageDimension2D = 4096, .maxImageArrayLayers = 256,
+      .maxImageDimension1D = 4096, .maxImageDimension2D = 4096, .maxImageDimension3D = 2048,
+      .maxImageDimensionCube = 4096, .maxImageArrayLayers = 256,
+      .maxTexelBufferElements = 1 << 27,
+      .maxSamplerAllocationCount = 4000,
+      .bufferImageGranularity = 64,
+      .maxPerStageDescriptorSamplers = APEX_MAX_DESCRIPTORS,
+      .maxPerStageDescriptorSampledImages = APEX_MAX_DESCRIPTORS,
+      .maxPerStageDescriptorInputAttachments = 8,
+      .maxDescriptorSetSamplers = APEX_MAX_DESCRIPTORS,
+      .maxDescriptorSetSampledImages = APEX_MAX_DESCRIPTORS,
+      .maxDescriptorSetInputAttachments = 8,
+      .maxVertexInputAttributes = 32, .maxVertexInputBindings = APEX_DRAW_MAX_BINDINGS,
+      .maxVertexInputAttributeOffset = 2047, .maxVertexInputBindingStride = 2048,
+      .maxVertexOutputComponents = 128, .maxFragmentInputComponents = 128,
+      .maxFragmentOutputAttachments = 8, .maxFragmentCombinedOutputResources = 16,
+      .maxColorAttachments = 8,
+      .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 1,
+      .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
+      .maxViewports = 1, .maxViewportDimensions = {4096, 4096},
+      .viewportBoundsRange = {-8192.0f, 8191.0f}, .viewportSubPixelBits = 8,
+      .subPixelPrecisionBits = 8, .subTexelPrecisionBits = 8, .mipmapPrecisionBits = 8,
+      .minTexelBufferOffsetAlignment = 4,
+      .minTexelOffset = -8, .maxTexelOffset = 7, .minTexelGatherOffset = -8, .maxTexelGatherOffset = 7,
+      .minInterpolationOffset = -0.5f, .maxInterpolationOffset = 0.4375f,
+      .subPixelInterpolationOffsetBits = 4,
+      .maxFramebufferWidth = 4096, .maxFramebufferHeight = 4096, .maxFramebufferLayers = 256,
+      .framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .maxSampleMaskWords = 1, .discreteQueuePriorities = 2,
+      .pointSizeRange = {1.0f, 1.0f}, .lineWidthRange = {1.0f, 1.0f},
+      .standardSampleLocations = true,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .minMemoryMapAlignment = 4096,
       .minUniformBufferOffsetAlignment = 4,
       .minStorageBufferOffsetAlignment = 4,
       .nonCoherentAtomSize = 1,
       .optimalBufferCopyOffsetAlignment = 64,
+      /* Device timebase: 250 MHz on both profiles. */
+      .timestampPeriod = 4.0f, .timestampComputeAndGraphics = true,
       .optimalBufferCopyRowPitchAlignment = 64,
       /* Descriptor bounds are checked without rounding, per 32-bit component. */
       .robustStorageBufferAccessSizeAlignment = 1,
