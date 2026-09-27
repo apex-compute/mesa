@@ -280,6 +280,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_scalar_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_index_type_uint8 = true,
+      .KHR_draw_indirect_count = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
@@ -289,6 +290,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .samplerMirrorClampToEdge = true,
       .largePoints = true,
       .indexTypeUint8 = true,
+      .multiDrawIndirect = true,
+      .drawIndirectFirstInstance = true,
+      .drawIndirectCount = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
@@ -332,7 +336,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxVertexOutputComponents = 128, .maxFragmentInputComponents = 128,
       .maxFragmentOutputAttachments = 8, .maxFragmentCombinedOutputResources = 16,
       .maxColorAttachments = 8,
-      .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 1,
+      .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 65535,
       .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
       .maxViewports = 1, .maxViewportDimensions = {4096, 4096},
       .viewportBoundsRange = {-8192.0f, 8191.0f}, .viewportSubPixelBits = 8,

@@ -17,8 +17,13 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint
 const uint TRAILER = 8u;
 const uint DRAW = TRAILER + 8u;
 
-uint draw(uint i) { return root[DRAW + i]; }
-uint64_t address(uint i) { return uint64_t(draw(i)) | (uint64_t(draw(i + 1u)) << 32); }
+uint64_t address(uint i) { return uint64_t(root[DRAW + i]) | (uint64_t(root[DRAW + i + 1u]) << 32); }
+// Dynamic words of indirect draws live in the resolved parameter block.
+uint draw(uint i)
+{
+   uint64_t params = address(APEX_DRAW_PARAMS);
+   return APEX_DRAW_DYNAMIC(i) && params != 0ul ? Words(params).w[i] : root[DRAW + i];
+}
 
 // Primitive restart: the index at a draw position equals the all-ones value.
 bool restart_at(uint position)
@@ -45,12 +50,8 @@ float plane_distance(uint plane, vec4 v, vec2 guard)
    return v.w - v.z;
 }
 
-void main()
+void setup(uint g, uint prims)
 {
-   uint prims = draw(APEX_DRAW_PRIM_COUNT);
-   uint g = root[TRAILER] * 64u + gl_GlobalInvocationID.x;
-   if (g >= prims * draw(APEX_DRAW_INSTANCE_COUNT))
-      return;
    uint instance = g / prims, p = g - instance * prims;
    uint topology = draw(APEX_DRAW_TOPOLOGY);
    // Strips and fans restart after a restart index: primitives touching one
@@ -255,4 +256,17 @@ void main()
    records.w[record + APEX_PRIM_UNION_BOX + 1u] = empty ? 0u : uint(union_first.y);
    records.w[record + APEX_PRIM_UNION_BOX + 2u] = empty ? 0u : uint(union_last.x);
    records.w[record + APEX_PRIM_UNION_BOX + 3u] = empty ? 0u : uint(union_last.y);
+}
+
+// Workgroups base + launch index, stepping by the launch count below the
+// job's end: direct jobs run each once, indirect jobs cover the whole draw.
+void main()
+{
+   uint prims = draw(APEX_DRAW_PRIM_COUNT), total = prims * draw(APEX_DRAW_INSTANCE_COUNT);
+   uint end = min(root[TRAILER + 4u], (total + 63u) / 64u);
+   for (uint w = root[TRAILER] + gl_WorkGroupID.x; w < end; w += root[TRAILER + 3u]) {
+      uint g = w * 64u + gl_LocalInvocationID.x;
+      if (g < total)
+         setup(g, prims);
+   }
 }

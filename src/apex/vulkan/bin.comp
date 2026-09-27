@@ -12,14 +12,18 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint
 
 const uint TRAILER = 8u;
 const uint DRAW = TRAILER + 8u;
-uint draw(uint i) { return root[DRAW + i]; }
-uint64_t address(uint i) { return uint64_t(draw(i)) | (uint64_t(draw(i + 1u)) << 32); }
+uint64_t address(uint i) { return uint64_t(root[DRAW + i]) | (uint64_t(root[DRAW + i + 1u]) << 32); }
+// Dynamic words of indirect draws live in the resolved parameter block.
+uint draw(uint i)
+{
+   uint64_t params = address(APEX_DRAW_PARAMS);
+   return APEX_DRAW_DYNAMIC(i) && params != 0ul ? Words(params).w[i] : root[DRAW + i];
+}
 
-void main()
+void bin_chunk(uint item)
 {
    uint columns = draw(APEX_DRAW_BIN_COLUMNS), bins = columns * draw(APEX_DRAW_BIN_ROWS);
    uint padded = (bins + 15u) & ~15u;
-   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
    uint chunk = item / padded, bin = item - chunk * padded;
    uint chunks = draw(APEX_DRAW_BIN_CHUNKS);
    if (bin >= bins || chunk >= chunks)
@@ -42,4 +46,14 @@ void main()
          list.w[base + n++] = p;
    }
    Words(address(APEX_DRAW_BIN_COUNTS)).w[bin * chunks + chunk] = n;
+}
+
+// Workgroups base + launch index, stepping by the launch count below the
+// job's end: direct jobs run each once, indirect jobs cover every bin chunk.
+void main()
+{
+   uint padded = (draw(APEX_DRAW_BIN_COLUMNS) * draw(APEX_DRAW_BIN_ROWS) + 15u) & ~15u;
+   uint end = min(root[TRAILER + 4u], padded * draw(APEX_DRAW_BIN_CHUNKS) / 16u);
+   for (uint w = root[TRAILER] + gl_WorkGroupID.x; w < end; w += root[TRAILER + 3u])
+      bin_chunk(w * 16u + gl_LocalInvocationID.x);
 }

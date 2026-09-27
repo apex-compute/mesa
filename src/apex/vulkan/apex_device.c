@@ -403,8 +403,10 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
          return VK_ERROR_FEATURE_NOT_PRESENT;
       /* Dedicated resources use ordinary storage with a zero binding offset. */
    }
-   if ((!info->allocationSize && (!import || types)) || info->allocationSize > 64 * 1024 * 1024)
+   if ((!info->allocationSize && (!import || types)) || info->allocationSize > 64 * 1024 * 1024) {
+      mesa_logw("TEMP alloc %" PRIu64, (uint64_t)info->allocationSize);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
    struct apex_memory *mem = vk_device_memory_create(&device->vk, info, alloc, sizeof(*mem));
    if (!mem)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1594,14 +1596,39 @@ float_bits(float value)
    return bits;
 }
 
-/* Records vertex, setup and fragment jobs for one direct draw. */
+/* Arena layout: vertex records, primitive records, bin lists, bin counts,
+ * then the parameter block. */
+static VkResult
+draw_arena(struct apex_device *device, uint64_t *va)
+{
+   const uint64_t size = (uint64_t)APEX_ARENA_VERTEX_BYTES + APEX_ARENA_PRIM_BYTES +
+                         APEX_ARENA_LIST_BYTES + APEX_ARENA_COUNT_BYTES + 4096;
+   VkResult result = VK_SUCCESS;
+   mtx_lock(&device->memory_mutex);
+   if (!device->arena.handle)
+      result = bo_create(device, size, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, 0, &device->arena);
+   *va = device->arena.va;
+   mtx_unlock(&device->memory_mutex);
+   return result;
+}
+
+/* Indirect draw source: the command address, an optional count address and
+ * the draw's index within a multi-draw. */
+struct apex_indirect {
+   uint64_t command, count;
+   uint32_t index;
+};
+
+/* Records vertex, setup, bin and fragment jobs for one draw. Indirect draws
+ * add a resolve job and size their jobs to cover the arena's capacity. */
 static void
 record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t instance_count,
-            uint32_t first_vertex, uint32_t first_instance, bool indexed, int32_t vertex_offset)
+            uint32_t first_vertex, uint32_t first_instance, bool indexed, int32_t vertex_offset,
+            const struct apex_indirect *indirect)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   if (!vertex_count || !instance_count)
+   if (!indirect && (!vertex_count || !instance_count))
       return;
    uint32_t topology = dyn->ia.primitive_topology;
    uint32_t prims;
@@ -1630,15 +1657,34 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    uint64_t vertices = (uint64_t)vertex_count * instance_count;
    uint64_t vertex_bytes = vertices * cmd->vertex->vertex.stride * 4;
    uint64_t prim_bytes = (uint64_t)prims * instance_count * APEX_SUBPRIMS * APEX_PRIM_WORDS * 4;
-   if (vertex_bytes > 64 * 1024 * 1024 || prim_bytes > 64 * 1024 * 1024) {
+   if (vertex_bytes > APEX_DRAW_MAX_SCRATCH || prim_bytes > APEX_DRAW_MAX_SCRATCH) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }
    uint32_t draw[APEX_DRAW_WORDS] = {0};
-   uint64_t vertex_va = record_scratch(cmd, vertex_bytes);
-   uint64_t prim_va = record_scratch(cmd, prim_bytes);
-   if (!vertex_va || !prim_va)
-      return;
+   uint64_t vertex_va, prim_va, arena = 0;
+   if (indirect) {
+      result = draw_arena(device, &arena);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+      vertex_va = arena;
+      prim_va = arena + APEX_ARENA_VERTEX_BYTES;
+      uint64_t params = prim_va + APEX_ARENA_PRIM_BYTES + APEX_ARENA_LIST_BYTES + APEX_ARENA_COUNT_BYTES;
+      draw[APEX_DRAW_PARAMS] = params;
+      draw[APEX_DRAW_PARAMS + 1] = params >> 32;
+      draw[APEX_DRAW_INDIRECT] = indirect->command;
+      draw[APEX_DRAW_INDIRECT + 1] = indirect->command >> 32;
+      draw[APEX_DRAW_INDIRECT_COUNT] = indirect->count;
+      draw[APEX_DRAW_INDIRECT_COUNT + 1] = indirect->count >> 32;
+      draw[APEX_DRAW_INDIRECT_INDEX] = indirect->index;
+   } else {
+      vertex_va = record_scratch(cmd, vertex_bytes);
+      prim_va = record_scratch(cmd, prim_bytes);
+      if (!vertex_va || !prim_va)
+         return;
+   }
    draw[APEX_DRAW_VERTEX_LO] = vertex_va;
    draw[APEX_DRAW_VERTEX_HI] = vertex_va >> 32;
    draw[APEX_DRAW_VERTEX_STRIDE] = cmd->vertex->vertex.stride;
@@ -1743,57 +1789,81 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    draw[APEX_DRAW_OCCLUSION] = cmd->occlusion;
    draw[APEX_DRAW_OCCLUSION + 1] = cmd->occlusion >> 32;
 
-   struct apex_program *vs = &cmd->vertex->program;
-   uint32_t limit = MIN2(vs->max_workgroups, 1024);
-   uint32_t vertex_groups = DIV_ROUND_UP(vertices, 64);
-   for (uint32_t base = 0; base < vertex_groups; base += limit)
-      push_job(cmd, vs, cmd->graphics_sets, MIN2(vertex_groups - base, limit), base, 0, draw);
-   if (dyn->rs.rasterizer_discard_enable || !prims)
-      return;
-   uint32_t setup_groups = DIV_ROUND_UP((uint64_t)prims * instance_count, 64);
-   limit = MIN2(setup->max_workgroups, 1024);
-   for (uint32_t base = 0; base < setup_groups; base += limit)
-      push_job(cmd, setup, NULL, MIN2(setup_groups - base, limit), base, 0, draw);
-   uint32_t tiles = (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 2], 4) - draw[APEX_DRAW_SCISSOR] / 4) *
-                    (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 3], 4) - draw[APEX_DRAW_SCISSOR + 1] / 4);
-   if (!tiles)
-      return;
-   /* Smallest bins (one 4-pixel tile up) whose ordered lists fit in 32 MiB. */
-   uint64_t total = (uint64_t)prims * instance_count;
-   uint32_t chunks = DIV_ROUND_UP(total, APEX_BIN_CHUNK), shift = 2, columns, rows, bin_x0, bin_y0;
-   for (;; shift++) {
-      bin_x0 = draw[APEX_DRAW_SCISSOR] >> shift;
-      bin_y0 = draw[APEX_DRAW_SCISSOR + 1] >> shift;
-      columns = ((draw[APEX_DRAW_SCISSOR + 2] + (1u << shift) - 1) >> shift) - bin_x0;
-      rows = ((draw[APEX_DRAW_SCISSOR + 3] + (1u << shift) - 1) >> shift) - bin_y0;
-      if ((uint64_t)columns * rows * total * 4 <= 32 * 1024 * 1024 || shift == 13)
-         break;
-   }
-   uint64_t bins = (uint64_t)columns * rows;
-   uint64_t lists = record_scratch(cmd, bins * total * 4);
-   uint64_t counts = record_scratch(cmd, bins * chunks * 4);
-   if (!lists || !counts)
-      return;
-   draw[APEX_DRAW_BIN_LISTS] = lists;
-   draw[APEX_DRAW_BIN_LISTS + 1] = lists >> 32;
-   draw[APEX_DRAW_BIN_COUNTS] = counts;
-   draw[APEX_DRAW_BIN_COUNTS + 1] = counts >> 32;
-   draw[APEX_DRAW_BIN_SHIFT] = shift;
-   draw[APEX_DRAW_BIN_COLUMNS] = columns;
-   draw[APEX_DRAW_BIN_ROWS] = rows;
-   draw[APEX_DRAW_BIN_CHUNKS] = chunks;
-   draw[APEX_DRAW_BIN_X0] = bin_x0;
-   draw[APEX_DRAW_BIN_Y0] = bin_y0;
-   struct apex_program *binner;
+   /* Direct jobs run workgroups [base, base + groups) once. Indirect jobs
+    * step a bounded launch through counts resolved when the draw runs. */
+   struct apex_program *vs = &cmd->vertex->program, *binner, *resolve = NULL;
    result = apex_internal_program(device, APEX_INTERNAL_BIN, &binner);
+   if (result == VK_SUCCESS && indirect)
+      result = apex_internal_program(device, APEX_INTERNAL_RESOLVE, &resolve);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
    }
-   uint32_t bin_groups = DIV_ROUND_UP(align64(bins, 16) * chunks, 16);
-   limit = MIN2(binner->max_workgroups, 1024);
-   for (uint32_t base = 0; base < bin_groups; base += limit)
-      push_job(cmd, binner, NULL, MIN2(bin_groups - base, limit), base, 0, draw);
+   uint32_t tiles = (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 2], 4) - draw[APEX_DRAW_SCISSOR] / 4) *
+                    (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 3], 4) - draw[APEX_DRAW_SCISSOR + 1] / 4);
+   bool raster = !dyn->rs.rasterizer_discard_enable && tiles;
+   if (indirect) {
+      uint64_t lists = prim_va + APEX_ARENA_PRIM_BYTES, counts = lists + APEX_ARENA_LIST_BYTES;
+      draw[APEX_DRAW_BIN_LISTS] = lists;
+      draw[APEX_DRAW_BIN_LISTS + 1] = lists >> 32;
+      draw[APEX_DRAW_BIN_COUNTS] = counts;
+      draw[APEX_DRAW_BIN_COUNTS + 1] = counts >> 32;
+      push_job(cmd, resolve, NULL, 1, 0, 1, draw);
+      push_job(cmd, vs, cmd->graphics_sets, MIN2(vs->max_workgroups, 1024), 0, UINT32_MAX, draw);
+      if (raster) {
+         push_job(cmd, setup, NULL, MIN2(setup->max_workgroups, 1024), 0, UINT32_MAX, draw);
+         push_job(cmd, binner, NULL, MIN2(binner->max_workgroups, 1024), 0, UINT32_MAX, draw);
+      }
+   } else {
+      uint32_t limit = MIN2(vs->max_workgroups, 1024);
+      uint32_t vertex_groups = DIV_ROUND_UP(vertices, 64);
+      for (uint32_t base = 0; base < vertex_groups; base += limit) {
+         uint32_t groups = MIN2(vertex_groups - base, limit);
+         push_job(cmd, vs, cmd->graphics_sets, groups, base, base + groups, draw);
+      }
+      if (!raster || !prims)
+         return;
+      uint32_t setup_groups = DIV_ROUND_UP((uint64_t)prims * instance_count, 64);
+      limit = MIN2(setup->max_workgroups, 1024);
+      for (uint32_t base = 0; base < setup_groups; base += limit) {
+         uint32_t groups = MIN2(setup_groups - base, limit);
+         push_job(cmd, setup, NULL, groups, base, base + groups, draw);
+      }
+      /* Smallest bins (one 4-pixel tile up) whose ordered lists fit in 32 MiB. */
+      uint64_t total = (uint64_t)prims * instance_count;
+      uint32_t chunks = DIV_ROUND_UP(total, APEX_BIN_CHUNK), shift = 2, columns, rows, bin_x0, bin_y0;
+      for (;; shift++) {
+         bin_x0 = draw[APEX_DRAW_SCISSOR] >> shift;
+         bin_y0 = draw[APEX_DRAW_SCISSOR + 1] >> shift;
+         columns = ((draw[APEX_DRAW_SCISSOR + 2] + (1u << shift) - 1) >> shift) - bin_x0;
+         rows = ((draw[APEX_DRAW_SCISSOR + 3] + (1u << shift) - 1) >> shift) - bin_y0;
+         if ((uint64_t)columns * rows * total * 4 <= APEX_DRAW_MAX_LISTS || shift == 13)
+            break;
+      }
+      uint64_t bins = (uint64_t)columns * rows;
+      uint64_t lists = record_scratch(cmd, bins * total * 4);
+      uint64_t counts = record_scratch(cmd, bins * chunks * 4);
+      if (!lists || !counts)
+         return;
+      draw[APEX_DRAW_BIN_LISTS] = lists;
+      draw[APEX_DRAW_BIN_LISTS + 1] = lists >> 32;
+      draw[APEX_DRAW_BIN_COUNTS] = counts;
+      draw[APEX_DRAW_BIN_COUNTS + 1] = counts >> 32;
+      draw[APEX_DRAW_BIN_SHIFT] = shift;
+      draw[APEX_DRAW_BIN_COLUMNS] = columns;
+      draw[APEX_DRAW_BIN_ROWS] = rows;
+      draw[APEX_DRAW_BIN_CHUNKS] = chunks;
+      draw[APEX_DRAW_BIN_X0] = bin_x0;
+      draw[APEX_DRAW_BIN_Y0] = bin_y0;
+      uint32_t bin_groups = DIV_ROUND_UP(align64(bins, 16) * chunks, 16);
+      limit = MIN2(binner->max_workgroups, 1024);
+      for (uint32_t base = 0; base < bin_groups; base += limit) {
+         uint32_t groups = MIN2(bin_groups - base, limit);
+         push_job(cmd, binner, NULL, groups, base, base + groups, draw);
+      }
+   }
+   if (!raster)
+      return;
    /* The launch watchdog bounds each workgroup: a fragment job walks at most
     * APEX_TILES_PER_WORKGROUP tiles per workgroup. */
    struct apex_program *fs = &cmd->fragment->program;
@@ -1808,7 +1878,7 @@ apex_CmdDraw(VkCommandBuffer handle, uint32_t vertex_count, uint32_t instance_co
              uint32_t first_vertex, uint32_t first_instance)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   record_draw(cmd, vertex_count, instance_count, first_vertex, first_instance, false, 0);
+   record_draw(cmd, vertex_count, instance_count, first_vertex, first_instance, false, 0, NULL);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1816,7 +1886,56 @@ apex_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t insta
                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   record_draw(cmd, index_count, instance_count, first_index, first_instance, true, vertex_offset);
+   record_draw(cmd, index_count, instance_count, first_index, first_instance, true, vertex_offset, NULL);
+}
+
+static void
+record_indirect(struct apex_command_buffer *cmd, VkBuffer buffer, VkDeviceSize offset,
+                VkBuffer count_buffer, VkDeviceSize count_offset, uint32_t draws, uint32_t stride,
+                bool indexed)
+{
+   VK_FROM_HANDLE(apex_buffer, args, buffer);
+   VK_FROM_HANDLE(apex_buffer, count, count_buffer);
+   for (uint32_t i = 0; i < draws; i++) {
+      struct apex_indirect indirect = {
+         .command = args->vk.device_address + offset + (uint64_t)i * stride,
+         .count = count ? count->vk.device_address + count_offset : 0, .index = i,
+      };
+      record_draw(cmd, 0, 0, 0, 0, indexed, 0, &indirect);
+   }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDrawIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset, uint32_t draws,
+                     uint32_t stride)
+{
+   record_indirect(apex_command_buffer_from_handle(handle), buffer, offset, VK_NULL_HANDLE, 0,
+                   draws, stride, false);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDrawIndexedIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                            uint32_t draws, uint32_t stride)
+{
+   record_indirect(apex_command_buffer_from_handle(handle), buffer, offset, VK_NULL_HANDLE, 0,
+                   draws, stride, true);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDrawIndirectCount(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                          VkBuffer count, VkDeviceSize count_offset, uint32_t draws, uint32_t stride)
+{
+   record_indirect(apex_command_buffer_from_handle(handle), buffer, offset, count, count_offset,
+                   draws, stride, false);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDrawIndexedIndirectCount(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                                 VkBuffer count, VkDeviceSize count_offset, uint32_t draws,
+                                 uint32_t stride)
+{
+   record_indirect(apex_command_buffer_from_handle(handle), buffer, offset, count, count_offset,
+                   draws, stride, true);
 }
 
 /* ---- Events and queries --------------------------------------------------- */
@@ -3096,6 +3215,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdBindVertexBuffers2 = apex_CmdBindVertexBuffers2,
       .CmdBindIndexBuffer2 = apex_CmdBindIndexBuffer2,
       .CmdDraw = apex_CmdDraw, .CmdDrawIndexed = apex_CmdDrawIndexed,
+      .CmdDrawIndirect = apex_CmdDrawIndirect, .CmdDrawIndexedIndirect = apex_CmdDrawIndexedIndirect,
+      .CmdDrawIndirectCount = apex_CmdDrawIndirectCount,
+      .CmdDrawIndexedIndirectCount = apex_CmdDrawIndexedIndirectCount,
       .QueueWaitIdle = apex_QueueWaitIdle,
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
@@ -3123,6 +3245,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->completion = 0;
    device->point = 0;
    memset(device->internal, 0, sizeof(device->internal));
+   device->arena = (struct apex_bo){0};
    list_inithead(&device->retired);
    list_inithead(&device->memories);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {

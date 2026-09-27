@@ -13,6 +13,7 @@ enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 
 enum apex_internal {
    APEX_INTERNAL_SETUP, APEX_INTERNAL_BIN, APEX_INTERNAL_COPY, APEX_INTERNAL_CLEAR, APEX_INTERNAL_TIMESTAMP, APEX_INTERNAL_QUERY_COPY,
+   APEX_INTERNAL_RESOLVE,
    APEX_INTERNAL_COUNT
 };
 
@@ -93,6 +94,9 @@ struct apex_device {
    struct list_head retired;
    /* Internal programs, compiled on first use. */
    struct apex_program *internal[APEX_INTERNAL_COUNT];
+   /* Indirect draw scratch and parameter block, created on first use under
+    * memory_mutex (see APEX_ARENA_* in apex_draw.h). */
+   struct apex_bo arena;
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 

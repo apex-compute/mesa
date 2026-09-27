@@ -14,6 +14,7 @@
 #include "apex_clear_spv.h"
 #include "apex_timestamp_spv.h"
 #include "apex_querycopy_spv.h"
+#include "apex_resolve_spv.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
@@ -45,15 +46,27 @@ root_word(nir_builder *b, unsigned offset)
 }
 
 static nir_def *
-draw_word(nir_builder *b, const struct apex_program *program, unsigned word)
-{
-   return root_word(b, draw_offset(program, word));
-}
-
-static nir_def *
 draw_address(nir_builder *b, const struct apex_program *program, unsigned word)
 {
-   return nir_vec2(b, draw_word(b, program, word), draw_word(b, program, word + 1));
+   return nir_vec2(b, root_word(b, draw_offset(program, word)),
+                   root_word(b, draw_offset(program, word + 1)));
+}
+
+/* Dynamic words of indirect draws come from the resolved parameter block. */
+static nir_def *
+draw_word(nir_builder *b, const struct apex_program *program, unsigned word)
+{
+   if (!APEX_DRAW_DYNAMIC(word))
+      return root_word(b, draw_offset(program, word));
+   nir_def *params = draw_address(b, program, APEX_DRAW_PARAMS);
+   nir_push_if(b, nir_ine_imm(b, nir_ior(b, nir_channel(b, params, 0), nir_channel(b, params, 1)), 0));
+   nir_def *resolved = nir_load_global_2x32(b, 1, 32,
+      nir_build_addr_iadd_imm(b, params, nir_address_format_2x32bit_global, nir_var_mem_global, word * 4),
+      .align_mul = 4);
+   nir_push_else(b, NULL);
+   nir_def *direct = root_word(b, draw_offset(program, word));
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, resolved, direct);
 }
 
 static nir_def *
@@ -359,15 +372,25 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_builder *b = &builder;
    const struct apex_program *program = &shader->program;
    struct vertex_lowering ctx = {.shader = shader, .vi = vi};
-   /* Linear vertex over V x I from the job's base plus the native launch. */
-   nir_def *linear = nir_iadd(b, nir_imul_imm(b, nir_iadd(b, root_word(b, apex_program_trailer(program)),
-                                                           native_workgroup(b)), 64),
-                              nir_load_local_invocation_index(b));
+   /* Linear vertex over V x I: workgroups base + native launch, stepping by
+    * the launch count below the job's end, so indirect jobs cover the draw. */
+   unsigned trailer = apex_program_trailer(program);
    nir_def *per_instance = draw_word(b, program, APEX_DRAW_VERTEX_COUNT);
    nir_def *total = nir_imul(b, per_instance, draw_word(b, program, APEX_DRAW_INSTANCE_COUNT));
+   nir_def *first_instance = draw_word(b, program, APEX_DRAW_FIRST_INSTANCE);
+   nir_def *end = nir_umin(b, root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups) + 4),
+                           nir_ushr_imm(b, nir_iadd_imm(b, total, 63), 6));
+   nir_variable *w_var = nir_local_variable_create(impl, glsl_uint_type(), "vertex_group");
+   nir_store_var(b, w_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
+   nir_loop *loop = nir_push_loop(b);
+   nir_def *w = nir_load_var(b, w_var);
+   nir_push_if(b, nir_uge(b, w, end));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+   nir_def *linear = nir_iadd(b, nir_imul_imm(b, w, 64), nir_load_local_invocation_index(b));
    nir_def *instance = nir_udiv(b, linear, nir_umax(b, per_instance, nir_imm_int(b, 1)));
    nir_def *position = nir_isub(b, linear, nir_imul(b, instance, per_instance));
-   ctx.instance = nir_iadd(b, instance, draw_word(b, program, APEX_DRAW_FIRST_INSTANCE));
+   ctx.instance = nir_iadd(b, instance, first_instance);
    nir_if *guard = nir_push_if(b, nir_ult(b, linear, total));
    /* Indexed draws read 8/16/32-bit indices; others count from firstVertex.
     * A restart index shades vertex 0 for a record no primitive reads. */
@@ -395,6 +418,8 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_cf_reinsert(&body, b->cursor);
    b->cursor = nir_after_cf_list(&guard->then_list);
    nir_pop_if(b, guard);
+   nir_store_var(b, w_var, nir_iadd(b, w, root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups))), 1);
+   nir_pop_loop(b, loop);
    lower_collected(nir, lower_vertex_intrinsic, &ctx);
    return !ctx.invalid;
 }
@@ -1372,6 +1397,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
       [APEX_INTERNAL_CLEAR] = {apex_clear_spv, ARRAY_SIZE(apex_clear_spv)},
       [APEX_INTERNAL_TIMESTAMP] = {apex_timestamp_spv, ARRAY_SIZE(apex_timestamp_spv)},
       [APEX_INTERNAL_QUERY_COPY] = {apex_querycopy_spv, ARRAY_SIZE(apex_querycopy_spv)},
+      [APEX_INTERNAL_RESOLVE] = {apex_resolve_spv, ARRAY_SIZE(apex_resolve_spv)},
    };
    struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
                                             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -1405,6 +1431,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
 void
 apex_graphics_finish(struct apex_device *device)
 {
+   apex_bo_finish(device, &device->arena);
    for (unsigned i = 0; i < APEX_INTERNAL_COUNT; i++) {
       if (device->internal[i]) {
          apex_program_finish(device, device->internal[i]);

@@ -60,7 +60,29 @@
 /* Constant factor, slope factor, clamp (FP32) and depth unorm bits (0 float). */
 #define APEX_DRAW_DEPTH_BIAS 190
 #define APEX_DRAW_RESTART 194        /* indexed primitive restart enabled */
-#define APEX_DRAW_WORDS 195
+/* Indirect draws: the resolve job writes the dynamic words (counts, first
+ * vertex/instance, vertex offset and bin geometry) at their draw-block
+ * indices into a parameter block; kernels read those words from it when
+ * APEX_DRAW_PARAMS is nonzero. Resolve reads the command at APEX_DRAW_INDIRECT
+ * and zeroes draws at or beyond the count word at APEX_DRAW_INDIRECT_COUNT. */
+#define APEX_DRAW_PARAMS 195          /* parameter block VA lo, hi; zero when direct */
+#define APEX_DRAW_INDIRECT 197        /* VkDraw[Indexed]IndirectCommand VA lo, hi */
+#define APEX_DRAW_INDIRECT_COUNT 199  /* count VA lo, hi; zero without a count buffer */
+#define APEX_DRAW_INDIRECT_INDEX 201  /* draw index for the count comparison */
+#define APEX_DRAW_WORDS 202
+#define APEX_DRAW_DYNAMIC(w) (((w) >= APEX_DRAW_VERTEX_COUNT && (w) <= APEX_DRAW_FIRST_INSTANCE) || \
+                              (w) == APEX_DRAW_PRIM_COUNT || (w) == APEX_DRAW_INDEX + 3 || \
+                              ((w) >= APEX_DRAW_BIN_SHIFT && (w) <= APEX_DRAW_BIN_Y0))
+/* Indirect draw scratch: one device arena reused by every indirect draw,
+ * since a device's jobs execute serially. Every job maps the whole VM, so
+ * the arena stays small; larger indirect draws resolve to zero vertices. */
+#define APEX_ARENA_VERTEX_BYTES (16u << 20)
+#define APEX_ARENA_PRIM_BYTES (32u << 20)
+#define APEX_ARENA_LIST_BYTES (16u << 20)
+#define APEX_ARENA_COUNT_BYTES (256u << 10)
+/* Direct draws size scratch per draw up to these limits. */
+#define APEX_DRAW_MAX_SCRATCH (64u << 20)
+#define APEX_DRAW_MAX_LISTS (32u << 20)
 #define APEX_BIN_CHUNK 256
 
 /* Primitive record fields. Edge i is opposite vertex i; E(p) = a x + b y + c
