@@ -1641,7 +1641,8 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    }
    if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
        !cmd->vertex || !cmd->fragment ||
-       dyn->vp.viewport_count != 1 || dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
+       !dyn->vp.viewport_count || dyn->vp.viewport_count > APEX_DRAW_MAX_VIEWPORTS ||
+       dyn->vp.scissor_count < dyn->vp.viewport_count || dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
        (indexed && !cmd->index.bytes)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -1714,22 +1715,38 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    }
    draw[APEX_DRAW_WIDTH] = width;
    draw[APEX_DRAW_HEIGHT] = height;
-   const VkViewport *vp = &dyn->vp.viewports[0];
-   const float viewport[6] = {vp->x, vp->y, vp->width, vp->height, vp->minDepth, vp->maxDepth};
-   for (unsigned i = 0; i < 6; i++)
-      draw[APEX_DRAW_VIEWPORT + i] = float_bits(viewport[i]);
-   const VkRect2D *scissor = &dyn->vp.scissors[0];
+   /* Each viewport's scissor is intersected with the render area and the
+    * framebuffer; tiles cover their union. */
    const VkRect2D *area = &cmd->rendering.area;
-   int64_t x0 = MAX3(scissor->offset.x, area->offset.x, 0);
-   int64_t y0 = MAX3(scissor->offset.y, area->offset.y, 0);
-   int64_t x1 = MIN3((int64_t)scissor->offset.x + scissor->extent.width,
-                     (int64_t)area->offset.x + area->extent.width, width);
-   int64_t y1 = MIN3((int64_t)scissor->offset.y + scissor->extent.height,
-                     (int64_t)area->offset.y + area->extent.height, height);
-   draw[APEX_DRAW_SCISSOR] = x0;
-   draw[APEX_DRAW_SCISSOR + 1] = y0;
-   draw[APEX_DRAW_SCISSOR + 2] = MAX2(x1, x0);
-   draw[APEX_DRAW_SCISSOR + 3] = MAX2(y1, y0);
+   int64_t ux0 = INT64_MAX, uy0 = INT64_MAX, ux1 = 0, uy1 = 0;
+   for (unsigned v = 0; v < dyn->vp.viewport_count; v++) {
+      const VkViewport *vp = &dyn->vp.viewports[v];
+      const float viewport[6] = {vp->x, vp->y, vp->width, vp->height, vp->minDepth, vp->maxDepth};
+      for (unsigned i = 0; i < 6; i++)
+         draw[APEX_DRAW_VIEWPORTS + v * 6 + i] = float_bits(viewport[i]);
+      const VkRect2D *scissor = &dyn->vp.scissors[v];
+      int64_t x0 = MAX3(scissor->offset.x, area->offset.x, 0);
+      int64_t y0 = MAX3(scissor->offset.y, area->offset.y, 0);
+      int64_t x1 = MAX2(MIN3((int64_t)scissor->offset.x + scissor->extent.width,
+                             (int64_t)area->offset.x + area->extent.width, width), x0);
+      int64_t y1 = MAX2(MIN3((int64_t)scissor->offset.y + scissor->extent.height,
+                             (int64_t)area->offset.y + area->extent.height, height), y0);
+      uint32_t *words = &draw[APEX_DRAW_SCISSORS + v * 4];
+      words[0] = x0, words[1] = y0, words[2] = x1, words[3] = y1;
+      if (x0 < x1 && y0 < y1) {
+         ux0 = MIN2(ux0, x0), uy0 = MIN2(uy0, y0);
+         ux1 = MAX2(ux1, x1), uy1 = MAX2(uy1, y1);
+      }
+   }
+   if (ux0 == INT64_MAX)
+      ux0 = uy0 = ux1 = uy1 = 0;
+   draw[APEX_DRAW_SCISSOR] = ux0;
+   draw[APEX_DRAW_SCISSOR + 1] = uy0;
+   draw[APEX_DRAW_SCISSOR + 2] = ux1;
+   draw[APEX_DRAW_SCISSOR + 3] = uy1;
+   draw[APEX_DRAW_VIEWPORT_COUNT] = dyn->vp.viewport_count;
+   int viewport_slot = cmd->vertex->vertex.slot[VARYING_SLOT_VIEWPORT];
+   draw[APEX_DRAW_VIEWPORT_SLOT] = viewport_slot < 0 ? ~0u : viewport_slot;
    draw[APEX_DRAW_CULL] = dyn->rs.cull_mode;
    draw[APEX_DRAW_FRONT_FACE] = dyn->rs.front_face;
    const struct apex_image *ds = cmd->rendering.depth.image;
@@ -1738,7 +1755,8 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
                            (depth && dyn->ds.depth.test_enable && dyn->ds.depth.write_enable) << 1 |
                            (stencil && dyn->ds.stencil.test_enable) << 2 |
                            (depth && dyn->rs.depth_bias.enable) << 3 |
-                           dyn->ds.depth.compare_op << 4;
+                           dyn->ds.depth.compare_op << 4 |
+                           (uint32_t)dyn->rs.depth_clamp_enable << 8;
    for (unsigned f = 0; f < 2; f++) {
       const struct vk_stencil_test_face_state *face = f ? &dyn->ds.stencil.back : &dyn->ds.stencil.front;
       draw[APEX_DRAW_STENCIL + f * 2] = face->op.fail | face->op.pass << 3 | face->op.depth_fail << 6 |

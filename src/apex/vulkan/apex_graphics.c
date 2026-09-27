@@ -333,6 +333,8 @@ assign_vertex_slots(struct apex_shader *shader, const nir_shader *nir)
    }
    if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ))
       shader->vertex.slot[VARYING_SLOT_PSIZ] = words++;
+   if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT))
+      shader->vertex.slot[VARYING_SLOT_VIEWPORT] = words++;
    shader->vertex.stride = words;
 }
 
@@ -431,6 +433,7 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
 struct fragment_lowering {
    struct apex_shader *shader;
    nir_variable *perspective, *linear, *coord, *front, *covered, *killed, *sources, *primitive;
+   nir_variable *viewport;
    nir_variable *color[APEX_DRAW_MAX_COLOR], *depth;
    bool invalid;
 };
@@ -477,6 +480,10 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       nir_def *sources = nir_load_var(b, ctx->sources);
       if (location == VARYING_SLOT_PRIMITIVE_ID) {
          replacement = nir_load_var(b, ctx->primitive);
+         break;
+      }
+      if (location == VARYING_SLOT_VIEWPORT) {
+         replacement = nir_load_var(b, ctx->viewport);
          break;
       }
       if (location == VARYING_SLOT_PNTC) {
@@ -852,6 +859,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    ctx.killed = nir_local_variable_create(impl, glsl_bool_type(), "killed");
    ctx.sources = nir_local_variable_create(impl, glsl_uvec_type(3), "sources");
    ctx.primitive = nir_local_variable_create(impl, glsl_uint_type(), "primitive");
+   ctx.viewport = nir_local_variable_create(impl, glsl_uint_type(), "viewport");
    ctx.depth = nir_local_variable_create(impl, glsl_float_type(), "depth");
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       ctx.color[k] = nir_local_variable_create(impl, vec4, "color");
@@ -1003,7 +1011,10 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *qx = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, px, 8), 128));
    nir_def *qy = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, py, 8), 128));
    nir_def *edge[3];
-   nir_def *covered = inside;
+   /* The box is clipped to the primitive's viewport scissor. */
+   nir_def *covered = nir_iand(b, inside,
+      nir_iand(b, nir_iand(b, nir_uge(b, px, FIELD(APEX_PRIM_BOX)), nir_ult(b, px, FIELD(APEX_PRIM_BOX + 2))),
+                  nir_iand(b, nir_uge(b, py, FIELD(APEX_PRIM_BOX + 1)), nir_ult(b, py, FIELD(APEX_PRIM_BOX + 3)))));
    for (unsigned e = 0; e < 3; e++) {
       unsigned w = APEX_PRIM_EDGE + e * 4;
       nir_def *c = nir_pack_64_2x32_split(b, FIELD(w + 2), FIELD(w + 3));
@@ -1044,6 +1055,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_store_var(b, ctx.sources, nir_vec3(b, FIELD(APEX_PRIM_SOURCE), FIELD(APEX_PRIM_SOURCE + 1),
                                           FIELD(APEX_PRIM_SOURCE + 2)), 0x7);
    nir_store_var(b, ctx.primitive, FIELD(APEX_PRIM_ID), 1);
+   nir_store_var(b, ctx.viewport, nir_iand_imm(b, nir_ushr_imm(b, FIELD(APEX_PRIM_FLAGS), 16), 0xf), 1);
    nir_store_var(b, ctx.covered, covered, 1);
    nir_store_var(b, ctx.killed, nir_imm_false(b), 1);
    nir_store_var(b, ctx.depth, z, 1);
@@ -1069,6 +1081,17 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
       nir_def *depth_pass = nir_imm_true(b), *depth_write = nir_imm_false(b), *fragment = NULL;
       if (z_channel) {
          nir_def *z = nir_load_var(b, ctx.depth);
+         /* Depth clamp bounds the fragment to its viewport's depth range. */
+         nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, control, 256), 0));
+         nir_def *range = nir_iadd_imm(b, nir_imul_imm(b, nir_load_var(b, ctx.viewport), 24),
+                                       draw_offset(program, APEX_DRAW_VIEWPORTS + 4));
+         nir_def *near = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), range, .align_mul = 4,
+                                       .access = ACCESS_NON_WRITEABLE);
+         nir_def *far = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_iadd_imm(b, range, 4),
+                                      .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+         nir_def *clamped = nir_fmin(b, nir_fmax(b, z, nir_fmin(b, near, far)), nir_fmax(b, near, far));
+         nir_pop_if(b, NULL);
+         z = nir_if_phi(b, clamped, z);
          nir_def *old = channel_bits(b, texel, z_channel);
          nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, control, 4), 7);
          nir_def *pass;

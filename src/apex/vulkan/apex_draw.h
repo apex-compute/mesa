@@ -21,12 +21,12 @@
 #define APEX_DRAW_TOPOLOGY 10
 #define APEX_DRAW_WIDTH 11            /* framebuffer extent in pixels */
 #define APEX_DRAW_HEIGHT 12
-#define APEX_DRAW_VIEWPORT 13         /* x, y, width, height, minDepth, maxDepth (FP32) */
-#define APEX_DRAW_SCISSOR 19          /* x0, y0, x1, y1 exclusive, intersected with the render area */
+/* Words 13..18 are unused; viewports live at APEX_DRAW_VIEWPORTS. */
+#define APEX_DRAW_SCISSOR 19          /* union of the scissors below: x0, y0, x1, y1 exclusive */
 #define APEX_DRAW_CULL 23             /* VkCullModeFlags */
 #define APEX_DRAW_FRONT_FACE 24       /* VkFrontFace */
 /* Bit 0 depth test, bit 1 depth write, bit 2 stencil test, bit 3 depth bias,
- * bits 4..6 depth VkCompareOp. */
+ * bits 4..6 depth VkCompareOp, bit 8 depth clamp. */
 #define APEX_DRAW_DEPTH 25
 #define APEX_DRAW_COLOR 26            /* per attachment: VA lo, VA hi, row stride */
 #define APEX_DRAW_COLOR_WORDS 3
@@ -73,7 +73,12 @@
 /* Fragment jobs: bin chunks [first, end) of this job. Consecutive jobs keep
  * API order per pixel while each workgroup walks a bounded primitive count. */
 #define APEX_DRAW_CHUNK_RANGE 202
-#define APEX_DRAW_WORDS 204
+#define APEX_DRAW_MAX_VIEWPORTS 16
+#define APEX_DRAW_VIEWPORTS 204       /* per viewport: x, y, width, height, minDepth, maxDepth (FP32) */
+#define APEX_DRAW_SCISSORS 300        /* per viewport: x0, y0, x1, y1 exclusive, within the render area */
+#define APEX_DRAW_VIEWPORT_SLOT 364   /* vertex-record word of gl_ViewportIndex, ~0 for viewport 0 */
+#define APEX_DRAW_VIEWPORT_COUNT 365
+#define APEX_DRAW_WORDS 366
 #define APEX_FRAGMENT_CHUNKS 8        /* bin chunks per fragment job */
 #define APEX_DRAW_DYNAMIC(w) (((w) >= APEX_DRAW_VERTEX_COUNT && (w) <= APEX_DRAW_FIRST_INSTANCE) || \
                               (w) == APEX_DRAW_PRIM_COUNT || (w) == APEX_DRAW_INDEX + 3 || \
@@ -100,7 +105,7 @@
 #define APEX_PRIM_INV_W 20            /* 1/w per vertex (FP32) */
 #define APEX_PRIM_WEIGHTS 23          /* 3 x 3 FP32: sub-vertex i weight of source vertex j */
 #define APEX_PRIM_SOURCE 32           /* 3 source vertex record indices */
-#define APEX_PRIM_FLAGS 35            /* bit 0 front-facing; bits 8..9 provoking source */
+#define APEX_PRIM_FLAGS 35            /* bit 0 front-facing; bits 16..19 viewport index */
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */
 #define APEX_PRIM_DEPTH_OFFSET 38     /* depth bias of this triangle (FP32) */

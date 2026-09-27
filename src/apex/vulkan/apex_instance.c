@@ -293,6 +293,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .multiDrawIndirect = true,
       .drawIndirectFirstInstance = true,
       .drawIndirectCount = true,
+      .depthClamp = true,
+      .multiViewport = true,
+      .shaderOutputViewportIndex = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
@@ -338,7 +341,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxColorAttachments = 8,
       .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 65535,
       .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
-      .maxViewports = 1, .maxViewportDimensions = {4096, 4096},
+      .maxViewports = APEX_DRAW_MAX_VIEWPORTS, .maxViewportDimensions = {4096, 4096},
       .viewportBoundsRange = {-8192.0f, 8191.0f}, .viewportSubPixelBits = 8,
       .subPixelPrecisionBits = 8, .subTexelPrecisionBits = 8, .mipmapPrecisionBits = 8,
       .minTexelBufferOffsetAlignment = 4,

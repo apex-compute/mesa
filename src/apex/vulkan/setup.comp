@@ -82,22 +82,29 @@ void setup(uint g, uint prims)
                                    vertices.w[base + 2u], vertices.w[base + 3u]));
       B[i] = vec3(i == 0u ? 1.0 : 0.0, i == 1u ? 1.0 : 0.0, i == 2u ? 1.0 : 0.0);
    }
-   vec4 viewport = uintBitsToFloat(uvec4(draw(APEX_DRAW_VIEWPORT), draw(APEX_DRAW_VIEWPORT + 1u),
-                                         draw(APEX_DRAW_VIEWPORT + 2u), draw(APEX_DRAW_VIEWPORT + 3u)));
-   float min_depth = uintBitsToFloat(draw(APEX_DRAW_VIEWPORT + 4u));
-   float max_depth = uintBitsToFloat(draw(APEX_DRAW_VIEWPORT + 5u));
+   // The provoking vertex (source 0) selects the viewport and scissor.
+   uint viewport_slot = draw(APEX_DRAW_VIEWPORT_SLOT);
+   uint vi = viewport_slot == ~0u ? 0u : vertices.w[source[0] * stride + viewport_slot];
+   if (vi >= draw(APEX_DRAW_VIEWPORT_COUNT))
+      vi = 0u;
+   uint vw = APEX_DRAW_VIEWPORTS + vi * 6u;
+   vec4 viewport = uintBitsToFloat(uvec4(draw(vw), draw(vw + 1u), draw(vw + 2u), draw(vw + 3u)));
+   float min_depth = uintBitsToFloat(draw(vw + 4u));
+   float max_depth = uintBitsToFloat(draw(vw + 5u));
+   // Depth clamp disables the z >= 0 and z <= w planes.
+   uint planes = (draw(APEX_DRAW_DEPTH) & 256u) != 0u ? 5u : 7u;
    vec2 scale = viewport.zw * 0.5, offset = viewport.xy + scale;
    vec2 guard = vec2(30000.0) / (abs(scale) + abs(offset) + 1.0);
 
    // Points and lines keep n = 1 or 2 vertices through clipping.
    uint n = skip ? 0u : topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
    if (n == 1u) {
-      for (uint plane = 0u; plane < 7u; plane++)
+      for (uint plane = 0u; plane < planes; plane++)
          if (plane_distance(plane, P[0], guard) < 0.0)
             n = 0u;
    } else if (n == 2u) {
       float t0 = 0.0, t1 = 1.0;
-      for (uint plane = 0u; plane < 7u; plane++) {
+      for (uint plane = 0u; plane < planes; plane++) {
          float d0 = plane_distance(plane, P[0], guard), d1 = plane_distance(plane, P[1], guard);
          if (d0 < 0.0 && d1 < 0.0)
             t0 = 2.0;
@@ -115,7 +122,7 @@ void setup(uint g, uint prims)
          P[1] = mix(p0, p1, t1); B[1] = mix(b0, b1, t1);
       }
    }
-   for (uint plane = 0u; plane < 7u && n >= 3u; plane++) {
+   for (uint plane = 0u; plane < planes && n >= 3u; plane++) {
       vec4 Q[10];
       vec3 C[10];
       uint m = 0u;
@@ -178,8 +185,8 @@ void setup(uint g, uint prims)
    ivec2 union_first = ivec2(0x7fffffff), union_last = ivec2(-0x7fffffff - 1);
    uint cull = draw(APEX_DRAW_CULL);
    bool ccw = draw(APEX_DRAW_FRONT_FACE) == 0u;
-   ivec4 scissor = ivec4(draw(APEX_DRAW_SCISSOR), draw(APEX_DRAW_SCISSOR + 1u),
-                         draw(APEX_DRAW_SCISSOR + 2u), draw(APEX_DRAW_SCISSOR + 3u));
+   uint sw = APEX_DRAW_SCISSORS + vi * 4u;
+   ivec4 scissor = ivec4(draw(sw), draw(sw + 1u), draw(sw + 2u), draw(sw + 3u));
    for (uint k = 1u; k + 1u < n; k++) {
       uint v[3] = uint[3](0u, k, k + 1u);
       int64_t area = int64_t(q[v[1]].x - q[v[0]].x) * int64_t(q[v[2]].y - q[v[0]].y) -
@@ -246,7 +253,7 @@ void setup(uint g, uint prims)
                   bias_clamp < 0.0 ? max(offset, bias_clamp) : offset;
       }
       records.w[r + APEX_PRIM_DEPTH_OFFSET] = floatBitsToUint(offset);
-      records.w[r + APEX_PRIM_FLAGS] = front ? 1u : 0u;
+      records.w[r + APEX_PRIM_FLAGS] = (front ? 1u : 0u) | vi << 16;
       records.w[r + APEX_PRIM_ID] = p;
       count++;
    }
