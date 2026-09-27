@@ -40,7 +40,7 @@ void bin_chunk(uint item)
    uint end = min(total, chunk * APEX_BIN_CHUNK + APEX_BIN_CHUNK);
    uint n = 0u;
    for (uint p = chunk * APEX_BIN_CHUNK; p < end; p++) {
-      uint r = p * APEX_SUBPRIMS * APEX_PRIM_WORDS + APEX_PRIM_UNION_BOX;
+      uint r = p * APEX_SUBPRIMS_FOR(draw(APEX_DRAW_TOPOLOGY)) * APEX_PRIM_WORDS + APEX_PRIM_UNION_BOX;
       ivec4 box = ivec4(records.w[r], records.w[r + 1u], records.w[r + 2u], records.w[r + 3u]);
       if (all(lessThan(box.xy, hi)) && all(greaterThan(box.zw, lo)))
          list.w[base + n++] = p;

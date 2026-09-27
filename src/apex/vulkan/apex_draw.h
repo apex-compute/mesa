@@ -13,7 +13,8 @@
 #define APEX_DRAW_INSTANCE_COUNT 4
 #define APEX_DRAW_FIRST_VERTEX 5
 #define APEX_DRAW_FIRST_INSTANCE 6
-/* Primitive records: APEX_SUBPRIMS records of APEX_PRIM_WORDS per input primitive. */
+/* Primitive records: APEX_SUBPRIMS_FOR(topology) records of APEX_PRIM_WORDS per
+ * input primitive. */
 #define APEX_DRAW_PRIM_LO 7
 #define APEX_DRAW_PRIM_HI 8
 #define APEX_DRAW_PRIM_COUNT 9        /* input primitives per instance */
@@ -102,7 +103,8 @@
 #define APEX_PRIM_UNION_BOX 40        /* first record only: box of all records, pixels */
 #define APEX_PRIM_WORDS 44
 #define APEX_TILES_PER_WORKGROUP 1 /* per fragment job: bounded launch runtime */
-#define APEX_SUBPRIMS 8               /* a clipped triangle fans into at most 7 */
+/* A clipped triangle fans into at most 7 records; point and line quads into 2. */
+#define APEX_SUBPRIMS_FOR(topology) ((topology) <= 2u ? 2u : 8u)
 
 /* Internal pitched copy job words (in place of the draw block). */
 #define APEX_COPY_SRC 0

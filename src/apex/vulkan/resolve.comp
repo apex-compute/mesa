@@ -32,7 +32,7 @@ void main()
                 topology == 3u ? vertices / 3u : (vertices >= 3u ? vertices - 2u : 0u);
    uint64_t total = uint64_t(prims) * instances;
    if (uint64_t(vertices) * instances * draw(APEX_DRAW_VERTEX_STRIDE) * 4ul > uint64_t(APEX_ARENA_VERTEX_BYTES) ||
-       total * uint64_t(APEX_SUBPRIMS * APEX_PRIM_WORDS * 4u) > uint64_t(APEX_ARENA_PRIM_BYTES)) {
+       total * uint64_t(APEX_SUBPRIMS_FOR(topology) * APEX_PRIM_WORDS * 4u) > uint64_t(APEX_ARENA_PRIM_BYTES)) {
       vertices = 0u;
       prims = 0u;
       total = 0ul;

@@ -1656,7 +1656,7 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    }
    uint64_t vertices = (uint64_t)vertex_count * instance_count;
    uint64_t vertex_bytes = vertices * cmd->vertex->vertex.stride * 4;
-   uint64_t prim_bytes = (uint64_t)prims * instance_count * APEX_SUBPRIMS * APEX_PRIM_WORDS * 4;
+   uint64_t prim_bytes = (uint64_t)prims * instance_count * APEX_SUBPRIMS_FOR(topology) * APEX_PRIM_WORDS * 4;
    if (vertex_bytes > APEX_DRAW_MAX_SCRATCH || prim_bytes > APEX_DRAW_MAX_SCRATCH) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;

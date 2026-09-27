@@ -173,7 +173,7 @@ void setup(uint g, uint prims)
    }
 
    Words records = Words(address(APEX_DRAW_PRIM_LO));
-   uint record = g * APEX_SUBPRIMS * APEX_PRIM_WORDS;
+   uint record = g * APEX_SUBPRIMS_FOR(topology) * APEX_PRIM_WORDS;
    uint count = 0u;
    ivec2 union_first = ivec2(0x7fffffff), union_last = ivec2(-0x7fffffff - 1);
    uint cull = draw(APEX_DRAW_CULL);

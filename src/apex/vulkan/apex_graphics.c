@@ -980,7 +980,9 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *p = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_BIN_LISTS),
                                          nir_ishl_imm(b, nir_iadd(b, segment, entry), 2)));
    nir_def *first = address_add(b, draw_address(b, program, APEX_DRAW_PRIM_LO),
-                                nir_imul_imm(b, p, APEX_SUBPRIMS * APEX_PRIM_WORDS * 4));
+                                nir_imul(b, p, nir_bcsel(b, nir_ule_imm(b, draw_word(b, program, APEX_DRAW_TOPOLOGY), 2),
+                                                         nir_imm_int(b, APEX_SUBPRIMS_FOR(0) * APEX_PRIM_WORDS * 4),
+                                                         nir_imm_int(b, APEX_SUBPRIMS_FOR(3) * APEX_PRIM_WORDS * 4))));
    nir_def *count = load_word(b, address_add(b, first, nir_imm_int(b, APEX_PRIM_COUNT * 4)));
    nir_variable *s_var = nir_local_variable_create(impl, glsl_uint_type(), "subprimitive");
    nir_store_var(b, s_var, nir_imm_int(b, 0), 1);
