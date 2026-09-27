@@ -279,6 +279,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_robustness2 = true,
       .EXT_scalar_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_index_type_uint8 = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
@@ -287,6 +288,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .scalarBlockLayout = true,
       .samplerMirrorClampToEdge = true,
       .largePoints = true,
+      .indexTypeUint8 = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {

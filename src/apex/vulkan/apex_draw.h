@@ -24,7 +24,9 @@
 #define APEX_DRAW_SCISSOR 19          /* x0, y0, x1, y1 exclusive, intersected with the render area */
 #define APEX_DRAW_CULL 23             /* VkCullModeFlags */
 #define APEX_DRAW_FRONT_FACE 24       /* VkFrontFace */
-#define APEX_DRAW_DEPTH 25            /* bit 0 test, bit 1 write, bits 4..6 VkCompareOp */
+/* Bit 0 depth test, bit 1 depth write, bit 2 stencil test, bit 3 depth bias,
+ * bits 4..6 depth VkCompareOp. */
+#define APEX_DRAW_DEPTH 25
 #define APEX_DRAW_COLOR 26            /* per attachment: VA lo, VA hi, row stride */
 #define APEX_DRAW_COLOR_WORDS 3
 #define APEX_DRAW_MAX_COLOR 8
@@ -33,7 +35,7 @@
 #define APEX_DRAW_BINDINGS 85         /* per vertex binding: VA lo, VA hi, bytes, stride */
 #define APEX_DRAW_BINDING_WORDS 4
 #define APEX_DRAW_MAX_BINDINGS 16
-#define APEX_DRAW_INDEX 149           /* VA lo, VA hi, bytes/index (0 non-indexed), vertex offset */
+#define APEX_DRAW_INDEX 149           /* VA lo, VA hi, bytes/index 1, 2, 4 (0 non-indexed), vertex offset */
 /* Per attachment: word 0 = src color | dst color << 8 | src alpha << 16 |
  * dst alpha << 24 (VkBlendFactor); word 1 = color op | alpha op << 8 |
  * write mask << 16 | enable << 24. */
@@ -51,7 +53,14 @@
 #define APEX_DRAW_BIN_X0 183          /* first bin column and row */
 #define APEX_DRAW_BIN_Y0 184
 #define APEX_DRAW_POINT_SIZE 185     /* vertex-record word of gl_PointSize, ~0 for 1.0 */
-#define APEX_DRAW_WORDS 186
+/* Front then back face: ops word = fail | pass << 3 | depth fail << 6 |
+ * compare << 9 (VkStencilOp, VkCompareOp); masks word = compare mask |
+ * write mask << 8 | reference << 16. */
+#define APEX_DRAW_STENCIL 186
+/* Constant factor, slope factor, clamp (FP32) and depth unorm bits (0 float). */
+#define APEX_DRAW_DEPTH_BIAS 190
+#define APEX_DRAW_RESTART 194        /* indexed primitive restart enabled */
+#define APEX_DRAW_WORDS 195
 #define APEX_BIN_CHUNK 256
 
 /* Primitive record fields. Edge i is opposite vertex i; E(p) = a x + b y + c
@@ -67,6 +76,7 @@
 #define APEX_PRIM_FLAGS 35            /* bit 0 front-facing; bits 8..9 provoking source */
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */
+#define APEX_PRIM_DEPTH_OFFSET 38     /* depth bias of this triangle (FP32) */
 #define APEX_PRIM_UNION_BOX 40        /* first record only: box of all records, pixels */
 #define APEX_PRIM_WORDS 44
 #define APEX_TILES_PER_WORKGROUP 1 /* per fragment job: bounded launch runtime */
@@ -82,6 +92,12 @@
 #define APEX_COPY_WORDS 8             /* 32-bit words per row */
 #define APEX_COPY_ROWS 9
 #define APEX_COPY_LAYERS 10
+/* Element mode (depth/stencil aspects): APEX_COPY_WORDS counts elements of
+ * 1 or 4 bytes spaced by the strides; the mask selects destination bits. */
+#define APEX_COPY_ELEMENT 11          /* element bytes, 0 for word rows */
+#define APEX_COPY_SRC_STRIDE 12
+#define APEX_COPY_DST_STRIDE 13
+#define APEX_COPY_DST_MASK 14
 
 /* Query slots: 64-bit value, 32-bit availability, padding. */
 #define APEX_QUERY_STRIDE 16
@@ -101,5 +117,6 @@
 #define APEX_CLEAR_LAYERS 6
 #define APEX_CLEAR_BYTES 7            /* texel bytes: 1, 2, 4, 8 or 16 */
 #define APEX_CLEAR_PATTERN 8          /* packed texel, 4 words */
+#define APEX_CLEAR_MASK 12            /* texel bits to write, 4 words */
 
 #endif

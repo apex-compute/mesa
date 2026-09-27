@@ -131,6 +131,7 @@ struct apex_command_buffer {
       VkRect2D area;
       uint32_t color_count;
       struct apex_attachment color[APEX_DRAW_MAX_COLOR], depth;
+      bool has_depth, has_stencil;
    } rendering;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_memory, vk.base, VkDeviceMemory, VK_OBJECT_TYPE_DEVICE_MEMORY);
@@ -647,21 +648,26 @@ apex_format_features(VkFormat format, bool buffer)
       if (depth)
          features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
    }
-   switch (format) {
-   case VK_FORMAT_R32_UINT:
-      return features | color | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-             VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
-   case VK_FORMAT_R8G8B8A8_UNORM:
-      return features | color | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
-             VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_R32G32B32A32_SFLOAT:
-      return features | color | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
-   case VK_FORMAT_D32_SFLOAT:
-      return features | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
-   default:
-      return features;
+   enum pipe_format pformat = vk_format_to_pipe_format(format);
+   if (vk_format_is_depth_or_stencil(format)) {
+      switch (format) {
+      case VK_FORMAT_D16_UNORM: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D32_SFLOAT:
+      case VK_FORMAT_S8_UINT: case VK_FORMAT_D24_UNORM_S8_UINT: case VK_FORMAT_D32_SFLOAT_S8_UINT:
+         features |= transfer | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+         break;
+      default:
+         break;
+      }
+   } else if (apex_attachment_format_supported(pformat)) {
+      features |= color;
+      if (!util_format_is_pure_integer(pformat))
+         features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
    }
+   if (format == VK_FORMAT_R32_UINT)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+   if (format == VK_FORMAT_R8G8B8A8_UNORM)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+   return features;
 }
 
 VkResult
@@ -1407,21 +1413,22 @@ attachment_address(const struct apex_attachment *a)
    return image_address(a->image, a->level, a->layer, (VkOffset3D){0});
 }
 
+/* Clear texels: pattern words 0-3, write mask words 4-7. */
 static void record_clear(struct apex_command_buffer *cmd, const struct apex_image *image,
                          unsigned level, unsigned layer, unsigned layers, VkRect2D rect,
-                         const uint32_t pattern[4]);
-static void pack_color(VkFormat format, const VkClearColorValue *color, uint32_t pattern[4]);
+                         const uint32_t texel[8]);
+static void pack_color(VkFormat format, const VkClearColorValue *color, uint32_t texel[8]);
 static void pack_depth_stencil(VkFormat format, VkImageAspectFlags aspects,
-                               const VkClearDepthStencilValue *value, uint32_t pattern[4]);
+                               const VkClearDepthStencilValue *value, uint32_t texel[8]);
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   struct apex_attachment depth = attachment(info->pDepthAttachment);
+   struct apex_attachment stencil = attachment(info->pStencilAttachment);
    if (info->layerCount > 1 || info->viewMask || info->colorAttachmentCount > APEX_DRAW_MAX_COLOR ||
-       (info->pStencilAttachment && info->pStencilAttachment->imageView &&
-        (!info->pDepthAttachment ||
-         info->pStencilAttachment->imageView != info->pDepthAttachment->imageView))) {
+       (depth.image && stencil.image && memcmp(&depth, &stencil, sizeof(depth)))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -1435,21 +1442,30 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       cmd->rendering.color[k] = attachment(a);
       if (!cmd->rendering.color[k].image || resuming || a->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
          continue;
-      uint32_t pattern[4];
-      pack_color(cmd->rendering.color[k].image->vk.format, &a->clearValue.color, pattern);
+      uint32_t texel[8];
+      pack_color(cmd->rendering.color[k].image->vk.format, &a->clearValue.color, texel);
       record_clear(cmd, cmd->rendering.color[k].image, cmd->rendering.color[k].level,
-                   cmd->rendering.color[k].layer, 1, info->renderArea, pattern);
+                   cmd->rendering.color[k].layer, 1, info->renderArea, texel);
    }
-   if (info->pDepthAttachment) {
-      cmd->rendering.depth = attachment(info->pDepthAttachment);
-      if (cmd->rendering.depth.image && !resuming &&
-          info->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-         uint32_t pattern[4];
-         pack_depth_stencil(cmd->rendering.depth.image->vk.format, VK_IMAGE_ASPECT_DEPTH_BIT,
-                            &info->pDepthAttachment->clearValue.depthStencil, pattern);
-         record_clear(cmd, cmd->rendering.depth.image, cmd->rendering.depth.level,
-                      cmd->rendering.depth.layer, 1, info->renderArea, pattern);
-      }
+   /* One depth/stencil target: the depth view, else the stencil view. */
+   cmd->rendering.depth = depth.image ? depth : stencil;
+   cmd->rendering.has_depth = depth.image;
+   cmd->rendering.has_stencil = stencil.image;
+   VkImageAspectFlags clear = 0;
+   VkClearDepthStencilValue value = {0};
+   if (depth.image && info->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      clear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      value.depth = info->pDepthAttachment->clearValue.depthStencil.depth;
+   }
+   if (stencil.image && info->pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      clear |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      value.stencil = info->pStencilAttachment->clearValue.depthStencil.stencil;
+   }
+   if (clear && !resuming) {
+      uint32_t texel[8];
+      pack_depth_stencil(cmd->rendering.depth.image->vk.format, clear, &value, texel);
+      record_clear(cmd, cmd->rendering.depth.image, cmd->rendering.depth.level,
+                   cmd->rendering.depth.layer, 1, info->renderArea, texel);
    }
 }
 
@@ -1465,14 +1481,14 @@ apex_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAt
          &cmd->rendering.depth;
       if (!target || !target->image)
          continue;
-      uint32_t pattern[4];
+      uint32_t texel[8];
       if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-         pack_color(target->image->vk.format, &a->clearValue.color, pattern);
+         pack_color(target->image->vk.format, &a->clearValue.color, texel);
       else
-         pack_depth_stencil(target->image->vk.format, a->aspectMask, &a->clearValue.depthStencil, pattern);
+         pack_depth_stencil(target->image->vk.format, a->aspectMask, &a->clearValue.depthStencil, texel);
       for (unsigned r = 0; r < rect_count; r++)
          record_clear(cmd, target->image, target->level, target->layer + rects[r].baseArrayLayer,
-                      rects[r].layerCount, rects[r].rect, pattern);
+                      rects[r].layerCount, rects[r].rect, texel);
    }
 }
 
@@ -1505,7 +1521,8 @@ apex_CmdBindIndexBuffer2(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize o
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    VK_FROM_HANDLE(apex_buffer, index, buffer);
-   cmd->index.bytes = type == VK_INDEX_TYPE_UINT32 ? 4 : type == VK_INDEX_TYPE_UINT16 ? 2 : 0;
+   cmd->index.bytes = type == VK_INDEX_TYPE_UINT32 ? 4 : type == VK_INDEX_TYPE_UINT16 ? 2 :
+                      type == VK_INDEX_TYPE_UINT8 ? 1 : 0;
    cmd->index.va = index ? index->vk.device_address + offset : 0;
    cmd->index.size = !index ? 0 : size == VK_WHOLE_SIZE ? index->vk.size - offset : size;
    if (!cmd->index.bytes)
@@ -1565,9 +1582,8 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    default: prims = vertex_count >= 3 ? vertex_count - 2 : 0; break;
    }
    if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-       !cmd->vertex || !cmd->fragment || dyn->ia.primitive_restart_enable ||
+       !cmd->vertex || !cmd->fragment ||
        dyn->vp.viewport_count != 1 || dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
-       dyn->rs.depth_bias.enable || dyn->ds.stencil.test_enable ||
        (indexed && !cmd->index.bytes)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -1639,8 +1655,30 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    draw[APEX_DRAW_SCISSOR + 3] = MAX2(y1, y0);
    draw[APEX_DRAW_CULL] = dyn->rs.cull_mode;
    draw[APEX_DRAW_FRONT_FACE] = dyn->rs.front_face;
-   draw[APEX_DRAW_DEPTH] = (dyn->ds.depth.test_enable && cmd->rendering.depth.image) |
-                           (dyn->ds.depth.write_enable << 1) | (dyn->ds.depth.compare_op << 4);
+   const struct apex_image *ds = cmd->rendering.depth.image;
+   bool depth = ds && cmd->rendering.has_depth, stencil = ds && cmd->rendering.has_stencil;
+   draw[APEX_DRAW_DEPTH] = (depth && dyn->ds.depth.test_enable) |
+                           (depth && dyn->ds.depth.test_enable && dyn->ds.depth.write_enable) << 1 |
+                           (stencil && dyn->ds.stencil.test_enable) << 2 |
+                           (depth && dyn->rs.depth_bias.enable) << 3 |
+                           dyn->ds.depth.compare_op << 4;
+   for (unsigned f = 0; f < 2; f++) {
+      const struct vk_stencil_test_face_state *face = f ? &dyn->ds.stencil.back : &dyn->ds.stencil.front;
+      draw[APEX_DRAW_STENCIL + f * 2] = face->op.fail | face->op.pass << 3 | face->op.depth_fail << 6 |
+                                        face->op.compare << 9;
+      draw[APEX_DRAW_STENCIL + f * 2 + 1] = face->compare_mask | face->write_mask << 8 |
+                                            (face->reference & 0xff) << 16;
+   }
+   draw[APEX_DRAW_DEPTH_BIAS] = float_bits(dyn->rs.depth_bias.constant_factor);
+   draw[APEX_DRAW_DEPTH_BIAS + 1] = float_bits(dyn->rs.depth_bias.slope_factor);
+   draw[APEX_DRAW_DEPTH_BIAS + 2] = float_bits(dyn->rs.depth_bias.clamp);
+   if (ds) {
+      enum pipe_format zs = vk_format_to_pipe_format(ds->vk.format);
+      const struct util_format_description *desc = util_format_description(zs);
+      unsigned z = desc->swizzle[0];
+      if (z <= PIPE_SWIZZLE_W && desc->channel[z].type == UTIL_FORMAT_TYPE_UNSIGNED)
+         draw[APEX_DRAW_DEPTH_BIAS + 3] = desc->channel[z].size;
+   }
    for (unsigned l = 0; l < 32; l++) {
       int slot = cmd->vertex->vertex.slot[VARYING_SLOT_VAR0 + l];
       draw[APEX_DRAW_SLOTS + l] = slot < 0 ? ~0u : slot;
@@ -1659,6 +1697,7 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       draw[APEX_DRAW_INDEX + 1] = cmd->index.va >> 32;
       draw[APEX_DRAW_INDEX + 2] = cmd->index.bytes;
       draw[APEX_DRAW_INDEX + 3] = vertex_offset;
+      draw[APEX_DRAW_RESTART] = dyn->ia.primitive_restart_enable;
    }
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
       const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[k];
@@ -2142,6 +2181,44 @@ image_address(const struct apex_image *image, unsigned level, unsigned layer, Vk
 
 /* Linear image rows use the ordinary cached buffer meta kernels. Neither path
  * binds descriptor sets; preserve the application's pipeline and push image. */
+/* One invocation per 64-word or 64-element chunk of a row. */
+static void
+push_copy(struct apex_command_buffer *cmd, struct apex_program *copy, const uint32_t *words,
+          uint64_t chunks)
+{
+   uint32_t groups = DIV_ROUND_UP(chunks, 16);
+   uint32_t limit = MIN2(copy->max_workgroups, 1024);
+   for (uint32_t base = 0; base < groups; base += limit)
+      push_job(cmd, copy, NULL, MIN2(groups - base, limit), base, 0, words);
+}
+
+/* Copies one aspect of combined depth/stencil texels as strided elements,
+ * writing only `mask` bits of each destination element. */
+static void
+copy_elements(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row, uint64_t src_slice,
+              uint32_t src_stride, uint64_t dst, uint32_t dst_row, uint64_t dst_slice,
+              uint32_t dst_stride, uint32_t element, uint32_t mask, VkExtent3D extent, uint32_t layers)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   struct apex_program *copy;
+   VkResult result = src_slice > UINT32_MAX || dst_slice > UINT32_MAX ? VK_ERROR_FEATURE_NOT_PRESENT :
+                     apex_internal_program(device, APEX_INTERNAL_COPY, &copy);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   uint32_t words[APEX_DRAW_WORDS] = {
+      [APEX_COPY_SRC] = src, [APEX_COPY_SRC + 1] = src >> 32,
+      [APEX_COPY_DST] = dst, [APEX_COPY_DST + 1] = dst >> 32,
+      [APEX_COPY_SRC_ROW] = src_row, [APEX_COPY_DST_ROW] = dst_row,
+      [APEX_COPY_SRC_SLICE] = src_slice, [APEX_COPY_DST_SLICE] = dst_slice,
+      [APEX_COPY_WORDS] = extent.width, [APEX_COPY_ROWS] = extent.height, [APEX_COPY_LAYERS] = layers,
+      [APEX_COPY_ELEMENT] = element, [APEX_COPY_SRC_STRIDE] = src_stride,
+      [APEX_COPY_DST_STRIDE] = dst_stride, [APEX_COPY_DST_MASK] = mask,
+   };
+   push_copy(cmd, copy, words, DIV_ROUND_UP(extent.width, 64) * extent.height * layers);
+}
+
 static void
 copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row, uint64_t src_slice,
                 uint64_t dst, uint32_t dst_row, uint64_t dst_slice, VkExtent3D extent, uint32_t layers,
@@ -2166,11 +2243,7 @@ copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
       words[APEX_COPY_WORDS] = row_bytes / 4;
       words[APEX_COPY_ROWS] = extent.height;
       words[APEX_COPY_LAYERS] = layers;
-      uint64_t chunks = DIV_ROUND_UP(row_bytes / 4, 64) * extent.height * layers;
-      uint32_t groups = DIV_ROUND_UP(chunks, 16);
-      uint32_t limit = MIN2(copy->max_workgroups, 1024);
-      for (uint32_t base = 0; base < groups; base += limit)
-         push_job(cmd, copy, NULL, MIN2(groups - base, limit), base, 0, words);
+      push_copy(cmd, copy, words, DIV_ROUND_UP(row_bytes / 4, 64) * extent.height * layers);
       return;
    }
    struct apex_pipeline *pipeline = cmd->pipeline;
@@ -2204,6 +2277,26 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
       unsigned l = r->imageSubresource.mipLevel;
       uint64_t image_va = image_address(image, l, r->imageSubresource.baseArrayLayer, r->imageOffset);
       uint64_t buffer_va = buffer->vk.device_address + r->bufferOffset;
+      VkFormat format = image->vk.format;
+      if (vk_format_has_depth(format) && vk_format_has_stencil(format)) {
+         /* Buffers hold one aspect: 4-byte depth or 1-byte stencil elements. */
+         const struct util_format_description *desc =
+            util_format_description(vk_format_to_pipe_format(format));
+         bool stencil = r->imageSubresource.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT;
+         const struct util_format_channel_description *ch = &desc->channel[desc->swizzle[stencil]];
+         unsigned element = stencil ? 1 : 4, texel = vk_format_get_blocksize(format);
+         uint64_t texel_va = image_va + ch->shift / 8;
+         if (to_image)
+            copy_elements(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B, element,
+                          texel_va, image->levels[l].row_stride, image->levels[l].slice_stride, texel,
+                          element, ch->size == 32 ? ~0u : BITFIELD_MASK(ch->size), r->imageExtent,
+                          r->imageSubresource.layerCount);
+         else
+            copy_elements(cmd, texel_va, image->levels[l].row_stride, image->levels[l].slice_stride,
+                          texel, buffer_va, layout.row_stride_B, layout.image_stride_B, element,
+                          element, ~0u, r->imageExtent, r->imageSubresource.layerCount);
+         continue;
+      }
       if (to_image)
          copy_image_rows(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B,
                          image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
@@ -2256,7 +2349,7 @@ apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
 /* Records the internal clear kernel over layers x rect of one level. */
 static void
 record_clear(struct apex_command_buffer *cmd, const struct apex_image *image, unsigned level,
-             unsigned layer, unsigned layers, VkRect2D rect, const uint32_t pattern[4])
+             unsigned layer, unsigned layers, VkRect2D rect, const uint32_t texel[8])
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    unsigned width = u_minify(image->vk.extent.width, level);
@@ -2285,7 +2378,8 @@ record_clear(struct apex_command_buffer *cmd, const struct apex_image *image, un
       [APEX_CLEAR_WIDTH] = x1 - x0, [APEX_CLEAR_ROWS] = y1 - y0, [APEX_CLEAR_LAYERS] = layers,
       [APEX_CLEAR_BYTES] = vk_format_get_blocksize(image->vk.format),
    };
-   memcpy(&words[APEX_CLEAR_PATTERN], pattern, 4 * sizeof(uint32_t));
+   memcpy(&words[APEX_CLEAR_PATTERN], texel, 4 * sizeof(uint32_t));
+   memcpy(&words[APEX_CLEAR_MASK], texel + 4, 4 * sizeof(uint32_t));
    uint64_t items = DIV_ROUND_UP(x1 - x0, 64) * (y1 - y0) * layers;
    uint32_t groups = DIV_ROUND_UP(items, 16), limit = MIN2(program->max_workgroups, 1024);
    for (uint32_t base = 0; base < groups; base += limit)
@@ -2293,34 +2387,49 @@ record_clear(struct apex_command_buffer *cmd, const struct apex_image *image, un
 }
 
 static void
-pack_color(VkFormat format, const VkClearColorValue *color, uint32_t pattern[4])
+pack_color(VkFormat format, const VkClearColorValue *color, uint32_t texel[8])
 {
-   memset(pattern, 0, 4 * sizeof(uint32_t));
-   util_format_pack_rgba(vk_format_to_pipe_format(format), pattern, color, 1);
+   memset(texel, 0, 4 * sizeof(uint32_t));
+   memset(texel + 4, 0xff, 4 * sizeof(uint32_t));
+   util_format_pack_rgba(vk_format_to_pipe_format(format), texel, color, 1);
 }
 
 static void
 pack_depth_stencil(VkFormat format, VkImageAspectFlags aspects, const VkClearDepthStencilValue *value,
-                   uint32_t pattern[4])
+                   uint32_t texel[8])
 {
-   memset(pattern, 0, 4 * sizeof(uint32_t));
+   memset(texel, 0, 8 * sizeof(uint32_t));
    enum pipe_format pformat = vk_format_to_pipe_format(format);
-   if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
-      util_format_pack_z_float(pformat, pattern, &value->depth, 1);
-   if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
-      util_format_pack_s_8uint(pformat, pattern, (const uint8_t *)&value->stencil, 1);
+   const struct util_format_description *desc = util_format_description(pformat);
+   /* Z is swizzle 0 and S swizzle 1 of a depth/stencil description; each
+    * aspect packs separately and contributes its bits under its mask. */
+   uint8_t stencil = value->stencil;
+   for (unsigned i = 0; i < 2; i++) {
+      unsigned channel = desc->swizzle[i];
+      if (!(aspects & (i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT)) ||
+          channel > PIPE_SWIZZLE_W)
+         continue;
+      const struct util_format_channel_description *ch = &desc->channel[channel];
+      uint32_t packed[4] = {0}, mask = BITFIELD_MASK(ch->size) << (ch->shift % 32);
+      if (i)
+         util_format_pack_s_8uint(pformat, packed, &stencil, 1);
+      else
+         util_format_pack_z_float(pformat, packed, &value->depth, 1);
+      texel[ch->shift / 32] |= packed[ch->shift / 32] & mask;
+      texel[4 + ch->shift / 32] |= mask;
+   }
 }
 
 static void
 clear_ranges(struct apex_command_buffer *cmd, struct apex_image *image, uint32_t count,
-             const VkImageSubresourceRange *ranges, const uint32_t pattern[4])
+             const VkImageSubresourceRange *ranges, const uint32_t texel[8])
 {
    for (unsigned i = 0; i < count; i++) {
       unsigned levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
       unsigned layers = vk_image_subresource_layer_count(&image->vk, &ranges[i]);
       for (unsigned l = ranges[i].baseMipLevel; l < ranges[i].baseMipLevel + levels; l++)
          record_clear(cmd, image, l, ranges[i].baseArrayLayer, layers,
-                      (VkRect2D){{0, 0}, {image->vk.extent.width, image->vk.extent.height}}, pattern);
+                      (VkRect2D){{0, 0}, {image->vk.extent.width, image->vk.extent.height}}, texel);
    }
 }
 
@@ -2330,9 +2439,9 @@ apex_CmdClearColorImage(VkCommandBuffer handle, VkImage img, VkImageLayout layou
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    VK_FROM_HANDLE(apex_image, image, img);
-   uint32_t pattern[4];
-   pack_color(image->vk.format, color, pattern);
-   clear_ranges(cmd, image, count, ranges, pattern);
+   uint32_t texel[8];
+   pack_color(image->vk.format, color, texel);
+   clear_ranges(cmd, image, count, ranges, texel);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -2343,15 +2452,9 @@ apex_CmdClearDepthStencilImage(VkCommandBuffer handle, VkImage img, VkImageLayou
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    VK_FROM_HANDLE(apex_image, image, img);
    for (unsigned i = 0; i < count; i++) {
-      uint32_t pattern[4];
-      if ((ranges[i].aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) &&
-          vk_format_has_depth(image->vk.format) && vk_format_has_stencil(image->vk.format)) {
-         /* A partial-aspect clear of a combined format would need masking. */
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
-      pack_depth_stencil(image->vk.format, ranges[i].aspectMask, value, pattern);
-      clear_ranges(cmd, image, 1, &ranges[i], pattern);
+      uint32_t texel[8];
+      pack_depth_stencil(image->vk.format, ranges[i].aspectMask, value, texel);
+      clear_ranges(cmd, image, 1, &ranges[i], texel);
    }
 }
 

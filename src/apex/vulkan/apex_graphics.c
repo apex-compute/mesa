@@ -369,16 +369,22 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *position = nir_isub(b, linear, nir_imul(b, instance, per_instance));
    ctx.instance = nir_iadd(b, instance, draw_word(b, program, APEX_DRAW_FIRST_INSTANCE));
    nir_if *guard = nir_push_if(b, nir_ult(b, linear, total));
-   /* Indexed draws read 16/32-bit indices; others count from firstVertex. */
+   /* Indexed draws read 8/16/32-bit indices; others count from firstVertex.
+    * A restart index shades vertex 0 for a record no primitive reads. */
    nir_def *index_bytes = draw_word(b, program, APEX_DRAW_INDEX + 2);
    nir_push_if(b, nir_ine_imm(b, index_bytes, 0));
    nir_def *byte = nir_imul(b, nir_iadd(b, position, draw_word(b, program, APEX_DRAW_FIRST_VERTEX)),
                             index_bytes);
    nir_def *word = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_INDEX),
                                             nir_iand_imm(b, byte, ~3u)));
-   nir_def *index = nir_bcsel(b, nir_ieq_imm(b, index_bytes, 4), word,
-      nir_iand_imm(b, nir_ushr(b, word, nir_ishl_imm(b, nir_iand_imm(b, byte, 2), 3)), 0xffff));
-   index = nir_iadd(b, index, draw_word(b, program, APEX_DRAW_INDEX + 3));
+   nir_def *mask = nir_bcsel(b, nir_ieq_imm(b, index_bytes, 4), nir_imm_int(b, ~0),
+                             nir_bcsel(b, nir_ieq_imm(b, index_bytes, 2), nir_imm_int(b, 0xffff),
+                                       nir_imm_int(b, 0xff)));
+   nir_def *index = nir_iand(b, nir_ushr(b, word, nir_ishl_imm(b, nir_iand_imm(b, byte, 3), 3)), mask);
+   nir_def *restart = nir_iand(b, nir_ieq(b, index, mask),
+                               nir_ine_imm(b, draw_word(b, program, APEX_DRAW_RESTART), 0));
+   index = nir_iadd(b, nir_bcsel(b, restart, nir_imm_int(b, 0), index),
+                    draw_word(b, program, APEX_DRAW_INDEX + 3));
    nir_push_else(b, NULL);
    nir_def *direct = nir_iadd(b, position, draw_word(b, program, APEX_DRAW_FIRST_VERTEX));
    nir_pop_if(b, NULL);
@@ -571,52 +577,172 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+/* Texel values are 4 words; sub-word texels occupy the low bits. */
+static unsigned
+texel_words(enum pipe_format format)
+{
+   return MAX2(util_format_get_blocksizebits(format) / 32, 1);
+}
+
+static nir_def *
+channel_bits(nir_builder *b, nir_def *words, const struct util_format_channel_description *ch)
+{
+   nir_def *word = nir_channel(b, words, ch->shift / 32);
+   return ch->size == 32 ? word : nir_iand_imm(b, nir_ushr_imm(b, word, ch->shift % 32),
+                                               BITFIELD_MASK(ch->size));
+}
+
+/* Texel words to API components as FP32 (normalized and float formats). */
 static nir_def *
 unpack_color(nir_builder *b, enum pipe_format format, nir_def *words)
 {
    const struct util_format_description *desc = util_format_description(format);
-   if (desc->block.bits == 128 || format == PIPE_FORMAT_R32_UINT || format == PIPE_FORMAT_R32_SINT ||
-       format == PIPE_FORMAT_R32_FLOAT)
-      return words;
    nir_def *channels[4];
-   for (unsigned c = 0; c < 4; c++) {
-      unsigned swizzle = desc->swizzle[c];
-      channels[c] = swizzle <= PIPE_SWIZZLE_W ?
-         nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, nir_channel(b, words, 0),
-                                                                  desc->channel[swizzle].shift), 0xff)),
-                      1.0 / 255.0) :
-         nir_imm_float(b, swizzle == PIPE_SWIZZLE_1 ? 1.0f : 0.0f);
+   for (unsigned s = 0; s < 4; s++) {
+      unsigned swizzle = desc->swizzle[s];
+      if (swizzle > PIPE_SWIZZLE_W) {
+         channels[s] = nir_imm_float(b, swizzle == PIPE_SWIZZLE_1 ? 1.0f : 0.0f);
+         continue;
+      }
+      const struct util_format_channel_description *ch = &desc->channel[swizzle];
+      nir_def *raw = channel_bits(b, words, ch);
+      if (ch->type == UTIL_FORMAT_TYPE_FLOAT) {
+         channels[s] = ch->size == 16 ? apex_half_to_float(b, raw) : raw;
+      } else if (ch->type == UTIL_FORMAT_TYPE_UNSIGNED) {
+         channels[s] = nir_fmul_imm(b, nir_u2f32(b, raw), 1.0 / u_uintN_max(ch->size));
+      } else {
+         nir_def *value = nir_ishr_imm(b, nir_ishl_imm(b, raw, 32 - ch->size), 32 - ch->size);
+         channels[s] = nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, value), 1.0 / u_intN_max(ch->size)),
+                                nir_imm_float(b, -1.0f));
+      }
    }
-   return nir_vec(b, channels, 4);
+   nir_def *color = nir_vec(b, channels, 4);
+   if (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB)
+      color = nir_vector_insert_imm(b, nir_format_srgb_to_linear(b, color), channels[3], 3);
+   return color;
 }
 
-/* Unsigned-normalized 8-bit channels: clamp, scale and round to nearest even. */
+/* API components to texel words: normalized channels round to nearest even,
+ * integers clamp, FP16 rounds to nearest even. */
 static nir_def *
 pack_color(nir_builder *b, enum pipe_format format, nir_def *color)
 {
    const struct util_format_description *desc = util_format_description(format);
-   if (desc->block.bits == 128)
-      return color;
-   if (desc->block.bits == 32 && desc->nr_channels == 1)
-      return nir_channel(b, color, 0);
-   nir_def *packed = nir_imm_int(b, 0);
-   for (unsigned c = 0; c < 4; c++) {
-      /* Channel c of the format stores API component swizzle-inverse. */
-      for (unsigned s = 0; s < 4; s++) {
-         if (desc->swizzle[s] != c)
-            continue;
-         nir_def *v = nir_fsat(b, nir_channel(b, color, s));
-         nir_def *scaled = nir_fround_even(b, nir_fmul_imm(b, v, 255.0f));
-         packed = nir_ior(b, packed, nir_ishl_imm(b, nir_f2u32(b, scaled), desc->channel[c].shift));
-      }
+   if (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB)
+      color = nir_vector_insert_imm(b, nir_format_linear_to_srgb(b, color), nir_channel(b, color, 3), 3);
+   nir_def *words[4];
+   for (unsigned w = 0; w < 4; w++)
+      words[w] = nir_imm_int(b, 0);
+   for (unsigned c = 0; c < desc->nr_channels; c++) {
+      const struct util_format_channel_description *ch = &desc->channel[c];
+      unsigned s = 0;
+      while (s < 4 && desc->swizzle[s] != c)
+         s++;
+      if (s == 4 || ch->type == UTIL_FORMAT_TYPE_VOID)
+         continue;
+      nir_def *v = nir_channel(b, color, s);
+      const unsigned bits[1] = {ch->size};
+      if (ch->type == UTIL_FORMAT_TYPE_FLOAT)
+         v = ch->size == 16 ? apex_float_to_half(b, v) : v;
+      else if (ch->normalized)
+         v = ch->type == UTIL_FORMAT_TYPE_UNSIGNED ? nir_format_float_to_unorm(b, v, bits) :
+                                                     nir_format_float_to_snorm(b, v, bits);
+      else
+         v = ch->type == UTIL_FORMAT_TYPE_UNSIGNED ? nir_format_clamp_uint(b, v, bits) :
+                                                     nir_format_clamp_sint(b, v, bits);
+      if (ch->size < 32)
+         v = nir_iand_imm(b, v, BITFIELD_MASK(ch->size));
+      unsigned w = ch->shift / 32;
+      words[w] = nir_ior(b, words[w], nir_ishl_imm(b, v, ch->shift % 32));
    }
-   return packed;
+   return nir_vec(b, words, 4);
 }
 
-static unsigned
-color_words(enum pipe_format format)
+/* Lane l shades pixel x = (l & 1) | (l >> 1 & 2) of its quad row, so the
+ * pixels sharing a word with l's pixel are lanes l ^ 1 (16-bit texels) and
+ * also l ^ 4 and l ^ 5 (8-bit texels). */
+struct texel_target {
+   unsigned bits;
+   nir_def *address;          /* word-aligned address of the texel's first word */
+   nir_def *shift;            /* bit offset of a sub-word texel */
+};
+
+static struct texel_target
+texel_target(nir_builder *b, nir_def *base, nir_def *pitch, nir_def *px, nir_def *py,
+             enum pipe_format format)
 {
-   return util_format_description(format)->block.bits / 32;
+   struct texel_target t = {.bits = util_format_get_blocksizebits(format)};
+   nir_def *byte = nir_iadd(b, nir_imul(b, py, pitch), nir_imul_imm(b, px, t.bits / 8));
+   if (t.bits < 32) {
+      t.shift = nir_ishl_imm(b, nir_iand_imm(b, byte, 3), 3);
+      byte = nir_iand_imm(b, byte, ~3u);
+   }
+   t.address = address_add(b, base, byte);
+   return t;
+}
+
+static nir_def *
+load_texel(nir_builder *b, const struct texel_target *t)
+{
+   nir_def *w[4];
+   for (unsigned i = 0; i < 4; i++)
+      w[i] = i < MAX2(t->bits / 32, 1) ? load_word(b, address_add(b, t->address, nir_imm_int(b, i * 4))) :
+                                         nir_imm_int(b, 0);
+   if (t->bits < 32)
+      w[0] = nir_iand_imm(b, nir_ushr(b, w[0], t->shift), BITFIELD_MASK(t->bits));
+   return nir_vec(b, w, 4);
+}
+
+/* Runs with the whole wave active. A sub-word texel's word gathers every
+ * pixel sharing it, unchanged ones included, and its first pixel's lane
+ * stores it when any of them is in `store`. */
+static void
+store_texel(nir_builder *b, const struct texel_target *t, nir_def *texel, nir_def *lane,
+            nir_def *store)
+{
+   if (t->bits >= 32) {
+      nir_push_if(b, store);
+      for (unsigned i = 0; i < t->bits / 32; i++)
+         store_word(b, nir_channel(b, texel, i), address_add(b, t->address, nir_imm_int(b, i * 4)));
+      nir_pop_if(b, NULL);
+      return;
+   }
+   static const unsigned partners[] = {1, 4, 5};
+   nir_def *word = nir_ishl(b, nir_channel(b, texel, 0), t->shift);
+   nir_def *any = nir_b2i32(b, store), *combined = word;
+   for (unsigned p = 0; p < (t->bits == 16 ? 1 : 3); p++) {
+      nir_def *other = nir_ixor(b, lane, nir_imm_int(b, partners[p]));
+      combined = nir_ior(b, combined, nir_shuffle(b, word, other));
+      any = nir_ior(b, any, nir_shuffle(b, nir_b2i32(b, store), other));
+   }
+   nir_push_if(b, nir_iand(b, nir_ieq_imm(b, t->shift, 0), nir_ine_imm(b, any, 0)));
+   store_word(b, combined, t->address);
+   nir_pop_if(b, NULL);
+}
+
+/* VkCompareOp as a bit set: bit 0 less, bit 1 equal, bit 2 greater. */
+static nir_def *
+compare_op(nir_builder *b, nir_def *op, nir_def *less, nir_def *equal, nir_def *greater)
+{
+   return nir_ior(b, nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 1), 0), less),
+                  nir_ior(b, nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 2), 0), equal),
+                             nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 4), 0), greater)));
+}
+
+/* VkStencilOp on an 8-bit stencil value. */
+static nir_def *
+stencil_op(nir_builder *b, nir_def *op, nir_def *s, nir_def *reference)
+{
+   nir_def *up = nir_iadd_imm(b, s, 1), *down = nir_iadd_imm(b, s, -1);
+   nir_def *table[] = {
+      s, nir_imm_int(b, 0), reference, nir_umin(b, up, nir_imm_int(b, 255)),
+      nir_bcsel(b, nir_ieq_imm(b, s, 0), s, down), nir_ixor(b, s, nir_imm_int(b, 0xff)),
+      nir_iand_imm(b, up, 0xff), nir_iand_imm(b, down, 0xff),
+   };
+   nir_def *result = table[0];
+   for (unsigned i = 1; i < ARRAY_SIZE(table); i++)
+      result = nir_bcsel(b, nir_ieq_imm(b, op, i), table[i], result);
+   return result;
 }
 
 /* One VkBlendFactor for channel c. Dual-source factors read as zero. */
@@ -721,10 +847,28 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
           rp->color_attachment_formats[k] == VK_FORMAT_UNDEFINED)
          continue;
       formats[k] = vk_format_to_pipe_format(rp->color_attachment_formats[k]);
+      if (!apex_attachment_format_supported(formats[k]))
+         return false;
       stored[k] = nir_local_variable_create(impl, glsl_uvec4_type(), "stored");
    }
-   bool depth_target = rp && rp->depth_attachment_format == VK_FORMAT_D32_SFLOAT;
-   nir_variable *stored_depth = nir_local_variable_create(impl, glsl_uint_type(), "stored_depth");
+   /* One depth/stencil texel: Z is swizzle 0 and S swizzle 1 of its format. */
+   VkFormat ds_vk = !rp ? VK_FORMAT_UNDEFINED : rp->depth_attachment_format != VK_FORMAT_UNDEFINED ?
+                    rp->depth_attachment_format : rp->stencil_attachment_format;
+   enum pipe_format ds_format = vk_format_to_pipe_format(ds_vk);
+   const struct util_format_channel_description *z_channel = NULL, *s_channel = NULL;
+   if (ds_vk != VK_FORMAT_UNDEFINED) {
+      const struct util_format_description *desc = util_format_description(ds_format);
+      if (rp->depth_attachment_format != VK_FORMAT_UNDEFINED && desc->swizzle[0] <= PIPE_SWIZZLE_W)
+         z_channel = &desc->channel[desc->swizzle[0]];
+      if (rp->stencil_attachment_format != VK_FORMAT_UNDEFINED && desc->swizzle[1] <= PIPE_SWIZZLE_W)
+         s_channel = &desc->channel[desc->swizzle[1]];
+      if ((z_channel && !(z_channel->type == UTIL_FORMAT_TYPE_FLOAT ? z_channel->size == 32 :
+                          z_channel->normalized && z_channel->size <= 24)) ||
+          (s_channel && s_channel->size != 8))
+         return false;
+   }
+   bool ds_target = z_channel || s_channel;
+   nir_variable *stored_ds = nir_local_variable_create(impl, glsl_uvec4_type(), "stored_ds");
 
    nir_def *lane = nir_load_subgroup_invocation(b);
    nir_def *lx = nir_ior(b, nir_iand_imm(b, lane, 1), nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 2));
@@ -751,49 +895,42 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *tile_x = nir_ishl_imm(b, nir_iadd(b, tx0, tx), 2);
    nir_def *tile_y = nir_ishl_imm(b, nir_iadd(b, ty0, ty), 2);
    nir_def *px = nir_iadd(b, tile_x, lx), *py = nir_iadd(b, tile_y, ly);
-   nir_def *inside = nir_iand(b, nir_iand(b, nir_uge(b, px, x0), nir_ult(b, px, x1)),
-                              nir_iand(b, nir_uge(b, py, y0), nir_ult(b, py, y1)));
+   /* Rows of the scissor stay inside every attachment; each row is padded to
+    * whole tiles, so a tile's texels there may be read and rewritten. */
+   nir_def *row = nir_iand(b, nir_uge(b, py, y0), nir_ult(b, py, y1));
+   nir_def *inside = nir_iand(b, row, nir_iand(b, nir_uge(b, px, x0), nir_ult(b, px, x1)));
 
    /* Current attachment contents of this lane's pixel. */
-   nir_def *color_address[APEX_DRAW_MAX_COLOR] = {0};
-   nir_def *depth_address = NULL;
+   struct texel_target color_target[APEX_DRAW_MAX_COLOR], ds;
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
       if (!stored[k])
          continue;
       unsigned slot = APEX_DRAW_COLOR + k * APEX_DRAW_COLOR_WORDS;
-      color_address[k] = address_add(b, draw_address(b, program, slot),
-         nir_iadd(b, nir_imul(b, py, draw_word(b, program, slot + 2)),
-                  nir_imul_imm(b, px, color_words(formats[k]) * 4)));
+      color_target[k] = texel_target(b, draw_address(b, program, slot), draw_word(b, program, slot + 2),
+                                     px, py, formats[k]);
    }
-   if (depth_target)
-      depth_address = address_add(b, draw_address(b, program, APEX_DRAW_DEPTH_TARGET),
-         nir_iadd(b, nir_imul(b, py, draw_word(b, program, APEX_DRAW_DEPTH_TARGET + 2)),
-                  nir_imul_imm(b, px, 4)));
-   nir_def *zero4 = nir_imm_zero(b, 4, 32), *zero = nir_imm_int(b, 0);
-   nir_push_if(b, inside);
+   if (ds_target)
+      ds = texel_target(b, draw_address(b, program, APEX_DRAW_DEPTH_TARGET),
+                        draw_word(b, program, APEX_DRAW_DEPTH_TARGET + 2), px, py, ds_format);
+   nir_def *zero4 = nir_imm_zero(b, 4, 32);
+   nir_push_if(b, row);
    nir_def *loaded[APEX_DRAW_MAX_COLOR] = {0};
-   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
-      if (!stored[k])
-         continue;
-      unsigned words = color_words(formats[k]);
-      nir_def *w[4];
-      for (unsigned c = 0; c < 4; c++)
-         w[c] = c < words ? load_word(b, address_add(b, color_address[k], nir_imm_int(b, c * 4))) :
-                            nir_imm_int(b, 0);
-      loaded[k] = nir_vec(b, w, 4);
-   }
-   nir_def *loaded_depth = depth_target ? load_word(b, depth_address) : NULL;
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      if (stored[k])
+         loaded[k] = load_texel(b, &color_target[k]);
+   nir_def *loaded_ds = ds_target ? load_texel(b, &ds) : NULL;
    nir_pop_if(b, NULL);
-   nir_def *merged_load[APEX_DRAW_MAX_COLOR] = {0};
+   /* Phis first, then the stores that consume them. */
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       if (stored[k])
-         merged_load[k] = nir_if_phi(b, loaded[k], zero4);
-   nir_def *merged_depth = depth_target ? nir_if_phi(b, loaded_depth, zero) : NULL;
+         loaded[k] = nir_if_phi(b, loaded[k], zero4);
+   if (ds_target)
+      loaded_ds = nir_if_phi(b, loaded_ds, zero4);
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       if (stored[k])
-         nir_store_var(b, stored[k], merged_load[k], 0xf);
-   if (depth_target)
-      nir_store_var(b, stored_depth, merged_depth, 1);
+         nir_store_var(b, stored[k], loaded[k], 0xf);
+   if (ds_target)
+      nir_store_var(b, stored_ds, loaded_ds, 0xf);
 
    /* The tile lies in one bin; walk that bin's ordered list segments. */
    nir_def *shift = draw_word(b, program, APEX_DRAW_BIN_SHIFT);
@@ -846,14 +983,16 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_push_if(b, nir_vote_any(b, 1, covered));
    nir_def *reciprocal = FIELD(APEX_PRIM_RECIPROCAL_AREA);
    nir_def *lambda[3], *weighted[3];
-   nir_def *z = NULL, *sum = NULL;
+   /* z = z0 + l1 (z1 - z0) + l2 (z2 - z0) is exact for constant depth. */
+   nir_def *z = FIELD(APEX_PRIM_Z), *sum = NULL;
    for (unsigned i = 0; i < 3; i++) {
       lambda[i] = nir_fmul(b, nir_i2f32(b, edge[i]), reciprocal);
-      nir_def *zi = nir_fmul(b, lambda[i], FIELD(APEX_PRIM_Z + i));
+      if (i)
+         z = nir_ffma(b, lambda[i], nir_fsub(b, FIELD(APEX_PRIM_Z + i), FIELD(APEX_PRIM_Z)), z);
       weighted[i] = nir_fmul(b, lambda[i], FIELD(APEX_PRIM_INV_W + i));
-      z = z ? nir_fadd(b, z, zi) : zi;
       sum = sum ? nir_fadd(b, sum, weighted[i]) : weighted[i];
    }
+   z = nir_fadd(b, z, FIELD(APEX_PRIM_DEPTH_OFFSET));
    nir_def *normalize = nir_frcp(b, sum);
    nir_def *perspective[3], *linear[3];
    for (unsigned j = 0; j < 3; j++) {
@@ -889,19 +1028,64 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_pop_if(b, shade);
 
    nir_def *live = nir_iand(b, covered, nir_inot(b, nir_load_var(b, ctx.killed)));
-   if (depth_target) {
+   if (ds_target) {
+      /* Stencil test, then depth test; stencil ops follow their outcome. */
       nir_def *control = draw_word(b, program, APEX_DRAW_DEPTH);
-      nir_def *fragment = nir_load_var(b, ctx.depth);
-      nir_def *old = nir_load_var(b, stored_depth);
-      nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, control, 4), 7);
-      nir_def *pass = nir_ior(b,
-         nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 1), 0), nir_flt(b, fragment, old)),
-         nir_ior(b, nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 2), 0), nir_feq(b, fragment, old)),
-                    nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 4), 0), nir_flt(b, old, fragment))));
-      nir_def *test = nir_ine_imm(b, nir_iand_imm(b, control, 1), 0);
-      live = nir_iand(b, live, nir_ior(b, nir_inot(b, test), pass));
-      nir_def *write = nir_iand(b, live, nir_iand(b, test, nir_ine_imm(b, nir_iand_imm(b, control, 2), 0)));
-      nir_store_var(b, stored_depth, nir_bcsel(b, write, fragment, old), 1);
+      nir_def *texel = nir_load_var(b, stored_ds);
+      nir_def *words[4];
+      for (unsigned w = 0; w < 4; w++)
+         words[w] = nir_channel(b, texel, w);
+      nir_def *depth_pass = nir_imm_true(b), *depth_write = nir_imm_false(b), *fragment = NULL;
+      if (z_channel) {
+         nir_def *z = nir_load_var(b, ctx.depth);
+         nir_def *old = channel_bits(b, texel, z_channel);
+         nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, control, 4), 7);
+         nir_def *pass;
+         if (z_channel->type == UTIL_FORMAT_TYPE_FLOAT) {
+            fragment = z;
+            pass = compare_op(b, op, nir_flt(b, z, old), nir_feq(b, z, old), nir_flt(b, old, z));
+         } else {
+            const unsigned bits[1] = {z_channel->size};
+            fragment = nir_format_float_to_unorm(b, z, bits);
+            pass = compare_op(b, op, nir_ult(b, fragment, old), nir_ieq(b, fragment, old),
+                              nir_ult(b, old, fragment));
+         }
+         nir_def *test = nir_ine_imm(b, nir_iand_imm(b, control, 1), 0);
+         depth_pass = nir_ior(b, nir_inot(b, test), pass);
+         depth_write = nir_iand(b, test, nir_ine_imm(b, nir_iand_imm(b, control, 2), 0));
+      }
+      nir_def *stencil_pass = nir_imm_true(b);
+      if (s_channel) {
+         nir_def *front = nir_load_var(b, ctx.front);
+         nir_def *ops = nir_bcsel(b, front, draw_word(b, program, APEX_DRAW_STENCIL),
+                                  draw_word(b, program, APEX_DRAW_STENCIL + 2));
+         nir_def *masks = nir_bcsel(b, front, draw_word(b, program, APEX_DRAW_STENCIL + 1),
+                                    draw_word(b, program, APEX_DRAW_STENCIL + 3));
+         nir_def *compare_mask = nir_iand_imm(b, masks, 0xff);
+         nir_def *write_mask = nir_iand_imm(b, nir_ushr_imm(b, masks, 8), 0xff);
+         nir_def *reference = nir_iand_imm(b, nir_ushr_imm(b, masks, 16), 0xff);
+         nir_def *old = channel_bits(b, texel, s_channel);
+         nir_def *r = nir_iand(b, reference, compare_mask), *v = nir_iand(b, old, compare_mask);
+         nir_def *test = nir_ine_imm(b, nir_iand_imm(b, control, 4), 0);
+         nir_def *pass = compare_op(b, nir_iand_imm(b, nir_ushr_imm(b, ops, 9), 7),
+                                    nir_ult(b, r, v), nir_ieq(b, r, v), nir_ult(b, v, r));
+         stencil_pass = nir_ior(b, nir_inot(b, test), pass);
+         nir_def *shift = nir_bcsel(b, nir_inot(b, stencil_pass), nir_imm_int(b, 0),
+                                    nir_bcsel(b, depth_pass, nir_imm_int(b, 3), nir_imm_int(b, 6)));
+         nir_def *result = stencil_op(b, nir_iand_imm(b, nir_ushr(b, ops, shift), 7), old, reference);
+         result = nir_ior(b, nir_iand(b, result, write_mask), nir_iand(b, old, nir_inot(b, write_mask)));
+         unsigned w = s_channel->shift / 32, at = s_channel->shift % 32;
+         nir_def *updated = nir_ior(b, nir_iand_imm(b, words[w], ~(0xffu << at)), nir_ishl_imm(b, result, at));
+         words[w] = nir_bcsel(b, nir_iand(b, live, test), updated, words[w]);
+      }
+      live = nir_iand(b, live, nir_iand(b, depth_pass, stencil_pass));
+      if (z_channel) {
+         unsigned w = z_channel->shift / 32, at = z_channel->shift % 32;
+         uint32_t field = z_channel->size == 32 ? ~0u : BITFIELD_MASK(z_channel->size) << at;
+         nir_def *updated = nir_ior(b, nir_iand_imm(b, words[w], ~field), nir_ishl_imm(b, fragment, at));
+         words[w] = nir_bcsel(b, nir_iand(b, live, depth_write), updated, words[w]);
+      }
+      nir_store_var(b, stored_ds, nir_vec(b, words, 4), 0xf);
    }
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
       if (!stored[k])
@@ -923,15 +1107,24 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
             draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 1),
             draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 2),
             draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 3));
+         /* Fixed-point attachments clamp blend inputs to their range. */
+         nir_def *blend_src = src;
+         if (util_format_is_unorm(formats[k])) {
+            blend_src = nir_fsat(b, src);
+            constant = nir_fsat(b, constant);
+         } else if (util_format_is_snorm(formats[k])) {
+            blend_src = nir_fclamp(b, src, nir_imm_float(b, -1.0f), nir_imm_float(b, 1.0f));
+            constant = nir_fclamp(b, constant, nir_imm_float(b, -1.0f), nir_imm_float(b, 1.0f));
+         }
          nir_def *channels[4];
          for (unsigned c = 0; c < 4; c++) {
             bool alpha = c == 3;
             nir_def *sf = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state_word, alpha ? 16 : 0), 0x1f),
-                                       src, dst, constant, c);
+                                       blend_src, dst, constant, c);
             nir_def *df = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state_word, alpha ? 24 : 8), 0x1f),
-                                       src, dst, constant, c);
+                                       blend_src, dst, constant, c);
             nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, ops, alpha ? 8 : 0), 0xff);
-            channels[c] = blend_op(b, op, nir_channel(b, src, c), nir_channel(b, dst, c), sf, df);
+            channels[c] = blend_op(b, op, nir_channel(b, blend_src, c), nir_channel(b, dst, c), sf, df);
          }
          nir_def *blended = nir_vec(b, channels, 4);
          nir_pop_if(b, NULL);
@@ -941,7 +1134,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
       nir_def *mask = nir_iand_imm(b, nir_ushr_imm(b, ops, 16), 0xf);
       nir_def *merged[4];
       for (unsigned w = 0; w < 4; w++) {
-         if (w >= color_words(formats[k])) {
+         if (w >= texel_words(formats[k])) {
             merged[w] = nir_imm_int(b, 0);
             continue;
          }
@@ -969,17 +1162,11 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_store_var(b, c_var, nir_iadd_imm(b, chunk, 1), 1);
    nir_pop_loop(b, chunk_loop);
 
-   nir_push_if(b, inside);
-   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
-      if (!stored[k])
-         continue;
-      nir_def *value = nir_load_var(b, stored[k]);
-      for (unsigned w = 0; w < color_words(formats[k]); w++)
-         store_word(b, nir_channel(b, value, w), address_add(b, color_address[k], nir_imm_int(b, w * 4)));
-   }
-   if (depth_target)
-      store_word(b, nir_load_var(b, stored_depth), depth_address);
-   nir_pop_if(b, NULL);
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      if (stored[k])
+         store_texel(b, &color_target[k], nir_load_var(b, stored[k]), lane, inside);
+   if (ds_target)
+      store_texel(b, &ds, nir_load_var(b, stored_ds), lane, inside);
    nir_def *groups = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups));
    nir_store_var(b, t_var, nir_iadd(b, t, groups), 1);
    nir_pop_loop(b, tile_loop);
@@ -1152,6 +1339,8 @@ apex_hash_state(struct vk_physical_device *physical, const struct vk_graphics_pi
                           sizeof(state->rp->color_attachment_count));
       _mesa_blake3_update(&hash, &state->rp->depth_attachment_format,
                           sizeof(state->rp->depth_attachment_format));
+      _mesa_blake3_update(&hash, &state->rp->stencil_attachment_format,
+                          sizeof(state->rp->stencil_attachment_format));
    }
    _mesa_blake3_final(&hash, out);
 }

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
+#include "util/format/u_formats.h"
 
 struct vk_sampler;
 
@@ -44,6 +45,7 @@ struct apex_sampler_descriptor {
 
 bool apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping *mapping,
                         uint32_t out[3]);
+bool apex_attachment_format_supported(enum pipe_format format);
 void apex_sampler_encode(const VkSamplerCreateInfo *info, const struct vk_sampler *sampler,
                          uint32_t out[8]);
 

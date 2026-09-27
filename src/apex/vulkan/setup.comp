@@ -20,6 +20,16 @@ const uint DRAW = TRAILER + 6u;
 uint draw(uint i) { return root[DRAW + i]; }
 uint64_t address(uint i) { return uint64_t(draw(i)) | (uint64_t(draw(i + 1u)) << 32); }
 
+// Primitive restart: the index at a draw position equals the all-ones value.
+bool restart_at(uint position)
+{
+   uint bytes = draw(APEX_DRAW_INDEX + 2u);
+   uint byte = (position + draw(APEX_DRAW_FIRST_VERTEX)) * bytes;
+   uint word = Words(address(APEX_DRAW_INDEX) + uint64_t(byte & ~3u)).w[0];
+   uint mask = bytes == 4u ? ~0u : bytes == 2u ? 0xffffu : 0xffu;
+   return ((word >> ((byte & 3u) * 8u)) & mask) == mask;
+}
+
 vec4 P[10];
 vec3 B[10];
 
@@ -43,11 +53,24 @@ void main()
       return;
    uint instance = g / prims, p = g - instance * prims;
    uint topology = draw(APEX_DRAW_TOPOLOGY);
+   // Strips and fans restart after a restart index: primitives touching one
+   // are skipped, and winding parity and the fan center count from the start.
+   uint start = 0u;
+   bool skip = false;
+   if ((topology == 2u || topology >= 4u) && draw(APEX_DRAW_INDEX + 2u) != 0u &&
+       draw(APEX_DRAW_RESTART) != 0u) {
+      for (uint i = 0u; i < (topology == 2u ? 2u : 3u); i++)
+         skip = skip || restart_at(p + i);
+      start = p;
+      while (!skip && start > 0u && !restart_at(start - 1u))
+         start--;
+   }
+   uint k = p - start;
    uvec3 tuple = topology == 0u ? uvec3(p) :
                  topology == 1u ? uvec3(2u * p, 2u * p + 1u, 2u * p + 1u) :
                  topology == 2u ? uvec3(p, p + 1u, p + 1u) :
-                 topology == 5u ? uvec3(p + 1u, p + 2u, 0u) :
-                 topology == 4u ? ((p & 1u) != 0u ? uvec3(p, p + 2u, p + 1u) : uvec3(p, p + 1u, p + 2u)) :
+                 topology == 5u ? uvec3(p + 1u, p + 2u, start) :
+                 topology == 4u ? ((k & 1u) != 0u ? uvec3(p, p + 2u, p + 1u) : uvec3(p, p + 1u, p + 2u)) :
                  uvec3(3u * p, 3u * p + 1u, 3u * p + 2u);
    uvec3 source = tuple + instance * draw(APEX_DRAW_VERTEX_COUNT);
    Words vertices = Words(address(APEX_DRAW_VERTEX_LO));
@@ -66,7 +89,7 @@ void main()
    vec2 guard = vec2(30000.0) / (abs(scale) + abs(offset) + 1.0);
 
    // Points and lines keep n = 1 or 2 vertices through clipping.
-   uint n = topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
+   uint n = skip ? 0u : topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
    if (n == 1u) {
       for (uint plane = 0u; plane < 7u; plane++)
          if (plane_distance(plane, P[0], guard) < 0.0)
@@ -202,6 +225,26 @@ void main()
             records.w[r + APEX_PRIM_WEIGHTS + i * 3u + j] = floatBitsToUint(B[v[i]][j]);
          records.w[r + APEX_PRIM_SOURCE + i] = source[i];
       }
+      // Depth bias: m * slope + r * constant with the maximum depth slope m
+      // and the minimum resolvable difference r of the depth format.
+      float offset = 0.0;
+      if (polygon && (draw(APEX_DRAW_DEPTH) & 8u) != 0u) {
+         vec2 e1 = vec2(q[v[1]] - q[v[0]]) / 256.0, e2 = vec2(q[v[2]] - q[v[0]]) / 256.0;
+         float dz1 = z[v[1]] - z[v[0]], dz2 = z[v[2]] - z[v[0]];
+         float det = e1.x * e2.y - e2.x * e1.y;
+         float m = max(abs(dz1 * e2.y - dz2 * e1.y), abs(dz2 * e1.x - dz1 * e2.x)) / abs(det);
+         uint bits = draw(APEX_DRAW_DEPTH_BIAS + 3u);
+         float zmax = max(max(abs(z[v[0]]), abs(z[v[1]])), abs(z[v[2]]));
+         int exponent = int((floatBitsToUint(zmax) >> 23) & 0xffu) - 23;
+         float resolvable = bits != 0u ? uintBitsToFloat(uint(127 - int(bits)) << 23) :
+                                         uintBitsToFloat(uint(max(exponent, 1)) << 23);
+         offset = m * uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS + 1u)) +
+                  resolvable * uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS));
+         float bias_clamp = uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS + 2u));
+         offset = bias_clamp > 0.0 ? min(offset, bias_clamp) :
+                  bias_clamp < 0.0 ? max(offset, bias_clamp) : offset;
+      }
+      records.w[r + APEX_PRIM_DEPTH_OFFSET] = floatBitsToUint(offset);
       records.w[r + APEX_PRIM_FLAGS] = front ? 1u : 0u;
       records.w[r + APEX_PRIM_ID] = p;
       count++;

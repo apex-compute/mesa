@@ -7,6 +7,7 @@
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
 #include "util/bitset.h"
+#include "nir_builder.h"
 
 /* One native program and its descriptor-table layout: rows for every set
  * binding, the zero sentinel row, push constants and an immutable trailer.
@@ -55,6 +56,9 @@ VkResult apex_program_compile(struct vk_device *device, struct apex_program *pro
 void apex_program_finish(struct apex_device *device, struct apex_program *program);
 /* Lowers texture instructions to the software sampler (apex_texture.c). */
 bool apex_lower_textures(struct apex_program *program, struct nir_shader *nir);
+/* FP16 bits in the low half of a 32-bit value to FP32 bits, and back. */
+nir_def *apex_half_to_float(nir_builder *b, nir_def *h);
+nir_def *apex_float_to_half(nir_builder *b, nir_def *f);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 apex_CreateComputePipelines(VkDevice device, VkPipelineCache cache,

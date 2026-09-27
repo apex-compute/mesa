@@ -129,8 +129,8 @@ level_offset(nir_builder *b, const struct image_info *i, nir_def *level)
    return nir_load_var(b, offset);
 }
 
-static nir_def *
-half_to_float(nir_builder *b, nir_def *h)
+nir_def *
+apex_half_to_float(nir_builder *b, nir_def *h)
 {
    nir_def *sign = nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16);
    nir_def *e = nir_iand_imm(b, nir_ushr_imm(b, h, 10), 31);
@@ -141,6 +141,25 @@ half_to_float(nir_builder *b, nir_def *h)
    nir_def *value = nir_bcsel(b, nir_ieq_imm(b, e, 0), denormal,
                               nir_bcsel(b, nir_ieq_imm(b, e, 31), special, normal));
    return nir_ior(b, value, sign);
+}
+
+/* FP32 to FP16 bits with round-to-nearest-even in the low 16 bits. */
+nir_def *
+apex_float_to_half(nir_builder *b, nir_def *f)
+{
+   nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, f, 16), 0x8000);
+   nir_def *abs = nir_iand_imm(b, f, 0x7fffffff);
+   /* Normal results: rebias the exponent, then round 13 mantissa bits away. */
+   nir_def *rebased = nir_iadd_imm(b, abs, -(112 << 23));
+   nir_def *normal = nir_ushr_imm(b, nir_iadd(b, nir_iadd_imm(b, rebased, 0xfff),
+                                              nir_iand_imm(b, nir_ushr_imm(b, rebased, 13), 1)), 13);
+   /* Subnormal results are exact multiples of 2^-24 after rounding. */
+   nir_def *subnormal = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, abs, 16777216.0)));
+   nir_def *nan = nir_ior_imm(b, nir_iand_imm(b, nir_ushr_imm(b, abs, 13), 0x3ff), 0x7e00);
+   nir_def *result = nir_bcsel(b, nir_ult_imm(b, abs, 0x38800000), subnormal, normal);
+   result = nir_bcsel(b, nir_uge_imm(b, abs, 0x477ff000), nir_imm_int(b, 0x7c00), result);
+   result = nir_bcsel(b, nir_uge_imm(b, abs, 0x7f800001), nan, result);
+   return nir_ior(b, result, sign);
 }
 
 static nir_def *
@@ -193,7 +212,7 @@ decode_texel(nir_builder *b, const struct image_info *i, nir_def *address)
       nir_def *snorm = nir_fmax(b, nir_fdiv(b, nir_i2f32(b, extended),
                                            nir_u2f32(b, nir_ushr_imm(b, mask, 1))),
                                 nir_imm_float(b, -1.0f));
-      nir_def *fp = nir_bcsel(b, nir_ieq_imm(b, size, 16), half_to_float(b, raw), raw);
+      nir_def *fp = nir_bcsel(b, nir_ieq_imm(b, size, 16), apex_half_to_float(b, raw), raw);
       nir_def *value = raw;
       value = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_UNORM), unorm, value);
       value = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_SNORM), snorm, value);

@@ -1,7 +1,8 @@
 #version 450
-// Fills a rectangle of texels with one packed texel pattern: one invocation
-// per 64-texel chunk of a row. Texels of 1 or 2 bytes update their word with
-// masked atomics so neighboring lanes never overwrite each other.
+// Fills a rectangle of texels with one packed texel pattern under a bit mask
+// (one aspect of a depth/stencil texel): one invocation per 64-texel chunk of
+// a row. Texels of 1 or 2 bytes update their word with masked atomics so
+// neighboring lanes never overwrite each other.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -32,12 +33,16 @@ void main()
       uint64_t address = base + uint64_t(x) * bytes;
       if (bytes >= 4u) {
          Words texel = Words(address);
-         for (uint k = 0u; k < bytes / 4u; k++)
-            texel.w[k] = word(APEX_CLEAR_PATTERN + k);
+         for (uint k = 0u; k < bytes / 4u; k++) {
+            uint mask = word(APEX_CLEAR_MASK + k);
+            if (mask != 0u)
+               texel.w[k] = mask == ~0u ? word(APEX_CLEAR_PATTERN + k) :
+                            (texel.w[k] & ~mask) | (word(APEX_CLEAR_PATTERN + k) & mask);
+         }
       } else {
          Words aligned = Words(address & ~uint64_t(3));
          uint shift = uint(address & 3u) * 8u;
-         uint mask = (bytes == 1u ? 0xffu : 0xffffu) << shift;
+         uint mask = ((bytes == 1u ? 0xffu : 0xffffu) & word(APEX_CLEAR_MASK)) << shift;
          uint value = (word(APEX_CLEAR_PATTERN) << shift) & mask;
          atomicAnd(aligned.w[0], ~mask);
          atomicOr(aligned.w[0], value);
