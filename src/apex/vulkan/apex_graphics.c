@@ -318,6 +318,8 @@ assign_vertex_slots(struct apex_shader *shader, const nir_shader *nir)
          words += 4;
       }
    }
+   if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ))
+      shader->vertex.slot[VARYING_SLOT_PSIZ] = words++;
    shader->vertex.stride = words;
 }
 
@@ -430,6 +432,9 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
    b->cursor = nir_before_instr(&i->instr);
    nir_def *replacement = NULL;
    switch (i->intrinsic) {
+   case nir_intrinsic_load_point_coord:
+      replacement = nir_channels(b, nir_load_var(b, ctx->linear), 0x6);
+      break;
    case nir_intrinsic_load_interpolated_input:
    case nir_intrinsic_load_input: {
       unsigned location = nir_intrinsic_io_semantics(i).location;
@@ -441,6 +446,14 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       nir_def *sources = nir_load_var(b, ctx->sources);
       if (location == VARYING_SLOT_PRIMITIVE_ID) {
          replacement = nir_load_var(b, ctx->primitive);
+         break;
+      }
+      if (location == VARYING_SLOT_PNTC) {
+         /* Point setup stores gl_PointCoord in the second and third weights. */
+         nir_def *weights = nir_load_var(b, ctx->linear);
+         nir_def *coord = nir_vec4(b, nir_channel(b, weights, 1), nir_channel(b, weights, 2),
+                                   nir_imm_float(b, 0.0f), nir_imm_float(b, 1.0f));
+         replacement = nir_channels(b, coord, BITFIELD_RANGE(component, i->def.num_components));
          break;
       }
       if (location < VARYING_SLOT_VAR0 || location >= VARYING_SLOT_VAR0 + 32) {

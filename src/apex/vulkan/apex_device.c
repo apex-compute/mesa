@@ -1556,11 +1556,15 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    if (!vertex_count || !instance_count)
       return;
    uint32_t topology = dyn->ia.primitive_topology;
-   uint32_t prims = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ? vertex_count / 3 :
-                    (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
-                     topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && vertex_count >= 3 ?
-                    vertex_count - 2 : 0;
-   if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || topology < VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+   uint32_t prims;
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: prims = vertex_count; break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: prims = vertex_count / 2; break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: prims = vertex_count >= 2 ? vertex_count - 1 : 0; break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: prims = vertex_count / 3; break;
+   default: prims = vertex_count >= 3 ? vertex_count - 2 : 0; break;
+   }
+   if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
        !cmd->vertex || !cmd->fragment || dyn->ia.primitive_restart_enable ||
        dyn->vp.viewport_count != 1 || dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
        dyn->rs.depth_bias.enable || dyn->ds.stencil.test_enable ||
@@ -1641,6 +1645,8 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       int slot = cmd->vertex->vertex.slot[VARYING_SLOT_VAR0 + l];
       draw[APEX_DRAW_SLOTS + l] = slot < 0 ? ~0u : slot;
    }
+   int point_size = cmd->vertex->vertex.slot[VARYING_SLOT_PSIZ];
+   draw[APEX_DRAW_POINT_SIZE] = point_size < 0 ? ~0u : point_size;
    for (unsigned b = 0; b < APEX_DRAW_MAX_BINDINGS; b++) {
       unsigned slot = APEX_DRAW_BINDINGS + b * APEX_DRAW_BINDING_WORDS;
       draw[slot] = cmd->bindings[b].va;

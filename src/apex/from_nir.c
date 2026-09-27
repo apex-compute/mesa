@@ -436,6 +436,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    struct launch_lowering launch = {.invocations = invocations};
    nir_shader_intrinsics_pass(nir, lower_launch, nir_metadata_control_flow, &launch);
    if (launch.invalid) return fail(output, "only SSBO set 0 binding 0 is supported");
+   NIR_PASS(_, nir, nir_lower_flrp, 32, false);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_shader_lower_instructions, int32_division, lower_int32_division, NULL);
    const nir_lower_subgroups_options subgroups = {

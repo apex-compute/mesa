@@ -50,7 +50,8 @@
 #define APEX_DRAW_BIN_CHUNKS 182
 #define APEX_DRAW_BIN_X0 183          /* first bin column and row */
 #define APEX_DRAW_BIN_Y0 184
-#define APEX_DRAW_WORDS 185
+#define APEX_DRAW_POINT_SIZE 185     /* vertex-record word of gl_PointSize, ~0 for 1.0 */
+#define APEX_DRAW_WORDS 186
 #define APEX_BIN_CHUNK 256
 
 /* Primitive record fields. Edge i is opposite vertex i; E(p) = a x + b y + c

@@ -278,12 +278,15 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_timeline_semaphore = true,
       .EXT_robustness2 = true,
       .EXT_scalar_block_layout = true,
+      .KHR_sampler_mirror_clamp_to_edge = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
       .robustBufferAccess = true,
       .robustBufferAccess2 = true,
       .scalarBlockLayout = true,
+      .samplerMirrorClampToEdge = true,
+      .largePoints = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
@@ -346,7 +349,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1, .discreteQueuePriorities = 2,
-      .pointSizeRange = {1.0f, 1.0f}, .lineWidthRange = {1.0f, 1.0f},
+      .pointSizeRange = {1.0f, 64.0f}, .pointSizeGranularity = 1.0f / 128.0f, .lineWidthRange = {1.0f, 1.0f},
       .standardSampleLocations = true,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .minMemoryMapAlignment = 4096,
