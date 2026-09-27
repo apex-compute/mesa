@@ -62,7 +62,7 @@ image_exec(struct drm_apex_vm_exec *r)
    unsigned d = mock.dispatch++;
    uint64_t base = mock.gems[1].va;
    if (d == 0 || d == 15) {
-      CHECK(r->program_bytes == mock.pipelines[0]->code.size && r->workgroups == 1);
+      CHECK(r->program_bytes == mock.pipelines[0]->program.code.size && r->workgroups == 1);
       /* The descriptor update after recording swaps views: mip0/layer2 first,
        * mip1/layer1 second. Offsets include the nonzero image memory binding. */
       const uint64_t addresses[] = {base + 4224, base + 1152, base + 2240};
@@ -193,7 +193,7 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(mock.gems[h].live && mock.gems[1].live);
       CHECK(mock.gems[h].uploads == 1 && mock.gems[1].uploads == 2);
       CHECK(!r->flags && !r->status && !r->reason && !r->timestamp);
-      CHECK(r->program_bytes == mock.pipelines[p]->code.size);
+      CHECK(r->program_bytes == mock.pipelines[p]->program.code.size);
       unsigned table = d < 3 ? h + 1 : 8;
       CHECK(r->data_va == mock.gems[table].va && mock.gems[table].live);
       CHECK(mock.gems[table].uploads == 1);
@@ -210,7 +210,7 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(util_le32_to_cpu(extra[2]) == sizeof(mock.payload));
       for (unsigned i = 3; i < 8; i++) CHECK(!extra[i]);
       for (unsigned i = 24; i < 56; i++) CHECK(!rows[i]); /* unused set + sentinel */
-      CHECK(mock.pipelines[p]->push_size == 256);
+      CHECK(mock.pipelines[p]->program.push_size == 256);
       for (unsigned i = 0; i < 64; i++) {
          uint32_t expected = i < 4 ? 0 : 0xa5100000 + i * 37;
          if (d == 1 && i == 6) expected = 0xc0ffee00;
@@ -219,7 +219,7 @@ drm_ioctl(unsigned long request, void *arg)
          CHECK(rows[56 + i] == expected);
       }
       CHECK(r->workgroups == 1);
-      CHECK(!memcmp(mock.gems[h].local, mock.pipelines[p]->code.data, r->program_bytes));
+      CHECK(!memcmp(mock.gems[h].local, mock.pipelines[p]->program.code.data, r->program_bytes));
       void *local = mock.gems[1].local + starts[d] * 4;
       memcpy(mock.payload, local, sizeof(mock.payload));
       CHECK(!memcmp(mock.payload, mock.expected + starts[d], sizeof(mock.payload)));
@@ -267,8 +267,8 @@ __wrap_ioctl(int fd, unsigned long request, ...)
       CHECK(!r->bytes && !r->user_ptr);
       break;
    case 1:
-      CHECK(r->kind == APEX_NATIVE_PROGRAM && r->bytes == mock.pipelines[d]->code.size);
-      CHECK(!memcmp((void *)(uintptr_t)r->user_ptr, mock.pipelines[d]->code.data, r->bytes));
+      CHECK(r->kind == APEX_NATIVE_PROGRAM && r->bytes == mock.pipelines[d]->program.code.size);
+      CHECK(!memcmp((void *)(uintptr_t)r->user_ptr, mock.pipelines[d]->program.code.data, r->bytes));
       r->handle = 13;
       break;
    case 2:
@@ -454,7 +454,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipelines[i]) == VK_SUCCESS);
       mock.pipelines[i] = apex_pipeline_from_handle(pipelines[i]);
       if (i < 2 && invocations[0] != 16)
-         CHECK(!memcmp(mock.pipelines[i]->code.data, "APX2", 4));
+         CHECK(!memcmp(mock.pipelines[i]->program.code.data, "APX2", 4));
    }
    v->DestroyShaderModule(dev, module, NULL);
    const VkMemoryAllocateInfo mem_info = {

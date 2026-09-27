@@ -32,7 +32,7 @@ write_fixture(const char *directory, const char *name, VkPipeline handle,
    CHECK(snprintf(path, sizeof(path), "%s/%s.apx", directory, name) < sizeof(path));
    FILE *f = fopen(path, "wb");
    CHECK(f);
-   CHECK(fwrite(p->code.data, 1, p->code.size, f) == p->code.size);
+   CHECK(fwrite(p->program.code.data, 1, p->program.code.size, f) == p->program.code.size);
    CHECK(fclose(f) == 0);
    uint32_t input[800], expected[800];
    for (unsigned i = 0; i < 800; i++) {
@@ -181,8 +181,8 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
-   CHECK(p->descriptor_count == 5 && p->set_offsets[0] == 0 && p->set_offsets[1] == 1);
-   CHECK(p->push_size == 64);
+   CHECK(p->program.descriptor_count == 5 && p->program.set_offsets[0] == 0 && p->program.set_offsets[1] == 1);
+   CHECK(p->program.push_size == 64);
    CHECK(p->layout->dynamic_descriptor_offset[1] == (dynamic ? 1 : 0));
    VkDescriptorSetLayout swapped[] = {sets[1], sets[0]};
    VkPipelineLayoutCreateInfo wrong_layout_info = layout_info;
@@ -237,7 +237,7 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
       char name[4096];
       CHECK(snprintf(name, sizeof(name), "%s/%s.apx", output, fixture) < sizeof(name));
       f = fopen(name, "wb");
-      CHECK(f && fwrite(p->code.data, 1, p->code.size, f) == p->code.size && !fclose(f));
+      CHECK(f && fwrite(p->program.code.data, 1, p->program.code.size, f) == p->program.code.size && !fclose(f));
    }
    v->DestroyPipeline(dev, pipeline, NULL);
    apex_device_finish(&device);
@@ -291,7 +291,7 @@ test_rgba(struct vk_physical_device *physical, const char *path)
          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
-   CHECK(apex_pipeline_from_handle(pipeline)->descriptor_count == 2);
+   CHECK(apex_pipeline_from_handle(pipeline)->program.descriptor_count == 2);
    v->DestroyPipeline(dev, pipeline, NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);
    v->DestroyDescriptorSetLayout(dev, set, NULL);
@@ -365,17 +365,17 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
-   CHECK(p->descriptor_count == (multiple ? 2 : 1) && p->push_size == (multiple ? 0 : 20));
-   uint64_t padded_private = (uint64_t)word(p->code.data + 28) * 16;
-   CHECK(p->max_workgroups && p->max_workgroups <= 1024);
-   CHECK(padded_private * p->max_workgroups <= 2097152);
-   CHECK(p->max_workgroups == 1024 || padded_private * (p->max_workgroups + 1) > 2097152);
+   CHECK(p->program.descriptor_count == (multiple ? 2 : 1) && p->program.push_size == (multiple ? 0 : 20));
+   uint64_t padded_private = (uint64_t)word(p->program.code.data + 28) * 16;
+   CHECK(p->program.max_workgroups && p->program.max_workgroups <= 1024);
+   CHECK(padded_private * p->program.max_workgroups <= 2097152);
+   CHECK(p->program.max_workgroups == 1024 || padded_private * (p->program.max_workgroups + 1) > 2097152);
    if (output) {
       char filename[4096];
       const char *name = multiple ? "mesa-multiple" : grid ? "mesa-dispatch-grid" : "mesa-dispatch";
       CHECK(snprintf(filename, sizeof(filename), "%s/%s.apx", output, name) < sizeof(filename));
       f = fopen(filename, "wb");
-      CHECK(f && fwrite(p->code.data, 1, p->code.size, f) == p->code.size && !fclose(f));
+      CHECK(f && fwrite(p->program.code.data, 1, p->program.code.size, f) == p->program.code.size && !fclose(f));
    }
    v->DestroyPipeline(dev, pipeline, NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);
@@ -419,12 +419,12 @@ test_fill(struct vk_physical_device *physical, const char *output)
    VkPipeline handle = vk_meta_lookup_pipeline(&device.meta, &key, sizeof(key));
    CHECK(handle);
    struct apex_pipeline *pipeline = apex_pipeline_from_handle(handle);
-   CHECK(!pipeline->descriptor_count && pipeline->push_size == 16);
+   CHECK(!pipeline->program.descriptor_count && pipeline->program.push_size == 16);
    if (output) {
       char filename[4096];
       CHECK(snprintf(filename, sizeof(filename), "%s/mesa-fill.apx", output) < sizeof(filename));
       FILE *f = fopen(filename, "wb");
-      CHECK(f && fwrite(pipeline->code.data, 1, pipeline->code.size, f) == pipeline->code.size && !fclose(f));
+      CHECK(f && fwrite(pipeline->program.code.data, 1, pipeline->program.code.size, f) == pipeline->program.code.size && !fclose(f));
    }
    for (unsigned chunk = 1; chunk <= 16; chunk *= 2) {
       VkBufferCopy region = {.srcOffset = chunk, .dstOffset = 128 + chunk, .size = chunk * 3};
@@ -435,12 +435,12 @@ test_fill(struct vk_physical_device *physical, const char *output)
       handle = vk_meta_lookup_pipeline(&device.meta, &copy_key, sizeof(copy_key));
       CHECK(handle);
       pipeline = apex_pipeline_from_handle(handle);
-      CHECK(!pipeline->descriptor_count && pipeline->push_size == 24);
+      CHECK(!pipeline->program.descriptor_count && pipeline->program.push_size == 24);
       if (output) {
          char filename[4096];
          CHECK(snprintf(filename, sizeof(filename), "%s/mesa-copy%u.apx", output, chunk) < sizeof(filename));
          FILE *f = fopen(filename, "wb");
-         CHECK(f && fwrite(pipeline->code.data, 1, pipeline->code.size, f) == pipeline->code.size && !fclose(f));
+         CHECK(f && fwrite(pipeline->program.code.data, 1, pipeline->program.code.size, f) == pipeline->program.code.size && !fclose(f));
       }
    }
    CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
@@ -520,13 +520,13 @@ int main(int argc, char **argv)
                                                        infos, NULL, pipelines) == VK_SUCCESS);
    for (unsigned i = 0; i < 3; i++) {
       struct apex_pipeline *p = apex_pipeline_from_handle(pipelines[i]);
-      CHECK(p && p->code.size > 40 && p->code.data);
+      CHECK(p && p->program.code.size > 40 && p->program.code.data);
       CHECK(p->vk.bind_point == VK_PIPELINE_BIND_POINT_COMPUTE);
       for (unsigned j = 0; j < i; j++) {
          struct apex_pipeline *q = apex_pipeline_from_handle(pipelines[j]);
-         CHECK(p->code.data != q->code.data);
-         CHECK(p->code.size != q->code.size ||
-               memcmp(p->code.data, q->code.data, p->code.size) != 0);
+         CHECK(p->program.code.data != q->program.code.data);
+         CHECK(p->program.code.size != q->program.code.size ||
+               memcmp(p->program.code.data, q->program.code.data, p->program.code.size) != 0);
       }
    }
 
@@ -574,15 +574,15 @@ int main(int argc, char **argv)
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) == VK_SUCCESS);
    CHECK(mixed[0]);
    struct apex_pipeline *wide = apex_pipeline_from_handle(mixed[0]);
-   CHECK(wide->code.size >= 48 && word(wide->code.data) == 0x32585041 &&
-         word(wide->code.data + 4) == 2 && word(wide->code.data + 40) == 32 &&
-         !word(wide->code.data + 44));
+   CHECK(wide->program.code.size >= 48 && word(wide->program.code.data) == 0x32585041 &&
+         word(wide->program.code.data + 4) == 2 && word(wide->program.code.data + 40) == 32 &&
+         !word(wide->program.code.data + 44));
    if (output) {
       char path[4096];
       CHECK(snprintf(path, sizeof(path), "%s/mesa-wide.apx", output) < sizeof(path));
       FILE *wide_file = fopen(path, "wb");
-      CHECK(wide_file && fwrite(wide->code.data, 1, wide->code.size, wide_file) ==
-            wide->code.size && !fclose(wide_file));
+      CHECK(wide_file && fwrite(wide->program.code.data, 1, wide->program.code.size, wide_file) ==
+            wide->program.code.size && !fclose(wide_file));
    }
    device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup = {

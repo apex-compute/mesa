@@ -334,8 +334,8 @@ int main(int argc, char **argv)
          CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
          /* Exercise a smaller per-pipeline private-storage capacity. The
           * compiler fixture separately checks deriving it from padded lanes. */
-         CHECK(apex_pipeline_from_handle(pipeline)->max_workgroups == 1024);
-         apex_pipeline_from_handle(pipeline)->max_workgroups = grid_limit;
+         CHECK(apex_pipeline_from_handle(pipeline)->program.max_workgroups == 1024);
+         apex_pipeline_from_handle(pipeline)->program.max_workgroups = grid_limit;
          VkCommandPool pool;
          VkCommandPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT};

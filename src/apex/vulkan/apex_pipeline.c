@@ -7,7 +7,7 @@
 #include "vk_log.h"
 
 struct descriptor_lowering {
-   struct apex_pipeline *pipeline;
+   struct apex_program *program;
    bool invalid;
 };
 
@@ -20,14 +20,14 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
    switch (i->intrinsic) {
    case nir_intrinsic_vulkan_resource_index: {
       unsigned set = nir_intrinsic_desc_set(i), binding = nir_intrinsic_binding(i);
-      if (set >= ctx->pipeline->layout->set_count ||
+      if (set >= ctx->program->set_count ||
           (nir_intrinsic_desc_type(i) != nir_descriptor_type_storage_buffer &&
            nir_intrinsic_desc_type(i) != nir_descriptor_type_uniform_buffer)) {
          ctx->invalid = true;
          return false;
       }
       const struct apex_set_layout *layout =
-         (const void *)ctx->pipeline->layout->set_layouts[set];
+         ctx->program->set_layouts[set];
       if (!layout || binding >= layout->binding_count || !layout->bindings[binding].count) {
          ctx->invalid = true;
          return false;
@@ -41,12 +41,12 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
          return false;
       }
       nir_def *index = i->src[0].ssa;
-      BITSET_SET_COUNT(ctx->pipeline->used_descriptors,
-         ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset,
+      BITSET_SET_COUNT(ctx->program->used_descriptors,
+         ctx->program->set_offsets[set] + layout->bindings[binding].offset,
          layout->bindings[binding].count);
       /* Opaque resource references retain the binding bounds through reindex.
        * The table is limited to 4096 entries, so base/count fit in 16 bits. */
-      unsigned base = ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset;
+      unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].offset;
       unsigned packed = base | (layout->bindings[binding].count << 16);
       replacement = nir_vec2(b, nir_imm_int(b, packed), index);
       break;
@@ -60,7 +60,7 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
       nir_def *index = nir_channel(b, i->src[0].ssa, 1);
       nir_def *slot = nir_bcsel(b, nir_ult(b, index, nir_ushr_imm(b, packed, 16)),
          nir_iadd(b, nir_iand_imm(b, packed, 0xffff), index),
-         nir_imm_int(b, ctx->pipeline->descriptor_count));
+         nir_imm_int(b, ctx->program->descriptor_count));
       /* The descriptor load changes the opaque reference into index/offset. */
       replacement = nir_vec2(b, slot, nir_imm_int(b, 0));
       break;
@@ -165,7 +165,7 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_deref_instr *deref = nir_src_as_deref(i->src[0]);
    nir_variable *var = nir_deref_instr_get_variable(deref);
    bool rgba = var && var->data.image.format == PIPE_FORMAT_R8G8B8A8_UNORM;
-   if (!var || var->data.descriptor_set >= ctx->pipeline->layout->set_count ||
+   if (!var || var->data.descriptor_set >= ctx->program->set_count ||
        nir_intrinsic_image_dim(i) != GLSL_SAMPLER_DIM_2D ||
        (var->data.image.format != PIPE_FORMAT_R32_UINT && !rgba) ||
        (rgba && atomic) ||
@@ -185,7 +185,7 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
       }
    }
    unsigned set = var->data.descriptor_set, binding = var->data.binding;
-   const struct apex_set_layout *layout = (void *)ctx->pipeline->layout->set_layouts[set];
+   const struct apex_set_layout *layout = ctx->program->set_layouts[set];
    if (!layout || binding >= layout->binding_count || !layout->bindings[binding].count ||
        layout->bindings[binding].type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
       ctx->invalid = true;
@@ -201,10 +201,10 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
       ctx->invalid = true;
       return false;
    }
-   unsigned base = ctx->pipeline->set_offsets[set] + layout->bindings[binding].offset;
-   BITSET_SET_COUNT(ctx->pipeline->used_descriptors, base, layout->bindings[binding].count);
+   unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].offset;
+   BITSET_SET_COUNT(ctx->program->used_descriptors, base, layout->bindings[binding].count);
    nir_def *slot = nir_bcsel(b, nir_ult_imm(b, index, layout->bindings[binding].count),
-      nir_iadd_imm(b, index, base), nir_imm_int(b, ctx->pipeline->descriptor_count));
+      nir_iadd_imm(b, index, base), nir_imm_int(b, ctx->program->descriptor_count));
    nir_def *row = nir_imul_imm(b, slot, sizeof(union apex_descriptor));
    nir_def *words[7];
    for (unsigned c = 0; c < ARRAY_SIZE(words); c++)
@@ -278,16 +278,22 @@ lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+void
+apex_program_finish(struct apex_device *device, struct apex_program *program)
+{
+   if (program->bo.handle)
+      apex_bo_finish(device, &program->bo);
+   apex_compile_result_finish(&program->code);
+}
+
 static void
 apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
                       const VkAllocationCallbacks *alloc)
 {
    struct apex_pipeline *pipeline = (struct apex_pipeline *)vk;
-   if (pipeline->program.handle)
-      apex_bo_finish((struct apex_device *)device, &pipeline->program);
+   apex_program_finish((struct apex_device *)device, &pipeline->program);
    if (pipeline->layout)
       vk_pipeline_layout_unref(device, pipeline->layout);
-   apex_compile_result_finish(&pipeline->code);
    vk_pipeline_free(device, alloc, vk);
 }
 
@@ -300,8 +306,7 @@ lower_dispatch(nir_builder *b, nir_intrinsic_instr *i, void *data)
    if (!count && !global && i->intrinsic != nir_intrinsic_load_workgroup_id)
       return false;
    b->cursor = nir_before_instr(&i->instr);
-   unsigned offset = (ctx->pipeline->descriptor_count + 1) * sizeof(union apex_descriptor)
-      + ctx->pipeline->push_size;
+   unsigned offset = apex_program_trailer(ctx->program);
    offset += count ? offsetof(struct apex_dispatch_parameters, groups) :
                      offsetof(struct apex_dispatch_parameters, base);
    nir_def *words[3];
@@ -330,7 +335,7 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
    struct descriptor_lowering *ctx = data;
    if (i->intrinsic != nir_intrinsic_load_push_constant)
       return false;
-   unsigned base = nir_intrinsic_base(i), size = ctx->pipeline->push_size;
+   unsigned base = nir_intrinsic_base(i), size = ctx->program->push_size;
    bool aligned = (nir_intrinsic_align_mul(i) >= 4 && !(nir_intrinsic_align_offset(i) % 4)) ||
       (nir_src_is_const(i->src[0]) && !(nir_src_as_uint(i->src[0]) % 4));
    unsigned words = i->def.bit_size / 32;
@@ -339,7 +344,7 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
       ctx->invalid = true;
       return false;
    }
-   unsigned table_bytes = (ctx->pipeline->descriptor_count + 1) * sizeof(union apex_descriptor);
+   unsigned table_bytes = (ctx->program->descriptor_count + 1) * sizeof(union apex_descriptor);
    b->cursor = nir_before_instr(&i->instr);
    nir_def *values[8];
    for (unsigned c = 0; c < i->num_components * words; c++) {
@@ -408,6 +413,74 @@ global_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits,
    return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32, .align = 4};
 }
 
+bool
+apex_program_layout(struct apex_program *program, uint32_t set_count,
+                    struct vk_descriptor_set_layout *const *sets,
+                    uint32_t push_range_count, const VkPushConstantRange *ranges,
+                    VkShaderStageFlags stages)
+{
+   program->table = true;
+   program->set_count = set_count;
+   for (unsigned s = 0; s < set_count; s++) {
+      const struct apex_set_layout *set = (const void *)sets[s];
+      program->set_layouts[s] = set;
+      program->set_offsets[s] = program->descriptor_count;
+      if (set) program->descriptor_count += set->descriptor_count;
+   }
+   if (program->descriptor_count > APEX_MAX_DESCRIPTORS)
+      return false;
+   for (unsigned r = 0; r < push_range_count; r++) {
+      const VkPushConstantRange *range = &ranges[r];
+      if (!(range->stageFlags & stages))
+         continue;
+      if (!range->size ||
+          range->offset % 4 || range->size % 4 || range->offset >= APEX_MAX_PUSH_CONSTANTS ||
+          range->size > APEX_MAX_PUSH_CONSTANTS - range->offset)
+         return false;
+      program->push_size = MAX2(program->push_size, range->offset + range->size);
+   }
+   return true;
+}
+
+bool
+apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
+            nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
+   struct descriptor_lowering ctx = {.program = program};
+   nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
+   nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
+   nir_shader_intrinsics_pass(nir, lower_image, nir_metadata_none, &ctx);
+   nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
+   const nir_lower_mem_access_bit_sizes_options access = {
+      .callback = global_access_size, .modes = nir_var_mem_global,
+      .may_lower_unaligned_stores_to_atomics = true,
+   };
+   NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &access);
+   nir_shader_intrinsics_pass(nir, lower_global, nir_metadata_none, &ctx);
+   NIR_PASS(_, nir, nir_lower_int64);
+   NIR_PASS(_, nir, nir_lower_system_values);
+   return !ctx.invalid;
+}
+
+VkResult
+apex_program_compile(struct vk_device *device, struct apex_program *program, nir_shader *nir)
+{
+   uint64_t invocations = nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
+      nir->info.workgroup_size[2];
+   if (apex_from_nir(nir, &program->code))
+      return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "Apex compile: %s", program->code.diagnostic);
+   uint32_t private_bytes;
+   memcpy(&private_bytes, program->code.data + 28, sizeof(private_bytes));
+   uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
+   /* GPUVM reserves the low 2 MiB for this dispatch's padded private data. */
+   program->max_workgroups = program->table && extent ?
+      MIN2(1024, (2 * 1024 * 1024) / extent) : 1024;
+   return program->max_workgroups ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
 static const struct vk_pipeline_ops pipeline_ops = {
    .destroy = apex_pipeline_destroy,
 };
@@ -462,62 +535,22 @@ create_compute_pipeline(struct vk_device *device,
       if (!layout)
          goto unsupported_layout;
       pipeline->layout = vk_pipeline_layout_ref(layout);
-      for (unsigned s = 0; s < layout->set_count; s++) {
-         const struct apex_set_layout *set = (const void *)layout->set_layouts[s];
-         pipeline->set_offsets[s] = pipeline->descriptor_count;
-         if (set) pipeline->descriptor_count += set->descriptor_count;
-      }
-      if (pipeline->descriptor_count > APEX_MAX_DESCRIPTORS)
+      if (!apex_program_layout(&pipeline->program, layout->set_count, layout->set_layouts,
+                               layout->push_range_count, layout->push_ranges,
+                               VK_SHADER_STAGE_COMPUTE_BIT))
          goto unsupported_layout;
-      for (unsigned r = 0; r < layout->push_range_count; r++) {
-         const VkPushConstantRange *range = &layout->push_ranges[r];
-         if (!(range->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT))
-            continue;
-         if (!range->size ||
-             range->offset % 4 || range->size % 4 || range->offset >= APEX_MAX_PUSH_CONSTANTS ||
-             range->size > APEX_MAX_PUSH_CONSTANTS - range->offset)
-            goto unsupported_layout;
-         pipeline->push_size = MAX2(pipeline->push_size, range->offset + range->size);
-      }
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
-               nir_address_format_32bit_index_offset);
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
-      struct descriptor_lowering ctx = {.pipeline = pipeline};
-      nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
-      nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
-      nir_shader_intrinsics_pass(nir, lower_image, nir_metadata_none, &ctx);
-      nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
-      const nir_lower_mem_access_bit_sizes_options access = {
-         .callback = global_access_size, .modes = nir_var_mem_global,
-         .may_lower_unaligned_stores_to_atomics = true,
-      };
-      NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &access);
-      nir_shader_intrinsics_pass(nir, lower_global, nir_metadata_none, &ctx);
-      NIR_PASS(_, nir, nir_lower_int64);
-      NIR_PASS(_, nir, nir_lower_system_values);
+      struct descriptor_lowering ctx = {.program = &pipeline->program};
+      if (!apex_program_lower_resources(&pipeline->program, nir))
+         goto unsupported_layout;
       nir_shader_intrinsics_pass(nir, lower_dispatch, nir_metadata_control_flow, &ctx);
       if (ctx.invalid)
          goto unsupported_layout;
    }
-   int failed = apex_from_nir(nir, &pipeline->code);
-   uint64_t invocations = nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
-      nir->info.workgroup_size[2];
+   result = apex_program_compile(device, &pipeline->program, nir);
    ralloc_free(nir);
-   if (failed) {
-      result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
-                        "Apex compute: %s", pipeline->code.diagnostic);
+   if (result != VK_SUCCESS) {
       apex_pipeline_destroy(device, &pipeline->vk, alloc);
       return result;
-   }
-   uint32_t private_bytes;
-   memcpy(&private_bytes, pipeline->code.data + 28, sizeof(private_bytes));
-   uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
-   /* GPUVM reserves the low 2 MiB for this dispatch's padded private data. */
-   pipeline->max_workgroups = pipeline->layout && extent ?
-      MIN2(1024, (2 * 1024 * 1024) / extent) : 1024;
-   if (!pipeline->max_workgroups) {
-      apex_pipeline_destroy(device, &pipeline->vk, alloc);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    *out = apex_pipeline_to_handle(pipeline);
    return VK_SUCCESS;

@@ -76,7 +76,7 @@ struct apex_bound_set {
 };
 struct apex_dispatch {
    struct list_head link;
-   struct apex_pipeline *pipeline;
+   struct apex_program *program;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint32_t groups;
    struct apex_dispatch_parameters parameters;
@@ -1142,13 +1142,13 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
    if (!x || !y || !z)
       return;
    if (x > 65535 || y > 65535 || z > 65535 || !cmd->pipeline ||
-       (!cmd->pipeline->layout && (!cmd->sets[0] || x > 1024 || y != 1 || z != 1))) {
+       (!cmd->pipeline->program.table && (!cmd->sets[0] || x > 1024 || y != 1 || z != 1))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    /* Bound each row/chunk by queue count and padded private-storage capacity.
     * Each retains the API grid and its origin. */
-   uint32_t limit = cmd->pipeline->max_workgroups;
+   uint32_t limit = cmd->pipeline->program.max_workgroups;
    for (uint32_t gz = 0; gz < z; gz++)
       for (uint32_t gy = 0; gy < y; gy++)
          for (uint32_t gx = 0; gx < x; gx += limit) {
@@ -1159,7 +1159,7 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
                return;
             }
             *dispatch = (struct apex_dispatch) {
-               .pipeline = cmd->pipeline, .groups = MIN2(x - gx, limit),
+               .program = &cmd->pipeline->program, .groups = MIN2(x - gx, limit),
                .parameters = {.base = {gx, gy, gz}, .groups = {x, y, z}},
             };
             memcpy(dispatch->sets, cmd->sets, sizeof(dispatch->sets));
@@ -1397,24 +1397,24 @@ static VkResult
 drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
             struct apex_bo *table)
 {
-   struct apex_pipeline *pipeline = dispatch->pipeline;
-   if (!pipeline->layout)
+   struct apex_program *program = dispatch->program;
+   if (!program->table)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   size_t push_offset = (pipeline->descriptor_count + 1) * sizeof(union apex_descriptor);
-   size_t parameters_offset = push_offset + pipeline->push_size;
+   size_t push_offset = (program->descriptor_count + 1) * sizeof(union apex_descriptor);
+   size_t parameters_offset = apex_program_trailer(program);
    size_t bytes = parameters_offset + sizeof(struct apex_dispatch_parameters);
    union apex_descriptor *rows = calloc(1, bytes);
    if (!rows)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   memcpy((uint8_t *)rows + push_offset, dispatch->push, pipeline->push_size);
+   memcpy((uint8_t *)rows + push_offset, dispatch->push, program->push_size);
    struct apex_dispatch_parameters *parameters = (void *)((uint8_t *)rows + parameters_offset);
    for (unsigned axis = 0; axis < 3; axis++) {
       parameters->base[axis] = util_cpu_to_le32(dispatch->parameters.base[axis]);
       parameters->groups[axis] = util_cpu_to_le32(dispatch->parameters.groups[axis]);
    }
    VkResult result = VK_ERROR_DEVICE_LOST;
-   for (unsigned s = 0; s < pipeline->layout->set_count; s++) {
-      const struct apex_set_layout *layout = (const void *)pipeline->layout->set_layouts[s];
+   for (unsigned s = 0; s < program->set_count; s++) {
+      const struct apex_set_layout *layout = program->set_layouts[s];
       if (!layout || !layout->descriptor_count)
          continue;
       const struct apex_bound_set *bound = dispatch->sets[s];
@@ -1422,7 +1422,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
       for (unsigned b = 0, d = 0; d < layout->descriptor_count; d++) {
          while (d >= layout->bindings[b].offset + layout->bindings[b].count)
             b++;
-         if (!BITSET_TEST(pipeline->used_descriptors, pipeline->set_offsets[s] + d))
+         if (!BITSET_TEST(program->used_descriptors, program->set_offsets[s] + d))
             continue;
          if (!set || memcmp(set->layout->vk.blake3, layout->vk.blake3, BLAKE3_OUT_LEN))
             goto out;
@@ -1436,7 +1436,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
             unsigned l = view->base_mip_level;
             uint64_t va = image->memory->storage->bo.va + image->offset + image->levels[l].offset +
                           (uint64_t)view->base_array_layer * image->levels[l].slice_stride;
-            rows[pipeline->set_offsets[s] + d].image = (struct apex_image_descriptor) {
+            rows[program->set_offsets[s] + d].image = (struct apex_image_descriptor) {
                util_cpu_to_le32(va), util_cpu_to_le32(va >> 32),
                util_cpu_to_le32(u_minify(image->vk.extent.width, l)),
                util_cpu_to_le32(u_minify(image->vk.extent.height, l)),
@@ -1462,21 +1462,21 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
              range > buffer->vk.size - binding->offset - dynamic)
             goto out;
          uint64_t va = buffer->memory->storage->bo.va + buffer->offset + binding->offset + dynamic;
-         rows[pipeline->set_offsets[s] + d].buffer = (struct apex_buffer_descriptor) {
+         rows[program->set_offsets[s] + d].buffer = (struct apex_buffer_descriptor) {
             util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range), 0,
          };
       }
    }
-   if (!pipeline->program.handle) {
-      result = bo_create(device, pipeline->code.size,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, 0, 0, &pipeline->program);
+   if (!program->bo.handle) {
+      result = bo_create(device, program->code.size,
+                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, 0, 0, &program->bo);
       if (result != VK_SUCCESS)
          goto out;
-      memcpy(pipeline->program.map, pipeline->code.data, pipeline->code.size);
-      result = bo_transfer(device, &pipeline->program, APEX_DRM_TRANSFER_TO_LOCAL,
-                           0, pipeline->code.size);
+      memcpy(program->bo.map, program->code.data, program->code.size);
+      result = bo_transfer(device, &program->bo, APEX_DRM_TRANSFER_TO_LOCAL,
+                           0, program->code.size);
       if (result != VK_SUCCESS) {
-         apex_bo_finish(device, &pipeline->program);
+         apex_bo_finish(device, &program->bo);
          goto out;
       }
    }
@@ -1498,8 +1498,8 @@ drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
    if (result != VK_SUCCESS)
       goto out;
    struct drm_apex_vm_exec args = {
-      .program_va = dispatch->pipeline->program.va,
-      .program_bytes = dispatch->pipeline->code.size,
+      .program_va = dispatch->program->bo.va,
+      .program_bytes = dispatch->program->code.size,
       .data_va = table.va,
       .workgroups = dispatch->groups,
    };
@@ -1530,7 +1530,7 @@ dispatch_compute(struct apex_device *device, const struct apex_dispatch *dispatc
    VkResult result = VK_ERROR_DEVICE_LOST;
    struct apex_ioctl_native program = {
       .operation = APEX_NATIVE_ALLOC, .kind = APEX_NATIVE_PROGRAM,
-      .user_ptr = (uintptr_t)dispatch->pipeline->code.data, .bytes = dispatch->pipeline->code.size,
+      .user_ptr = (uintptr_t)dispatch->program->code.data, .bytes = dispatch->program->code.size,
    };
    struct apex_ioctl_native allocation = {.operation = APEX_NATIVE_ALLOC, .bytes = bytes};
    if (ioctl(device->fd, APEX_IOCTL_NATIVE, &program) ||
@@ -1642,8 +1642,8 @@ submit_async(struct apex_device *device, struct vk_queue_submit *submit)
          if (result != VK_SUCCESS)
             goto out;
          pending->args = (struct drm_apex_vm_submit) {
-            .program_va = dispatch->pipeline->program.va,
-            .program_bytes = dispatch->pipeline->code.size,
+            .program_va = dispatch->program->bo.va,
+            .program_bytes = dispatch->program->code.size,
             .data_va = pending->table.va, .workgroups = dispatch->groups,
          };
       }
