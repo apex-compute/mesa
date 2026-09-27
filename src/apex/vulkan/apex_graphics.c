@@ -980,6 +980,32 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *row = nir_iand(b, nir_uge(b, py, y0), nir_ult(b, py, y1));
    nir_def *inside = nir_iand(b, row, nir_iand(b, nir_uge(b, px, x0), nir_ult(b, px, x1)));
 
+   /* The tile lies in one bin. Tiles whose bin holds no primitive in this
+    * job's chunk range keep their attachments untouched. */
+   nir_def *shift = draw_word(b, program, APEX_DRAW_BIN_SHIFT);
+   nir_def *columns = draw_word(b, program, APEX_DRAW_BIN_COLUMNS);
+   nir_def *bin = nir_iadd(b, nir_imul(b, nir_isub(b, nir_ushr(b, tile_y, shift),
+                                                    draw_word(b, program, APEX_DRAW_BIN_Y0)), columns),
+                           nir_isub(b, nir_ushr(b, tile_x, shift), draw_word(b, program, APEX_DRAW_BIN_X0)));
+   nir_variable *busy_var = nir_local_variable_create(impl, glsl_bool_type(), "busy");
+   nir_variable *k_var = nir_local_variable_create(impl, glsl_uint_type(), "busy_chunk");
+   nir_store_var(b, busy_var, nir_imm_false(b), 1);
+   nir_store_var(b, k_var, draw_word(b, program, APEX_DRAW_CHUNK_RANGE), 1);
+   nir_push_loop(b);
+   {
+      nir_def *all = draw_word(b, program, APEX_DRAW_BIN_CHUNKS);
+      nir_def *k = loop_counter(b, k_var, nir_umin(b, all, draw_word(b, program, APEX_DRAW_CHUNK_RANGE + 1)));
+      nir_def *count = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_BIN_COUNTS),
+         nir_ishl_imm(b, nir_iadd(b, nir_imul(b, bin, all), k), 2)));
+      nir_push_if(b, nir_ine_imm(b, count, 0));
+      nir_store_var(b, busy_var, nir_imm_true(b), 1);
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, NULL);
+      nir_store_var(b, k_var, nir_iadd_imm(b, k, 1), 1);
+   }
+   nir_pop_loop(b, NULL);
+   nir_push_if(b, nir_load_var(b, busy_var));
+
    /* Current attachment contents of this lane's sample: samples of a pixel
     * are consecutive texels. */
    nir_def *vx = nir_iadd(b, nir_imul_imm(b, px, samples), sample);
@@ -1014,12 +1040,6 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    if (ds_target)
       nir_store_var(b, stored_ds, loaded_ds, 0xf);
 
-   /* The tile lies in one bin; walk that bin's ordered list segments. */
-   nir_def *shift = draw_word(b, program, APEX_DRAW_BIN_SHIFT);
-   nir_def *columns = draw_word(b, program, APEX_DRAW_BIN_COLUMNS);
-   nir_def *bin = nir_iadd(b, nir_imul(b, nir_isub(b, nir_ushr(b, tile_y, shift),
-                                                    draw_word(b, program, APEX_DRAW_BIN_Y0)), columns),
-                           nir_isub(b, nir_ushr(b, tile_x, shift), draw_word(b, program, APEX_DRAW_BIN_X0)));
    nir_variable *c_var = nir_local_variable_create(impl, glsl_uint_type(), "chunk");
    nir_store_var(b, c_var, draw_word(b, program, APEX_DRAW_CHUNK_RANGE), 1);
    nir_loop *chunk_loop = nir_push_loop(b);
@@ -1315,6 +1335,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
          store_texel(b, &color_target[k], nir_load_var(b, stored[k]), lane, inside, samples);
    if (ds_target)
       store_texel(b, &ds, nir_load_var(b, stored_ds), lane, inside, samples);
+   nir_pop_if(b, NULL); /* busy */
    nir_def *groups = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups));
    nir_store_var(b, t_var, nir_iadd(b, t, groups), 1);
    nir_pop_loop(b, tile_loop);

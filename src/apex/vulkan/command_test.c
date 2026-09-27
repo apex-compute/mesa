@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
+#include "apex_format.h"
 #include "apex_pipeline.h"
 #include "apex_native_uapi.h"
 #include "compiler/spirv/spirv.h"
@@ -65,18 +66,26 @@ image_exec(struct drm_apex_vm_exec *r)
       CHECK(r->program_bytes == mock.pipelines[0]->program.code.size && r->workgroups == 1);
       /* The descriptor update after recording swaps views: mip0/layer2 first,
        * mip1/layer1 second. Offsets include the nonzero image memory binding. */
-      const uint64_t addresses[] = {base + 4224, base + 1152, base + 2240};
-      const uint32_t tails[][6] = {{768, 0, 0, 0, 0, 0}, {11, 7, 2, 64, 448, 0}, {5, 3, 2, 64, 192, 0}};
-      for (unsigned row = 0; row < 3; row++) {
-         CHECK(((uint64_t)util_le32_to_cpu(words[row * 8 + 1]) << 32 |
-                util_le32_to_cpu(words[row * 8])) == addresses[row]);
-         for (unsigned i = 0; i < 6; i++) CHECK(util_le32_to_cpu(words[row * 8 + 2 + i]) == tails[row][i]);
+      /* Row 0: the storage buffer. Rows 1-4: two storage images in the
+       * two-row sampled layout (image base, level-0 extent, view range,
+       * format words, view type, samples). Row 5: the zero sentinel. */
+      CHECK(((uint64_t)util_le32_to_cpu(words[1]) << 32 | util_le32_to_cpu(words[0])) == base + 4224);
+      for (unsigned i = 2; i < 8; i++) CHECK(util_le32_to_cpu(words[i]) == (i == 2 ? 768 : 0));
+      uint32_t format[3];
+      CHECK(apex_format_encode(VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT, &(VkComponentMapping){0}, format));
+      const uint32_t views[2][4] = {{0, 1, 2, 2}, {1, 1, 1, 2}};
+      for (unsigned d = 0; d < 2; d++) {
+         const uint32_t *image = words + 8 + d * 16;
+         const uint32_t want[16] = {base + 256, (base + 256) >> 32, 11, 7, 1, 4,
+            views[d][0], views[d][1], views[d][2], views[d][3], format[0], format[1], format[2],
+            VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 0};
+         for (unsigned i = 0; i < 16; i++) CHECK(util_le32_to_cpu(image[i]) == want[i]);
       }
-      for (unsigned i = 24; i < 32; i++) CHECK(!words[i]);
-      for (unsigned i = 0; i < 4; i++) CHECK(words[32 + i] == 0xc0010000 + i);
+      for (unsigned i = 40; i < 48; i++) CHECK(!words[i]);
+      for (unsigned i = 0; i < 4; i++) CHECK(words[48 + i] == 0xc0010000 + i);
    } else if (d == 1 || d == 5) {
       /* Internal clear job: texels only, row padding untouched. */
-      const uint32_t *clear = words + 8 + 8;
+      const uint32_t *clear = words + 8 + 12;
       unsigned offset = d == 1 ? 9280 : 14592;
       uint32_t color = d == 1 ? 0x5a17c0de : 0xff80ff00;
       CHECK(((uint64_t)clear[1] << 32 | clear[0]) == base + offset);
@@ -94,7 +103,7 @@ image_exec(struct drm_apex_vm_exec *r)
       const unsigned from[] = {12316, 2308, 8648}, to[] = {2308, 8648, 12800};
       const unsigned src_row[] = {20, 64, 64}, dst_row[] = {64, 64, 28};
       const unsigned src_slice[] = {60, 192, 320}, dst_slice[] = {192, 320, 112};
-      const uint32_t *copy = words + 8 + 8;
+      const uint32_t *copy = words + 8 + 12;
       CHECK(((uint64_t)copy[1] << 32 | copy[0]) == base + from[phase]);
       CHECK(((uint64_t)copy[3] << 32 | copy[2]) == base + to[phase]);
       CHECK(copy[4] == src_row[phase] && copy[5] == dst_row[phase]);

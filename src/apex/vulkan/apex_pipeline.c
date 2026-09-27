@@ -148,137 +148,17 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+/* Image memory is global memory: storage images lower to global access in
+ * apex_lower_textures. */
 static bool
 lower_image(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
-   struct descriptor_lowering *ctx = data;
-   if (i->intrinsic == nir_intrinsic_barrier) {
-      nir_variable_mode modes = nir_intrinsic_memory_modes(i);
-      if (!(modes & nir_var_image))
-         return false;
-      nir_intrinsic_set_memory_modes(i, (modes & ~nir_var_image) | nir_var_mem_global);
-      return true;
-   }
-   bool load = i->intrinsic == nir_intrinsic_image_deref_load;
-   bool store = i->intrinsic == nir_intrinsic_image_deref_store;
-   bool swap = i->intrinsic == nir_intrinsic_image_deref_atomic_swap;
-   bool atomic = swap || i->intrinsic == nir_intrinsic_image_deref_atomic;
-   bool size = i->intrinsic == nir_intrinsic_image_deref_size;
-   if (!load && !store && !atomic && !size)
+   if (i->intrinsic != nir_intrinsic_barrier)
       return false;
-   nir_deref_instr *deref = nir_src_as_deref(i->src[0]);
-   nir_variable *var = nir_deref_instr_get_variable(deref);
-   bool rgba = var && var->data.image.format == PIPE_FORMAT_R8G8B8A8_UNORM;
-   if (!var || var->data.descriptor_set >= ctx->program->set_count ||
-       nir_intrinsic_image_dim(i) != GLSL_SAMPLER_DIM_2D ||
-       (var->data.image.format != PIPE_FORMAT_R32_UINT && !rgba) ||
-       (rgba && atomic) ||
-       (!store && i->def.bit_size != 32) ||
-       (load && i->def.num_components != 4) ||
-       (atomic && i->def.num_components != 1) ||
-       (size && i->def.num_components != (nir_intrinsic_image_array(i) ? 3 : 2)) ||
-       (store && (i->src[3].ssa->bit_size != 32 || i->src[3].ssa->num_components != 4))) {
-      ctx->invalid = true;
+   nir_variable_mode modes = nir_intrinsic_memory_modes(i);
+   if (!(modes & nir_var_image))
       return false;
-   }
-   if (load || store || size) {
-      nir_src lod = i->src[store ? 4 : size ? 1 : 3];
-      if (!nir_src_is_const(lod) || nir_src_as_uint(lod)) {
-         ctx->invalid = true;
-         return false;
-      }
-   }
-   unsigned set = var->data.descriptor_set, binding = var->data.binding;
-   const struct apex_set_layout *layout = ctx->program->set_layouts[set];
-   if (!layout || binding >= layout->binding_count || !layout->bindings[binding].count ||
-       layout->bindings[binding].type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
-      ctx->invalid = true;
-      return false;
-   }
-   b->cursor = nir_before_instr(&i->instr);
-   nir_def *index = nir_imm_int(b, 0);
-   if (deref->deref_type == nir_deref_type_array) {
-      index = deref->arr.index.ssa;
-      deref = nir_deref_instr_parent(deref);
-   }
-   if (deref->deref_type != nir_deref_type_var) {
-      ctx->invalid = true;
-      return false;
-   }
-   unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].slot;
-   BITSET_SET_COUNT(ctx->program->used_descriptors, base, layout->bindings[binding].count);
-   nir_def *slot = nir_bcsel(b, nir_ult_imm(b, index, layout->bindings[binding].count),
-      nir_iadd_imm(b, index, base), nir_imm_int(b, ctx->program->descriptor_count));
-   nir_def *row = nir_imul_imm(b, slot, sizeof(union apex_descriptor));
-   nir_def *words[7];
-   for (unsigned c = 0; c < ARRAY_SIZE(words); c++)
-      words[c] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-         nir_iadd_imm(b, row, c * 4), .align_mul = 4,
-         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
-   if (size) {
-      nir_def_rewrite_uses(&i->def, nir_vec(b, &words[2], i->def.num_components));
-   } else {
-      unsigned access = nir_intrinsic_access(i) | var->data.access;
-      nir_def *coord = i->src[1].ssa;
-      nir_def *x = nir_channel(b, coord, 0), *y = nir_channel(b, coord, 1);
-      nir_def *inside = nir_iand(b, nir_ult(b, x, words[2]), nir_ult(b, y, words[3]));
-      nir_def *offset = nir_iadd(b, nir_imul_imm(b, x, 4), nir_imul(b, y, words[5]));
-      if (nir_intrinsic_image_array(i)) {
-         nir_def *layer = nir_channel(b, coord, 2);
-         inside = nir_iand(b, inside, nir_ult(b, layer, words[4]));
-         offset = nir_iadd(b, offset, nir_imul(b, layer, words[6]));
-      }
-      nir_push_if(b, inside);
-      nir_def *address = nir_build_addr_iadd(b, nir_vec2(b, words[0], words[1]),
-         nir_address_format_2x32bit_global, nir_var_mem_global, offset);
-      nir_def *value = NULL;
-      if (store) {
-         nir_def *pixel = nir_channel(b, i->src[3].ssa, 0);
-         if (rgba) {
-            pixel = nir_imm_int(b, 0);
-            for (unsigned c = 0; c < 4; c++) {
-               nir_def *channel = nir_channel(b, i->src[3].ssa, c);
-               channel = nir_fmin(b, nir_fmax(b, channel, nir_imm_float(b, 0.0f)),
-                                  nir_imm_float(b, 1.0f));
-               nir_def *scaled = nir_fmul_imm(b, channel, 255.0f);
-               nir_def *integer = nir_f2u32(b, scaled);
-               nir_def *fraction = nir_fsub(b, scaled, nir_u2f32(b, integer));
-               nir_def *round_up = nir_ior(b, nir_flt(b, nir_imm_float(b, 0.5f), fraction),
-                  nir_iand(b, nir_feq_imm(b, fraction, 0.5f),
-                           nir_ine_imm(b, nir_iand_imm(b, integer, 1), 0)));
-               pixel = nir_ior(b, pixel,
-                  nir_ishl_imm(b, nir_iadd(b, integer, nir_b2i32(b, round_up)), c * 8));
-            }
-         }
-         nir_store_global_2x32(b, pixel, address, .align_mul = 4, .access = access);
-      }
-      else if (swap)
-         value = nir_global_atomic_swap_2x32(b, 32, address, i->src[3].ssa, i->src[4].ssa,
-            .atomic_op = nir_intrinsic_atomic_op(i), .access = access);
-      else if (atomic)
-         value = nir_global_atomic_2x32(b, 32, address, i->src[3].ssa,
-            .atomic_op = nir_intrinsic_atomic_op(i), .access = access);
-      else {
-         value = nir_load_global_2x32(b, 1, 32, address,
-                                    .align_mul = 4, .access = access);
-         if (rgba) {
-            nir_def *channels[4];
-            for (unsigned c = 0; c < 4; c++)
-               channels[c] = nir_fmul_imm(b,
-                  nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, value, c * 8), 0xff)),
-                  1.0f / 255.0f);
-            value = nir_vec(b, channels, 4);
-         } else {
-            value = nir_vec4(b, value, nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 1));
-         }
-      }
-      nir_push_else(b, NULL);
-      nir_def *zero = nir_imm_zero(b, store ? 1 : i->def.num_components, 32);
-      nir_pop_if(b, NULL);
-      if (!store)
-         nir_def_rewrite_uses(&i->def, nir_if_phi(b, value, zero));
-   }
-   nir_instr_remove(&i->instr);
+   nir_intrinsic_set_memory_modes(i, (modes & ~nir_var_image) | nir_var_mem_global);
    return true;
 }
 
@@ -357,8 +237,8 @@ wrap_workgroups(const struct apex_program *program, nir_shader *nir)
    nir_builder builder = nir_builder_at(nir_before_impl(impl));
    nir_builder *b = &builder;
    unsigned trailer = apex_program_trailer(program);
-   nir_def *words[8];
-   for (unsigned w = 0; w < 8; w++)
+   nir_def *words[11];
+   for (unsigned w = 0; w < 11; w++)
       words[w] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_imm_int(b, trailer + w * 4),
                                .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
    nir_def *indirect = nir_vec2(b, words[6], words[7]);
@@ -386,8 +266,9 @@ wrap_workgroups(const struct apex_program *program, nir_shader *nir)
    nir_pop_if(b, NULL);
    nir_def *gx = nir_channel(b, grid, 0), *gy = nir_channel(b, grid, 1);
    nir_def *row = nir_udiv(b, l, gx);
-   nir_store_var(b, ctx.id, nir_vec3(b, nir_isub(b, l, nir_imul(b, row, gx)),
-                                     nir_umod(b, row, gy), nir_udiv(b, row, gy)), 0x7);
+   nir_def *origin = nir_vec3(b, words[8], words[9], words[10]);
+   nir_store_var(b, ctx.id, nir_iadd(b, origin, nir_vec3(b, nir_isub(b, l, nir_imul(b, row, gx)),
+                                                        nir_umod(b, row, gy), nir_udiv(b, row, gy))), 0x7);
    nir_cf_reinsert(&body, b->cursor);
    b->cursor = nir_after_cf_list(&loop->body);
    /* Shared memory of one workgroup is reused by the next. */

@@ -196,7 +196,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
       CHECK(mem.memoryTypes[1 + coherent].heapIndex == 1 &&
-            !mem.memoryHeaps[1].flags && mem.memoryHeaps[1].size == 64 * 1024 * 1024);
+            !mem.memoryHeaps[1].flags && mem.memoryHeaps[1].size == 1024ull * 1024 * 1024);
    }
    PROC(GetPhysicalDeviceExternalBufferPropertiesKHR, get_external);
    VkPhysicalDeviceExternalBufferInfo external = {
@@ -258,18 +258,20 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
                                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
    const VkFormatFeatureFlags sampled = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
    const VkFormatFeatureFlags texel = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT |
-                                      VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+                                      VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT |
+                                      VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
    CHECK(format.linearTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
             sampled | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) &&
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
          format.optimalTilingFeatures == format.linearTilingFeatures && format.bufferFeatures == texel);
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-      transfer_features | sampled;
+      VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | transfer_features | sampled;
    CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features &&
-         format.bufferFeatures == texel);
+         format.bufferFeatures == (texel | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT));
    CHECK(props.limits.maxImageDimension2D == 4096 && props.limits.maxImageArrayLayers == 256);
    PROC(GetPhysicalDeviceImageFormatProperties, get_image_format);
    VkImageFormatProperties image_props;
@@ -277,10 +279,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &image_props) == VK_SUCCESS);
    CHECK(image_props.maxExtent.width == 4096 && image_props.maxExtent.height == 4096 && image_props.maxExtent.depth == 1);
    CHECK(image_props.maxMipLevels == 13 && image_props.maxArrayLayers == 256 &&
-         image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT && image_props.maxResourceSize == 64 * 1024 * 1024);
+         image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT && image_props.maxResourceSize == 1024ull * 1024 * 1024);
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
-      VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
-   CHECK(!image_props.maxExtent.width && !image_props.sampleCounts && !image_props.maxResourceSize);
+      VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_SUCCESS);
+   CHECK(image_props.maxExtent.depth == 2048 && image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
       VK_IMAGE_USAGE_SAMPLED_BIT, 0, &image_props) == VK_SUCCESS);
    CHECK(get_image_format(physical, VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
@@ -295,7 +297,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
       &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    CHECK(get_image_format(physical, VK_FORMAT_R32_SINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
-      VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+      VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_SUCCESS);
    PROC(GetPhysicalDeviceQueueFamilyProperties, get_queues);
    VkQueueFamilyProperties queue_props;
    count = 1;

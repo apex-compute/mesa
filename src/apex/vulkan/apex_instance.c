@@ -19,7 +19,7 @@
 
 /* Development protocol only. This compute subset is not a conformant Vulkan
  * device. The library/manifest are uninstalled and instance creation is opt-in. */
-#define APEX_DEVELOPMENT_API VK_API_VERSION_1_0
+#define APEX_DEVELOPMENT_API VK_API_VERSION_1_1
 
 struct apex_physical_device {
    struct vk_physical_device vk;
@@ -96,7 +96,7 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
                                         VK_MEMORY_PROPERTY_HOST_CACHED_BIT},
       .memoryTypes[1] = {.propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT},
       .memoryHeapCount = 1,
-      .memoryHeaps[0] = {.size = 64 * 1024 * 1024,
+      .memoryHeaps[0] = {.size = APEX_MAX_ALLOCATION,
                         .flags = device->prime_coherent ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0},
    };
    if (device->host_coherent) {
@@ -107,7 +107,7 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
                           VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
          .heapIndex = mem->memoryHeapCount++,
       };
-      mem->memoryHeaps[1] = (VkMemoryHeap) {.size = 64 * 1024 * 1024};
+      mem->memoryHeaps[1] = (VkMemoryHeap) {.size = APEX_MAX_ALLOCATION};
    }
 }
 
@@ -136,10 +136,12 @@ apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat form
 {
    VkFormatFeatureFlags2 features = apex_format_features(format, false);
    VkFormatFeatureFlags2 buffer = apex_format_features(format, true);
+   /* Legacy flags hold bits 0..30; higher bits exist only in FormatFeatureFlags2. */
+   const VkFormatFeatureFlags2 legacy = 0x7fffffffull;
    properties->formatProperties = (VkFormatProperties) {
-      .linearTilingFeatures = (VkFormatFeatureFlags)features,
-      .optimalTilingFeatures = (VkFormatFeatureFlags)features,
-      .bufferFeatures = (VkFormatFeatureFlags)buffer,
+      .linearTilingFeatures = (VkFormatFeatureFlags)(features & legacy),
+      .optimalTilingFeatures = (VkFormatFeatureFlags)(features & legacy),
+      .bufferFeatures = (VkFormatFeatureFlags)(buffer & legacy),
    };
    VkFormatProperties3 *props3 = vk_find_struct(properties->pNext, FORMAT_PROPERTIES_3);
    if (props3) {
@@ -282,6 +284,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_index_type_uint8 = true,
       .KHR_draw_indirect_count = true,
       .KHR_multiview = true,
+      .KHR_push_descriptor = true,
+      .KHR_descriptor_update_template = true,
       .EXT_shader_viewport_index_layer = true,
    };
    const struct vk_features features = {
@@ -301,6 +305,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .shaderOutputLayer = true,
       .multiview = true,
       .sampleRateShading = true,
+      .shaderStorageImageExtendedFormats = true,
+      .shaderStorageImageReadWithoutFormat = true,
+      .shaderStorageImageWriteWithoutFormat = true,
+      .fragmentStoresAndAtomics = true,
+      .vertexPipelineStoresAndAtomics = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
@@ -346,7 +355,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxColorAttachments = 8,
       .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 65535,
       .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
-      .maxMultiviewViewCount = 32, .maxMultiviewInstanceIndex = (1u << 27) - 1,
+      .maxPushDescriptors = 32, .maxMultiviewViewCount = 32, .maxMultiviewInstanceIndex = (1u << 27) - 1,
       .maxViewports = APEX_DRAW_MAX_VIEWPORTS, .maxViewportDimensions = {4096, 4096},
       .viewportBoundsRange = {-8192.0f, 8191.0f}, .viewportSubPixelBits = 8,
       .subPixelPrecisionBits = 8, .subTexelPrecisionBits = 8, .mipmapPrecisionBits = 8,
@@ -379,6 +388,15 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .robustStorageBufferAccessSizeAlignment = 1,
       .robustUniformBufferAccessSizeAlignment = 1,
       .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
+      .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+      .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+         VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+         VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+         VK_SUBGROUP_FEATURE_QUAD_BIT,
+      /* Points are rejected only by the z planes and the guard band. */
+      .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
+      .maxPerSetDescriptors = APEX_MAX_DESCRIPTORS,
+      .maxMemoryAllocationSize = APEX_MAX_ALLOCATION,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
    };
    /* Opaque-fd compatibility is the flat GEM byte layout, revision 1. */

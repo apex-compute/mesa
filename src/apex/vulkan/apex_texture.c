@@ -669,6 +669,195 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
    return true;
 }
 
+/* Stores RGBA components (FP32 bits or integers) as one texel of the format
+ * words: the inverse of decode_texel. Sub-word texels merge into their word
+ * with atomics so neighbouring invocations never overwrite each other. */
+static void
+encode_texel(nir_builder *b, const struct image_info *i, nir_def *address, nir_def *value)
+{
+   nir_def *words[4];
+   for (unsigned w = 0; w < 4; w++)
+      words[w] = nir_imm_int(b, 0);
+   for (unsigned k = 0; k < 4; k++) {
+      nir_def *field = nir_iand_imm(b, nir_ushr_imm(b, i->format[1 + k / 2], 16 * (k % 2)), 0xffff);
+      nir_def *shift = nir_iand_imm(b, field, 127);
+      nir_def *size = nir_iand_imm(b, nir_ushr_imm(b, field, 7), 63);
+      nir_def *type = nir_ushr_imm(b, field, 13);
+      /* The API component whose swizzle selects stored channel k. */
+      nir_def *v = nir_imm_int(b, 0);
+      for (unsigned c = 0; c < 4; c++) {
+         nir_def *select = nir_iand_imm(b, nir_ushr_imm(b, i->format[0], 8 + 3 * c), 7);
+         v = nir_bcsel(b, nir_ieq_imm(b, select, k), nir_channel(b, value, c), v);
+      }
+      nir_def *full = nir_ieq_imm(b, size, 32);
+      nir_def *mask = nir_bcsel(b, full, nir_imm_int(b, ~0u),
+                                nir_isub(b, nir_ishl(b, nir_imm_int(b, 1), size), nir_imm_int(b, 1)));
+      nir_def *half = nir_ushr_imm(b, mask, 1);
+      nir_def *unorm = nir_f2u32(b, nir_fround_even(b, nir_fmul(b, nir_fsat(b, v), nir_u2f32(b, mask))));
+      nir_def *snorm = nir_f2i32(b, nir_fround_even(b, nir_fmul(b, nir_fmin(b, nir_fmax(b, v,
+         nir_imm_float(b, -1.0f)), nir_imm_float(b, 1.0f)), nir_u2f32(b, half))));
+      nir_def *uint = nir_umin(b, v, mask);
+      nir_def *sint = nir_imin(b, nir_imax(b, v, nir_ineg(b, nir_iadd_imm(b, half, 1))), half);
+      nir_def *fp = nir_bcsel(b, nir_ieq_imm(b, size, 16), apex_float_to_half(b, v), v);
+      nir_def *bits = nir_imm_int(b, 0);
+      bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_UNORM), unorm, bits);
+      bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_SNORM), snorm, bits);
+      bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_UINT), uint, bits);
+      bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_SINT), sint, bits);
+      bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_FLOAT), fp, bits);
+      bits = nir_ishl(b, nir_iand(b, bits, mask), nir_iand_imm(b, shift, 31));
+      for (unsigned w = 0; w < 4; w++)
+         words[w] = nir_ior(b, words[w], nir_bcsel(b, nir_ieq_imm(b, nir_ushr_imm(b, shift, 5), w),
+                                                    bits, nir_imm_int(b, 0)));
+   }
+   nir_def *byte = nir_channel(b, address, 0);
+   nir_push_if(b, nir_ult_imm(b, i->bytes, 4));
+   {
+      nir_def *aligned = nir_vec2(b, nir_iand_imm(b, byte, ~3u), nir_channel(b, address, 1));
+      nir_def *shift = nir_ishl_imm(b, nir_iand_imm(b, byte, 3), 3);
+      nir_def *mask = nir_ishl(b, nir_isub(b, nir_ishl(b, nir_imm_int(b, 1), nir_ishl_imm(b, i->bytes, 3)),
+                                           nir_imm_int(b, 1)), shift);
+      nir_global_atomic_2x32(b, 32, aligned, nir_inot(b, mask), .atomic_op = nir_atomic_op_iand);
+      nir_global_atomic_2x32(b, 32, aligned, nir_iand(b, nir_ishl(b, words[0], shift), mask),
+                             .atomic_op = nir_atomic_op_ior);
+   }
+   nir_push_else(b, NULL);
+   for (unsigned w = 0; w < 4; w++) {
+      nir_push_if(b, nir_ult(b, nir_imm_int(b, w * 4), i->bytes));
+      nir_store_global_2x32(b, words[w], nir_build_addr_iadd_imm(b, address,
+         nir_address_format_2x32bit_global, nir_var_mem_global, w * 4), .align_mul = 4);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
+/* Storage images use the sampled-image descriptor (level base_level only);
+ * storage texel buffers use the texel-buffer row. Loads decode and stores
+ * encode through the view's format words, so shader formats are optional. */
+static bool
+lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *ctx)
+{
+   bool load = i->intrinsic == nir_intrinsic_image_deref_load;
+   bool store = i->intrinsic == nir_intrinsic_image_deref_store;
+   bool swap = i->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+   bool atomic = swap || i->intrinsic == nir_intrinsic_image_deref_atomic;
+   bool size = i->intrinsic == nir_intrinsic_image_deref_size;
+   bool samples = i->intrinsic == nir_intrinsic_image_deref_samples;
+   if (!load && !store && !atomic && !size && !samples)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   if ((!store && i->def.bit_size != 32) ||
+       (store && i->src[3].ssa->bit_size != 32)) {
+      ctx->invalid = true;
+      return false;
+   }
+   if (samples) {
+      nir_def_replace(&i->def, nir_imm_int(b, 1));
+      return true;
+   }
+   /* The binding must hold storage images, or texel buffers for buffer images. */
+   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(i);
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(i->src[0]));
+   const struct apex_set_layout *layout = var && var->data.descriptor_set < ctx->program->set_count ?
+      ctx->program->set_layouts[var->data.descriptor_set] : NULL;
+   VkDescriptorType type = layout && var->data.binding < layout->binding_count ?
+      layout->bindings[var->data.binding].type : VK_DESCRIPTOR_TYPE_MAX_ENUM;
+   if (dim == GLSL_SAMPLER_DIM_BUF ? type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER &&
+                                     type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER :
+                                     type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+      ctx->invalid = true;
+      return false;
+   }
+   nir_def *row = deref_row(b, ctx, nir_src_as_deref(i->src[0]), false);
+   bool array = nir_intrinsic_image_array(i);
+   struct image_info img;
+   nir_def *inside, *address;
+   nir_def *coord = size ? NULL : i->src[1].ssa;
+   if (dim == GLSL_SAMPLER_DIM_BUF) {
+      /* Texel buffers: address, byte range, elements, format words. */
+      img = (struct image_info){0};
+      img.address = nir_vec2(b, row_word(b, row, 0), row_word(b, row, 1));
+      for (unsigned k = 0; k < 3; k++)
+         img.format[k] = row_word(b, row, 4 + k);
+      img.bytes = nir_iand_imm(b, img.format[0], 31);
+      if (size) {
+         nir_def_replace(&i->def, nir_trim_vector(b, row_word(b, row, 3), i->def.num_components));
+         return true;
+      }
+      nir_def *x = nir_channel(b, coord, 0);
+      inside = nir_ult(b, x, row_word(b, row, 3));
+      address = nir_build_addr_iadd(b, img.address, nir_address_format_2x32bit_global,
+                                    nir_var_mem_global, nir_imul(b, x, img.bytes));
+   } else {
+      bool three_d = dim == GLSL_SAMPLER_DIM_3D, cube = dim == GLSL_SAMPLER_DIM_CUBE;
+      unsigned dims = dim == GLSL_SAMPLER_DIM_1D ? 1 : three_d ? 3 : 2;
+      img = load_image(b, row, three_d);
+      nir_def *level = img.base_level;
+      nir_def *extent[3] = {minify(b, img.width, level), minify(b, img.height, level),
+                            minify(b, img.depth, level)};
+      if (size) {
+         nir_def *out[4];
+         for (unsigned a = 0; a < dims; a++)
+            out[a] = extent[a];
+         unsigned n = dims;
+         if (array || cube) {
+            nir_def *layers = cube ? nir_udiv_imm(b, img.layer_count, 6) : img.layer_count;
+            if (array)
+               out[n++] = layers;
+         }
+         for (unsigned a = n; a < 4; a++)
+            out[a] = nir_imm_int(b, 1);
+         nir_def_replace(&i->def, nir_vec(b, out, i->def.num_components));
+         return true;
+      }
+      nir_def *index[3];
+      inside = nir_imm_true(b);
+      for (unsigned a = 0; a < 3; a++) {
+         index[a] = a < dims ? nir_channel(b, coord, a) : nir_imm_int(b, 0);
+         if (a < dims)
+            inside = nir_iand(b, inside, nir_ult(b, index[a], extent[a]));
+      }
+      nir_def *z = index[2];
+      if (!three_d) {
+         /* Cube images address a face (or face of a layer) as a layer. */
+         nir_def *layer = array || cube ? nir_channel(b, coord, dims) : nir_imm_int(b, 0);
+         inside = nir_iand(b, inside, nir_ult(b, layer, img.layer_count));
+         z = nir_iadd(b, img.base_layer, layer);
+      }
+      nir_def *offset = level_offset(b, &img, level);
+      nir_def *bytes = nir_iadd(b, offset, nir_iadd(b, nir_imul(b, z, plane_bytes(b, &img, level)),
+         nir_iadd(b, nir_imul(b, index[1], row_pitch(b, &img, level)), nir_imul(b, index[0], img.bytes))));
+      address = nir_build_addr_iadd(b, img.address, nir_address_format_2x32bit_global,
+                                    nir_var_mem_global, bytes);
+   }
+   nir_def *zero = nir_imm_zero(b, load ? 4 : 1, 32);
+   nir_push_if(b, inside);
+   nir_def *result = NULL;
+   if (load) {
+      result = decode_texel(b, &img, address);
+   } else if (store) {
+      nir_def *value = i->src[3].ssa;
+      nir_def *channels[4];
+      for (unsigned c = 0; c < 4; c++)
+         channels[c] = c < value->num_components ? nir_channel(b, value, c) : nir_imm_int(b, 0);
+      encode_texel(b, &img, address, nir_vec(b, channels, 4));
+   } else if (swap) {
+      result = nir_global_atomic_swap_2x32(b, 32, address, i->src[3].ssa, i->src[4].ssa,
+                                           .atomic_op = nir_intrinsic_atomic_op(i));
+   } else {
+      result = nir_global_atomic_2x32(b, 32, address, i->src[3].ssa,
+                                      .atomic_op = nir_intrinsic_atomic_op(i));
+   }
+   nir_pop_if(b, NULL);
+   if (store) {
+      nir_instr_remove(&i->instr);
+      return true;
+   }
+   nir_def *phi = nir_if_phi(b, result, zero);
+   nir_def_replace(&i->def, nir_trim_vector(b, phi, i->def.num_components));
+   return true;
+}
+
 bool
 apex_lower_textures(struct apex_program *program, nir_shader *nir)
 {
@@ -678,15 +867,16 @@ apex_lower_textures(struct apex_program *program, nir_shader *nir)
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex)
-               util_dynarray_append(&list, nir_instr_as_tex(instr));
+            if (instr->type == nir_instr_type_tex || instr->type == nir_instr_type_intrinsic)
+               util_dynarray_append(&list, instr);
          }
       }
    }
    bool progress = false;
    nir_builder b = nir_builder_create(nir_shader_get_entrypoint(nir));
-   util_dynarray_foreach(&list, nir_tex_instr *, tex)
-      progress |= lower_tex(&b, *tex, &ctx);
+   util_dynarray_foreach(&list, nir_instr *, instr)
+      progress |= (*instr)->type == nir_instr_type_tex ? lower_tex(&b, nir_instr_as_tex(*instr), &ctx) :
+                  lower_storage(&b, nir_instr_as_intrinsic(*instr), &ctx);
    util_dynarray_fini(&list);
    nir_progress(progress, nir_shader_get_entrypoint(nir), nir_metadata_none);
    return !ctx.invalid;

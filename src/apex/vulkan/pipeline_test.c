@@ -181,7 +181,8 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
-   CHECK(p->program.descriptor_count == 5 && p->program.set_offsets[0] == 0 && p->program.set_offsets[1] == 1);
+   CHECK(p->program.descriptor_count == (images ? 7 : 5) && p->program.set_offsets[0] == 0 &&
+         p->program.set_offsets[1] == 1);
    CHECK(p->program.push_size == 64);
    CHECK(p->layout->dynamic_descriptor_offset[1] == (dynamic ? 1 : 0));
    VkDescriptorSetLayout swapped[] = {sets[1], sets[0]};
@@ -291,7 +292,7 @@ test_rgba(struct vk_physical_device *physical, const char *path)
          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
-   CHECK(apex_pipeline_from_handle(pipeline)->program.descriptor_count == 2);
+   CHECK(apex_pipeline_from_handle(pipeline)->program.descriptor_count == 3); /* image: 2 rows */
    v->DestroyPipeline(dev, pipeline, NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);
    v->DestroyDescriptorSetLayout(dev, set, NULL);

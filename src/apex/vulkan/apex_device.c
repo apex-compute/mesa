@@ -26,7 +26,6 @@
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/u_debug.h"
-#include "util/os_time.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -275,7 +274,7 @@ static uint64_t
 dma_buf_size(int fd)
 {
    off_t size = lseek(fd, 0, SEEK_END);
-   if (size <= 0 || size > 64 * 1024 * 1024 || size % 4096 ||
+   if (size <= 0 || size > APEX_MAX_ALLOCATION || size % 4096 ||
        lseek(fd, 0, SEEK_SET) < 0)
       return 0;
    return size;
@@ -409,7 +408,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
          return VK_ERROR_FEATURE_NOT_PRESENT;
       /* Dedicated resources use ordinary storage with a zero binding offset. */
    }
-   if ((!info->allocationSize && (!import || types)) || info->allocationSize > 64 * 1024 * 1024) {
+   if ((!info->allocationSize && (!import || types)) || info->allocationSize > APEX_MAX_ALLOCATION) {
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
    struct apex_memory *mem = vk_device_memory_create(&device->vk, info, alloc, sizeof(*mem));
@@ -626,25 +625,41 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
 VkFormatFeatureFlags2
 apex_format_features(VkFormat format, bool buffer)
 {
+   if (format == VK_FORMAT_UNDEFINED)
+      return 0;
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
                                           VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
    const VkFormatFeatureFlags2 color = transfer | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+   enum pipe_format pformat = vk_format_to_pipe_format(format);
+   /* Storage texels encode and decode through the format words: the plain
+    * formats the fragment kernel can write, except sRGB. */
+   bool storage = !vk_format_is_depth_or_stencil(format) && !util_format_is_srgb(pformat) &&
+                  apex_attachment_format_supported(pformat);
+   bool storage_atomic = format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
    if (buffer) {
-      const struct util_format_description *desc =
-         util_format_description(vk_format_to_pipe_format(format));
+      const struct util_format_description *desc = util_format_description(pformat);
       if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.bits > 128 ||
-          util_format_is_srgb(vk_format_to_pipe_format(format)))
+          util_format_is_srgb(pformat))
          return 0;
+      uint32_t encoded[3];
+      VkFormatFeatureFlags2 features = 0;
+      if (apex_format_encode(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, encoded))
+         features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
+      if (storage)
+         features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+                     VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                     VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      if (storage_atomic)
+         features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+      /* Vertex fetch reads 8, 16 and 32-bit integer or FP32 channels. */
+      bool vertex = true;
       for (unsigned c = 0; c < desc->nr_channels; c++) {
          const struct util_format_channel_description *ch = &desc->channel[c];
          if (ch->size % 8 || ch->size > 32 || ch->type == UTIL_FORMAT_TYPE_FIXED ||
              (ch->type == UTIL_FORMAT_TYPE_FLOAT && ch->size != 32))
-            return 0;
+            vertex = false;
       }
-      uint32_t encoded[3];
-      return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT |
-             (apex_format_encode(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, encoded) ?
-              VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT : 0);
+      return features | (vertex ? VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT : 0);
    }
    VkFormatFeatureFlags2 features = 0;
    uint32_t encoded[3];
@@ -658,7 +673,12 @@ apex_format_features(VkFormat format, bool buffer)
       if (depth)
          features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
    }
-   enum pipe_format pformat = vk_format_to_pipe_format(format);
+   if (storage)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+   if (storage && storage_atomic)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
    if (vk_format_is_depth_or_stencil(format)) {
       switch (format) {
       case VK_FORMAT_D16_UNORM: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D32_SFLOAT:
@@ -673,10 +693,11 @@ apex_format_features(VkFormat format, bool buffer)
       if (!util_format_is_pure_integer(pformat))
          features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
    }
-   if (format == VK_FORMAT_R32_UINT)
-      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
-   if (format == VK_FORMAT_R8G8B8A8_UNORM)
-      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+   /* Blits run through vk_meta: sampled sources, rendered destinations. */
+   if (features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)
+      features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+   if (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))
+      features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
    return features;
 }
 
@@ -697,11 +718,10 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
       VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
       VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    if (features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)
-      usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-   /* Storage and attachment paths address 2D images only. */
-   if (info->type != VK_IMAGE_TYPE_2D)
-      usage &= ~(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+      usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+   if (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))
+      usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+   /* 1D images render as one row and 3D images as depth-slice layers. */
    /* Aliased or mutable images share one linear layout for identical parameters. */
    if (!features || info->type > VK_IMAGE_TYPE_3D ||
        (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
@@ -716,7 +736,7 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
    properties->imageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = {4096, info->type == VK_IMAGE_TYPE_1D ? 1 : 4096, three_d ? 2048 : 1},
       .maxMipLevels = 13, .maxArrayLayers = three_d ? 1 : 256,
-      .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = 64 * 1024 * 1024,
+      .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = APEX_MAX_ALLOCATION,
    };
    /* 4x multisampling: single-level 2D optimal attachments. */
    if (info->type == VK_IMAGE_TYPE_2D && info->tiling == VK_IMAGE_TILING_OPTIMAL &&
@@ -864,7 +884,7 @@ apex_CreateImageView(VkDevice dev, const VkImageViewCreateInfo *info,
    VK_FROM_HANDLE(apex_image, image, info->image);
    *out = VK_NULL_HANDLE;
    /* Views may reinterpret texels of the same size (mutable-format images). */
-   if (info->flags || !image ||
+   if ((info->flags & ~VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) || !image ||
        vk_format_get_blocksize(info->format) != vk_format_get_blocksize(image->vk.format))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    struct vk_image_view *view = vk_image_view_create(&device->vk, info, alloc, sizeof(*view));
@@ -1169,6 +1189,18 @@ write_template(struct apex_descriptor_set *set, const struct vk_descriptor_updat
       write_set(set, entry->binding, entry->array_element, entry->array_count, entry->type,
                 (const uint8_t *)data + entry->offset, entry->stride);
    }
+}
+
+/* Support is exactly successful layout creation. */
+static VKAPI_ATTR void VKAPI_CALL
+apex_GetDescriptorSetLayoutSupport(VkDevice dev, const VkDescriptorSetLayoutCreateInfo *info,
+                                   VkDescriptorSetLayoutSupport *support)
+{
+   VK_FROM_HANDLE(vk_device, device, dev);
+   VkDescriptorSetLayout layout;
+   support->supported = apex_CreateDescriptorSetLayout(dev, info, NULL, &layout) == VK_SUCCESS;
+   if (support->supported)
+      device->dispatch_table.DestroyDescriptorSetLayout(dev, layout, NULL);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1476,7 +1508,18 @@ push_compute(struct apex_command_buffer *cmd, struct apex_dispatch_parameters pa
 }
 
 static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDispatchBase(VkCommandBuffer handle, uint32_t ox, uint32_t oy, uint32_t oz,
+                     uint32_t x, uint32_t y, uint32_t z);
+
+static VKAPI_ATTR void VKAPI_CALL
 apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
+{
+   apex_CmdDispatchBase(handle, 0, 0, 0, x, y, z);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDispatchBase(VkCommandBuffer handle, uint32_t ox, uint32_t oy, uint32_t oz,
+                     uint32_t x, uint32_t y, uint32_t z)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    if (!x || !y || !z)
@@ -1497,7 +1540,7 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
    for (uint32_t first = 0; first < total; first += limit) {
       uint32_t count = MIN2(total - first, limit);
       push_compute(cmd, (struct apex_dispatch_parameters) {
-         .base = {first, first + count, count}, .groups = {x, y, z}}, count);
+         .base = {first, first + count, count}, .groups = {x, y, z}, .origin = {ox, oy, oz}}, count);
    }
 }
 
@@ -1630,6 +1673,14 @@ record_resolve(struct apex_command_buffer *cmd, const struct apex_image *src, ui
    uint32_t groups = DIV_ROUND_UP(items, 16), limit = MIN2(program->max_workgroups, 1024);
    for (uint32_t base = 0; base < groups; base += limit)
       push_job(cmd, program, NULL, MIN2(groups - base, limit), base, 0, words);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBlitImage2(VkCommandBuffer handle, const VkBlitImageInfo2 *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   vk_meta_blit_image2(&cmd->vk, &device->meta, info);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1860,7 +1911,9 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    if (!indirect && (!vertex_count || !instance_count))
       return;
-   uint32_t topology = dyn->ia.primitive_topology;
+   /* vk_meta rectangles arrive as two-triangle lists. */
+   uint32_t topology = dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA ?
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : dyn->ia.primitive_topology;
    uint32_t prims;
    switch (topology) {
    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: prims = vertex_count; break;
@@ -2703,6 +2756,16 @@ copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
    memcpy(cmd->push, push, sizeof(push));
 }
 
+/* A copy region's first layer and layer count: depth slices of 3D images. */
+static void
+region_layers(const struct apex_image *image, const VkImageSubresourceLayers *sub,
+              VkOffset3D offset, VkExtent3D extent, uint32_t *first, uint32_t *count)
+{
+   bool three_d = image->vk.image_type == VK_IMAGE_TYPE_3D;
+   *first = three_d ? offset.z : sub->baseArrayLayer;
+   *count = three_d ? extent.depth : vk_image_subresource_layer_count(&image->vk, sub);
+}
+
 static void
 copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
                    struct apex_image *image, unsigned count, const VkBufferImageCopy2 *regions,
@@ -2712,7 +2775,9 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
       const VkBufferImageCopy2 *r = &regions[i];
       struct vk_image_buffer_layout layout = vk_image_buffer_copy_layout(&image->vk, r);
       unsigned l = r->imageSubresource.mipLevel;
-      uint64_t image_va = image_address(image, l, r->imageSubresource.baseArrayLayer, r->imageOffset);
+      uint32_t first, layers;
+      region_layers(image, &r->imageSubresource, r->imageOffset, r->imageExtent, &first, &layers);
+      uint64_t image_va = image_address(image, l, first, r->imageOffset);
       uint64_t buffer_va = buffer->vk.device_address + r->bufferOffset;
       VkFormat format = image->vk.format;
       if (vk_format_has_depth(format) && vk_format_has_stencil(format)) {
@@ -2727,23 +2792,21 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
             copy_elements(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B, element,
                           texel_va, image->levels[l].row_stride, image->levels[l].slice_stride, texel,
                           element, ch->size == 32 ? ~0u : BITFIELD_MASK(ch->size), r->imageExtent,
-                          r->imageSubresource.layerCount);
+                          layers);
          else
             copy_elements(cmd, texel_va, image->levels[l].row_stride, image->levels[l].slice_stride,
                           texel, buffer_va, layout.row_stride_B, layout.image_stride_B, element,
-                          element, ~0u, r->imageExtent, r->imageSubresource.layerCount);
+                          element, ~0u, r->imageExtent, layers);
          continue;
       }
       if (to_image)
          copy_image_rows(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B,
                          image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
-                         r->imageExtent, r->imageSubresource.layerCount,
-                         image_pixel_bytes(image));
+                         r->imageExtent, layers, image_pixel_bytes(image));
       else
          copy_image_rows(cmd, image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
                          buffer_va, layout.row_stride_B, layout.image_stride_B,
-                         r->imageExtent, r->imageSubresource.layerCount,
-                         image_pixel_bytes(image));
+                         r->imageExtent, layers, image_pixel_bytes(image));
    }
 }
 
@@ -2774,12 +2837,17 @@ apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
    for (unsigned i = 0; i < info->regionCount; i++) {
       const VkImageCopy2 *r = &info->pRegions[i];
       unsigned sl = r->srcSubresource.mipLevel, dl = r->dstSubresource.mipLevel;
-      copy_image_rows(cmd, image_address(src, sl, r->srcSubresource.baseArrayLayer, r->srcOffset),
+      uint32_t src_first, dst_first, layers, unused;
+      region_layers(src, &r->srcSubresource, r->srcOffset, r->extent, &src_first, &layers);
+      region_layers(dst, &r->dstSubresource, r->dstOffset, r->extent, &dst_first, &unused);
+      /* 2D arrays and 3D images exchange layers for depth slices. */
+      layers = MAX2(layers, r->extent.depth);
+      VkExtent3D extent = {r->extent.width, r->extent.height, 1};
+      copy_image_rows(cmd, image_address(src, sl, src_first, r->srcOffset),
                       src->levels[sl].row_stride, src->levels[sl].slice_stride,
-                      image_address(dst, dl, r->dstSubresource.baseArrayLayer, r->dstOffset),
+                      image_address(dst, dl, dst_first, r->dstOffset),
                       dst->levels[dl].row_stride, dst->levels[dl].slice_stride,
-                      r->extent, r->srcSubresource.layerCount,
-                      image_pixel_bytes(src));
+                      extent, layers, image_pixel_bytes(src));
    }
 }
 
@@ -2950,6 +3018,7 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
    case VK_DESCRIPTOR_TYPE_SAMPLER:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
       const VkDescriptorImageInfo *info = value;
       bool sampler = binding->type == VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -2986,27 +3055,6 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
          for (unsigned w = 0; row && w < 8; w++)
             out[w] = util_cpu_to_le32(row[w]);
       }
-      return true;
-   }
-   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
-      const VkDescriptorImageInfo *info = value;
-      VK_FROM_HANDLE(vk_image_view, view, info->imageView);
-      if (!view)
-         return true;
-      struct apex_image *image = (void *)view->image;
-      if (!image->memory)
-         return false;
-      unsigned l = view->base_mip_level;
-      uint64_t va = image->memory->storage->bo.va + image->offset + image->levels[l].offset +
-                    (uint64_t)view->base_array_layer * image->levels[l].slice_stride;
-      rows->image = (struct apex_image_descriptor) {
-         util_cpu_to_le32(va), util_cpu_to_le32(va >> 32),
-         util_cpu_to_le32(u_minify(image->vk.extent.width, l)),
-         util_cpu_to_le32(u_minify(image->vk.extent.height, l)),
-         util_cpu_to_le32(view->layer_count),
-         util_cpu_to_le32(image->levels[l].row_stride),
-         util_cpu_to_le32(image->levels[l].slice_stride), 0,
-      };
       return true;
    }
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
@@ -3069,6 +3117,8 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
    }
    for (unsigned w = 0; w < 2; w++)
       parameters->indirect[w] = util_cpu_to_le32(dispatch->parameters.indirect[w]);
+   for (unsigned axis = 0; axis < 3; axis++)
+      parameters->origin[axis] = util_cpu_to_le32(dispatch->parameters.origin[axis]);
    if (dispatch->graphics) {
       uint32_t *draw = (void *)(parameters + 1);
       for (unsigned i = 0; i < APEX_DRAW_WORDS; i++)
@@ -3488,6 +3538,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .ResetDescriptorPool = apex_ResetDescriptorPool, .AllocateDescriptorSets = apex_AllocateDescriptorSets,
       .FreeDescriptorSets = apex_FreeDescriptorSets, .UpdateDescriptorSets = apex_UpdateDescriptorSets,
       .UpdateDescriptorSetWithTemplate = apex_UpdateDescriptorSetWithTemplate,
+      .GetDescriptorSetLayoutSupport = apex_GetDescriptorSetLayoutSupport,
       .CmdPushDescriptorSet2 = apex_CmdPushDescriptorSet2,
       .CmdPushDescriptorSetWithTemplate2 = apex_CmdPushDescriptorSetWithTemplate2,
       .BeginCommandBuffer = apex_BeginCommandBuffer, .EndCommandBuffer = apex_EndCommandBuffer,
@@ -3501,7 +3552,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdCopyImageToBuffer2 = apex_CmdCopyImageToBuffer2,
       .CmdCopyImage2 = apex_CmdCopyImage2, .CmdClearColorImage = apex_CmdClearColorImage,
       .CmdBeginRendering = apex_CmdBeginRendering, .CmdEndRendering = apex_CmdEndRendering,
-      .CmdResolveImage2 = apex_CmdResolveImage2,
+      .CmdResolveImage2 = apex_CmdResolveImage2, .CmdBlitImage2 = apex_CmdBlitImage2,
+      .CmdDispatchBase = apex_CmdDispatchBase,
       .CmdClearAttachments = apex_CmdClearAttachments,
       .CmdClearDepthStencilImage = apex_CmdClearDepthStencilImage,
       .CmdBindVertexBuffers2 = apex_CmdBindVertexBuffers2,
@@ -3577,6 +3629,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; i++)
       device->meta.buffer_access.optimal_wg_size[i] = 16;
    device->meta.cmd_bind_map_buffer = bind_map_upload;
+   /* Meta draws rectangles with its own vertex shader writing gl_Layer. */
+   device->meta.use_rect_list_pipeline = true;
+   device->meta.use_gs_for_layer = false;
    device->queue.driver_submit = submit_queue;
    if (async) {
       struct drm_syncobj_create create = {0};

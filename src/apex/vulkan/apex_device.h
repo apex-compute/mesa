@@ -19,6 +19,8 @@ enum apex_internal {
 
 /* Host table limits; descriptors are ordinary LOCAL memory. */
 #define APEX_MAX_DESCRIPTORS 4096
+/* Largest allocation: the per-client page tables map about 1 GiB. */
+#define APEX_MAX_ALLOCATION (1024ull * 1024 * 1024)
 #define APEX_MAX_BINDINGS 1024
 #define APEX_MAX_PUSH_CONSTANTS 256
 #define APEX_EXTERNAL_MEMORY_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | \
@@ -56,12 +58,14 @@ union apex_descriptor {
 /* Immutable trailer after descriptors and push constants, in little endian. */
 /* Compute jobs: base = first and end linear workgroup and the launch stride,
  * groups = API grid, indirect = VkDispatchIndirectCommand address supplying
- * the grid (zero for direct jobs). Graphics jobs use base[0] and groups[0..1]
- * as their launch range. */
+ * the grid (zero for direct jobs), origin = vkCmdDispatchBase offset. Graphics
+ * jobs use base[0] and groups[0..1] as their launch range. */
 struct apex_dispatch_parameters {
    uint32_t base[3];
    uint32_t groups[3];
    uint32_t indirect[2];
+   uint32_t origin[3];
+   uint32_t reserved;
 };
 
 struct apex_bo {

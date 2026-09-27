@@ -15,7 +15,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
 const uint TRAILER = 8u;
-const uint DRAW = TRAILER + 8u;
+const uint DRAW = TRAILER + 12u;
 
 uint64_t address(uint i) { return uint64_t(root[DRAW + i]) | (uint64_t(root[DRAW + i + 1u]) << 32); }
 // Dynamic words of indirect draws live in the resolved parameter block.
