@@ -4,6 +4,7 @@
 #include "apex_pipeline.h"
 #include "vk_shader.h"
 #include "compiler/shader_enums.h"
+#include "apex_draw.h"
 
 /* A graphics stage compiled to one native program. Vertex records hold the
  * clip position then each written generic location; `slot` maps varying
@@ -24,7 +25,8 @@ extern const struct vk_device_shader_ops apex_device_shader_ops;
 void apex_cmd_bind_shaders(struct vk_command_buffer *cmd, uint32_t count,
                            const mesa_shader_stage *stages, struct vk_shader **const shaders);
 
-/* Device-owned internal triangle setup program, compiled on first use. */
-VkResult apex_setup_program(struct apex_device *device, struct apex_program **out);
+/* Device-owned internal programs, compiled on first use. */
+VkResult apex_internal_program(struct apex_device *device, enum apex_internal which,
+                               struct apex_program **out);
 void apex_graphics_finish(struct apex_device *device);
 #endif

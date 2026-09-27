@@ -6,6 +6,9 @@
  * perspective-correct interpolation for every pixel. */
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -117,7 +120,9 @@ reference(struct reference *out)
 int
 main(int argc, char **argv)
 {
-   CHECK(argc == 4);
+   /* --export reads results through an exported dma-buf, as KMS scanout does. */
+   CHECK(argc == 4 || (argc == 5 && !strcmp(argv[4], "--export")));
+   const bool export = argc == 5;
    setenv("APEX_DEVELOPMENT", "1", 1);
    setenv("VK_DRIVER_FILES", argv[1], 1);
    size_t vs_size, fs_size;
@@ -141,11 +146,14 @@ main(int argc, char **argv)
    VkPhysicalDeviceMemoryProperties memory;
    GetPhysicalDeviceMemoryProperties(physical, &memory);
    VkDevice device;
+   const char *extensions[] = {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME};
    VK(CreateDevice(physical, &(VkDeviceCreateInfo){
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
          .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
          .pQueuePriorities = &(float){1.0f}},
+      .enabledExtensionCount = export ? 3 : 0, .ppEnabledExtensionNames = extensions,
    }, NULL, &device));
 #define GD(name) PFN_vk##name name = (PFN_vk##name)GetDeviceProcAddr(device, "vk" #name); CHECK(name)
    GD(GetDeviceQueue); GD(CreateBuffer); GD(GetBufferMemoryRequirements); GD(AllocateMemory);
@@ -188,7 +196,38 @@ main(int argc, char **argv)
    VK(CreateBuffer(device, &(VkBufferCreateInfo){
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = WIDTH * HEIGHT * 8,
       .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT}, NULL, &readback));
-   VK(BindBufferMemory(device, readback, allocation, color_offset));
+   uint8_t *exported = NULL;
+   int export_fd = -1;
+   if (export) {
+      GD(GetMemoryFdKHR);
+      uint32_t device_type = UINT32_MAX;
+      for (uint32_t i = 0; i < memory.memoryTypeCount && device_type == UINT32_MAX; i++)
+         if (memory.memoryTypes[i].propertyFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            device_type = i;
+      CHECK(device_type != UINT32_MAX);
+      VkDeviceMemory shared;
+      VK(AllocateMemory(device, &(VkMemoryAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = WIDTH * HEIGHT * 8,
+         .memoryTypeIndex = device_type,
+         .pNext = &(VkExportMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT}}, NULL, &shared));
+      VK(GetMemoryFdKHR(device, &(VkMemoryGetFdInfoKHR){
+         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = shared,
+         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT}, &export_fd));
+      exported = mmap(NULL, WIDTH * HEIGHT * 8, PROT_READ, MAP_SHARED, export_fd, 0);
+      CHECK(exported != MAP_FAILED);
+      VkBuffer external;
+      VK(CreateBuffer(device, &(VkBufferCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = WIDTH * HEIGHT * 8,
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+         .pNext = &(VkExternalMemoryBufferCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT}}, NULL, &external));
+      VK(BindBufferMemory(device, external, shared, 0));
+      readback = external;
+   } else {
+      VK(BindBufferMemory(device, readback, allocation, color_offset));
+   }
 
    const VkFormat formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT};
    VkImage images[2];
@@ -317,6 +356,11 @@ main(int argc, char **argv)
       VK_NULL_HANDLE));
    VK(QueueWaitIdle(queue));
    VK(InvalidateMappedMemoryRanges(device, 1, &whole));
+   if (export) {
+      struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+      CHECK(!ioctl(export_fd, DMA_BUF_IOCTL_SYNC, &sync));
+      memcpy(mapped + color_offset, exported, WIDTH * HEIGHT * 8);
+   }
 
    struct reference *expected = calloc(WIDTH * HEIGHT, sizeof(*expected));
    CHECK(expected);

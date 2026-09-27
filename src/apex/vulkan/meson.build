@@ -6,10 +6,16 @@ apex_setup_spv_h = custom_target('apex_setup_spv',
              '-I' + meson.current_source_dir(), '--vn', 'apex_setup_spv', '@INPUT@', '-o', '@OUTPUT@'],
   depend_files : files('apex_draw.h'),
 )
+apex_copy_spv_h = custom_target('apex_copy_spv',
+  input : 'copy.comp', output : 'apex_copy_spv.h',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
+             '-I' + meson.current_source_dir(), '--vn', 'apex_copy_spv', '@INPUT@', '-o', '@OUTPUT@'],
+  depend_files : files('apex_draw.h'),
+)
 apex_pipeline = static_library('apex_pipeline',
-  ['apex_pipeline.c', 'apex_device.c', 'apex_graphics.c', apex_setup_spv_h],
+  ['apex_pipeline.c', 'apex_device.c', 'apex_graphics.c', apex_setup_spv_h, apex_copy_spv_h],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime_headers, idep_nir],
+  dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, idep_nir],
 )
 apex_entrypoints = custom_target('apex_entrypoints',
   input : [vk_entrypoints_gen, vk_api_xml],
@@ -22,12 +28,12 @@ apex_entrypoints = custom_target('apex_entrypoints',
 # Uninstalled development driver: instance creation requires APEX_DEVELOPMENT=1.
 apex_instance = static_library('apex_instance', ['apex_instance.c', apex_entrypoints],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime_headers, dep_libdrm],
+  dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, dep_libdrm],
 )
 apex_icd = shared_library('vulkan_apex',
   link_whole : [apex_instance],
   link_with : [apex_pipeline, apex_nir, apex_rs],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil, dep_libdrm],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil, dep_libdrm],
   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections],
   link_depends : vulkan_icd_link_depends,
   link_language : 'cpp', gnu_symbol_visibility : 'hidden', install : false,
@@ -43,7 +49,7 @@ apex_development_icd = custom_target('apex_development_icd',
 )
 apex_instance_test = executable('apex-instance-test', ['instance_test.c', apex_entrypoints[0]],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil, dep_libdrm, dep_dl],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil, dep_libdrm, dep_dl],
   link_with : [apex_instance, apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=drmGetDevices2', '-Wl,--wrap=drmFreeDevices',
                '-Wl,--wrap=drmGetVersion', '-Wl,--wrap=drmFreeVersion',
@@ -107,7 +113,7 @@ apex_multiple_spv = custom_target('apex-multiple-spv',
 )
 apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_language : 'cpp', install : false,
 )
@@ -133,7 +139,7 @@ test('apex-pipeline', apex_pipeline_test,
   args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv], suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
@@ -142,7 +148,7 @@ test('apex-command', apex_command_test, args : [apex_pipeline_spv], suite : ['ap
 test('apex-image-command', apex_command_test, args : [apex_images_spv, '--images'], suite : ['apex'])
 apex_external_memory_test = executable('apex-external-memory-test', 'external_memory_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
@@ -150,7 +156,7 @@ apex_external_memory_test = executable('apex-external-memory-test', 'external_me
 test('apex-external-memory', apex_external_memory_test, suite : ['apex'])
 apex_async_test = executable('apex-async-test', 'async_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
@@ -158,7 +164,7 @@ apex_async_test = executable('apex-async-test', 'async_test.c',
 test('apex-async', apex_async_test, args : [apex_pipeline_spv], suite : ['apex'])
 apex_sync_test = executable('apex-sync-test', 'sync_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_args : ['-Wl,--wrap=cnd_wait'],
   link_language : 'cpp', install : false,
 )
@@ -178,3 +184,6 @@ foreach stage : ['vert', 'frag']
     build_by_default : true,
   )
 endforeach
+apex_present_test = executable('apex-present-test', 'present_test.c',
+  include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
+)

@@ -8,6 +8,7 @@
 #include "vk_limits.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
+#include "wsi_common.h"
 #include "util/log.h"
 #include "util/os_misc.h"
 #include <fcntl.h>
@@ -26,6 +27,9 @@ struct apex_physical_device {
    bool host_coherent;
    struct vk_sync_type sync_type;
    const struct vk_sync_type *sync_types[2];
+   /* Presentation through Mesa's display WSI on the device's primary node. */
+   struct wsi_device wsi_device;
+   int display_fd;
 };
 VK_DEFINE_HANDLE_CASTS(apex_physical_device, vk.base, VkPhysicalDevice,
                       VK_OBJECT_TYPE_PHYSICAL_DEVICE);
@@ -36,6 +40,10 @@ static const struct vk_instance_extension_table instance_extensions = {
    .KHR_external_semaphore_capabilities = true,
    .KHR_external_fence_capabilities = true,
    .EXT_debug_utils = true,
+   .KHR_surface = true,
+   .KHR_display = true,
+   .KHR_get_surface_capabilities2 = true,
+   .KHR_get_display_properties2 = true,
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -194,11 +202,24 @@ apex_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    return VK_SUCCESS;
 }
 
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+wsi_proc_addr(VkPhysicalDevice physical, const char *name)
+{
+   VK_FROM_HANDLE(apex_physical_device, device, physical);
+   return vk_instance_get_proc_addr_unchecked(device->vk.instance, name);
+}
+
 static void
 destroy_physical(struct vk_physical_device *vk)
 {
    struct apex_physical_device *physical = (void *)vk;
    const VkAllocationCallbacks *alloc = &vk->instance->alloc;
+   if (physical->vk.wsi_device) {
+      physical->vk.wsi_device = NULL;
+      wsi_device_finish(&physical->wsi_device, alloc);
+   }
+   if (physical->display_fd >= 0)
+      close(physical->display_fd);
    vk_physical_device_finish(vk);
    vk_free(alloc, physical->render_node);
    vk_free(alloc, physical);
@@ -238,7 +259,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    struct vk_physical_device_dispatch_table dispatch;
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &apex_physical_device_entrypoints, true);
+   vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &wsi_physical_device_entrypoints, false);
    const struct vk_device_extension_table extensions = {
+      .KHR_swapchain = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .KHR_get_memory_requirements2 = true,
       .KHR_dedicated_allocation = true,
       .KHR_external_memory = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
@@ -291,6 +314,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .minUniformBufferOffsetAlignment = 4,
       .minStorageBufferOffsetAlignment = 4,
       .nonCoherentAtomSize = 1,
+      .optimalBufferCopyOffsetAlignment = 64,
+      .optimalBufferCopyRowPitchAlignment = 64,
       /* Descriptor bounds are checked without rounding, per 32-bit component. */
       .robustStorageBufferAccessSizeAlignment = 1,
       .robustUniformBufferAccessSizeAlignment = 1,
@@ -322,6 +347,21 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    physical->host_coherent = caps.capabilities & APEX_DRM_CAP_HOST_COHERENT;
    physical->sync_types[0] = &physical->sync_type;
    physical->vk.supported_sync_types = physical->sync_types;
+   /* Swapchain images blit into exported PRIME buffers that KMS scans out;
+    * the primary node needs the video group or seat access. */
+   physical->display_fd = -1;
+   if (instance->enabled_extensions.KHR_display && (drm->available_nodes & (1 << DRM_NODE_PRIMARY)))
+      physical->display_fd = open(drm->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
+   result = wsi_device_init(&physical->wsi_device, apex_physical_device_to_handle(physical),
+                            wsi_proc_addr, &instance->alloc, physical->display_fd, NULL,
+                            &(struct wsi_device_options){.sw_device = false});
+   if (result != VK_SUCCESS) {
+      destroy_physical(&physical->vk);
+      return result;
+   }
+   physical->wsi_device.supports_scanout = false;
+   physical->wsi_device.supports_modifiers = false;
+   physical->vk.wsi_device = &physical->wsi_device;
    *out = &physical->vk;
    return VK_SUCCESS;
 }
@@ -341,6 +381,7 @@ apex_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallback
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    struct vk_instance_dispatch_table dispatch;
    vk_instance_dispatch_table_from_entrypoints(&dispatch, &apex_instance_entrypoints, true);
+   vk_instance_dispatch_table_from_entrypoints(&dispatch, &wsi_instance_entrypoints, false);
    VkResult result = vk_instance_init(instance, &instance_extensions, &dispatch, info, alloc);
    if (result != VK_SUCCESS) {
       vk_free(alloc, instance);
@@ -348,7 +389,7 @@ apex_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallback
    }
    instance->physical_devices.try_create_for_drm = try_create_physical;
    instance->physical_devices.destroy = destroy_physical;
-   mesa_logw("Apex development driver: incomplete and non-conformant; no WSI");
+   mesa_logw("Apex development driver: incomplete and non-conformant");
    *out = vk_instance_to_handle(instance);
    return VK_SUCCESS;
 }

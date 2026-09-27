@@ -1,0 +1,41 @@
+#version 450
+// Pitched copy of 32-bit words: one invocation per 64-word chunk of a row.
+// Trailer words after the dispatch parameters (see apex_draw.h):
+// source/destination address, row and slice pitches, words per row, rows
+// and layers. Addresses and pitches are 4-byte aligned.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_draw.h"
+// One wave per workgroup keeps each launch far below the watchdog.
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint TRAILER = 8u;
+const uint COPY = TRAILER + 6u;
+
+uint word(uint i) { return root[COPY + i]; }
+uint64_t address(uint i) { return uint64_t(word(i)) | (uint64_t(word(i + 1u)) << 32); }
+
+void main()
+{
+   uint count = word(APEX_COPY_WORDS);
+   uint chunks = (count + 63u) / 64u;
+   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
+   uint rows = word(APEX_COPY_ROWS);
+   if (item >= chunks * rows * word(APEX_COPY_LAYERS))
+      return;
+   uint row = item / chunks;
+   uint chunk = item - row * chunks;
+   uint layer = row / rows;
+   row -= layer * rows;
+   uint64_t src = address(APEX_COPY_SRC) + uint64_t(layer) * word(APEX_COPY_SRC_SLICE) +
+                  uint64_t(row) * word(APEX_COPY_SRC_ROW);
+   uint64_t dst = address(APEX_COPY_DST) + uint64_t(layer) * word(APEX_COPY_DST_SLICE) +
+                  uint64_t(row) * word(APEX_COPY_DST_ROW);
+   Words from = Words(src), to = Words(dst);
+   uint end = min(count, chunk * 64u + 64u);
+   for (uint i = chunk * 64u; i < end; i++)
+      to.w[i] = from.w[i];
+}

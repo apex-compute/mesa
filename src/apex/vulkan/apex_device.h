@@ -9,6 +9,8 @@
 
 enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 
+enum apex_internal { APEX_INTERNAL_SETUP, APEX_INTERNAL_COPY, APEX_INTERNAL_COUNT };
+
 /* Host table limits; descriptors are ordinary LOCAL memory. */
 #define APEX_MAX_DESCRIPTORS 4096
 #define APEX_MAX_BINDINGS 1024
@@ -71,8 +73,8 @@ struct apex_device {
    uint32_t completion;
    uint64_t point;
    struct list_head retired;
-   /* Internal triangle setup program, compiled on first draw. */
-   struct apex_program *setup;
+   /* Internal programs, compiled on first use. */
+   struct apex_program *internal[APEX_INTERNAL_COUNT];
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 

@@ -308,7 +308,7 @@ int main(void)
       VkImage image;
       CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
       v->GetImageMemoryRequirements(dev, image, &req);
-      CHECK(req.memoryTypeBits == (coherent ? 5 : 3));
+      CHECK(req.memoryTypeBits == (coherent ? 7 : 3));
       CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
       ai.pNext = &export;
       CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_ERROR_INVALID_EXTERNAL_HANDLE);

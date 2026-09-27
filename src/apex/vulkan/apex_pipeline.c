@@ -5,6 +5,10 @@
 #include "compiler/spirv/nir_spirv.h"
 #include "vk_device.h"
 #include "vk_log.h"
+#include "util/log.h"
+#include "util/os_misc.h"
+#include "util/u_atomic.h"
+#include <stdio.h>
 
 struct descriptor_lowering {
    struct apex_program *program;
@@ -419,8 +423,23 @@ apex_program_compile(struct vk_device *device, struct apex_program *program, nir
    if (apex_from_nir(nir, &program->code))
       return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex compile: %s", program->code.diagnostic);
-   uint32_t private_bytes;
+   uint32_t private_bytes, instructions, vector;
    memcpy(&private_bytes, program->code.data + 28, sizeof(private_bytes));
+   memcpy(&instructions, program->code.data + 8, sizeof(instructions));
+   memcpy(&vector, program->code.data + 20, sizeof(vector));
+   mesa_logd("Apex program: %u instructions, v%u, %u private bytes/lane, %u invocations",
+             instructions, vector, private_bytes, (unsigned)invocations);
+   const char *dump = os_get_option("APEX_DUMP_PROGRAMS");
+   if (dump) {
+      static unsigned serial;
+      char path[512];
+      snprintf(path, sizeof(path), "%s/program-%u.apx", dump, p_atomic_inc_return(&serial));
+      FILE *f = fopen(path, "wb");
+      if (f) {
+         fwrite(program->code.data, 1, program->code.size, f);
+         fclose(f);
+      }
+   }
    uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
    /* GPUVM reserves the low 2 MiB for this dispatch's padded private data. */
    program->max_workgroups = program->table && extent ?

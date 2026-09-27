@@ -111,7 +111,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(create(&info, NULL, &instance) == VK_ERROR_INCOMPATIBLE_DRIVER);
    CHECK(instance == VK_NULL_HANDLE);
    CHECK(!setenv("APEX_DEVELOPMENT", "1", 1));
-   const char *unsupported = "VK_KHR_surface";
+   const char *unsupported = "VK_KHR_xcb_surface";
    info.enabledExtensionCount = 1;
    info.ppEnabledExtensionNames = &unsupported;
    CHECK(create(&info, NULL, &instance) == VK_ERROR_EXTENSION_NOT_PRESENT);

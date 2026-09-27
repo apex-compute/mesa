@@ -55,6 +55,18 @@
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */
 #define APEX_PRIM_WORDS 40
+#define APEX_TILES_PER_WORKGROUP 4 /* per fragment job: bounded launch runtime */
 #define APEX_SUBPRIMS 8               /* a clipped triangle fans into at most 7 */
+
+/* Internal pitched copy job words (in place of the draw block). */
+#define APEX_COPY_SRC 0
+#define APEX_COPY_DST 2
+#define APEX_COPY_SRC_ROW 4
+#define APEX_COPY_DST_ROW 5
+#define APEX_COPY_SRC_SLICE 6
+#define APEX_COPY_DST_SLICE 7
+#define APEX_COPY_WORDS 8             /* 32-bit words per row */
+#define APEX_COPY_ROWS 9
+#define APEX_COPY_LAYERS 10
 
 #endif

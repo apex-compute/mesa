@@ -20,6 +20,7 @@
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "vk_sampler.h"
+#include "wsi_common.h"
 #include "util/format/u_format.h"
 #include "util/os_time.h"
 #include <errno.h>
@@ -382,12 +383,16 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    if ((import && (import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
                    import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ||
        (types & ~APEX_EXTERNAL_MEMORY_TYPES) ||
-       ((import || types) && (!device->prime_coherent || info->memoryTypeIndex != 1)))
+       /* Imports use the device-only type. Export also admits explicit-transfer
+        * type 0: after first export shmem is canonical and transfers only wait. */
+       ((import || types) && (!device->prime_coherent ||
+                              (info->memoryTypeIndex != 1 && (import || info->memoryTypeIndex != 0)))))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    vk_foreach_struct_const(sType, ext, info->pNext) {
       if (sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO &&
           sType != VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR &&
-          sType != VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO)
+          sType != VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO &&
+          sType != VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       /* Dedicated resources use ordinary storage with a zero binding offset. */
    }
@@ -651,7 +656,8 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
       usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
    if (!features || info->type != VK_IMAGE_TYPE_2D ||
        (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
-       info->flags || (info->usage & ~usage))
+       /* Aliased images share one linear layout for identical parameters. */
+       (info->flags & ~VK_IMAGE_CREATE_ALIAS_BIT) || (info->usage & ~usage))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
@@ -726,8 +732,10 @@ apex_DestroyImage(VkDevice dev, VkImage handle, const VkAllocationCallbacks *all
 static void
 image_memory_requirements(struct apex_device *device, VkDeviceSize size, VkMemoryRequirements2 *out)
 {
+   /* Images may also live in device-only PRIME-capable storage. */
    out->memoryRequirements = (VkMemoryRequirements) {
-      .size = size, .alignment = 64, .memoryTypeBits = host_memory_types(device),
+      .size = size, .alignment = 64,
+      .memoryTypeBits = host_memory_types(device) | (device->prime_coherent ? 2 : 0),
    };
    VkMemoryDedicatedRequirements *dedicated = vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
    if (dedicated) {
@@ -829,6 +837,21 @@ apex_DestroySampler(VkDevice dev, VkSampler handle, const VkAllocationCallbacks 
    VK_FROM_HANDLE(vk_sampler, sampler, handle);
    if (sampler)
       vk_sampler_destroy(&device->vk, alloc, sampler);
+}
+
+/* Query pools exist for API object lifetime; no query types execute yet. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+apex_CreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo *info,
+                     const VkAllocationCallbacks *alloc, VkQueryPool *out)
+{
+   *out = VK_NULL_HANDLE;
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+/* No pool is ever created, so only VK_NULL_HANDLE reaches destruction. */
+static VKAPI_ATTR void VKAPI_CALL
+apex_DestroyQueryPool(VkDevice dev, VkQueryPool handle, const VkAllocationCallbacks *alloc)
+{
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -1438,7 +1461,7 @@ apex_CmdBindIndexBuffer2(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize o
 static void
 push_job(struct apex_command_buffer *cmd, struct apex_program *program,
          struct apex_bound_set *const *sets, uint32_t groups, uint32_t base,
-         const uint32_t *draw)
+         uint32_t end, const uint32_t *draw)
 {
    struct apex_dispatch *job = vk_zalloc(&cmd->vk.pool->alloc, sizeof(*job), 8,
                                          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -1448,7 +1471,7 @@ push_job(struct apex_command_buffer *cmd, struct apex_program *program,
    }
    job->program = program;
    job->groups = groups;
-   job->parameters = (struct apex_dispatch_parameters){.base = {base}, .groups = {groups, 1, 1}};
+   job->parameters = (struct apex_dispatch_parameters){.base = {base}, .groups = {groups, end, 1}};
    memcpy(job->push, cmd->graphics_push, sizeof(job->push));
    job->graphics = true;
    memcpy(job->draw, draw, sizeof(job->draw));
@@ -1492,7 +1515,7 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       return;
    }
    struct apex_program *setup;
-   VkResult result = apex_setup_program(device, &setup);
+   VkResult result = apex_internal_program(device, APEX_INTERNAL_SETUP, &setup);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
@@ -1590,19 +1613,24 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    uint32_t limit = MIN2(vs->max_workgroups, 1024);
    uint32_t vertex_groups = DIV_ROUND_UP(vertices, 64);
    for (uint32_t base = 0; base < vertex_groups; base += limit)
-      push_job(cmd, vs, cmd->graphics_sets, MIN2(vertex_groups - base, limit), base, draw);
+      push_job(cmd, vs, cmd->graphics_sets, MIN2(vertex_groups - base, limit), base, 0, draw);
    if (dyn->rs.rasterizer_discard_enable || !prims)
       return;
    uint32_t setup_groups = DIV_ROUND_UP((uint64_t)prims * instance_count, 64);
    limit = MIN2(setup->max_workgroups, 1024);
    for (uint32_t base = 0; base < setup_groups; base += limit)
-      push_job(cmd, setup, NULL, MIN2(setup_groups - base, limit), base, draw);
+      push_job(cmd, setup, NULL, MIN2(setup_groups - base, limit), base, 0, draw);
    uint32_t tiles = (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 2], 4) - draw[APEX_DRAW_SCISSOR] / 4) *
                     (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 3], 4) - draw[APEX_DRAW_SCISSOR + 1] / 4);
    if (!tiles)
       return;
+   /* The launch watchdog bounds each workgroup: a fragment job walks at most
+    * APEX_TILES_PER_WORKGROUP tiles per workgroup. */
    struct apex_program *fs = &cmd->fragment->program;
-   push_job(cmd, fs, cmd->graphics_sets, MIN3(tiles, fs->max_workgroups, 1024), 0, draw);
+   uint32_t groups = MIN3(tiles, fs->max_workgroups, 1024);
+   for (uint32_t base = 0; base < tiles; base += groups * APEX_TILES_PER_WORKGROUP)
+      push_job(cmd, fs, cmd->graphics_sets, MIN2(groups, tiles - base), base,
+               MIN2(tiles, base + groups * APEX_TILES_PER_WORKGROUP), draw);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1697,6 +1725,31 @@ copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
                 uint32_t pixel)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
+   uint64_t row_bytes = (uint64_t)extent.width * pixel;
+   struct apex_program *copy;
+   /* Word-aligned regions copy in few jobs: one invocation per 64-word chunk. */
+   if (!((src | dst | src_row | dst_row | src_slice | dst_slice | row_bytes) & 3) &&
+       src_slice <= UINT32_MAX && dst_slice <= UINT32_MAX &&
+       apex_internal_program(device, APEX_INTERNAL_COPY, &copy) == VK_SUCCESS) {
+      uint32_t words[APEX_DRAW_WORDS] = {0};
+      words[APEX_COPY_SRC] = src;
+      words[APEX_COPY_SRC + 1] = src >> 32;
+      words[APEX_COPY_DST] = dst;
+      words[APEX_COPY_DST + 1] = dst >> 32;
+      words[APEX_COPY_SRC_ROW] = src_row;
+      words[APEX_COPY_DST_ROW] = dst_row;
+      words[APEX_COPY_SRC_SLICE] = src_slice;
+      words[APEX_COPY_DST_SLICE] = dst_slice;
+      words[APEX_COPY_WORDS] = row_bytes / 4;
+      words[APEX_COPY_ROWS] = extent.height;
+      words[APEX_COPY_LAYERS] = layers;
+      uint64_t chunks = DIV_ROUND_UP(row_bytes / 4, 64) * extent.height * layers;
+      uint32_t groups = DIV_ROUND_UP(chunks, 16);
+      uint32_t limit = MIN2(copy->max_workgroups, 1024);
+      for (uint32_t base = 0; base < groups; base += limit)
+         push_job(cmd, copy, NULL, MIN2(groups - base, limit), base, 0, words);
+      return;
+   }
    struct apex_pipeline *pipeline = cmd->pipeline;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    memcpy(push, cmd->push, sizeof(push));
@@ -1704,8 +1757,8 @@ copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
       for (unsigned y = 0; y < extent.height; y++) {
          VkDeviceMemoryCopyKHR region = {
             .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
-            .srcRange = {.address = src + z * src_slice + (uint64_t)y * src_row, .size = (uint64_t)extent.width * pixel},
-            .dstRange = {.address = dst + z * dst_slice + (uint64_t)y * dst_row, .size = (uint64_t)extent.width * pixel},
+            .srcRange = {.address = src + z * src_slice + (uint64_t)y * src_row, .size = row_bytes},
+            .dstRange = {.address = dst + z * dst_slice + (uint64_t)y * dst_row, .size = row_bytes},
          };
          VkCopyDeviceMemoryInfoKHR info = {
             .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR, .regionCount = 1, .pRegions = &region,
@@ -2282,6 +2335,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .GetImageSubresourceLayout = apex_GetImageSubresourceLayout,
       .CreateImageView = apex_CreateImageView, .DestroyImageView = apex_DestroyImageView,
       .CreateSampler = apex_CreateSampler, .DestroySampler = apex_DestroySampler,
+      .CreateQueryPool = apex_CreateQueryPool, .DestroyQueryPool = apex_DestroyQueryPool,
       .CreateDescriptorSetLayout = apex_CreateDescriptorSetLayout,
       .CreateDescriptorPool = apex_CreateDescriptorPool, .DestroyDescriptorPool = apex_DestroyDescriptorPool,
       .ResetDescriptorPool = apex_ResetDescriptorPool, .AllocateDescriptorSets = apex_AllocateDescriptorSets,
@@ -2312,6 +2366,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    vk_device_dispatch_table_from_entrypoints(&dispatch,
       &vk_cmd_enqueue_unless_primary_device_entrypoints, true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &entrypoints, false);
+   vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
    VkResult result = vk_device_init(&device->vk, physical, &dispatch, info, alloc);
    if (result != VK_SUCCESS)
       return result;
@@ -2324,7 +2379,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->host_coherent = host_coherent;
    device->completion = 0;
    device->point = 0;
-   device->setup = NULL;
+   memset(device->internal, 0, sizeof(device->internal));
    list_inithead(&device->retired);
    list_inithead(&device->memories);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {

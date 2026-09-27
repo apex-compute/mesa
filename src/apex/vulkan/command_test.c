@@ -61,7 +61,7 @@ image_exec(struct drm_apex_vm_exec *r)
    const uint32_t *words = (void *)mock.gems[table].local;
    unsigned d = mock.dispatch++;
    uint64_t base = mock.gems[1].va;
-   if (d == 0 || d == 15) {
+   if (d == 0 || d == 6) {
       CHECK(r->program_bytes == mock.pipelines[0]->program.code.size && r->workgroups == 1);
       /* The descriptor update after recording swaps views: mip0/layer2 first,
        * mip1/layer1 second. Offsets include the nonzero image memory binding. */
@@ -74,7 +74,7 @@ image_exec(struct drm_apex_vm_exec *r)
       }
       for (unsigned i = 24; i < 32; i++) CHECK(!words[i]);
       for (unsigned i = 0; i < 4; i++) CHECK(words[32 + i] == 0xc0010000 + i);
-   } else if (d == 1 || d == 14) {
+   } else if (d == 1 || d == 5) {
       const uint32_t *push = words + 8;
       unsigned offset = d == 1 ? 9280 : 14592;
       uint32_t color = d == 1 ? 0x5a17c0de : 0xff80ff00;
@@ -83,18 +83,23 @@ image_exec(struct drm_apex_vm_exec *r)
       for (unsigned i = offset / 4; i < (offset + push[3]) / 4; i++)
          ((uint32_t *)mock.gems[1].local)[i] = color;
    } else {
-      CHECK(d >= 2 && d <= 13);
-      unsigned phase = (d - 2) / 4, layer = ((d - 2) % 4) / 2, y = (d - 2) % 2;
-      const unsigned from[] = {12316 + layer * 60 + y * 20, 2308 + layer * 192 + y * 64,
-                               8648 + layer * 320 + y * 64};
-      const unsigned to[] = {2308 + layer * 192 + y * 64, 8648 + layer * 320 + y * 64,
-                             12800 + layer * 112 + y * 28};
-      const uint32_t *push = words + 8;
-      CHECK(((uint64_t)push[1] << 32 | push[0]) == base + from[phase]);
-      CHECK(((uint64_t)push[3] << 32 | push[2]) == base + to[phase]);
-      CHECK(push[4] == 12);
-      /* Model the already-qualified meta copy only; this is transport evidence. */
-      memcpy(mock.gems[1].local + to[phase], mock.gems[1].local + from[phase], 12);
+      /* One internal pitched-copy job per region covers both layers and rows. */
+      CHECK(d >= 2 && d <= 4);
+      unsigned phase = d - 2;
+      const unsigned from[] = {12316, 2308, 8648}, to[] = {2308, 8648, 12800};
+      const unsigned src_row[] = {20, 64, 64}, dst_row[] = {64, 64, 28};
+      const unsigned src_slice[] = {60, 192, 320}, dst_slice[] = {192, 320, 112};
+      const uint32_t *copy = words + 8 + 6;
+      CHECK(((uint64_t)copy[1] << 32 | copy[0]) == base + from[phase]);
+      CHECK(((uint64_t)copy[3] << 32 | copy[2]) == base + to[phase]);
+      CHECK(copy[4] == src_row[phase] && copy[5] == dst_row[phase]);
+      CHECK(copy[6] == src_slice[phase] && copy[7] == dst_slice[phase]);
+      CHECK(copy[8] == 3 && copy[9] == 2 && copy[10] == 2);
+      /* Model the copy kernel only; this is transport evidence. */
+      for (unsigned layer = 0; layer < 2; layer++)
+         for (unsigned y = 0; y < 2; y++)
+            memcpy(mock.gems[1].local + to[phase] + layer * dst_slice[phase] + y * dst_row[phase],
+                   mock.gems[1].local + from[phase] + layer * src_slice[phase] + y * src_row[phase], 12);
    }
    r->status = 1;
    return 0;
@@ -1122,7 +1127,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    VkCommandBufferSubmitInfo cb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd};
    VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cb};
    CHECK(v->QueueSubmit2(vk_queue_to_handle(&device.queue), 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
-   CHECK(v->QueueWaitIdle(vk_queue_to_handle(&device.queue)) == VK_SUCCESS && mock.dispatch == 16);
+   CHECK(v->QueueWaitIdle(vk_queue_to_handle(&device.queue)) == VK_SUCCESS && mock.dispatch == 7);
    CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
    for (unsigned i = 2320; i < 2384; i++) expected[i] = 0x5a17c0de;
    for (unsigned i = 3648; i < 3680; i++) expected[i] = 0xff80ff00;

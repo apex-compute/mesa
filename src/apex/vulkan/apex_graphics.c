@@ -9,6 +9,7 @@
 #include "apex_graphics.h"
 #include "apex_draw.h"
 #include "apex_setup_spv.h"
+#include "apex_copy_spv.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
@@ -30,11 +31,13 @@ draw_offset(const struct apex_program *program, unsigned word)
    return apex_program_trailer(program) + sizeof(struct apex_dispatch_parameters) + word * 4;
 }
 
+/* Draw words are reloaded at each use: uniform values have no scalar
+ * register home here, and hoisting them keeps vector registers live. */
 static nir_def *
 root_word(nir_builder *b, unsigned offset)
 {
    return nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_imm_int(b, offset), .align_mul = 4,
-                        .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
+                        .access = ACCESS_NON_WRITEABLE);
 }
 
 static nir_def *
@@ -666,8 +669,9 @@ loop_counter(nir_builder *b, nir_variable *var, nir_def *limit)
 
 static bool
 build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
-                      const struct vk_render_pass_state *rp)
+                      const struct vk_graphics_pipeline_state *state)
 {
+   const struct vk_render_pass_state *rp = state ? state->rp : NULL;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    const struct apex_program *program = &shader->program;
    struct fragment_lowering ctx = {.shader = shader};
@@ -709,6 +713,10 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *lx = nir_ior(b, nir_iand_imm(b, lane, 1), nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 2));
    nir_def *ly = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 1),
                          nir_iand_imm(b, nir_ushr_imm(b, lane, 2), 2));
+   unsigned trailer = apex_program_trailer(program);
+   nir_variable *t_var = nir_local_variable_create(impl, glsl_uint_type(), "tile");
+   nir_store_var(b, t_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
+   nir_loop *tile_loop = nir_push_loop(b);
    nir_def *x0 = draw_word(b, program, APEX_DRAW_SCISSOR);
    nir_def *y0 = draw_word(b, program, APEX_DRAW_SCISSOR + 1);
    nir_def *x1 = draw_word(b, program, APEX_DRAW_SCISSOR + 2);
@@ -717,16 +725,9 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *tw = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, x1, 3), 2), tx0);
    nir_def *th = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, y1, 3), 2), ty0);
    nir_def *empty = nir_ior(b, nir_uge(b, x0, x1), nir_uge(b, y0, y1));
-   nir_def *tiles = nir_bcsel(b, empty, nir_imm_int(b, 0), nir_imul(b, tw, th));
-   unsigned trailer = apex_program_trailer(program);
-   nir_def *groups = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups));
-   nir_def *prims = nir_imul(b, draw_word(b, program, APEX_DRAW_PRIM_COUNT),
-                             draw_word(b, program, APEX_DRAW_INSTANCE_COUNT));
-   nir_def *prim_base = draw_address(b, program, APEX_DRAW_PRIM_LO);
-
-   nir_variable *t_var = nir_local_variable_create(impl, glsl_uint_type(), "tile");
-   nir_store_var(b, t_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
-   nir_loop *tile_loop = nir_push_loop(b);
+   /* A job covers tiles [base, end) with a stride of its workgroup count. */
+   nir_def *end = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups) + 4);
+   nir_def *tiles = nir_bcsel(b, empty, nir_imm_int(b, 0), nir_umin(b, nir_imul(b, tw, th), end));
    nir_def *t = loop_counter(b, t_var, tiles);
    nir_def *ty = nir_udiv(b, t, tw);
    nir_def *tx = nir_isub(b, t, nir_imul(b, ty, tw));
@@ -780,8 +781,10 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_variable *p_var = nir_local_variable_create(impl, glsl_uint_type(), "primitive_index");
    nir_store_var(b, p_var, nir_imm_int(b, 0), 1);
    nir_loop *prim_loop = nir_push_loop(b);
+   nir_def *prims = nir_imul(b, draw_word(b, program, APEX_DRAW_PRIM_COUNT),
+                             draw_word(b, program, APEX_DRAW_INSTANCE_COUNT));
    nir_def *p = loop_counter(b, p_var, prims);
-   nir_def *first = address_add(b, prim_base, nir_imul_imm(b, p, APEX_SUBPRIMS * APEX_PRIM_WORDS * 4));
+   nir_def *first = address_add(b, draw_address(b, program, APEX_DRAW_PRIM_LO), nir_imul_imm(b, p, APEX_SUBPRIMS * APEX_PRIM_WORDS * 4));
    nir_def *count = load_word(b, address_add(b, first, nir_imm_int(b, APEX_PRIM_COUNT * 4)));
    nir_variable *s_var = nir_local_variable_create(impl, glsl_uint_type(), "subprimitive");
    nir_store_var(b, s_var, nir_imm_int(b, 0), 1);
@@ -866,32 +869,39 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
       nir_def *write = nir_iand(b, live, nir_iand(b, test, nir_ine_imm(b, nir_iand_imm(b, control, 2), 0)));
       nir_store_var(b, stored_depth, nir_bcsel(b, write, fragment, old), 1);
    }
-   nir_def *constant = nir_vec4(b, draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS),
-      draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 1),
-      draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 2),
-      draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 3));
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
       if (!stored[k])
          continue;
       nir_def *old = nir_load_var(b, stored[k]);
       nir_def *src = nir_load_var(b, ctx.color[k]);
-      nir_def *state = draw_word(b, program, APEX_DRAW_BLEND + k * 2);
+      nir_def *state_word = draw_word(b, program, APEX_DRAW_BLEND + k * 2);
       nir_def *ops = draw_word(b, program, APEX_DRAW_BLEND + k * 2 + 1);
       bool integer = util_format_is_pure_integer(formats[k]);
       nir_def *result = src;
-      if (!integer) {
+      /* Statically disabled blending emits nothing; otherwise the enable
+       * bit selects a uniform branch. */
+      bool never = !state || !state->cb || (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) &&
+                   (k >= state->cb->attachment_count || !state->cb->attachments[k].blend_enable));
+      if (!integer && !never) {
+         nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, ops, 1u << 24), 0));
          nir_def *dst = unpack_color(b, formats[k], old);
+         nir_def *constant = nir_vec4(b, draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS),
+            draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 1),
+            draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 2),
+            draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 3));
          nir_def *channels[4];
          for (unsigned c = 0; c < 4; c++) {
             bool alpha = c == 3;
-            nir_def *sf = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state, alpha ? 16 : 0), 0x1f),
+            nir_def *sf = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state_word, alpha ? 16 : 0), 0x1f),
                                        src, dst, constant, c);
-            nir_def *df = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state, alpha ? 24 : 8), 0x1f),
+            nir_def *df = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state_word, alpha ? 24 : 8), 0x1f),
                                        src, dst, constant, c);
             nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, ops, alpha ? 8 : 0), 0xff);
             channels[c] = blend_op(b, op, nir_channel(b, src, c), nir_channel(b, dst, c), sf, df);
          }
-         result = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, ops, 1u << 24), 0), nir_vec(b, channels, 4), src);
+         nir_def *blended = nir_vec(b, channels, 4);
+         nir_pop_if(b, NULL);
+         result = nir_if_phi(b, blended, src);
       }
       nir_def *packed = pack_color(b, formats[k], result);
       nir_def *mask = nir_iand_imm(b, nir_ushr_imm(b, ops, 16), 0xf);
@@ -926,6 +936,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    if (depth_target)
       store_word(b, nir_load_var(b, stored_depth), depth_address);
    nir_pop_if(b, NULL);
+   nir_def *groups = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups));
    nir_store_var(b, t_var, nir_iadd(b, t, groups), 1);
    nir_pop_loop(b, tile_loop);
    return true;
@@ -1016,7 +1027,7 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
       goto fail;
    bool built = info->stage == MESA_SHADER_VERTEX ?
       state && state->vi && build_vertex_kernel(shader, nir, state->vi) :
-      build_fragment_kernel(shader, nir, state ? state->rp : NULL);
+      build_fragment_kernel(shader, nir, state);
    if (!built)
       goto fail;
    convert_to_launch(nir, info->stage == MESA_SHADER_VERTEX ? 64 : 16);
@@ -1111,15 +1122,20 @@ const struct vk_device_shader_ops apex_device_shader_ops = {
    .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
 };
 
-/* ---- Internal setup program ---------------------------------------------- */
+/* ---- Internal programs ---------------------------------------------------- */
 
 VkResult
-apex_setup_program(struct apex_device *device, struct apex_program **out)
+apex_internal_program(struct apex_device *device, enum apex_internal which,
+                      struct apex_program **out)
 {
-   if (device->setup) {
-      *out = device->setup;
+   if (device->internal[which]) {
+      *out = device->internal[which];
       return VK_SUCCESS;
    }
+   static const struct { const uint32_t *code; size_t words; } sources[] = {
+      [APEX_INTERNAL_SETUP] = {apex_setup_spv, ARRAY_SIZE(apex_setup_spv)},
+      [APEX_INTERNAL_COPY] = {apex_copy_spv, ARRAY_SIZE(apex_copy_spv)},
+   };
    struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
                                             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!program)
@@ -1133,7 +1149,7 @@ apex_setup_program(struct apex_device *device, struct apex_program **out)
                                                                 MESA_SHADER_COMPUTE, NULL);
    options.environment = NIR_SPIRV_VULKAN;
    options.capabilities = &caps;
-   nir_shader *nir = spirv_to_nir(apex_setup_spv, ARRAY_SIZE(apex_setup_spv), NULL,
+   nir_shader *nir = spirv_to_nir(sources[which].code, sources[which].words, NULL,
                                   MESA_SHADER_COMPUTE, "main", &options, &apex_nir_options);
    VkResult result = nir ? apex_program_compile(&device->vk, program, nir) :
                            VK_ERROR_INITIALIZATION_FAILED;
@@ -1143,7 +1159,7 @@ apex_setup_program(struct apex_device *device, struct apex_program **out)
       vk_free(&device->vk.alloc, program);
       return result;
    }
-   device->setup = program;
+   device->internal[which] = program;
    *out = program;
    return VK_SUCCESS;
 }
@@ -1151,9 +1167,11 @@ apex_setup_program(struct apex_device *device, struct apex_program **out)
 void
 apex_graphics_finish(struct apex_device *device)
 {
-   if (device->setup) {
-      apex_program_finish(device, device->setup);
-      vk_free(&device->vk.alloc, device->setup);
-      device->setup = NULL;
+   for (unsigned i = 0; i < APEX_INTERNAL_COUNT; i++) {
+      if (device->internal[i]) {
+         apex_program_finish(device, device->internal[i]);
+         vk_free(&device->vk.alloc, device->internal[i]);
+         device->internal[i] = NULL;
+      }
    }
 }
