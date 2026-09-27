@@ -70,7 +70,11 @@
 #define APEX_DRAW_INDIRECT 197        /* VkDraw[Indexed]IndirectCommand VA lo, hi */
 #define APEX_DRAW_INDIRECT_COUNT 199  /* count VA lo, hi; zero without a count buffer */
 #define APEX_DRAW_INDIRECT_INDEX 201  /* draw index for the count comparison */
-#define APEX_DRAW_WORDS 202
+/* Fragment jobs: bin chunks [first, end) of this job. Consecutive jobs keep
+ * API order per pixel while each workgroup walks a bounded primitive count. */
+#define APEX_DRAW_CHUNK_RANGE 202
+#define APEX_DRAW_WORDS 204
+#define APEX_FRAGMENT_CHUNKS 8        /* bin chunks per fragment job */
 #define APEX_DRAW_DYNAMIC(w) (((w) >= APEX_DRAW_VERTEX_COUNT && (w) <= APEX_DRAW_FIRST_INSTANCE) || \
                               (w) == APEX_DRAW_PRIM_COUNT || (w) == APEX_DRAW_INDEX + 3 || \
                               ((w) >= APEX_DRAW_BIN_SHIFT && (w) <= APEX_DRAW_BIN_Y0))

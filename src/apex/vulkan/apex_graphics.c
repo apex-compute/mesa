@@ -910,7 +910,10 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *tx0 = nir_ushr_imm(b, x0, 2), *ty0 = nir_ushr_imm(b, y0, 2);
    nir_def *tw = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, x1, 3), 2), tx0);
    nir_def *th = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, y1, 3), 2), ty0);
-   nir_def *empty = nir_ior(b, nir_uge(b, x0, x1), nir_uge(b, y0, y1));
+   /* A job whose chunk range starts past the draw's chunks has no work. */
+   nir_def *empty = nir_ior(b, nir_ior(b, nir_uge(b, x0, x1), nir_uge(b, y0, y1)),
+                            nir_uge(b, draw_word(b, program, APEX_DRAW_CHUNK_RANGE),
+                                    draw_word(b, program, APEX_DRAW_BIN_CHUNKS)));
    /* A job covers tiles [base, end) with a stride of its workgroup count. */
    nir_def *end = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups) + 4);
    nir_def *tiles = nir_bcsel(b, empty, nir_imm_int(b, 0), nir_umin(b, nir_imul(b, tw, th), end));
@@ -964,10 +967,11 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
                                                     draw_word(b, program, APEX_DRAW_BIN_Y0)), columns),
                            nir_isub(b, nir_ushr(b, tile_x, shift), draw_word(b, program, APEX_DRAW_BIN_X0)));
    nir_variable *c_var = nir_local_variable_create(impl, glsl_uint_type(), "chunk");
-   nir_store_var(b, c_var, nir_imm_int(b, 0), 1);
+   nir_store_var(b, c_var, draw_word(b, program, APEX_DRAW_CHUNK_RANGE), 1);
    nir_loop *chunk_loop = nir_push_loop(b);
    nir_def *chunks = draw_word(b, program, APEX_DRAW_BIN_CHUNKS);
-   nir_def *chunk = loop_counter(b, c_var, chunks);
+   nir_def *chunk = loop_counter(b, c_var, nir_umin(b, chunks,
+                                                    draw_word(b, program, APEX_DRAW_CHUNK_RANGE + 1)));
    nir_def *entries = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_BIN_COUNTS),
       nir_ishl_imm(b, nir_iadd(b, nir_imul(b, bin, chunks), chunk), 2)));
    nir_def *segment = nir_iadd(b, nir_imul(b, bin, nir_imul(b, draw_word(b, program, APEX_DRAW_PRIM_COUNT),

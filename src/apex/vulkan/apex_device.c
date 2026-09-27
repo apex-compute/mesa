@@ -1868,9 +1868,17 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
     * APEX_TILES_PER_WORKGROUP tiles per workgroup. */
    struct apex_program *fs = &cmd->fragment->program;
    uint32_t groups = MIN3(tiles, fs->max_workgroups, 1024);
-   for (uint32_t base = 0; base < tiles; base += groups * APEX_TILES_PER_WORKGROUP)
-      push_job(cmd, fs, cmd->graphics_sets, MIN2(groups, tiles - base), base,
-               MIN2(tiles, base + groups * APEX_TILES_PER_WORKGROUP), draw);
+   /* Direct draws split their chunks across jobs; an indirect draw's count
+    * is unknown here, so one job set walks all of its chunks. */
+   uint32_t step = indirect ? UINT32_MAX : APEX_FRAGMENT_CHUNKS;
+   uint32_t chunks = indirect ? 1 : draw[APEX_DRAW_BIN_CHUNKS];
+   for (uint32_t first = 0; first < chunks; first += step) {
+      draw[APEX_DRAW_CHUNK_RANGE] = first;
+      draw[APEX_DRAW_CHUNK_RANGE + 1] = indirect ? UINT32_MAX : first + step;
+      for (uint32_t base = 0; base < tiles; base += groups * APEX_TILES_PER_WORKGROUP)
+         push_job(cmd, fs, cmd->graphics_sets, MIN2(groups, tiles - base), base,
+                  MIN2(tiles, base + groups * APEX_TILES_PER_WORKGROUP), draw);
+   }
 }
 
 static VKAPI_ATTR void VKAPI_CALL
