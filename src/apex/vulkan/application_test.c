@@ -221,8 +221,7 @@ int main(int argc, char **argv)
       const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                             VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
                                             VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
-      CHECK((features.optimalTilingFeatures & required) == required &&
-            !(features.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+      CHECK((features.optimalTilingFeatures & required) == required);
       VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
          .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
          .extent = {2, 2, 1}, .mipLevels = 1, .arrayLayers = 1,

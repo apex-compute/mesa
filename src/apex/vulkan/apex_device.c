@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
 #include "apex_native_uapi.h"
-#include "apex_pipeline.h"
+#include "apex_graphics.h"
+#include "apex_draw.h"
 #include "drm-uapi/apex_drm.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
@@ -13,7 +14,9 @@
 #include "vk_descriptor_set_layout.h"
 #include "vk_device_memory.h"
 #include "vk_drm_syncobj.h"
+#include "vk_format.h"
 #include "vk_image.h"
+#include "vk_render_pass.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "vk_sampler.h"
@@ -81,6 +84,9 @@ struct apex_dispatch {
    uint32_t groups;
    struct apex_dispatch_parameters parameters;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   /* Graphics jobs append the draw block after the dispatch parameters. */
+   bool graphics;
+   uint32_t draw[APEX_DRAW_WORDS];
 };
 struct apex_pending_dispatch {
    struct list_head link;
@@ -88,11 +94,18 @@ struct apex_pending_dispatch {
    struct drm_apex_vm_submit args;
    uint64_t point;
 };
+/* Recorded device memory created at first submission: snapshots of host
+ * bytes (read-only) or zero-filled draw scratch (read-write). */
 struct apex_upload {
    struct list_head link;
    struct apex_bo bo;
    uint64_t reserved_va, size;
+   bool scratch;
    uint8_t data[];
+};
+struct apex_attachment {
+   struct apex_image *image;
+   uint32_t level, layer;
 };
 struct apex_command_buffer {
    struct vk_command_buffer vk;
@@ -100,6 +113,19 @@ struct apex_command_buffer {
    struct apex_pipeline *pipeline;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   /* Graphics bind point. */
+   struct apex_bound_set *graphics_sets[MESA_VK_MAX_DESCRIPTOR_SETS];
+   uint8_t graphics_push[APEX_MAX_PUSH_CONSTANTS];
+   struct apex_shader *vertex, *fragment;
+   struct vk_vertex_input_state vertex_input;
+   struct vk_sample_locations_state sample_locations;
+   struct { uint64_t va, size; } bindings[APEX_DRAW_MAX_BINDINGS];
+   struct { uint64_t va, size; uint32_t bytes; } index;
+   struct {
+      VkRect2D area;
+      uint32_t color_count;
+      struct apex_attachment color[APEX_DRAW_MAX_COLOR], depth;
+   } rendering;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_memory, vk.base, VkDeviceMemory, VK_OBJECT_TYPE_DEVICE_MEMORY);
 VK_DEFINE_NONDISP_HANDLE_CASTS(apex_buffer, vk.base, VkBuffer, VK_OBJECT_TYPE_BUFFER);
@@ -497,7 +523,8 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    if (info->flags || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
        (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)))
+                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
@@ -573,16 +600,58 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
    return VK_SUCCESS;
 }
 
+/* Tiling features for images; vertex-buffer features for buffers. */
+VkFormatFeatureFlags2
+apex_format_features(VkFormat format, bool buffer)
+{
+   const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+                                          VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   const VkFormatFeatureFlags2 color = transfer | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+   if (buffer) {
+      const struct util_format_description *desc =
+         util_format_description(vk_format_to_pipe_format(format));
+      if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.bits > 128 ||
+          util_format_is_srgb(vk_format_to_pipe_format(format)))
+         return 0;
+      for (unsigned c = 0; c < desc->nr_channels; c++) {
+         const struct util_format_channel_description *ch = &desc->channel[c];
+         if (ch->size % 8 || ch->size > 32 || ch->type == UTIL_FORMAT_TYPE_FIXED ||
+             (ch->type == UTIL_FORMAT_TYPE_FLOAT && ch->size != 32))
+            return 0;
+      }
+      return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+   }
+   switch (format) {
+   case VK_FORMAT_R32_UINT:
+      return color | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      return color | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+      return color | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
+   case VK_FORMAT_D32_SFLOAT:
+      return transfer | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+   default:
+      return 0;
+   }
+}
+
 VkResult
 apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
                               VkImageFormatProperties2 *properties)
 {
    properties->imageFormatProperties = (VkImageFormatProperties){0};
-   if ((info->format != VK_FORMAT_R32_UINT && info->format != VK_FORMAT_R8G8B8A8_UNORM) ||
-       info->type != VK_IMAGE_TYPE_2D ||
+   VkFormatFeatureFlags2 features = apex_format_features(info->format, false);
+   VkImageUsageFlags usage = 0;
+   if (features & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   if (features & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   if (features & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+   if (features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   if (features & VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)
+      usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   if (!features || info->type != VK_IMAGE_TYPE_2D ||
        (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
-       info->flags || (info->usage & ~(VK_IMAGE_USAGE_STORAGE_BIT |
-                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+       info->flags || (info->usage & ~usage))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
@@ -602,7 +671,7 @@ image_layout(const VkImageCreateInfo *info, struct apex_image *image)
 {
    VkDeviceSize size = 0;
    for (unsigned l = 0; l < info->mipLevels; l++) {
-      uint32_t row = align(u_minify(info->extent.width, l) * 4, 64);
+      uint32_t row = align(u_minify(info->extent.width, l) * vk_format_get_blocksize(info->format), 64);
       uint32_t slice = row * u_minify(info->extent.height, l);
       if (image) {
          image->levels[l].offset = size;
@@ -999,10 +1068,18 @@ clear_commands(struct apex_command_buffer *cmd)
       vk_free(&cmd->vk.pool->alloc, dispatch);
    }
    cmd->pipeline = NULL;
-   for (unsigned s = 0; s < ARRAY_SIZE(cmd->sets); s++)
+   for (unsigned s = 0; s < ARRAY_SIZE(cmd->sets); s++) {
       bound_set_unref(cmd, cmd->sets[s]);
+      bound_set_unref(cmd, cmd->graphics_sets[s]);
+   }
    memset(cmd->sets, 0, sizeof(cmd->sets));
+   memset(cmd->graphics_sets, 0, sizeof(cmd->graphics_sets));
+   cmd->vertex = cmd->fragment = NULL;
+   memset(cmd->bindings, 0, sizeof(cmd->bindings));
+   memset(&cmd->index, 0, sizeof(cmd->index));
+   memset(&cmd->rendering, 0, sizeof(cmd->rendering));
    memset(cmd->push, 0, sizeof(cmd->push));
+   memset(cmd->graphics_push, 0, sizeof(cmd->graphics_push));
 }
 
 static void
@@ -1045,6 +1122,8 @@ create_command_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level, 
    }
    list_inithead(&cmd->dispatches);
    list_inithead(&cmd->uploads);
+   cmd->vk.dynamic_graphics_state.vi = &cmd->vertex_input;
+   cmd->vk.dynamic_graphics_state.ms.sample_locations = &cmd->sample_locations;
    *out = &cmd->vk;
    return VK_SUCCESS;
 }
@@ -1068,6 +1147,10 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_CmdBindPipeline(VkCommandBuffer handle, VkPipelineBindPoint point, VkPipeline pipeline)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   if (point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+      vk_common_CmdBindPipeline(handle, point, pipeline);
+      return;
+   }
    if (point != VK_PIPELINE_BIND_POINT_COMPUTE) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -1082,8 +1165,8 @@ apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsIn
    uint32_t first = info->firstSet, count = info->descriptorSetCount;
    const VkDescriptorSet *sets = info->pDescriptorSets;
    const uint32_t *offsets = info->pDynamicOffsets;
-   if (info->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || first > MESA_VK_MAX_DESCRIPTOR_SETS ||
-       count > MESA_VK_MAX_DESCRIPTOR_SETS - first) {
+   if (!(info->stageFlags & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS)) ||
+       first > MESA_VK_MAX_DESCRIPTOR_SETS || count > MESA_VK_MAX_DESCRIPTOR_SETS - first) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -1114,8 +1197,17 @@ apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsIn
          for (unsigned d = 0; d < binding->count; d++)
             bound->offsets[binding->offset + d] = offsets[consumed++];
       }
-      bound_set_unref(cmd, cmd->sets[first + s]);
-      cmd->sets[first + s] = bound;
+      /* Compute and graphics bind points keep separate set bindings. */
+      if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
+         bound_set_unref(cmd, cmd->sets[first + s]);
+         cmd->sets[first + s] = bound;
+      }
+      if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+         if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+            bound->refs++;
+         bound_set_unref(cmd, cmd->graphics_sets[first + s]);
+         cmd->graphics_sets[first + s] = bound;
+      }
    }
 }
 
@@ -1123,16 +1215,17 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPushConstants2(VkCommandBuffer handle, const VkPushConstantsInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   /* Push ranges may name stages unsupported by this compute-only queue. */
-   if (!(info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT))
-      return;
    uint32_t offset = info->offset, size = info->size;
    if (offset % 4 || size % 4 ||
        !size || offset >= APEX_MAX_PUSH_CONSTANTS || size > APEX_MAX_PUSH_CONSTANTS - offset) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   memcpy(cmd->push + offset, info->pValues, size);
+   /* Compute and graphics bind points keep separate push images. */
+   if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+      memcpy(cmd->push + offset, info->pValues, size);
+   if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+      memcpy(cmd->graphics_push + offset, info->pValues, size);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1169,6 +1262,363 @@ apex_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
                   dispatch->sets[s]->refs++;
             list_addtail(&dispatch->link, &cmd->dispatches);
          }
+}
+
+void
+apex_cmd_bind_shaders(struct vk_command_buffer *vk, uint32_t count,
+                      const mesa_shader_stage *stages, struct vk_shader **const shaders)
+{
+   struct apex_command_buffer *cmd = (void *)vk;
+   for (uint32_t i = 0; i < count; i++) {
+      struct apex_shader *shader = shaders[i] ? container_of(shaders[i], struct apex_shader, vk) : NULL;
+      if (stages[i] == MESA_SHADER_VERTEX)
+         cmd->vertex = shader;
+      else if (stages[i] == MESA_SHADER_FRAGMENT)
+         cmd->fragment = shader;
+   }
+}
+
+static uint64_t image_address(const struct apex_image *image, unsigned level, unsigned layer,
+                              VkOffset3D offset);
+
+/* Reserves GPUVA for zero-filled read-write memory created at submission. */
+static uint64_t
+record_scratch(struct apex_command_buffer *cmd, uint64_t size)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   struct apex_upload *upload = vk_zalloc(&cmd->vk.pool->alloc, sizeof(*upload), 8,
+                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!upload) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return 0;
+   }
+   upload->size = MAX2(size, 4);
+   upload->scratch = true;
+   mtx_lock(&device->va_mutex);
+   upload->reserved_va = util_vma_heap_alloc(&device->va_heap, align64(upload->size, 4096), 4096);
+   mtx_unlock(&device->va_mutex);
+   if (!upload->reserved_va) {
+      vk_free(&cmd->vk.pool->alloc, upload);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return 0;
+   }
+   list_addtail(&upload->link, &cmd->uploads);
+   return upload->reserved_va;
+}
+
+static struct apex_attachment
+attachment(const VkRenderingAttachmentInfo *info)
+{
+   VK_FROM_HANDLE(vk_image_view, view, info ? info->imageView : VK_NULL_HANDLE);
+   if (!view)
+      return (struct apex_attachment){0};
+   return (struct apex_attachment) {
+      .image = (struct apex_image *)view->image,
+      .level = view->base_mip_level, .layer = view->base_array_layer,
+   };
+}
+
+static uint64_t
+attachment_address(const struct apex_attachment *a)
+{
+   return image_address(a->image, a->level, a->layer, (VkOffset3D){0});
+}
+
+/* Load-op clears fill the render area rows of 32-bit formats. */
+static void
+clear_attachment(struct apex_command_buffer *cmd, const struct apex_attachment *a,
+                 VkRect2D area, uint32_t value)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   const struct apex_image *image = a->image;
+   uint32_t row = image->levels[a->level].row_stride;
+   uint32_t width = u_minify(image->vk.extent.width, a->level);
+   uint32_t height = u_minify(image->vk.extent.height, a->level);
+   uint32_t x0 = MIN2(area.offset.x, width), y0 = MIN2(area.offset.y, height);
+   uint32_t x1 = MIN2(area.offset.x + area.extent.width, width);
+   uint32_t y1 = MIN2(area.offset.y + area.extent.height, height);
+   if (x0 >= x1 || y0 >= y1)
+      return;
+   struct apex_pipeline *pipeline = cmd->pipeline;
+   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+   memcpy(push, cmd->push, sizeof(push));
+   uint64_t base = attachment_address(a);
+   bool rows = x0 == 0 && x1 == width;
+   for (uint32_t y = y0; y < (rows ? y0 + 1 : y1); y++) {
+      /* Row padding belongs to the subresource; full-width areas clear it too. */
+      VkDeviceAddressRangeKHR range = {
+         .address = base + (uint64_t)y * row + x0 * 4,
+         .size = rows ? (uint64_t)(y1 - y0) * row : (uint64_t)(x1 - x0) * 4,
+      };
+      vk_meta_fill_memory(&cmd->vk, &device->meta, &range, 0, value);
+   }
+   cmd->pipeline = pipeline;
+   memcpy(cmd->push, push, sizeof(push));
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   if (info->layerCount > 1 || info->viewMask || info->colorAttachmentCount > APEX_DRAW_MAX_COLOR ||
+       (info->pStencilAttachment && info->pStencilAttachment->imageView &&
+        (!info->pDepthAttachment ||
+         info->pStencilAttachment->imageView != info->pDepthAttachment->imageView))) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   memset(&cmd->rendering, 0, sizeof(cmd->rendering));
+   cmd->rendering.area = info->renderArea;
+   cmd->rendering.color_count = info->colorAttachmentCount;
+   /* RESUMING continues an earlier suspended pass without load operations. */
+   bool resuming = info->flags & VK_RENDERING_RESUMING_BIT;
+   for (unsigned k = 0; k < info->colorAttachmentCount; k++) {
+      const VkRenderingAttachmentInfo *a = &info->pColorAttachments[k];
+      cmd->rendering.color[k] = attachment(a);
+      if (!cmd->rendering.color[k].image || resuming || a->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
+         continue;
+      VkFormat format = cmd->rendering.color[k].image->vk.format;
+      if (vk_format_get_blocksize(format) != 4) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      uint32_t value = a->clearValue.color.uint32[0];
+      if (!vk_format_is_int(format))
+         util_format_pack_rgba(vk_format_to_pipe_format(format), &value,
+                               a->clearValue.color.float32, 1);
+      clear_attachment(cmd, &cmd->rendering.color[k], info->renderArea, value);
+   }
+   if (info->pDepthAttachment) {
+      cmd->rendering.depth = attachment(info->pDepthAttachment);
+      if (cmd->rendering.depth.image && !resuming &&
+          info->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+         uint32_t value;
+         memcpy(&value, &info->pDepthAttachment->clearValue.depthStencil.depth, 4);
+         clear_attachment(cmd, &cmd->rendering.depth, info->renderArea, value);
+      }
+   }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdEndRendering(VkCommandBuffer handle)
+{
+   /* Attachments are written in place; stores need no resolve. */
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBindVertexBuffers2(VkCommandBuffer handle, uint32_t first, uint32_t count,
+                           const VkBuffer *buffers, const VkDeviceSize *offsets,
+                           const VkDeviceSize *sizes, const VkDeviceSize *strides)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   for (uint32_t i = 0; i < count && first + i < APEX_DRAW_MAX_BINDINGS; i++) {
+      VK_FROM_HANDLE(apex_buffer, buffer, buffers[i]);
+      /* A null buffer binds zero bytes: fetches read zero. */
+      cmd->bindings[first + i].va = buffer ? buffer->vk.device_address + offsets[i] : 0;
+      cmd->bindings[first + i].size = !buffer ? 0 :
+         sizes && sizes[i] != VK_WHOLE_SIZE ? sizes[i] : buffer->vk.size - offsets[i];
+   }
+   if (strides)
+      vk_cmd_set_vertex_binding_strides(&cmd->vk, first, count, strides);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBindIndexBuffer2(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                         VkDeviceSize size, VkIndexType type)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, index, buffer);
+   cmd->index.bytes = type == VK_INDEX_TYPE_UINT32 ? 4 : type == VK_INDEX_TYPE_UINT16 ? 2 : 0;
+   cmd->index.va = index ? index->vk.device_address + offset : 0;
+   cmd->index.size = !index ? 0 : size == VK_WHOLE_SIZE ? index->vk.size - offset : size;
+   if (!cmd->index.bytes)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+}
+
+static void
+push_job(struct apex_command_buffer *cmd, struct apex_program *program,
+         struct apex_bound_set *const *sets, uint32_t groups, uint32_t base,
+         const uint32_t *draw)
+{
+   struct apex_dispatch *job = vk_zalloc(&cmd->vk.pool->alloc, sizeof(*job), 8,
+                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!job) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   job->program = program;
+   job->groups = groups;
+   job->parameters = (struct apex_dispatch_parameters){.base = {base}, .groups = {groups, 1, 1}};
+   memcpy(job->push, cmd->graphics_push, sizeof(job->push));
+   job->graphics = true;
+   memcpy(job->draw, draw, sizeof(job->draw));
+   if (sets) {
+      memcpy(job->sets, sets, sizeof(job->sets));
+      for (unsigned s = 0; s < ARRAY_SIZE(job->sets); s++)
+         if (job->sets[s])
+            job->sets[s]->refs++;
+   }
+   list_addtail(&job->link, &cmd->dispatches);
+}
+
+static uint32_t
+float_bits(float value)
+{
+   uint32_t bits;
+   memcpy(&bits, &value, sizeof(bits));
+   return bits;
+}
+
+/* Records vertex, setup and fragment jobs for one direct draw. */
+static void
+record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t instance_count,
+            uint32_t first_vertex, uint32_t first_instance, bool indexed, int32_t vertex_offset)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!vertex_count || !instance_count)
+      return;
+   uint32_t topology = dyn->ia.primitive_topology;
+   uint32_t prims = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ? vertex_count / 3 :
+                    (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                     topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && vertex_count >= 3 ?
+                    vertex_count - 2 : 0;
+   if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || topology < VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+       !cmd->vertex || !cmd->fragment || dyn->ia.primitive_restart_enable ||
+       dyn->vp.viewport_count != 1 || dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
+       dyn->rs.depth_bias.enable || dyn->ds.stencil.test_enable ||
+       (indexed && !cmd->index.bytes)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   struct apex_program *setup;
+   VkResult result = apex_setup_program(device, &setup);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   uint64_t vertices = (uint64_t)vertex_count * instance_count;
+   uint64_t vertex_bytes = vertices * cmd->vertex->vertex.stride * 4;
+   uint64_t prim_bytes = (uint64_t)prims * instance_count * APEX_SUBPRIMS * APEX_PRIM_WORDS * 4;
+   if (vertex_bytes > 64 * 1024 * 1024 || prim_bytes > 64 * 1024 * 1024) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   uint32_t draw[APEX_DRAW_WORDS] = {0};
+   uint64_t vertex_va = record_scratch(cmd, vertex_bytes);
+   uint64_t prim_va = record_scratch(cmd, prim_bytes);
+   if (!vertex_va || !prim_va)
+      return;
+   draw[APEX_DRAW_VERTEX_LO] = vertex_va;
+   draw[APEX_DRAW_VERTEX_HI] = vertex_va >> 32;
+   draw[APEX_DRAW_VERTEX_STRIDE] = cmd->vertex->vertex.stride;
+   draw[APEX_DRAW_VERTEX_COUNT] = vertex_count;
+   draw[APEX_DRAW_INSTANCE_COUNT] = instance_count;
+   draw[APEX_DRAW_FIRST_VERTEX] = first_vertex;
+   draw[APEX_DRAW_FIRST_INSTANCE] = first_instance;
+   draw[APEX_DRAW_PRIM_LO] = prim_va;
+   draw[APEX_DRAW_PRIM_HI] = prim_va >> 32;
+   draw[APEX_DRAW_PRIM_COUNT] = prims;
+   draw[APEX_DRAW_TOPOLOGY] = topology;
+   /* The framebuffer is the smallest bound attachment. */
+   uint32_t width = 4096, height = 4096;
+   for (unsigned k = 0; k <= APEX_DRAW_MAX_COLOR; k++) {
+      const struct apex_attachment *a = k < APEX_DRAW_MAX_COLOR ? &cmd->rendering.color[k] :
+                                                                  &cmd->rendering.depth;
+      if (!a->image)
+         continue;
+      width = MIN2(width, u_minify(a->image->vk.extent.width, a->level));
+      height = MIN2(height, u_minify(a->image->vk.extent.height, a->level));
+      unsigned slot = k < APEX_DRAW_MAX_COLOR ? APEX_DRAW_COLOR + k * APEX_DRAW_COLOR_WORDS :
+                                                APEX_DRAW_DEPTH_TARGET;
+      uint64_t va = attachment_address(a);
+      draw[slot] = va;
+      draw[slot + 1] = va >> 32;
+      draw[slot + 2] = a->image->levels[a->level].row_stride;
+   }
+   draw[APEX_DRAW_WIDTH] = width;
+   draw[APEX_DRAW_HEIGHT] = height;
+   const VkViewport *vp = &dyn->vp.viewports[0];
+   const float viewport[6] = {vp->x, vp->y, vp->width, vp->height, vp->minDepth, vp->maxDepth};
+   for (unsigned i = 0; i < 6; i++)
+      draw[APEX_DRAW_VIEWPORT + i] = float_bits(viewport[i]);
+   const VkRect2D *scissor = &dyn->vp.scissors[0];
+   const VkRect2D *area = &cmd->rendering.area;
+   int64_t x0 = MAX3(scissor->offset.x, area->offset.x, 0);
+   int64_t y0 = MAX3(scissor->offset.y, area->offset.y, 0);
+   int64_t x1 = MIN3((int64_t)scissor->offset.x + scissor->extent.width,
+                     (int64_t)area->offset.x + area->extent.width, width);
+   int64_t y1 = MIN3((int64_t)scissor->offset.y + scissor->extent.height,
+                     (int64_t)area->offset.y + area->extent.height, height);
+   draw[APEX_DRAW_SCISSOR] = x0;
+   draw[APEX_DRAW_SCISSOR + 1] = y0;
+   draw[APEX_DRAW_SCISSOR + 2] = MAX2(x1, x0);
+   draw[APEX_DRAW_SCISSOR + 3] = MAX2(y1, y0);
+   draw[APEX_DRAW_CULL] = dyn->rs.cull_mode;
+   draw[APEX_DRAW_FRONT_FACE] = dyn->rs.front_face;
+   draw[APEX_DRAW_DEPTH] = (dyn->ds.depth.test_enable && cmd->rendering.depth.image) |
+                           (dyn->ds.depth.write_enable << 1) | (dyn->ds.depth.compare_op << 4);
+   for (unsigned l = 0; l < 32; l++) {
+      int slot = cmd->vertex->vertex.slot[VARYING_SLOT_VAR0 + l];
+      draw[APEX_DRAW_SLOTS + l] = slot < 0 ? ~0u : slot;
+   }
+   for (unsigned b = 0; b < APEX_DRAW_MAX_BINDINGS; b++) {
+      unsigned slot = APEX_DRAW_BINDINGS + b * APEX_DRAW_BINDING_WORDS;
+      draw[slot] = cmd->bindings[b].va;
+      draw[slot + 1] = cmd->bindings[b].va >> 32;
+      draw[slot + 2] = MIN2(cmd->bindings[b].size, UINT32_MAX);
+      draw[slot + 3] = dyn->vi_binding_strides[b];
+   }
+   if (indexed) {
+      draw[APEX_DRAW_INDEX] = cmd->index.va;
+      draw[APEX_DRAW_INDEX + 1] = cmd->index.va >> 32;
+      draw[APEX_DRAW_INDEX + 2] = cmd->index.bytes;
+      draw[APEX_DRAW_INDEX + 3] = vertex_offset;
+   }
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
+      const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[k];
+      bool enabled = dyn->cb.color_write_enables & BITFIELD_BIT(k);
+      draw[APEX_DRAW_BLEND + k * 2] = a->src_color_blend_factor | a->dst_color_blend_factor << 8 |
+         a->src_alpha_blend_factor << 16 | a->dst_alpha_blend_factor << 24;
+      draw[APEX_DRAW_BLEND + k * 2 + 1] = a->color_blend_op | a->alpha_blend_op << 8 |
+         (enabled ? a->write_mask : 0) << 16 | (uint32_t)a->blend_enable << 24;
+   }
+   for (unsigned c = 0; c < 4; c++)
+      draw[APEX_DRAW_BLEND_CONSTANTS + c] = float_bits(dyn->cb.blend_constants[c]);
+
+   struct apex_program *vs = &cmd->vertex->program;
+   uint32_t limit = MIN2(vs->max_workgroups, 1024);
+   uint32_t vertex_groups = DIV_ROUND_UP(vertices, 64);
+   for (uint32_t base = 0; base < vertex_groups; base += limit)
+      push_job(cmd, vs, cmd->graphics_sets, MIN2(vertex_groups - base, limit), base, draw);
+   if (dyn->rs.rasterizer_discard_enable || !prims)
+      return;
+   uint32_t setup_groups = DIV_ROUND_UP((uint64_t)prims * instance_count, 64);
+   limit = MIN2(setup->max_workgroups, 1024);
+   for (uint32_t base = 0; base < setup_groups; base += limit)
+      push_job(cmd, setup, NULL, MIN2(setup_groups - base, limit), base, draw);
+   uint32_t tiles = (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 2], 4) - draw[APEX_DRAW_SCISSOR] / 4) *
+                    (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 3], 4) - draw[APEX_DRAW_SCISSOR + 1] / 4);
+   if (!tiles)
+      return;
+   struct apex_program *fs = &cmd->fragment->program;
+   push_job(cmd, fs, cmd->graphics_sets, MIN3(tiles, fs->max_workgroups, 1024), 0, draw);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDraw(VkCommandBuffer handle, uint32_t vertex_count, uint32_t instance_count,
+             uint32_t first_vertex, uint32_t first_instance)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   record_draw(cmd, vertex_count, instance_count, first_vertex, first_instance, false, 0);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t instance_count,
+                    uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   record_draw(cmd, index_count, instance_count, first_index, first_instance, true, vertex_offset);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1235,14 +1685,16 @@ image_address(const struct apex_image *image, unsigned level, unsigned layer, Vk
 {
    return image->memory->storage->bo.va + image->offset + image->levels[level].offset +
           (uint64_t)layer * image->levels[level].slice_stride +
-          (uint64_t)offset.y * image->levels[level].row_stride + (uint64_t)offset.x * 4;
+          (uint64_t)offset.y * image->levels[level].row_stride +
+          (uint64_t)offset.x * vk_format_get_blocksize(image->vk.format);
 }
 
 /* Linear image rows use the ordinary cached buffer meta kernels. Neither path
  * binds descriptor sets; preserve the application's pipeline and push image. */
 static void
 copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row, uint64_t src_slice,
-                uint64_t dst, uint32_t dst_row, uint64_t dst_slice, VkExtent3D extent, uint32_t layers)
+                uint64_t dst, uint32_t dst_row, uint64_t dst_slice, VkExtent3D extent, uint32_t layers,
+                uint32_t pixel)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    struct apex_pipeline *pipeline = cmd->pipeline;
@@ -1252,8 +1704,8 @@ copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
       for (unsigned y = 0; y < extent.height; y++) {
          VkDeviceMemoryCopyKHR region = {
             .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
-            .srcRange = {.address = src + z * src_slice + (uint64_t)y * src_row, .size = extent.width * 4ull},
-            .dstRange = {.address = dst + z * dst_slice + (uint64_t)y * dst_row, .size = extent.width * 4ull},
+            .srcRange = {.address = src + z * src_slice + (uint64_t)y * src_row, .size = (uint64_t)extent.width * pixel},
+            .dstRange = {.address = dst + z * dst_slice + (uint64_t)y * dst_row, .size = (uint64_t)extent.width * pixel},
          };
          VkCopyDeviceMemoryInfoKHR info = {
             .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR, .regionCount = 1, .pRegions = &region,
@@ -1279,11 +1731,13 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
       if (to_image)
          copy_image_rows(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B,
                          image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
-                         r->imageExtent, r->imageSubresource.layerCount);
+                         r->imageExtent, r->imageSubresource.layerCount,
+                         vk_format_get_blocksize(image->vk.format));
       else
          copy_image_rows(cmd, image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
                          buffer_va, layout.row_stride_B, layout.image_stride_B,
-                         r->imageExtent, r->imageSubresource.layerCount);
+                         r->imageExtent, r->imageSubresource.layerCount,
+                         vk_format_get_blocksize(image->vk.format));
    }
 }
 
@@ -1318,7 +1772,8 @@ apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
                       src->levels[sl].row_stride, src->levels[sl].slice_stride,
                       image_address(dst, dl, r->dstSubresource.baseArrayLayer, r->dstOffset),
                       dst->levels[dl].row_stride, dst->levels[dl].slice_stride,
-                      r->extent, r->srcSubresource.layerCount);
+                      r->extent, r->srcSubresource.layerCount,
+                      vk_format_get_blocksize(src->vk.format));
    }
 }
 
@@ -1402,7 +1857,8 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
       return VK_ERROR_FEATURE_NOT_PRESENT;
    size_t push_offset = (program->descriptor_count + 1) * sizeof(union apex_descriptor);
    size_t parameters_offset = apex_program_trailer(program);
-   size_t bytes = parameters_offset + sizeof(struct apex_dispatch_parameters);
+   size_t bytes = parameters_offset + sizeof(struct apex_dispatch_parameters) +
+                  (dispatch->graphics ? sizeof(dispatch->draw) : 0);
    union apex_descriptor *rows = calloc(1, bytes);
    if (!rows)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1411,6 +1867,11 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
    for (unsigned axis = 0; axis < 3; axis++) {
       parameters->base[axis] = util_cpu_to_le32(dispatch->parameters.base[axis]);
       parameters->groups[axis] = util_cpu_to_le32(dispatch->parameters.groups[axis]);
+   }
+   if (dispatch->graphics) {
+      uint32_t *draw = (void *)(parameters + 1);
+      for (unsigned i = 0; i < APEX_DRAW_WORDS; i++)
+         draw[i] = util_cpu_to_le32(dispatch->draw[i]);
    }
    VkResult result = VK_ERROR_DEVICE_LOST;
    for (unsigned s = 0; s < program->set_count; s++) {
@@ -1722,8 +2183,11 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
             continue;
          uint64_t va = upload->reserved_va;
          upload->reserved_va = 0;
-         if (bo_create(device, upload->size, APEX_DRM_VM_READ, 0, va, &upload->bo) != VK_SUCCESS)
+         uint32_t access = APEX_DRM_VM_READ | (upload->scratch ? APEX_DRM_VM_WRITE : 0);
+         if (bo_create(device, upload->size, access, 0, va, &upload->bo) != VK_SUCCESS)
             return vk_queue_set_lost(queue, "Apex update allocation failed");
+         if (upload->scratch)
+            continue;
          memcpy(upload->bo.map, upload->data, upload->size);
          if (bo_transfer(device, &upload->bo, APEX_DRM_TRANSFER_TO_LOCAL, 0, upload->size) != VK_SUCCESS)
             return vk_queue_set_lost(queue, "Apex update upload failed");
@@ -1831,6 +2295,10 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdCopyBufferToImage2 = apex_CmdCopyBufferToImage2,
       .CmdCopyImageToBuffer2 = apex_CmdCopyImageToBuffer2,
       .CmdCopyImage2 = apex_CmdCopyImage2, .CmdClearColorImage = apex_CmdClearColorImage,
+      .CmdBeginRendering = apex_CmdBeginRendering, .CmdEndRendering = apex_CmdEndRendering,
+      .CmdBindVertexBuffers2 = apex_CmdBindVertexBuffers2,
+      .CmdBindIndexBuffer2 = apex_CmdBindIndexBuffer2,
+      .CmdDraw = apex_CmdDraw, .CmdDrawIndexed = apex_CmdDrawIndexed,
       .QueueWaitIdle = apex_QueueWaitIdle,
       .GetFenceStatus = apex_GetFenceStatus,
       .GetSemaphoreCounterValue = apex_GetSemaphoreCounterValue,
@@ -1848,6 +2316,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    if (result != VK_SUCCESS)
       return result;
    device->vk.command_dispatch_table = &device->cmd_dispatch;
+   device->vk.shader_ops = &apex_device_shader_ops;
    device->vk.command_buffer_ops = &command_ops;
    device->fd = fd;
    device->transport = transport;
@@ -1855,6 +2324,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->host_coherent = host_coherent;
    device->completion = 0;
    device->point = 0;
+   device->setup = NULL;
    list_inithead(&device->retired);
    list_inithead(&device->memories);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
@@ -1924,6 +2394,7 @@ apex_device_finish(struct apex_device *device)
       struct drm_syncobj_destroy destroy = {.handle = device->completion};
       ioctl(device->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
    }
+   apex_graphics_finish(device);
    vk_meta_device_finish(&device->vk, &device->meta);
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->memory_mutex);

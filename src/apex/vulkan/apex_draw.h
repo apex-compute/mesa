@@ -34,7 +34,12 @@
 #define APEX_DRAW_BINDING_WORDS 4
 #define APEX_DRAW_MAX_BINDINGS 16
 #define APEX_DRAW_INDEX 149           /* VA lo, VA hi, bytes/index (0 non-indexed), vertex offset */
-#define APEX_DRAW_WORDS 153
+/* Per attachment: word 0 = src color | dst color << 8 | src alpha << 16 |
+ * dst alpha << 24 (VkBlendFactor); word 1 = color op | alpha op << 8 |
+ * write mask << 16 | enable << 24. */
+#define APEX_DRAW_BLEND 153
+#define APEX_DRAW_BLEND_CONSTANTS 169 /* FP32 RGBA */
+#define APEX_DRAW_WORDS 173
 
 /* Primitive record fields. Edge i is opposite vertex i; E(p) = a x + b y + c
  * in Q16.8 fixed point with the top-left bias folded into c: covered iff all

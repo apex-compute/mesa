@@ -69,7 +69,7 @@ apex_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical, uint32_t
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, properties, count);
    vk_outarray_append_typed(VkQueueFamilyProperties2, &out, prop) {
       prop->queueFamilyProperties = (VkQueueFamilyProperties) {
-         .queueFlags = VK_QUEUE_COMPUTE_BIT,
+         .queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT,
          .queueCount = 1,
       };
    }
@@ -124,21 +124,17 @@ VKAPI_ATTR void VKAPI_CALL
 apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat format,
                                        VkFormatProperties2 *properties)
 {
-   VkFormatFeatureFlags features = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-   if (format == VK_FORMAT_R32_UINT)
-      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
-   else if (format == VK_FORMAT_R8G8B8A8_UNORM)
-      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
-   else
-      features = 0;
+   VkFormatFeatureFlags2 features = apex_format_features(format, false);
+   VkFormatFeatureFlags2 buffer = apex_format_features(format, true);
    properties->formatProperties = (VkFormatProperties) {
-      .linearTilingFeatures = features, .optimalTilingFeatures = features,
+      .linearTilingFeatures = (VkFormatFeatureFlags)features,
+      .optimalTilingFeatures = (VkFormatFeatureFlags)features,
+      .bufferFeatures = (VkFormatFeatureFlags)buffer,
    };
    VkFormatProperties3 *props3 = vk_find_struct(properties->pNext, FORMAT_PROPERTIES_3);
    if (props3) {
       props3->linearTilingFeatures = props3->optimalTilingFeatures = features;
-      props3->bufferFeatures = 0;
+      props3->bufferFeatures = buffer;
    }
 }
 
@@ -269,7 +265,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .apiVersion = APEX_DEVELOPMENT_API,
       .vendorID = 0x10ee, .deviceID = 0xa15e,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
-      .deviceName = "Apex development compute (non-conformant)",
+      .deviceName = "Apex development (non-conformant)",
       .maxMemoryAllocationCount = 4096,
       .maxBoundDescriptorSets = MESA_VK_MAX_DESCRIPTOR_SETS,
       .maxPerStageDescriptorUniformBuffers = APEX_MAX_DESCRIPTORS,
@@ -352,7 +348,7 @@ apex_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallback
    }
    instance->physical_devices.try_create_for_drm = try_create_physical;
    instance->physical_devices.destroy = destroy_physical;
-   mesa_logw("Apex development compute driver: incomplete and non-conformant; no graphics or WSI");
+   mesa_logw("Apex development driver: incomplete and non-conformant; no WSI");
    *out = vk_instance_to_handle(instance);
    return VK_SUCCESS;
 }

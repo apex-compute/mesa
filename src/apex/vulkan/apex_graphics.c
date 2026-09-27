@@ -1,0 +1,1159 @@
+/* SPDX-License-Identifier: MIT */
+/* Graphics shaders as native programs. A draw executes three jobs on the
+ * ordinary queue: the vertex kernel writes one output record per vertex, the
+ * internal setup kernel clips, snaps and writes primitive records, and the
+ * fragment kernel walks screen tiles, rasterizes every primitive in order,
+ * runs the fragment shader in 2x2 quads and merges into the attachments.
+ * Draw state is data in the job trailer (apex_draw.h); attachment formats
+ * specialize the fragment kernel. */
+#include "apex_graphics.h"
+#include "apex_draw.h"
+#include "apex_setup_spv.h"
+#include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_format_convert.h"
+#include "compiler/spirv/nir_spirv.h"
+#include "util/format/u_format.h"
+#include "compiler/spirv/spirv_info.h"
+#include "vk_alloc.h"
+#include "vk_format.h"
+#include "vk_graphics_state.h"
+#include "vk_log.h"
+#include "vk_nir.h"
+#include "vk_pipeline.h"
+#include "vk_shader.h"
+
+/* Byte offset of draw word `word` in a graphics job's data root. */
+static unsigned
+draw_offset(const struct apex_program *program, unsigned word)
+{
+   return apex_program_trailer(program) + sizeof(struct apex_dispatch_parameters) + word * 4;
+}
+
+static nir_def *
+root_word(nir_builder *b, unsigned offset)
+{
+   return nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_imm_int(b, offset), .align_mul = 4,
+                        .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
+}
+
+static nir_def *
+draw_word(nir_builder *b, const struct apex_program *program, unsigned word)
+{
+   return root_word(b, draw_offset(program, word));
+}
+
+static nir_def *
+draw_address(nir_builder *b, const struct apex_program *program, unsigned word)
+{
+   return nir_vec2(b, draw_word(b, program, word), draw_word(b, program, word + 1));
+}
+
+static nir_def *
+address_add(nir_builder *b, nir_def *address, nir_def *bytes)
+{
+   return nir_build_addr_iadd(b, address, nir_address_format_2x32bit_global,
+                              nir_var_mem_global, bytes);
+}
+
+static nir_def *
+load_word(nir_builder *b, nir_def *address)
+{
+   return nir_load_global_2x32(b, 1, 32, address, .align_mul = 4);
+}
+
+static void
+store_word(nir_builder *b, nir_def *value, nir_def *address)
+{
+   nir_store_global_2x32(b, value, address, .align_mul = 4);
+}
+
+/* Native launch geometry of the current job: coarse workgroup index. */
+static nir_def *
+native_workgroup(nir_builder *b)
+{
+   return nir_channel(b, nir_load_base_workgroup_id(b, 32), 0);
+}
+
+static unsigned
+attribute_slots(const struct glsl_type *type, bool bindless)
+{
+   return glsl_count_attribute_slots(type, false);
+}
+
+/* Converts in/out variables to IO intrinsics indexed by API location. */
+static void
+lower_stage_io(nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir),
+            nir_var_shader_in | nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_shader_in | nir_var_shader_out,
+            UINT32_MAX);
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_shader_out) {
+      var->data.driver_location = var->data.location;
+      if (nir->info.stage == MESA_SHADER_VERTEX && var->data.mode == nir_var_shader_in)
+         var->data.driver_location -= VERT_ATTRIB_GENERIC0;
+   }
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, attribute_slots,
+            nir_lower_io_use_interpolated_input_intrinsics);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_lower_system_values);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
+/* Makes a lowered stage an ordinary native launch of `invocations` lanes. */
+static void
+convert_to_launch(nir_shader *nir, unsigned invocations)
+{
+   nir_remove_dead_variables(nir, nir_var_shader_in | nir_var_shader_out, NULL);
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+   nir->info.workgroup_size[0] = invocations;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+}
+
+/* ---- Vertex stage -------------------------------------------------------- */
+
+struct vertex_lowering {
+   struct apex_shader *shader;
+   const struct vk_vertex_input_state *vi;
+   nir_def *vertex, *instance, *index, *record;
+   bool invalid;
+};
+
+/* One vertex channel of a plain format, as FP32 or integer bits. */
+static nir_def *
+fetch_channel(nir_builder *b, const struct util_format_description *desc, unsigned c,
+              nir_def *address, nir_def *byte)
+{
+   const struct util_format_channel_description *ch = &desc->channel[c];
+   unsigned bits = ch->size, shift = ch->shift;
+   /* Load the aligned word(s) covering the channel. */
+   nir_def *first = nir_iadd_imm(b, byte, shift / 8);
+   nir_def *aligned = nir_iand_imm(b, first, ~3u);
+   nir_def *offset = nir_ishl_imm(b, nir_iand_imm(b, first, 3), 3);
+   nir_def *lo = load_word(b, address_add(b, address, aligned));
+   nir_def *value;
+   if (bits == 32) {
+      /* 32-bit channels are word aligned. */
+      value = lo;
+   } else {
+      nir_def *hi = load_word(b, address_add(b, address, nir_iadd_imm(b, aligned, 4)));
+      nir_def *joined = nir_bcsel(b, nir_ieq_imm(b, offset, 0), lo,
+         nir_ior(b, nir_ushr(b, lo, offset), nir_ishl(b, hi, nir_isub(b, nir_imm_int(b, 32), offset))));
+      value = nir_iand_imm(b, nir_ushr_imm(b, joined, shift % 8), BITFIELD_MASK(bits));
+   }
+   switch (ch->type) {
+   case UTIL_FORMAT_TYPE_FLOAT:
+      /* The vertex format table admits only 32-bit float channels. */
+      return value;
+   case UTIL_FORMAT_TYPE_UNSIGNED:
+      if (ch->normalized)
+         return nir_fmul_imm(b, nir_u2f32(b, value), 1.0 / BITFIELD_MASK(bits));
+      return desc->channel[c].pure_integer ? value : nir_u2f32(b, value);
+   case UTIL_FORMAT_TYPE_SIGNED: {
+      nir_def *extended = bits == 32 ? value :
+         nir_ishr_imm(b, nir_ishl_imm(b, value, 32 - bits), 32 - bits);
+      if (ch->normalized)
+         return nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, extended), 1.0 / BITFIELD_MASK(bits - 1)),
+                         nir_imm_float(b, -1.0f));
+      return desc->channel[c].pure_integer ? extended : nir_i2f32(b, extended);
+   }
+   default:
+      return nir_imm_int(b, 0);
+   }
+}
+
+static nir_def *
+fetch_attribute(nir_builder *b, struct vertex_lowering *ctx, unsigned location,
+                unsigned component, unsigned count, bool integer)
+{
+   const struct vk_vertex_attribute_state *attr = &ctx->vi->attributes[location];
+   const struct vk_vertex_binding_state *binding = &ctx->vi->bindings[attr->binding];
+   const struct apex_program *program = &ctx->shader->program;
+   enum pipe_format pformat = vk_format_to_pipe_format(attr->format);
+   const struct util_format_description *desc = util_format_description(pformat);
+   if (!(ctx->vi->attributes_valid & BITFIELD_BIT(location)) || !desc ||
+       desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.bits > 128) {
+      ctx->invalid = true;
+      return nir_imm_zero(b, count, 32);
+   }
+   unsigned slot = APEX_DRAW_BINDINGS + attr->binding * APEX_DRAW_BINDING_WORDS;
+   /* Instance-rate elements: firstInstance + (InstanceIndex - firstInstance) / divisor;
+    * a zero divisor repeats firstInstance. */
+   nir_def *first_instance = draw_word(b, program, APEX_DRAW_FIRST_INSTANCE);
+   nir_def *element = ctx->vertex;
+   if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE) {
+      element = binding->divisor == 1 ? ctx->instance :
+                binding->divisor == 0 ? first_instance :
+                nir_iadd(b, first_instance,
+                         nir_udiv_imm(b, nir_isub(b, ctx->instance, first_instance), binding->divisor));
+   }
+   nir_def *byte = nir_iadd_imm(b, nir_imul(b, element, draw_word(b, program, slot + 3)), attr->offset);
+   /* Robust fetch: an attribute beyond the bound range reads zero. */
+   nir_def *inside = nir_uge(b, draw_word(b, program, slot + 2),
+                             nir_iadd_imm(b, byte, desc->block.bits / 8));
+   nir_def *address = draw_address(b, program, slot);
+   nir_def *values[4], *fallback[4];
+   /* Phi sources must exist before the if: phis lead their block. */
+   for (unsigned c = 0; c < count; c++)
+      fallback[c] = component + c == 3 ? (integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f)) :
+                                         nir_imm_int(b, 0);
+   nir_push_if(b, inside);
+   nir_def *fetched[4];
+   for (unsigned c = 0; c < 4; c++) {
+      unsigned swizzle = desc->swizzle[c];
+      if (swizzle <= PIPE_SWIZZLE_W)
+         fetched[c] = fetch_channel(b, desc, swizzle, address, byte);
+      else if (swizzle == PIPE_SWIZZLE_1)
+         fetched[c] = integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f);
+      else
+         fetched[c] = nir_imm_int(b, 0);
+   }
+   nir_pop_if(b, NULL);
+   for (unsigned c = 0; c < count; c++)
+      values[c] = nir_if_phi(b, fetched[component + c], fallback[c]);
+   return nir_vec(b, values, count);
+}
+
+static bool
+lower_vertex_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   struct vertex_lowering *ctx = data;
+   const struct apex_program *program = &ctx->shader->program;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *replacement = NULL;
+   switch (i->intrinsic) {
+   case nir_intrinsic_load_input: {
+      if (i->def.bit_size != 32) {
+         ctx->invalid = true;
+         return false;
+      }
+      unsigned location = nir_intrinsic_io_semantics(i).location - VERT_ATTRIB_GENERIC0;
+      nir_alu_type type = nir_intrinsic_dest_type(i);
+      replacement = fetch_attribute(b, ctx, location, nir_intrinsic_component(i),
+                                    i->def.num_components,
+                                    nir_alu_type_get_base_type(type) != nir_type_float);
+      break;
+   }
+   case nir_intrinsic_store_output: {
+      unsigned location = nir_intrinsic_io_semantics(i).location;
+      int slot = ctx->shader->vertex.slot[location];
+      if (slot < 0) {
+         /* Outputs without a consumer-visible slot are discarded. */
+         nir_instr_remove(&i->instr);
+         return true;
+      }
+      nir_def *value = i->src[0].ssa;
+      unsigned component = nir_intrinsic_component(i);
+      for (unsigned c = 0; c < value->num_components; c++) {
+         if (!(nir_intrinsic_write_mask(i) & BITFIELD_BIT(c)))
+            continue;
+         nir_def *word = nir_channel(b, value, c);
+         if (word->bit_size != 32) {
+            ctx->invalid = true;
+            return false;
+         }
+         store_word(b, word, address_add(b, ctx->record,
+                                         nir_imm_int(b, (slot + component + c) * 4)));
+      }
+      nir_instr_remove(&i->instr);
+      return true;
+   }
+   case nir_intrinsic_load_vertex_id:
+      replacement = ctx->index;
+      break;
+   case nir_intrinsic_load_vertex_id_zero_base:
+      replacement = nir_isub(b, ctx->index, draw_word(b, program, APEX_DRAW_FIRST_VERTEX));
+      break;
+   case nir_intrinsic_load_first_vertex:
+   case nir_intrinsic_load_base_vertex:
+      replacement = draw_word(b, program, i->intrinsic == nir_intrinsic_load_first_vertex ?
+                              APEX_DRAW_FIRST_VERTEX : APEX_DRAW_INDEX + 3);
+      break;
+   case nir_intrinsic_load_instance_id:
+      replacement = nir_isub(b, ctx->instance, draw_word(b, program, APEX_DRAW_FIRST_INSTANCE));
+      break;
+   case nir_intrinsic_load_base_instance:
+      replacement = draw_word(b, program, APEX_DRAW_FIRST_INSTANCE);
+      break;
+   case nir_intrinsic_load_draw_id:
+   case nir_intrinsic_load_view_index:
+      replacement = nir_imm_int(b, 0);
+      break;
+   case nir_intrinsic_load_is_indexed_draw:
+      replacement = nir_ine_imm(b, draw_word(b, program, APEX_DRAW_INDEX + 2), 0);
+      break;
+   default:
+      return false;
+   }
+   nir_def_rewrite_uses(&i->def, replacement);
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
+/* Record layout: position first, then written generic locations in order. */
+static void
+assign_vertex_slots(struct apex_shader *shader, const nir_shader *nir)
+{
+   memset(shader->vertex.slot, 0xff, sizeof(shader->vertex.slot));
+   shader->vertex.slot[VARYING_SLOT_POS] = 0;
+   unsigned words = 4;
+   for (unsigned l = 0; l < 32; l++) {
+      if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VAR0 + l)) {
+         shader->vertex.slot[VARYING_SLOT_VAR0 + l] = words;
+         words += 4;
+      }
+   }
+   shader->vertex.stride = words;
+}
+
+/* Runs `lower` on each collected intrinsic; lowering may insert control flow. */
+static bool
+lower_collected(nir_shader *nir, bool (*lower)(nir_builder *, nir_intrinsic_instr *, void *),
+                void *data)
+{
+   struct util_dynarray list;
+   util_dynarray_init(&list, NULL);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic)
+               util_dynarray_append(&list, nir_instr_as_intrinsic(instr));
+         }
+      }
+   }
+   bool progress = false;
+   nir_builder b = nir_builder_create(nir_shader_get_entrypoint(nir));
+   util_dynarray_foreach(&list, nir_intrinsic_instr *, i)
+      progress |= lower(&b, *i, data);
+   util_dynarray_fini(&list);
+   nir_progress(progress, nir_shader_get_entrypoint(nir), nir_metadata_none);
+   return progress;
+}
+
+static bool
+build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
+                    const struct vk_vertex_input_state *vi)
+{
+   assign_vertex_slots(shader, nir);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+   nir_builder builder = nir_builder_at(nir_before_impl(impl));
+   nir_builder *b = &builder;
+   const struct apex_program *program = &shader->program;
+   struct vertex_lowering ctx = {.shader = shader, .vi = vi};
+   /* Linear vertex over V x I from the job's base plus the native launch. */
+   nir_def *linear = nir_iadd(b, nir_imul_imm(b, nir_iadd(b, root_word(b, apex_program_trailer(program)),
+                                                           native_workgroup(b)), 64),
+                              nir_load_local_invocation_index(b));
+   nir_def *per_instance = draw_word(b, program, APEX_DRAW_VERTEX_COUNT);
+   nir_def *total = nir_imul(b, per_instance, draw_word(b, program, APEX_DRAW_INSTANCE_COUNT));
+   nir_def *instance = nir_udiv(b, linear, nir_umax(b, per_instance, nir_imm_int(b, 1)));
+   nir_def *position = nir_isub(b, linear, nir_imul(b, instance, per_instance));
+   ctx.instance = nir_iadd(b, instance, draw_word(b, program, APEX_DRAW_FIRST_INSTANCE));
+   nir_if *guard = nir_push_if(b, nir_ult(b, linear, total));
+   /* Indexed draws read 16/32-bit indices; others count from firstVertex. */
+   nir_def *index_bytes = draw_word(b, program, APEX_DRAW_INDEX + 2);
+   nir_push_if(b, nir_ine_imm(b, index_bytes, 0));
+   nir_def *byte = nir_imul(b, nir_iadd(b, position, draw_word(b, program, APEX_DRAW_FIRST_VERTEX)),
+                            index_bytes);
+   nir_def *word = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_INDEX),
+                                            nir_iand_imm(b, byte, ~3u)));
+   nir_def *index = nir_bcsel(b, nir_ieq_imm(b, index_bytes, 4), word,
+      nir_iand_imm(b, nir_ushr(b, word, nir_ishl_imm(b, nir_iand_imm(b, byte, 2), 3)), 0xffff));
+   index = nir_iadd(b, index, draw_word(b, program, APEX_DRAW_INDEX + 3));
+   nir_push_else(b, NULL);
+   nir_def *direct = nir_iadd(b, position, draw_word(b, program, APEX_DRAW_FIRST_VERTEX));
+   nir_pop_if(b, NULL);
+   ctx.index = nir_if_phi(b, index, direct);
+   ctx.vertex = ctx.index;
+   ctx.record = address_add(b, draw_address(b, program, APEX_DRAW_VERTEX_LO),
+                            nir_imul_imm(b, linear, shader->vertex.stride * 4));
+   nir_cf_reinsert(&body, b->cursor);
+   b->cursor = nir_after_cf_list(&guard->then_list);
+   nir_pop_if(b, guard);
+   lower_collected(nir, lower_vertex_intrinsic, &ctx);
+   return !ctx.invalid;
+}
+
+/* ---- Fragment stage ------------------------------------------------------ */
+
+/* Lane l of a SIMD16 wave shades pixel (2 (l>>2 & 1) + (l & 1),
+ * 2 (l >> 3) + (l>>1 & 1)) of a 4x4 tile: lanes 4q..4q+3 form 2x2 quad q. */
+struct fragment_lowering {
+   struct apex_shader *shader;
+   nir_variable *perspective, *linear, *coord, *front, *covered, *killed, *sources, *primitive;
+   nir_variable *color[APEX_DRAW_MAX_COLOR], *depth;
+   bool invalid;
+};
+
+static nir_def *
+attribute(nir_builder *b, struct fragment_lowering *ctx, nir_def *source, unsigned location,
+          unsigned component)
+{
+   const struct apex_program *program = &ctx->shader->program;
+   nir_def *slot = draw_word(b, program, APEX_DRAW_SLOTS + location - VARYING_SLOT_VAR0);
+   nir_def *word = nir_iadd(b, nir_imul(b, source, draw_word(b, program, APEX_DRAW_VERTEX_STRIDE)),
+                            nir_iadd_imm(b, slot, component));
+   return load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_VERTEX_LO),
+                                   nir_imul_imm(b, word, 4)));
+}
+
+static nir_def *
+lane_shuffle(nir_builder *b, nir_def *value, nir_def *lane)
+{
+   nir_def *channels[4];
+   for (unsigned c = 0; c < value->num_components; c++)
+      channels[c] = nir_shuffle(b, nir_channel(b, value, c), lane);
+   return nir_vec(b, channels, value->num_components);
+}
+
+static bool
+lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   struct fragment_lowering *ctx = data;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *replacement = NULL;
+   switch (i->intrinsic) {
+   case nir_intrinsic_load_interpolated_input:
+   case nir_intrinsic_load_input: {
+      unsigned location = nir_intrinsic_io_semantics(i).location;
+      unsigned component = nir_intrinsic_component(i);
+      if (i->def.bit_size != 32) {
+         ctx->invalid = true;
+         return false;
+      }
+      nir_def *sources = nir_load_var(b, ctx->sources);
+      if (location == VARYING_SLOT_PRIMITIVE_ID) {
+         replacement = nir_load_var(b, ctx->primitive);
+         break;
+      }
+      if (location < VARYING_SLOT_VAR0 || location >= VARYING_SLOT_VAR0 + 32) {
+         replacement = nir_imm_zero(b, i->def.num_components, 32);
+         break;
+      }
+      nir_def *values[4];
+      if (i->intrinsic == nir_intrinsic_load_input) {
+         /* Flat inputs take the provoking vertex, source 0. */
+         for (unsigned c = 0; c < i->def.num_components; c++)
+            values[c] = attribute(b, ctx, nir_channel(b, sources, 0), location, component + c);
+      } else {
+         nir_intrinsic_instr *bary = nir_src_as_intrinsic(i->src[0]);
+         bool linear = bary && nir_intrinsic_interp_mode(bary) == INTERP_MODE_NOPERSPECTIVE;
+         nir_def *weights = nir_load_var(b, linear ? ctx->linear : ctx->perspective);
+         for (unsigned c = 0; c < i->def.num_components; c++) {
+            nir_def *sum = NULL;
+            for (unsigned j = 0; j < 3; j++) {
+               nir_def *term = nir_fmul(b, nir_channel(b, weights, j),
+                  attribute(b, ctx, nir_channel(b, sources, j), location, component + c));
+               sum = sum ? nir_fadd(b, sum, term) : term;
+            }
+            values[c] = sum;
+         }
+      }
+      replacement = nir_vec(b, values, i->def.num_components);
+      break;
+   }
+   case nir_intrinsic_load_frag_coord:
+      replacement = nir_load_var(b, ctx->coord);
+      break;
+   case nir_intrinsic_load_front_face:
+      replacement = nir_load_var(b, ctx->front);
+      if (i->def.bit_size == 32)
+         replacement = nir_b2b32(b, replacement);
+      break;
+   case nir_intrinsic_load_helper_invocation:
+   case nir_intrinsic_is_helper_invocation:
+      replacement = nir_ior(b, nir_inot(b, nir_load_var(b, ctx->covered)), nir_load_var(b, ctx->killed));
+      if (i->def.bit_size == 32)
+         replacement = nir_b2b32(b, replacement);
+      break;
+   case nir_intrinsic_load_sample_id:
+   case nir_intrinsic_load_layer_id:
+   case nir_intrinsic_load_view_index:
+      replacement = nir_imm_int(b, 0);
+      break;
+   case nir_intrinsic_load_sample_mask_in:
+      replacement = nir_b2i32(b, nir_load_var(b, ctx->covered));
+      break;
+   case nir_intrinsic_load_sample_pos:
+   case nir_intrinsic_load_sample_pos_or_center:
+      replacement = nir_imm_vec2(b, 0.5f, 0.5f);
+      break;
+   case nir_intrinsic_load_barycentric_pixel:
+   case nir_intrinsic_load_barycentric_centroid:
+   case nir_intrinsic_load_barycentric_sample:
+   case nir_intrinsic_load_barycentric_at_sample:
+   case nir_intrinsic_load_barycentric_at_offset:
+      /* Consumed by load_interpolated_input through its interpolation mode. */
+      return false;
+   case nir_intrinsic_store_output: {
+      unsigned location = nir_intrinsic_io_semantics(i).location;
+      nir_def *value = i->src[0].ssa;
+      unsigned component = nir_intrinsic_component(i);
+      nir_variable *var = location == FRAG_RESULT_DEPTH ? ctx->depth :
+         location >= FRAG_RESULT_DATA0 && location < FRAG_RESULT_DATA0 + APEX_DRAW_MAX_COLOR ?
+         ctx->color[location - FRAG_RESULT_DATA0] : NULL;
+      if (var && value->bit_size == 32) {
+         nir_def *old = nir_load_var(b, var);
+         nir_def *channels[4];
+         for (unsigned c = 0; c < old->num_components; c++) {
+            unsigned source = c - component;
+            channels[c] = c >= component && source < value->num_components &&
+               (nir_intrinsic_write_mask(i) & BITFIELD_BIT(source)) ?
+               nir_channel(b, value, source) : nir_channel(b, old, c);
+         }
+         nir_store_var(b, var, nir_vec(b, channels, old->num_components), BITFIELD_MASK(4));
+      } else if (var) {
+         ctx->invalid = true;
+         return false;
+      }
+      nir_instr_remove(&i->instr);
+      return true;
+   }
+   case nir_intrinsic_terminate:
+   case nir_intrinsic_demote:
+      nir_store_var(b, ctx->killed, nir_imm_true(b), 1);
+      nir_instr_remove(&i->instr);
+      return true;
+   case nir_intrinsic_terminate_if:
+   case nir_intrinsic_demote_if:
+      nir_store_var(b, ctx->killed, nir_ior(b, nir_load_var(b, ctx->killed), i->src[0].ssa), 1);
+      nir_instr_remove(&i->instr);
+      return true;
+   case nir_intrinsic_ddx: case nir_intrinsic_ddx_fine: case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy: case nir_intrinsic_ddy_fine: case nir_intrinsic_ddy_coarse: {
+      bool x = i->intrinsic == nir_intrinsic_ddx || i->intrinsic == nir_intrinsic_ddx_fine ||
+               i->intrinsic == nir_intrinsic_ddx_coarse;
+      bool coarse = i->intrinsic == nir_intrinsic_ddx_coarse || i->intrinsic == nir_intrinsic_ddy_coarse;
+      unsigned axis = x ? 1 : 2;
+      nir_def *lane = nir_load_subgroup_invocation(b);
+      /* Coarse derivatives use the quad's first row/column pair. */
+      nir_def *base = nir_iand_imm(b, lane, coarse ? ~3u : ~axis);
+      nir_def *value = i->src[0].ssa;
+      replacement = nir_fsub(b, lane_shuffle(b, value, nir_ior_imm(b, base, axis)),
+                             lane_shuffle(b, value, base));
+      break;
+   }
+   default:
+      return false;
+   }
+   nir_def_rewrite_uses(&i->def, replacement);
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
+static nir_def *
+unpack_color(nir_builder *b, enum pipe_format format, nir_def *words)
+{
+   const struct util_format_description *desc = util_format_description(format);
+   if (desc->block.bits == 128 || format == PIPE_FORMAT_R32_UINT || format == PIPE_FORMAT_R32_SINT ||
+       format == PIPE_FORMAT_R32_FLOAT)
+      return words;
+   nir_def *channels[4];
+   for (unsigned c = 0; c < 4; c++) {
+      unsigned swizzle = desc->swizzle[c];
+      channels[c] = swizzle <= PIPE_SWIZZLE_W ?
+         nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, nir_channel(b, words, 0),
+                                                                  desc->channel[swizzle].shift), 0xff)),
+                      1.0 / 255.0) :
+         nir_imm_float(b, swizzle == PIPE_SWIZZLE_1 ? 1.0f : 0.0f);
+   }
+   return nir_vec(b, channels, 4);
+}
+
+/* Unsigned-normalized 8-bit channels: clamp, scale and round to nearest even. */
+static nir_def *
+pack_color(nir_builder *b, enum pipe_format format, nir_def *color)
+{
+   const struct util_format_description *desc = util_format_description(format);
+   if (desc->block.bits == 128)
+      return color;
+   if (desc->block.bits == 32 && desc->nr_channels == 1)
+      return nir_channel(b, color, 0);
+   nir_def *packed = nir_imm_int(b, 0);
+   for (unsigned c = 0; c < 4; c++) {
+      /* Channel c of the format stores API component swizzle-inverse. */
+      for (unsigned s = 0; s < 4; s++) {
+         if (desc->swizzle[s] != c)
+            continue;
+         nir_def *v = nir_fsat(b, nir_channel(b, color, s));
+         nir_def *scaled = nir_fround_even(b, nir_fmul_imm(b, v, 255.0f));
+         packed = nir_ior(b, packed, nir_ishl_imm(b, nir_f2u32(b, scaled), desc->channel[c].shift));
+      }
+   }
+   return packed;
+}
+
+static unsigned
+color_words(enum pipe_format format)
+{
+   return util_format_description(format)->block.bits / 32;
+}
+
+/* One VkBlendFactor for channel c. Dual-source factors read as zero. */
+static nir_def *
+blend_factor(nir_builder *b, nir_def *factor, nir_def *src, nir_def *dst, nir_def *constant,
+             unsigned c)
+{
+   nir_def *one = nir_imm_float(b, 1.0f);
+   nir_def *src_a = nir_channel(b, src, 3), *dst_a = nir_channel(b, dst, 3);
+   nir_def *table[] = {
+      nir_imm_float(b, 0.0f), one,
+      nir_channel(b, src, c), nir_fsub(b, one, nir_channel(b, src, c)),
+      nir_channel(b, dst, c), nir_fsub(b, one, nir_channel(b, dst, c)),
+      src_a, nir_fsub(b, one, src_a), dst_a, nir_fsub(b, one, dst_a),
+      nir_channel(b, constant, c), nir_fsub(b, one, nir_channel(b, constant, c)),
+      nir_channel(b, constant, 3), nir_fsub(b, one, nir_channel(b, constant, 3)),
+      c == 3 ? one : nir_fmin(b, src_a, nir_fsub(b, one, dst_a)),
+   };
+   nir_def *result = table[0];
+   for (unsigned f = 1; f < ARRAY_SIZE(table); f++)
+      result = nir_bcsel(b, nir_ieq_imm(b, factor, f), table[f], result);
+   return result;
+}
+
+/* VkBlendOp ADD, SUBTRACT, REVERSE_SUBTRACT, MIN, MAX. */
+static nir_def *
+blend_op(nir_builder *b, nir_def *op, nir_def *s, nir_def *d, nir_def *sf, nir_def *df)
+{
+   nir_def *ss = nir_fmul(b, s, sf), *dd = nir_fmul(b, d, df);
+   nir_def *result = nir_fadd(b, ss, dd);
+   result = nir_bcsel(b, nir_ieq_imm(b, op, 1), nir_fsub(b, ss, dd), result);
+   result = nir_bcsel(b, nir_ieq_imm(b, op, 2), nir_fsub(b, dd, ss), result);
+   result = nir_bcsel(b, nir_ieq_imm(b, op, 3), nir_fmin(b, s, d), result);
+   return nir_bcsel(b, nir_ieq_imm(b, op, 4), nir_fmax(b, s, d), result);
+}
+
+/* Bits of packed color storage written by API channel mask `mask`. */
+static nir_def *
+write_bits(nir_builder *b, enum pipe_format format, nir_def *mask, unsigned word)
+{
+   const struct util_format_description *desc = util_format_description(format);
+   nir_def *bits = nir_imm_int(b, 0);
+   for (unsigned s = 0; s < 4; s++) {
+      unsigned channel = desc->swizzle[s];
+      if (channel > PIPE_SWIZZLE_W)
+         continue;
+      const struct util_format_channel_description *ch = &desc->channel[channel];
+      unsigned first = ch->shift, last = ch->shift + ch->size;
+      if (last <= word * 32 || first >= word * 32 + 32)
+         continue;
+      uint32_t field = ch->size == 32 ? ~0u : BITFIELD_MASK(ch->size) << (first - word * 32);
+      bits = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, mask, 1u << s), 0),
+                       nir_ior_imm(b, bits, field), bits);
+   }
+   return bits;
+}
+
+static nir_def *
+loop_counter(nir_builder *b, nir_variable *var, nir_def *limit)
+{
+   nir_def *value = nir_load_var(b, var);
+   nir_push_if(b, nir_uge(b, value, limit));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+   return value;
+}
+
+static bool
+build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
+                      const struct vk_render_pass_state *rp)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   const struct apex_program *program = &shader->program;
+   struct fragment_lowering ctx = {.shader = shader};
+   const struct glsl_type *vec4 = glsl_vec4_type(), *vec3 = glsl_vec_type(3);
+   ctx.perspective = nir_local_variable_create(impl, vec3, "perspective");
+   ctx.linear = nir_local_variable_create(impl, vec3, "linear");
+   ctx.coord = nir_local_variable_create(impl, vec4, "coord");
+   ctx.front = nir_local_variable_create(impl, glsl_bool_type(), "front");
+   ctx.covered = nir_local_variable_create(impl, glsl_bool_type(), "covered");
+   ctx.killed = nir_local_variable_create(impl, glsl_bool_type(), "killed");
+   ctx.sources = nir_local_variable_create(impl, glsl_uvec_type(3), "sources");
+   ctx.primitive = nir_local_variable_create(impl, glsl_uint_type(), "primitive");
+   ctx.depth = nir_local_variable_create(impl, glsl_float_type(), "depth");
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      ctx.color[k] = nir_local_variable_create(impl, vec4, "color");
+   lower_collected(nir, lower_fragment_intrinsic, &ctx);
+   if (ctx.invalid)
+      return false;
+
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+   nir_builder builder = nir_builder_at(nir_before_impl(impl));
+   nir_builder *b = &builder;
+
+   /* Attachments the fragment shader writes, with their storage formats. */
+   enum pipe_format formats[APEX_DRAW_MAX_COLOR] = {0};
+   nir_variable *stored[APEX_DRAW_MAX_COLOR] = {0};
+   for (unsigned k = 0; rp && k < rp->color_attachment_count && k < APEX_DRAW_MAX_COLOR; k++) {
+      if (!(nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DATA0 + k)) ||
+          rp->color_attachment_formats[k] == VK_FORMAT_UNDEFINED)
+         continue;
+      formats[k] = vk_format_to_pipe_format(rp->color_attachment_formats[k]);
+      stored[k] = nir_local_variable_create(impl, glsl_uvec4_type(), "stored");
+   }
+   bool depth_target = rp && rp->depth_attachment_format == VK_FORMAT_D32_SFLOAT;
+   nir_variable *stored_depth = nir_local_variable_create(impl, glsl_uint_type(), "stored_depth");
+
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *lx = nir_ior(b, nir_iand_imm(b, lane, 1), nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 2));
+   nir_def *ly = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 1),
+                         nir_iand_imm(b, nir_ushr_imm(b, lane, 2), 2));
+   nir_def *x0 = draw_word(b, program, APEX_DRAW_SCISSOR);
+   nir_def *y0 = draw_word(b, program, APEX_DRAW_SCISSOR + 1);
+   nir_def *x1 = draw_word(b, program, APEX_DRAW_SCISSOR + 2);
+   nir_def *y1 = draw_word(b, program, APEX_DRAW_SCISSOR + 3);
+   nir_def *tx0 = nir_ushr_imm(b, x0, 2), *ty0 = nir_ushr_imm(b, y0, 2);
+   nir_def *tw = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, x1, 3), 2), tx0);
+   nir_def *th = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, y1, 3), 2), ty0);
+   nir_def *empty = nir_ior(b, nir_uge(b, x0, x1), nir_uge(b, y0, y1));
+   nir_def *tiles = nir_bcsel(b, empty, nir_imm_int(b, 0), nir_imul(b, tw, th));
+   unsigned trailer = apex_program_trailer(program);
+   nir_def *groups = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups));
+   nir_def *prims = nir_imul(b, draw_word(b, program, APEX_DRAW_PRIM_COUNT),
+                             draw_word(b, program, APEX_DRAW_INSTANCE_COUNT));
+   nir_def *prim_base = draw_address(b, program, APEX_DRAW_PRIM_LO);
+
+   nir_variable *t_var = nir_local_variable_create(impl, glsl_uint_type(), "tile");
+   nir_store_var(b, t_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
+   nir_loop *tile_loop = nir_push_loop(b);
+   nir_def *t = loop_counter(b, t_var, tiles);
+   nir_def *ty = nir_udiv(b, t, tw);
+   nir_def *tx = nir_isub(b, t, nir_imul(b, ty, tw));
+   nir_def *tile_x = nir_ishl_imm(b, nir_iadd(b, tx0, tx), 2);
+   nir_def *tile_y = nir_ishl_imm(b, nir_iadd(b, ty0, ty), 2);
+   nir_def *px = nir_iadd(b, tile_x, lx), *py = nir_iadd(b, tile_y, ly);
+   nir_def *inside = nir_iand(b, nir_iand(b, nir_uge(b, px, x0), nir_ult(b, px, x1)),
+                              nir_iand(b, nir_uge(b, py, y0), nir_ult(b, py, y1)));
+
+   /* Current attachment contents of this lane's pixel. */
+   nir_def *color_address[APEX_DRAW_MAX_COLOR] = {0};
+   nir_def *depth_address = NULL;
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
+      if (!stored[k])
+         continue;
+      unsigned slot = APEX_DRAW_COLOR + k * APEX_DRAW_COLOR_WORDS;
+      color_address[k] = address_add(b, draw_address(b, program, slot),
+         nir_iadd(b, nir_imul(b, py, draw_word(b, program, slot + 2)),
+                  nir_imul_imm(b, px, color_words(formats[k]) * 4)));
+   }
+   if (depth_target)
+      depth_address = address_add(b, draw_address(b, program, APEX_DRAW_DEPTH_TARGET),
+         nir_iadd(b, nir_imul(b, py, draw_word(b, program, APEX_DRAW_DEPTH_TARGET + 2)),
+                  nir_imul_imm(b, px, 4)));
+   nir_def *zero4 = nir_imm_zero(b, 4, 32), *zero = nir_imm_int(b, 0);
+   nir_push_if(b, inside);
+   nir_def *loaded[APEX_DRAW_MAX_COLOR] = {0};
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
+      if (!stored[k])
+         continue;
+      unsigned words = color_words(formats[k]);
+      nir_def *w[4];
+      for (unsigned c = 0; c < 4; c++)
+         w[c] = c < words ? load_word(b, address_add(b, color_address[k], nir_imm_int(b, c * 4))) :
+                            nir_imm_int(b, 0);
+      loaded[k] = nir_vec(b, w, 4);
+   }
+   nir_def *loaded_depth = depth_target ? load_word(b, depth_address) : NULL;
+   nir_pop_if(b, NULL);
+   nir_def *merged_load[APEX_DRAW_MAX_COLOR] = {0};
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      if (stored[k])
+         merged_load[k] = nir_if_phi(b, loaded[k], zero4);
+   nir_def *merged_depth = depth_target ? nir_if_phi(b, loaded_depth, zero) : NULL;
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      if (stored[k])
+         nir_store_var(b, stored[k], merged_load[k], 0xf);
+   if (depth_target)
+      nir_store_var(b, stored_depth, merged_depth, 1);
+
+   nir_variable *p_var = nir_local_variable_create(impl, glsl_uint_type(), "primitive_index");
+   nir_store_var(b, p_var, nir_imm_int(b, 0), 1);
+   nir_loop *prim_loop = nir_push_loop(b);
+   nir_def *p = loop_counter(b, p_var, prims);
+   nir_def *first = address_add(b, prim_base, nir_imul_imm(b, p, APEX_SUBPRIMS * APEX_PRIM_WORDS * 4));
+   nir_def *count = load_word(b, address_add(b, first, nir_imm_int(b, APEX_PRIM_COUNT * 4)));
+   nir_variable *s_var = nir_local_variable_create(impl, glsl_uint_type(), "subprimitive");
+   nir_store_var(b, s_var, nir_imm_int(b, 0), 1);
+   nir_loop *sub_loop = nir_push_loop(b);
+   nir_def *s = loop_counter(b, s_var, count);
+   nir_def *record = address_add(b, first, nir_imul_imm(b, s, APEX_PRIM_WORDS * 4));
+#define FIELD(word) load_word(b, address_add(b, record, nir_imm_int(b, (word) * 4)))
+   nir_def *overlap = nir_iand(b,
+      nir_iand(b, nir_ult(b, FIELD(APEX_PRIM_BOX), nir_iadd_imm(b, tile_x, 4)),
+                  nir_ult(b, tile_x, FIELD(APEX_PRIM_BOX + 2))),
+      nir_iand(b, nir_ult(b, FIELD(APEX_PRIM_BOX + 1), nir_iadd_imm(b, tile_y, 4)),
+                  nir_ult(b, tile_y, FIELD(APEX_PRIM_BOX + 3))));
+   nir_push_if(b, overlap);
+   nir_def *qx = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, px, 8), 128));
+   nir_def *qy = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, py, 8), 128));
+   nir_def *edge[3];
+   nir_def *covered = inside;
+   for (unsigned e = 0; e < 3; e++) {
+      unsigned w = APEX_PRIM_EDGE + e * 4;
+      nir_def *c = nir_pack_64_2x32_split(b, FIELD(w + 2), FIELD(w + 3));
+      edge[e] = nir_iadd(b, nir_iadd(b, nir_imul(b, nir_i2i64(b, FIELD(w)), qx),
+                                         nir_imul(b, nir_i2i64(b, FIELD(w + 1)), qy)), c);
+      covered = nir_iand(b, covered, nir_ige_imm(b, edge[e], 0));
+   }
+   nir_push_if(b, nir_vote_any(b, 1, covered));
+   nir_def *reciprocal = FIELD(APEX_PRIM_RECIPROCAL_AREA);
+   nir_def *lambda[3], *weighted[3];
+   nir_def *z = NULL, *sum = NULL;
+   for (unsigned i = 0; i < 3; i++) {
+      lambda[i] = nir_fmul(b, nir_i2f32(b, edge[i]), reciprocal);
+      nir_def *zi = nir_fmul(b, lambda[i], FIELD(APEX_PRIM_Z + i));
+      weighted[i] = nir_fmul(b, lambda[i], FIELD(APEX_PRIM_INV_W + i));
+      z = z ? nir_fadd(b, z, zi) : zi;
+      sum = sum ? nir_fadd(b, sum, weighted[i]) : weighted[i];
+   }
+   nir_def *normalize = nir_frcp(b, sum);
+   nir_def *perspective[3], *linear[3];
+   for (unsigned j = 0; j < 3; j++) {
+      perspective[j] = linear[j] = NULL;
+      for (unsigned i = 0; i < 3; i++) {
+         nir_def *m = FIELD(APEX_PRIM_WEIGHTS + i * 3 + j);
+         nir_def *pw = nir_fmul(b, nir_fmul(b, weighted[i], normalize), m);
+         nir_def *lw = nir_fmul(b, lambda[i], m);
+         perspective[j] = perspective[j] ? nir_fadd(b, perspective[j], pw) : pw;
+         linear[j] = linear[j] ? nir_fadd(b, linear[j], lw) : lw;
+      }
+   }
+   nir_store_var(b, ctx.perspective, nir_vec(b, perspective, 3), 0x7);
+   nir_store_var(b, ctx.linear, nir_vec(b, linear, 3), 0x7);
+   nir_store_var(b, ctx.coord, nir_vec4(b, nir_fadd_imm(b, nir_u2f32(b, px), 0.5f),
+                                        nir_fadd_imm(b, nir_u2f32(b, py), 0.5f), z, sum), 0xf);
+   nir_store_var(b, ctx.front, nir_ine_imm(b, nir_iand_imm(b, FIELD(APEX_PRIM_FLAGS), 1), 0), 1);
+   nir_store_var(b, ctx.sources, nir_vec3(b, FIELD(APEX_PRIM_SOURCE), FIELD(APEX_PRIM_SOURCE + 1),
+                                          FIELD(APEX_PRIM_SOURCE + 2)), 0x7);
+   nir_store_var(b, ctx.primitive, FIELD(APEX_PRIM_ID), 1);
+   nir_store_var(b, ctx.covered, covered, 1);
+   nir_store_var(b, ctx.killed, nir_imm_false(b), 1);
+   nir_store_var(b, ctx.depth, z, 1);
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      nir_store_var(b, ctx.color[k], nir_imm_zero(b, 4, 32), 0xf);
+   /* Whole quads execute the shader so helpers supply derivatives. */
+   nir_def *quad = nir_b2i32(b, covered);
+   for (unsigned d = 1; d < 4; d++)
+      quad = nir_ior(b, quad, nir_shuffle(b, nir_b2i32(b, covered), nir_ixor(b, lane, nir_imm_int(b, d))));
+   nir_if *shade = nir_push_if(b, nir_ine_imm(b, quad, 0));
+   nir_cf_reinsert(&body, b->cursor);
+   b->cursor = nir_after_cf_list(&shade->then_list);
+   nir_pop_if(b, shade);
+
+   nir_def *live = nir_iand(b, covered, nir_inot(b, nir_load_var(b, ctx.killed)));
+   if (depth_target) {
+      nir_def *control = draw_word(b, program, APEX_DRAW_DEPTH);
+      nir_def *fragment = nir_load_var(b, ctx.depth);
+      nir_def *old = nir_load_var(b, stored_depth);
+      nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, control, 4), 7);
+      nir_def *pass = nir_ior(b,
+         nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 1), 0), nir_flt(b, fragment, old)),
+         nir_ior(b, nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 2), 0), nir_feq(b, fragment, old)),
+                    nir_iand(b, nir_ine_imm(b, nir_iand_imm(b, op, 4), 0), nir_flt(b, old, fragment))));
+      nir_def *test = nir_ine_imm(b, nir_iand_imm(b, control, 1), 0);
+      live = nir_iand(b, live, nir_ior(b, nir_inot(b, test), pass));
+      nir_def *write = nir_iand(b, live, nir_iand(b, test, nir_ine_imm(b, nir_iand_imm(b, control, 2), 0)));
+      nir_store_var(b, stored_depth, nir_bcsel(b, write, fragment, old), 1);
+   }
+   nir_def *constant = nir_vec4(b, draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS),
+      draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 1),
+      draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 2),
+      draw_word(b, program, APEX_DRAW_BLEND_CONSTANTS + 3));
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
+      if (!stored[k])
+         continue;
+      nir_def *old = nir_load_var(b, stored[k]);
+      nir_def *src = nir_load_var(b, ctx.color[k]);
+      nir_def *state = draw_word(b, program, APEX_DRAW_BLEND + k * 2);
+      nir_def *ops = draw_word(b, program, APEX_DRAW_BLEND + k * 2 + 1);
+      bool integer = util_format_is_pure_integer(formats[k]);
+      nir_def *result = src;
+      if (!integer) {
+         nir_def *dst = unpack_color(b, formats[k], old);
+         nir_def *channels[4];
+         for (unsigned c = 0; c < 4; c++) {
+            bool alpha = c == 3;
+            nir_def *sf = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state, alpha ? 16 : 0), 0x1f),
+                                       src, dst, constant, c);
+            nir_def *df = blend_factor(b, nir_iand_imm(b, nir_ushr_imm(b, state, alpha ? 24 : 8), 0x1f),
+                                       src, dst, constant, c);
+            nir_def *op = nir_iand_imm(b, nir_ushr_imm(b, ops, alpha ? 8 : 0), 0xff);
+            channels[c] = blend_op(b, op, nir_channel(b, src, c), nir_channel(b, dst, c), sf, df);
+         }
+         result = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, ops, 1u << 24), 0), nir_vec(b, channels, 4), src);
+      }
+      nir_def *packed = pack_color(b, formats[k], result);
+      nir_def *mask = nir_iand_imm(b, nir_ushr_imm(b, ops, 16), 0xf);
+      nir_def *merged[4];
+      for (unsigned w = 0; w < 4; w++) {
+         if (w >= color_words(formats[k])) {
+            merged[w] = nir_imm_int(b, 0);
+            continue;
+         }
+         nir_def *bits = write_bits(b, formats[k], mask, w);
+         merged[w] = nir_ior(b, nir_iand(b, nir_channel(b, packed, w), bits),
+                             nir_iand(b, nir_channel(b, old, w), nir_inot(b, bits)));
+      }
+      nir_store_var(b, stored[k], nir_bcsel(b, live, nir_vec(b, merged, 4), old), 0xf);
+   }
+   nir_pop_if(b, NULL); /* any covered */
+   nir_pop_if(b, NULL); /* box overlap */
+#undef FIELD
+   nir_store_var(b, s_var, nir_iadd_imm(b, s, 1), 1);
+   nir_pop_loop(b, sub_loop);
+   nir_store_var(b, p_var, nir_iadd_imm(b, p, 1), 1);
+   nir_pop_loop(b, prim_loop);
+
+   nir_push_if(b, inside);
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
+      if (!stored[k])
+         continue;
+      nir_def *value = nir_load_var(b, stored[k]);
+      for (unsigned w = 0; w < color_words(formats[k]); w++)
+         store_word(b, nir_channel(b, value, w), address_add(b, color_address[k], nir_imm_int(b, w * 4)));
+   }
+   if (depth_target)
+      store_word(b, nir_load_var(b, stored_depth), depth_address);
+   nir_pop_if(b, NULL);
+   nir_store_var(b, t_var, nir_iadd(b, t, groups), 1);
+   nir_pop_loop(b, tile_loop);
+   return true;
+}
+
+/* ---- Shader objects ------------------------------------------------------ */
+
+static void
+apex_shader_destroy(struct vk_device *device, struct vk_shader *vk,
+                    const VkAllocationCallbacks *alloc)
+{
+   struct apex_shader *shader = container_of(vk, struct apex_shader, vk);
+   apex_program_finish((struct apex_device *)device, &shader->program);
+   for (unsigned s = 0; s < ARRAY_SIZE(shader->set_layouts); s++)
+      if (shader->set_layouts[s])
+         vk_descriptor_set_layout_unref(device, shader->set_layouts[s]);
+   vk_shader_free(device, alloc, vk);
+}
+
+/* Binaries are not yet portable across layouts; caches recompile. */
+static bool
+apex_shader_serialize(struct vk_device *device, const struct vk_shader *shader, struct blob *blob)
+{
+   return false;
+}
+
+static VkResult
+apex_shader_executable_properties(struct vk_device *device, const struct vk_shader *shader,
+                                  uint32_t *count, VkPipelineExecutablePropertiesKHR *properties)
+{
+   *count = 0;
+   return VK_SUCCESS;
+}
+
+static VkResult
+apex_shader_executable_statistics(struct vk_device *device, const struct vk_shader *shader,
+                                  uint32_t index, uint32_t *count,
+                                  VkPipelineExecutableStatisticKHR *statistics)
+{
+   *count = 0;
+   return VK_SUCCESS;
+}
+
+static VkResult
+apex_shader_executable_representations(struct vk_device *device, const struct vk_shader *shader,
+   uint32_t index, uint32_t *count, VkPipelineExecutableInternalRepresentationKHR *representations)
+{
+   *count = 0;
+   return VK_SUCCESS;
+}
+
+static const struct vk_shader_ops apex_shader_ops = {
+   .destroy = apex_shader_destroy,
+   .serialize = apex_shader_serialize,
+   .get_executable_properties = apex_shader_executable_properties,
+   .get_executable_statistics = apex_shader_executable_statistics,
+   .get_executable_internal_representations = apex_shader_executable_representations,
+};
+
+static VkResult
+compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
+              const struct vk_graphics_pipeline_state *state,
+              const VkAllocationCallbacks *alloc, struct vk_shader **out)
+{
+   nir_shader *nir = info->nir;
+   *out = NULL;
+   if (info->stage != MESA_SHADER_VERTEX && info->stage != MESA_SHADER_FRAGMENT) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   struct apex_shader *shader = vk_shader_zalloc(device, &apex_shader_ops, info->stage,
+                                                 alloc, sizeof(*shader));
+   if (!shader) {
+      ralloc_free(nir);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   for (unsigned s = 0; s < info->set_layout_count; s++)
+      if (info->set_layouts[s])
+         shader->set_layouts[s] = vk_descriptor_set_layout_ref(info->set_layouts[s]);
+   VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
+   /* All graphics stages share one push image covering every stage's range. */
+   if (!apex_program_layout(&shader->program, info->set_layout_count, info->set_layouts,
+                            info->push_constant_range_count, info->push_constant_ranges,
+                            VK_SHADER_STAGE_ALL_GRAPHICS))
+      goto fail;
+   lower_stage_io(nir);
+   if (!apex_program_lower_resources(&shader->program, nir))
+      goto fail;
+   bool built = info->stage == MESA_SHADER_VERTEX ?
+      state && state->vi && build_vertex_kernel(shader, nir, state->vi) :
+      build_fragment_kernel(shader, nir, state ? state->rp : NULL);
+   if (!built)
+      goto fail;
+   convert_to_launch(nir, info->stage == MESA_SHADER_VERTEX ? 64 : 16);
+   result = apex_program_compile(device, &shader->program, nir);
+   if (result != VK_SUCCESS)
+      goto fail;
+   ralloc_free(nir);
+   *out = &shader->vk;
+   return VK_SUCCESS;
+fail:
+   ralloc_free(nir);
+   apex_shader_destroy(device, &shader->vk, alloc);
+   return result;
+}
+
+static VkResult
+apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_info *infos,
+             const struct vk_graphics_pipeline_state *state, const struct vk_features *features,
+             const VkAllocationCallbacks *alloc, struct vk_shader **shaders)
+{
+   VkResult result = VK_SUCCESS;
+   for (uint32_t i = 0; i < count; i++) {
+      if (result != VK_SUCCESS) {
+         ralloc_free(infos[i].nir);
+         shaders[i] = NULL;
+         continue;
+      }
+      result = compile_stage(device, &infos[i], state, alloc, &shaders[i]);
+   }
+   if (result != VK_SUCCESS) {
+      for (uint32_t i = 0; i < count; i++)
+         if (shaders[i])
+            apex_shader_destroy(device, shaders[i], alloc);
+   }
+   return result;
+}
+
+static VkResult
+apex_deserialize(struct vk_device *device, struct blob_reader *blob, uint32_t version,
+                 const VkAllocationCallbacks *alloc, struct vk_shader **out)
+{
+   return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+}
+
+static const struct nir_shader_compiler_options *
+apex_get_nir_options(struct vk_physical_device *physical, mesa_shader_stage stage,
+                     const struct vk_pipeline_robustness_state *rs)
+{
+   return &apex_nir_options;
+}
+
+static struct spirv_to_nir_options
+apex_get_spirv_options(struct vk_physical_device *physical, mesa_shader_stage stage,
+                       const struct vk_pipeline_robustness_state *rs)
+{
+   return (struct spirv_to_nir_options) {
+      .ssbo_addr_format = nir_address_format_32bit_index_offset,
+      .ubo_addr_format = nir_address_format_32bit_index_offset,
+      .shared_addr_format = nir_address_format_32bit_offset,
+      .phys_ssbo_addr_format = nir_address_format_64bit_global,
+      .push_const_addr_format = nir_address_format_32bit_offset,
+   };
+}
+
+/* Everything that specializes a stage: vertex input formats and attachment formats. */
+static void
+apex_hash_state(struct vk_physical_device *physical, const struct vk_graphics_pipeline_state *state,
+                const struct vk_features *features, VkShaderStageFlags stages, blake3_hash out)
+{
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   if (state && (stages & VK_SHADER_STAGE_VERTEX_BIT) && state->vi)
+      _mesa_blake3_update(&hash, state->vi, sizeof(*state->vi));
+   if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT) && state->rp) {
+      _mesa_blake3_update(&hash, state->rp->color_attachment_formats,
+                          sizeof(state->rp->color_attachment_formats));
+      _mesa_blake3_update(&hash, &state->rp->color_attachment_count,
+                          sizeof(state->rp->color_attachment_count));
+      _mesa_blake3_update(&hash, &state->rp->depth_attachment_format,
+                          sizeof(state->rp->depth_attachment_format));
+   }
+   _mesa_blake3_final(&hash, out);
+}
+
+const struct vk_device_shader_ops apex_device_shader_ops = {
+   .get_nir_options = apex_get_nir_options,
+   .get_spirv_options = apex_get_spirv_options,
+   .hash_state = apex_hash_state,
+   .compile = apex_compile,
+   .deserialize = apex_deserialize,
+   .cmd_bind_shaders = apex_cmd_bind_shaders,
+   .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
+};
+
+/* ---- Internal setup program ---------------------------------------------- */
+
+VkResult
+apex_setup_program(struct apex_device *device, struct apex_program **out)
+{
+   if (device->setup) {
+      *out = device->setup;
+      return VK_SUCCESS;
+   }
+   struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
+                                            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!program)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   /* Internal kernels address the data root directly: no descriptor sets. */
+   program->table = true;
+   struct spirv_capabilities caps = {
+      .Shader = true, .Int64 = true, .PhysicalStorageBufferAddresses = true,
+   };
+   struct spirv_to_nir_options options = apex_get_spirv_options(device->vk.physical,
+                                                                MESA_SHADER_COMPUTE, NULL);
+   options.environment = NIR_SPIRV_VULKAN;
+   options.capabilities = &caps;
+   nir_shader *nir = spirv_to_nir(apex_setup_spv, ARRAY_SIZE(apex_setup_spv), NULL,
+                                  MESA_SHADER_COMPUTE, "main", &options, &apex_nir_options);
+   VkResult result = nir ? apex_program_compile(&device->vk, program, nir) :
+                           VK_ERROR_INITIALIZATION_FAILED;
+   ralloc_free(nir);
+   if (result != VK_SUCCESS) {
+      apex_program_finish(device, program);
+      vk_free(&device->vk.alloc, program);
+      return result;
+   }
+   device->setup = program;
+   *out = program;
+   return VK_SUCCESS;
+}
+
+void
+apex_graphics_finish(struct apex_device *device)
+{
+   if (device->setup) {
+      apex_program_finish(device, device->setup);
+      vk_free(&device->vk.alloc, device->setup);
+      device->setup = NULL;
+   }
+}

@@ -256,12 +256,16 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_format(physical, VK_FORMAT_R8G8B8A8_UNORM, &format);
    const VkFormatFeatureFlags transfer_features = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-   CHECK(format.linearTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
-         format.optimalTilingFeatures == format.linearTilingFeatures && !format.bufferFeatures);
+   CHECK(format.linearTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) &&
+         format.optimalTilingFeatures == format.linearTilingFeatures &&
+         format.bufferFeatures == VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-      VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | transfer_features;
-   CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features && !format.bufferFeatures);
+      VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+      transfer_features;
+   CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features &&
+         format.bufferFeatures == VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
    CHECK(props.limits.maxImageDimension2D == 4096 && props.limits.maxImageArrayLayers == 256);
    PROC(GetPhysicalDeviceImageFormatProperties, get_image_format);
    VkImageFormatProperties image_props;
@@ -282,7 +286,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
       0, &image_props) == VK_SUCCESS);
    CHECK(get_image_format(physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
-      VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0,
+      VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
       &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    CHECK(get_image_format(physical, VK_FORMAT_R32_SINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
       VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
@@ -290,7 +294,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    VkQueueFamilyProperties queue_props;
    count = 1;
    get_queues(physical, &count, &queue_props);
-   CHECK(count == 1 && queue_props.queueCount == 1 && queue_props.queueFlags == VK_QUEUE_COMPUTE_BIT);
+   CHECK(count == 1 && queue_props.queueCount == 1 &&
+         queue_props.queueFlags == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT));
    PROC(CreateDevice, create_device);
    PROC(GetDeviceProcAddr, gdpa);
    float priority = 0;

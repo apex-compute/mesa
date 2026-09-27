@@ -990,7 +990,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
    VkImageFormatProperties2 props = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
    CHECK(apex_image_format_properties(&format, &props) == VK_SUCCESS &&
          props.imageFormatProperties.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
-   format.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   format.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
    CHECK(apex_image_format_properties(&format, &props) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    VkImageSubresource sub = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 1, .arrayLayer = 1};
    VkSubresourceLayout sublayout;

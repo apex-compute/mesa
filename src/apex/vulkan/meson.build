@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: MIT
-apex_pipeline = static_library('apex_pipeline', ['apex_pipeline.c', 'apex_device.c'],
+# The internal triangle setup kernel is SPIR-V embedded as a C array.
+apex_setup_spv_h = custom_target('apex_setup_spv',
+  input : 'setup.comp', output : 'apex_setup_spv.h',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
+             '-I' + meson.current_source_dir(), '--vn', 'apex_setup_spv', '@INPUT@', '-o', '@OUTPUT@'],
+  depend_files : files('apex_draw.h'),
+)
+apex_pipeline = static_library('apex_pipeline',
+  ['apex_pipeline.c', 'apex_device.c', 'apex_graphics.c', apex_setup_spv_h],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_nir],
 )
@@ -159,3 +167,14 @@ test('apex-sync', apex_sync_test, suite : ['apex'])
 apex_run = executable('apex-run', 'run.c',
   include_directories : inc_include, dependencies : dep_dl, install : false,
 )
+# Explicit hardware graphics gate through the public loader.
+apex_graphics_test = executable('apex-graphics-test', 'graphics_test.c',
+  include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
+)
+foreach stage : ['vert', 'frag']
+  custom_target('apex-triangle-' + stage,
+    input : 'triangle.' + stage, output : 'triangle.' + stage + '.spv',
+    command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
+    build_by_default : true,
+  )
+endforeach

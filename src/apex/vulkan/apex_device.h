@@ -71,11 +71,14 @@ struct apex_device {
    uint32_t completion;
    uint64_t point;
    struct list_head retired;
+   /* Internal triangle setup program, compiled on first draw. */
+   struct apex_program *setup;
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
 void apex_bo_finish(struct apex_device *device, struct apex_bo *bo);
 
+VkFormatFeatureFlags2 apex_format_features(VkFormat format, bool buffer);
 VkResult apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
                                       VkImageFormatProperties2 *properties);
 
