@@ -78,7 +78,17 @@
 #define APEX_DRAW_SCISSORS 300        /* per viewport: x0, y0, x1, y1 exclusive, within the render area */
 #define APEX_DRAW_VIEWPORT_SLOT 364   /* vertex-record word of gl_ViewportIndex, ~0 for viewport 0 */
 #define APEX_DRAW_VIEWPORT_COUNT 365
-#define APEX_DRAW_WORDS 366
+/* Layered rendering: per color attachment then depth, the byte stride between
+ * layers; the fragment job's layer; the vertex-record word of gl_Layer (~0
+ * for layer 0); and the multiview view index (~0 without multiview), which
+ * also selects the layer. */
+#define APEX_DRAW_LAYER_STRIDES 366
+#define APEX_DRAW_LAYER 375
+#define APEX_DRAW_LAYER_SLOT 376
+#define APEX_DRAW_VIEW 377
+/* Sample mask bits 0..15, alpha to coverage bit 16, alpha to one bit 17. */
+#define APEX_DRAW_MULTISAMPLE 378
+#define APEX_DRAW_WORDS 379
 #define APEX_FRAGMENT_CHUNKS 8        /* bin chunks per fragment job */
 #define APEX_DRAW_DYNAMIC(w) (((w) >= APEX_DRAW_VERTEX_COUNT && (w) <= APEX_DRAW_FIRST_INSTANCE) || \
                               (w) == APEX_DRAW_PRIM_COUNT || (w) == APEX_DRAW_INDEX + 3 || \
@@ -105,7 +115,7 @@
 #define APEX_PRIM_INV_W 20            /* 1/w per vertex (FP32) */
 #define APEX_PRIM_WEIGHTS 23          /* 3 x 3 FP32: sub-vertex i weight of source vertex j */
 #define APEX_PRIM_SOURCE 32           /* 3 source vertex record indices */
-#define APEX_PRIM_FLAGS 35            /* bit 0 front-facing; bits 16..19 viewport index */
+#define APEX_PRIM_FLAGS 35            /* bit 0 front-facing; bits 16..19 viewport index; bits 20..31 layer */
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */
 #define APEX_PRIM_DEPTH_OFFSET 38     /* depth bias of this triangle (FP32) */
@@ -131,6 +141,18 @@
 #define APEX_COPY_SRC_STRIDE 12
 #define APEX_COPY_DST_STRIDE 13
 #define APEX_COPY_DST_MASK 14
+
+/* Internal 4x resolve job words (in place of the draw block): one invocation
+ * per destination pixel of a width x rows x layers region. */
+#define APEX_RESOLVE_SRC 0            /* first source pixel VA lo, hi */
+#define APEX_RESOLVE_SRC_ROW 2
+#define APEX_RESOLVE_SRC_SLICE 3
+#define APEX_RESOLVE_DST 4            /* first destination pixel VA lo, hi */
+#define APEX_RESOLVE_DST_ROW 6
+#define APEX_RESOLVE_DST_SLICE 7
+#define APEX_RESOLVE_WIDTH 8
+#define APEX_RESOLVE_ROWS 9
+#define APEX_RESOLVE_LAYERS 10
 
 /* Query slots: 64-bit value, 32-bit availability, padding. */
 #define APEX_QUERY_STRIDE 16

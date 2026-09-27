@@ -188,6 +188,11 @@ apex_present_test = executable('apex-present-test', 'present_test.c',
 apex_texture_test = executable('apex-texture-test', 'texture_test.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
 )
+custom_target('apex-ms-texture-spv',
+  input : 'ms_texture.comp', output : 'ms_texture.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+  build_by_default : true,
+)
 custom_target('apex-texture-spv',
   input : 'texture.comp', output : 'texture.spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],

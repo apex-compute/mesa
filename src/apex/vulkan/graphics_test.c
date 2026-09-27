@@ -3,7 +3,10 @@
  * colors, one crossing the near plane, drawn through a render pass into
  * RGBA8 color and D32 depth. An independent reference repeats Vulkan's
  * viewport transform, Q16.8 snapping, top-left coverage, depth test and
- * perspective-correct interpolation for every pixel. */
+ * perspective-correct interpolation for every pixel. --msaa renders into 4x
+ * color and depth, resolves in the render pass and checks each pixel's
+ * average over the standard sample positions, with attributes at the pixel
+ * center and per-sample depth. */
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
 #include <linux/dma-buf.h>
@@ -59,11 +62,15 @@ struct reference {
    double depth, depth_tolerance, color[4];
 };
 
-/* Independent per-pixel reference in double precision. */
+static const double clear_color[4] = {0, 0, 0.5, 1};
+/* Standard 4x sample positions in Q8 pixel units; one center sample at 1x. */
+static const int64_t positions[4][2] = {{96, 32}, {224, 96}, {32, 160}, {160, 224}};
+
+/* Independent per-sample reference in double precision. */
 static void
-reference(struct reference *out)
+reference(struct reference *out, unsigned samples)
 {
-   for (unsigned p = 0; p < WIDTH * HEIGHT; p++)
+   for (unsigned p = 0; p < WIDTH * HEIGHT * samples; p++)
       out[p] = (struct reference){.known = true, .depth = 1.0, .depth_tolerance = 1e-5};
    for (unsigned t = 0; t < TRIANGLES; t++) {
       const float (*v)[8] = &vertices[t * 3];
@@ -80,15 +87,18 @@ reference(struct reference *out)
       int64_t area = (qx[1] - qx[0]) * (qy[2] - qy[0]) - (qx[2] - qx[0]) * (qy[1] - qy[0]);
       bool clipped = sz[0] < 0 || sz[1] < 0 || sz[2] < 0;
       for (unsigned y = 0; y < HEIGHT; y++) {
-         for (unsigned x = 0; x < WIDTH; x++) {
-            int64_t px = x * 256 + 128, py = y * 256 + 128;
-            int64_t e[3];
+         for (unsigned x = 0; x < WIDTH * samples; x++) {
+            unsigned s = x % samples;
+            int64_t px = x / samples * 256 + (samples > 1 ? positions[s][0] : 128);
+            int64_t py = y * 256 + (samples > 1 ? positions[s][1] : 128);
+            int64_t e[3], c[3];
             bool inside = area != 0;
             for (unsigned i = 0; i < 3 && inside; i++) {
                unsigned a = area > 0 ? (i + 1) % 3 : (i + 2) % 3;
                unsigned b = area > 0 ? (i + 2) % 3 : (i + 1) % 3;
                int64_t dx = qx[b] - qx[a], dy = qy[b] - qy[a];
                e[i] = dx * (py - qy[a]) - dy * (px - qx[a]);
+               c[i] = dx * (y * 256 + 128 - qy[a]) - dy * (x / samples * 256 + 128 - qx[a]);
                bool top_left = dy < 0 || (dy == 0 && dx > 0);
                inside = e[i] > 0 || (e[i] == 0 && top_left);
             }
@@ -97,21 +107,23 @@ reference(struct reference *out)
             double sum = (double)(e[0] + e[1] + e[2]);
             double l[3] = {e[0] / sum, e[1] / sum, e[2] / sum};
             double z = l[0] * sz[0] + l[1] * sz[1] + l[2] * sz[2];
-            struct reference *r = &out[y * WIDTH + x];
+            /* Attributes interpolate at the pixel center. */
+            double center[3] = {c[0] / sum, c[1] / sum, c[2] / sum};
+            struct reference *r = &out[y * WIDTH * samples + x];
             if (clipped && fabs(z) < 0.02) {
                r->known = false;
                continue;
             }
             if (z < 0 || z > 1 || !(z < r->depth))
                continue;
-            double w[3], s = 0;
+            double w[3], total = 0;
             for (unsigned i = 0; i < 3; i++)
-               s += w[i] = l[i] * rw[i];
+               total += w[i] = center[i] * rw[i];
             r->covered = true;
             r->depth = z;
             r->depth_tolerance = clipped ? 1e-3 : 1e-5;
-            for (unsigned c = 0; c < 4; c++)
-               r->color[c] = (w[0] * v[0][4 + c] + w[1] * v[1][4 + c] + w[2] * v[2][4 + c]) / s;
+            for (unsigned k = 0; k < 4; k++)
+               r->color[k] = (w[0] * v[0][4 + k] + w[1] * v[1][4 + k] + w[2] * v[2][4 + k]) / total;
          }
       }
    }
@@ -121,8 +133,9 @@ int
 main(int argc, char **argv)
 {
    /* --export reads results through an exported dma-buf, as KMS scanout does. */
-   CHECK(argc == 4 || (argc == 5 && !strcmp(argv[4], "--export")));
-   const bool export = argc == 5;
+   CHECK(argc == 4 || (argc == 5 && (!strcmp(argv[4], "--export") || !strcmp(argv[4], "--msaa"))));
+   const bool export = argc == 5 && !strcmp(argv[4], "--export");
+   const unsigned samples = argc == 5 && !strcmp(argv[4], "--msaa") ? 4 : 1;
    setenv("APEX_DEVELOPMENT", "1", 1);
    setenv("VK_DRIVER_FILES", argv[1], 1);
    size_t vs_size, fs_size;
@@ -229,17 +242,19 @@ main(int argc, char **argv)
       VK(BindBufferMemory(device, readback, allocation, color_offset));
    }
 
-   const VkFormat formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT};
-   VkImage images[2];
-   VkImageView views[2];
+   /* Color, depth and, with --msaa, the single-sampled resolve target. */
+   const VkFormat formats[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM};
+   VkImage images[3];
+   VkImageView views[3];
    VkDeviceSize offset = image_offset;
-   for (unsigned i = 0; i < 2; i++) {
+   const unsigned attachments = samples > 1 ? 3 : 2;
+   for (unsigned i = 0; i < attachments; i++) {
       VK(CreateImage(device, &(VkImageCreateInfo){
          .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
          .format = formats[i], .extent = {WIDTH, HEIGHT, 1}, .mipLevels = 1, .arrayLayers = 1,
-         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (i ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
-                                                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)},
+         .samples = i < 2 ? samples : VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = (i < 2 && samples > 1 ? 0 : VK_IMAGE_USAGE_TRANSFER_SRC_BIT) |
+                  (i == 1 ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)},
          NULL, &images[i]));
       VkMemoryRequirements requirements;
       GetImageMemoryRequirements(device, images[i], &requirements);
@@ -250,33 +265,39 @@ main(int argc, char **argv)
       VK(CreateImageView(device, &(VkImageViewCreateInfo){
          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = images[i],
          .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = formats[i],
-         .subresourceRange = {i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+         .subresourceRange = {i == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
          NULL, &views[i]));
    }
    CHECK(offset <= total);
 
    VkRenderPass pass;
    VK(CreateRenderPass(device, &(VkRenderPassCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2,
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = attachments,
       .pAttachments = (VkAttachmentDescription[]){
-         {.format = formats[0], .samples = VK_SAMPLE_COUNT_1_BIT,
+         {.format = formats[0], .samples = samples,
           .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
-         {.format = formats[1], .samples = VK_SAMPLE_COUNT_1_BIT,
+         {.format = formats[1], .samples = samples,
           .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+         {.format = formats[2], .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}},
       .subpassCount = 1,
       .pSubpasses = &(VkSubpassDescription){
          .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1,
          .pColorAttachments = &(VkAttachmentReference){0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+         .pResolveAttachments = samples > 1 ?
+            &(VkAttachmentReference){2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL} : NULL,
          .pDepthStencilAttachment = &(VkAttachmentReference){
             1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}},
    }, NULL, &pass));
    VkFramebuffer framebuffer;
    VK(CreateFramebuffer(device, &(VkFramebufferCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = pass, .attachmentCount = 2,
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = pass, .attachmentCount = attachments,
       .pAttachments = views, .width = WIDTH, .height = HEIGHT, .layers = 1}, NULL, &framebuffer));
 
    VkShaderModule modules[2];
@@ -317,7 +338,7 @@ main(int argc, char **argv)
          .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1},
       .pMultisampleState = &(VkPipelineMultisampleStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT},
+         .rasterizationSamples = samples},
       .pDepthStencilState = &(VkPipelineDepthStencilStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
          .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS},
@@ -345,8 +366,9 @@ main(int argc, char **argv)
    CmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer, &(VkDeviceSize){0});
    CmdDraw(cmd, TRIANGLES * 3, 1, 0, 0);
    CmdEndRenderPass(cmd);
-   for (unsigned i = 0; i < 2; i++)
-      CmdCopyImageToBuffer(cmd, images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
+   /* Multisampled depth has no buffer copy; --msaa reads the resolved color. */
+   for (unsigned i = 0; i < (samples > 1 ? 1 : 2); i++)
+      CmdCopyImageToBuffer(cmd, images[samples > 1 ? 2 : i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
          &(VkBufferImageCopy){.bufferOffset = i ? depth_offset - color_offset : 0,
             .imageSubresource = {i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
             .imageExtent = {WIDTH, HEIGHT, 1}});
@@ -362,24 +384,29 @@ main(int argc, char **argv)
       memcpy(mapped + color_offset, exported, WIDTH * HEIGHT * 8);
    }
 
-   struct reference *expected = calloc(WIDTH * HEIGHT, sizeof(*expected));
+   struct reference *expected = calloc(WIDTH * HEIGHT * samples, sizeof(*expected));
    CHECK(expected);
-   reference(expected);
+   reference(expected, samples);
    const uint32_t *color = (const void *)(mapped + color_offset);
    const float *depth = (const void *)(mapped + depth_offset);
    unsigned covered = 0, unknown = 0, failures = 0;
    for (unsigned p = 0; p < WIDTH * HEIGHT; p++) {
-      const struct reference *r = &expected[p];
-      if (!r->known) {
+      /* The resolved pixel averages its samples, each covered or clear. */
+      const struct reference *r = &expected[p * samples];
+      double want[4] = {0};
+      bool known = true, any = false;
+      for (unsigned s = 0; s < samples; s++) {
+         known &= r[s].known;
+         any |= r[s].covered;
+         for (unsigned c = 0; c < 4; c++)
+            want[c] += (r[s].covered ? fmin(fmax(r[s].color[c], 0), 1) : clear_color[c]) / samples;
+      }
+      if (!known) {
          unknown++;
          continue;
       }
-      double want[4] = {0, 0, 0.5, 1};
-      if (r->covered) {
-         covered++;
-         memcpy(want, r->color, sizeof(want));
-      }
-      bool ok = fabs(depth[p] - r->depth) <= r->depth_tolerance;
+      covered += any;
+      bool ok = samples > 1 || fabs(depth[p] - r->depth) <= r->depth_tolerance;
       for (unsigned c = 0; c < 4; c++)
          ok &= abs((int)((color[p] >> (8 * c)) & 0xff) - (int)lround(want[c] * 255)) <= 2;
       if (!ok && failures++ < 8)
@@ -394,9 +421,10 @@ main(int argc, char **argv)
       fprintf(stderr, "FAIL Apex graphics: %u mismatches\n", failures);
       return 1;
    }
-   printf("PASS Apex graphics: %ux%u RGBA8/D32 render pass, 3 depth-tested triangles, "
+   printf("PASS Apex graphics: %ux%u RGBA8/D32%s render pass, 3 depth-tested triangles, "
           "%u covered and %u clear pixels exact, %u near-clip edge pixels unconstrained\n",
-          WIDTH, HEIGHT, covered, WIDTH * HEIGHT - covered - unknown, unknown);
+          WIDTH, HEIGHT, samples > 1 ? " 4x resolved" : "", covered, WIDTH * HEIGHT - covered - unknown,
+          unknown);
    VK(DeviceWaitIdle(device));
    DestroyDevice(device, NULL);
    DestroyInstance(instance, NULL);

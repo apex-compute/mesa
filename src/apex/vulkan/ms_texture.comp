@@ -1,0 +1,14 @@
+#version 450
+// Reads every sample of a 4x4, 4-sample image: result[(y * 4 + x) * 4 + s].
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) buffer Out { vec4 result[]; };
+layout(set = 0, binding = 1) uniform sampler2DMS ms_tex;
+void main()
+{
+   uint i = gl_LocalInvocationID.x;
+   ivec2 p = ivec2(i % 4u, i / 4u);
+   for (int s = 0; s < 4; s++)
+      result[i * 4u + uint(s)] = texelFetch(ms_tex, p, s);
+   if (i == 0u)
+      result[64] = vec4(textureSamples(ms_tex));
+}

@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: MIT */
-/* Public-loader sampler gate: a 4x4 RGBA8 texture read by texelFetch,
- * nearest and bilinear textureLod in a compute shader, checked against
- * host references. */
+/* Public-loader gates for sampled images.
+ * texture: a 4x4 RGBA8 texture read by texelFetch, nearest and bilinear
+ * textureLod in a compute shader, checked against host references.
+ * --multisample: a cleared 4x4, 4-sample RGBA8 image read by texelFetch on
+ * every sample, plus textureSamples. */
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +46,11 @@ channel(unsigned x, unsigned y, unsigned c)
 int
 main(int argc, char **argv)
 {
-   CHECK(argc == 3);
+   CHECK(argc == 3 || (argc == 4 && (!strcmp(argv[3], "--multisample") ||
+                                     !strcmp(argv[3], "--multisample-uint"))));
+   bool multisample = argc == 4;
+   bool uint_format = multisample && !strcmp(argv[3], "--multisample-uint");
+   const VkClearColorValue clear = {.float32 = {0.25f, 0.5f, 0.75f, 1.0f}};
    setenv("APEX_DEVELOPMENT", "1", 1);
    setenv("VK_DRIVER_FILES", argv[1], 1);
    size_t code_size;
@@ -82,7 +89,7 @@ main(int argc, char **argv)
    GD(UpdateDescriptorSets); GD(CreateCommandPool); GD(AllocateCommandBuffers);
    GD(BeginCommandBuffer); GD(CmdCopyBufferToImage); GD(CmdPipelineBarrier); GD(CmdBindPipeline);
    GD(CmdBindDescriptorSets); GD(CmdDispatch); GD(EndCommandBuffer); GD(QueueSubmit);
-   GD(QueueWaitIdle); GD(DestroyDevice);
+   GD(QueueWaitIdle); GD(CmdClearColorImage); GD(DestroyDevice);
    VkQueue queue;
    GetDeviceQueue(device, 0, 0, &queue);
    uint32_t host_type = UINT32_MAX;
@@ -108,19 +115,21 @@ main(int argc, char **argv)
       .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT}, NULL, &upload));
    VK(BindBufferMemory(device, upload, allocation, 0));
    VK(CreateBuffer(device, &(VkBufferCreateInfo){.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-      .size = 48 * 16, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT}, NULL, &results));
+      .size = 80 * 16, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT}, NULL, &results));
    VK(BindBufferMemory(device, results, allocation, 4096));
    VkImage image;
    VK(CreateImage(device, &(VkImageCreateInfo){
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-      .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {4, 4, 1}, .mipLevels = 1, .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .format = uint_format ? VK_FORMAT_R32_UINT : VK_FORMAT_R8G8B8A8_UNORM, .extent = {4, 4, 1},
+      .mipLevels = 1, .arrayLayers = 1,
+      .samples = multisample ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT}, NULL, &image));
    VK(BindImageMemory(device, image, allocation, 65536));
    VkImageView view;
    VK(CreateImageView(device, &(VkImageViewCreateInfo){
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image,
-      .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = uint_format ? VK_FORMAT_R32_UINT : VK_FORMAT_R8G8B8A8_UNORM,
       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}, NULL, &view));
    VkSampler samplers[2];
    for (unsigned i = 0; i < 2; i++)
@@ -185,9 +194,14 @@ main(int argc, char **argv)
       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1}, &cmd));
    VK(BeginCommandBuffer(cmd, &(VkCommandBufferBeginInfo){
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
-   CmdCopyBufferToImage(cmd, upload, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-      &(VkBufferImageCopy){.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                           .imageExtent = {4, 4, 1}});
+   const VkClearColorValue uint_clear = {.uint32 = {7, 0, 0, 1}};
+   if (multisample)
+      CmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint_format ? &uint_clear : &clear, 1,
+                         &(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+   else
+      CmdCopyBufferToImage(cmd, upload, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+         &(VkBufferImageCopy){.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .imageExtent = {4, 4, 1}});
    CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
    CmdDispatch(cmd, 1, 1, 1);
@@ -199,6 +213,34 @@ main(int argc, char **argv)
    VK(InvalidateMappedMemoryRanges(device, 1, &whole));
    const float *out = (const float *)(mapped + 4096);
    unsigned failures = 0;
+   if (uint_format) {
+      const uint32_t *words = (const uint32_t *)out;
+      for (unsigned i = 0; i < 64; i++)
+         if ((words[i * 4] != 7 || words[i * 4 + 3] != 1) && failures++ < 8)
+            fprintf(stderr, "texel %u sample %u: got %u %u %u %u\n", i / 4, i % 4, words[i * 4],
+                    words[i * 4 + 1], words[i * 4 + 2], words[i * 4 + 3]);
+      for (unsigned i = 0; i < 16; i++)
+         if (words[(64 + i) * 4] != 4 && failures++ < 8)
+            fprintf(stderr, "texel %u: %u matching samples\n", i, words[(64 + i) * 4]);
+      printf("%s Apex multisample uint texture: %u mismatches\n", failures ? "FAIL" : "PASS", failures);
+      return failures != 0;
+   }
+   if (multisample) {
+      for (unsigned i = 0; i < 64; i++)
+         for (unsigned c = 0; c < 4; c++)
+            if (fabs(out[i * 4 + c] - clear.float32[c]) > 1.0 / 255 && failures++ < 8)
+               fprintf(stderr, "texel %u sample %u channel %u: got %f want %f\n", i / 4, i % 4, c,
+                       out[i * 4 + c], clear.float32[c]);
+      if (out[64 * 4] != 4.0f && failures++ < 8)
+         fprintf(stderr, "textureSamples: got %f want 4\n", out[64 * 4]);
+      if (failures) {
+         fprintf(stderr, "FAIL Apex multisample texture: %u mismatches\n", failures);
+         return 1;
+      }
+      printf("PASS Apex multisample texture: cleared 4x4 RGBA8 4-sample texelFetch, textureSamples\n");
+      DestroyDevice(device, NULL);
+      return 0;
+   }
    for (unsigned i = 0; i < 48; i++) {
       unsigned x = i % 4, y = (i / 4) % 4, block = i / 16;
       for (unsigned c = 0; c < 4; c++) {

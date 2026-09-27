@@ -60,7 +60,7 @@ struct image_info {
    nir_def *width, *height, *depth, *layers;
    nir_def *base_level, *levels, *base_layer, *layer_count;
    nir_def *format[3];
-   nir_def *bytes;
+   nir_def *bytes, *samples;
    bool three_d;
 };
 
@@ -69,7 +69,7 @@ load_image(nir_builder *b, nir_def *row, bool three_d)
 {
    struct image_info i = {.three_d = three_d};
    nir_def *w[16];
-   for (unsigned k = 0; k < 13; k++)
+   for (unsigned k = 0; k < 15; k++)
       w[k] = row_word(b, nir_iadd_imm(b, row, k / 8), k % 8);
    i.address = nir_vec2(b, w[0], w[1]);
    i.width = w[2];
@@ -84,6 +84,7 @@ load_image(nir_builder *b, nir_def *row, bool three_d)
    i.format[1] = w[11];
    i.format[2] = w[12];
    i.bytes = nir_iand_imm(b, w[10], 31);
+   i.samples = w[14];
    return i;
 }
 
@@ -97,8 +98,10 @@ minify(nir_builder *b, nir_def *size, nir_def *level)
 static nir_def *
 row_pitch(nir_builder *b, const struct image_info *i, nir_def *level)
 {
-   nir_def *bytes = nir_imul(b, minify(b, i->width, level), i->bytes);
-   return nir_iand_imm(b, nir_iadd_imm(b, bytes, 63), ~63u);
+   /* Multisampled rows hold every sample and align to 128 bytes. */
+   nir_def *bytes = nir_imul(b, nir_imul(b, minify(b, i->width, level), i->bytes), i->samples);
+   nir_def *align = nir_bcsel(b, nir_ugt_imm(b, i->samples, 1), nir_imm_int(b, 127), nir_imm_int(b, 63));
+   return nir_iand(b, nir_iadd(b, bytes, align), nir_inot(b, align));
 }
 
 static nir_def *
@@ -516,7 +519,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       nir_def_replace(&tex->def, img.levels);
       return true;
    case nir_texop_texture_samples:
-      nir_def_replace(&tex->def, nir_imm_int(b, 1));
+      nir_def_replace(&tex->def, img.samples);
       return true;
    case nir_texop_samples_identical:
       nir_def_replace(&tex->def, nir_imm_true(b));
@@ -542,6 +545,11 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       }
       for (unsigned a = dims; a < 3; a++)
          index[a] = nir_imm_int(b, 0);
+      /* Sample s of texel x is element x * samples + s. */
+      nir_def *ms_index = tex_src(tex, nir_tex_src_ms_index);
+      nir_def *sample = ms_index ? ms_index : nir_imm_int(b, 0);
+      inside = nir_iand(b, inside, nir_ult(b, sample, img.samples));
+      index[0] = nir_iadd(b, nir_imul(b, index[0], img.samples), sample);
       nir_def *z = three_d ? index[2] : img.base_layer;
       if (tex->is_array) {
          nir_def *layer = nir_channel(b, coord, dims);

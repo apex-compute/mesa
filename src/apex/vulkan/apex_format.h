@@ -30,7 +30,8 @@ struct apex_sampled_descriptor {
    uint32_t base_layer, layer_count;
    uint32_t format[3];
    uint32_t view_type;              /* VkImageViewType */
-   uint32_t reserved[2];
+   uint32_t samples;                /* 1 or 4; samples of a texel are consecutive */
+   uint32_t reserved;
 };
 
 /* Sampler row: word 0 = mag linear [0], min linear [1], mip linear [2],

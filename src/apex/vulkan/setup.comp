@@ -91,6 +91,11 @@ void setup(uint g, uint prims)
    vec4 viewport = uintBitsToFloat(uvec4(draw(vw), draw(vw + 1u), draw(vw + 2u), draw(vw + 3u)));
    float min_depth = uintBitsToFloat(draw(vw + 4u));
    float max_depth = uintBitsToFloat(draw(vw + 5u));
+   // Multiview renders view v into layer v; otherwise the provoking vertex's
+   // gl_Layer selects it.
+   uint layer_slot = draw(APEX_DRAW_LAYER_SLOT), view = draw(APEX_DRAW_VIEW);
+   uint layer = view != ~0u ? view :
+                layer_slot == ~0u ? 0u : min(vertices.w[source[0] * stride + layer_slot], 4095u);
    // Depth clamp disables the z >= 0 and z <= w planes.
    uint planes = (draw(APEX_DRAW_DEPTH) & 256u) != 0u ? 5u : 7u;
    vec2 scale = viewport.zw * 0.5, offset = viewport.xy + scale;
@@ -202,9 +207,9 @@ void setup(uint g, uint prims)
          area = -area;
       }
       ivec2 lo = min(min(q[v[0]], q[v[1]]), q[v[2]]), hi = max(max(q[v[0]], q[v[1]]), q[v[2]]);
-      // Pixel centers x*256+128 inside [lo, hi].
-      ivec2 first = max((lo - 128 + 255) >> 8, scissor.xy);
-      ivec2 last = min(((hi - 128) >> 8) + 1, scissor.zw);
+      // Pixels whose area meets [lo, hi]: any sample position may be inside.
+      ivec2 first = max(lo >> 8, scissor.xy);
+      ivec2 last = min((hi >> 8) + 1, scissor.zw);
       if (any(greaterThanEqual(first, last)))
          continue;
       uint r = record + count * APEX_PRIM_WORDS;
@@ -253,7 +258,7 @@ void setup(uint g, uint prims)
                   bias_clamp < 0.0 ? max(offset, bias_clamp) : offset;
       }
       records.w[r + APEX_PRIM_DEPTH_OFFSET] = floatBitsToUint(offset);
-      records.w[r + APEX_PRIM_FLAGS] = (front ? 1u : 0u) | vi << 16;
+      records.w[r + APEX_PRIM_FLAGS] = (front ? 1u : 0u) | vi << 16 | layer << 20;
       records.w[r + APEX_PRIM_ID] = p;
       count++;
    }

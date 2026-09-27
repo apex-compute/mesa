@@ -304,8 +304,10 @@ lower_vertex_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       replacement = draw_word(b, program, APEX_DRAW_FIRST_INSTANCE);
       break;
    case nir_intrinsic_load_draw_id:
-   case nir_intrinsic_load_view_index:
       replacement = nir_imm_int(b, 0);
+      break;
+   case nir_intrinsic_load_view_index:
+      replacement = nir_umin(b, draw_word(b, program, APEX_DRAW_VIEW), nir_imm_int(b, 31));
       break;
    case nir_intrinsic_load_is_indexed_draw:
       replacement = nir_ine_imm(b, draw_word(b, program, APEX_DRAW_INDEX + 2), 0);
@@ -335,6 +337,8 @@ assign_vertex_slots(struct apex_shader *shader, const nir_shader *nir)
       shader->vertex.slot[VARYING_SLOT_PSIZ] = words++;
    if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT))
       shader->vertex.slot[VARYING_SLOT_VIEWPORT] = words++;
+   if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER))
+      shader->vertex.slot[VARYING_SLOT_LAYER] = words++;
    shader->vertex.stride = words;
 }
 
@@ -433,7 +437,7 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
 struct fragment_lowering {
    struct apex_shader *shader;
    nir_variable *perspective, *linear, *coord, *front, *covered, *killed, *sources, *primitive;
-   nir_variable *viewport;
+   nir_variable *viewport, *sample, *mask_in, *position;
    nir_variable *color[APEX_DRAW_MAX_COLOR], *depth;
    bool invalid;
 };
@@ -486,6 +490,10 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
          replacement = nir_load_var(b, ctx->viewport);
          break;
       }
+      if (location == VARYING_SLOT_LAYER) {
+         replacement = draw_word(b, &ctx->shader->program, APEX_DRAW_LAYER);
+         break;
+      }
       if (location == VARYING_SLOT_PNTC) {
          /* Point setup stores gl_PointCoord in the second and third weights. */
          nir_def *weights = nir_load_var(b, ctx->linear);
@@ -535,16 +543,20 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
          replacement = nir_b2b32(b, replacement);
       break;
    case nir_intrinsic_load_sample_id:
+      replacement = nir_load_var(b, ctx->sample);
+      break;
    case nir_intrinsic_load_layer_id:
+      replacement = draw_word(b, &ctx->shader->program, APEX_DRAW_LAYER);
+      break;
    case nir_intrinsic_load_view_index:
-      replacement = nir_imm_int(b, 0);
+      replacement = nir_umin(b, draw_word(b, &ctx->shader->program, APEX_DRAW_VIEW), nir_imm_int(b, 31));
       break;
    case nir_intrinsic_load_sample_mask_in:
-      replacement = nir_b2i32(b, nir_load_var(b, ctx->covered));
+      replacement = nir_load_var(b, ctx->mask_in);
       break;
    case nir_intrinsic_load_sample_pos:
    case nir_intrinsic_load_sample_pos_or_center:
-      replacement = nir_imm_vec2(b, 0.5f, 0.5f);
+      replacement = nir_load_var(b, ctx->position);
       break;
    case nir_intrinsic_load_barycentric_pixel:
    case nir_intrinsic_load_barycentric_centroid:
@@ -713,6 +725,15 @@ texel_target(nir_builder *b, nir_def *base, nir_def *pitch, nir_def *px, nir_def
    return t;
 }
 
+/* Attachment base of the fragment job's layer. */
+static nir_def *
+layer_base(nir_builder *b, const struct apex_program *program, unsigned slot, unsigned attachment)
+{
+   return address_add(b, draw_address(b, program, slot),
+                      nir_imul(b, draw_word(b, program, APEX_DRAW_LAYER),
+                               draw_word(b, program, APEX_DRAW_LAYER_STRIDES + attachment)));
+}
+
 static nir_def *
 load_texel(nir_builder *b, const struct texel_target *t)
 {
@@ -730,7 +751,7 @@ load_texel(nir_builder *b, const struct texel_target *t)
  * stores it when any of them is in `store`. */
 static void
 store_texel(nir_builder *b, const struct texel_target *t, nir_def *texel, nir_def *lane,
-            nir_def *store)
+            nir_def *store, unsigned samples)
 {
    if (t->bits >= 32) {
       nir_push_if(b, store);
@@ -739,7 +760,8 @@ store_texel(nir_builder *b, const struct texel_target *t, nir_def *texel, nir_de
       nir_pop_if(b, NULL);
       return;
    }
-   static const unsigned partners[] = {1, 4, 5};
+   /* Word neighbours: pixels of a quad row, or samples of a pixel at 4x. */
+   const unsigned *partners = samples > 1 ? (const unsigned[]){4, 8, 12} : (const unsigned[]){1, 4, 5};
    nir_def *word = nir_ishl(b, nir_channel(b, texel, 0), t->shift);
    nir_def *any = nir_b2i32(b, store), *combined = word;
    for (unsigned p = 0; p < (t->bits == 16 ? 1 : 3); p++) {
@@ -860,6 +882,9 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    ctx.sources = nir_local_variable_create(impl, glsl_uvec_type(3), "sources");
    ctx.primitive = nir_local_variable_create(impl, glsl_uint_type(), "primitive");
    ctx.viewport = nir_local_variable_create(impl, glsl_uint_type(), "viewport");
+   ctx.sample = nir_local_variable_create(impl, glsl_uint_type(), "sample");
+   ctx.mask_in = nir_local_variable_create(impl, glsl_uint_type(), "mask_in");
+   ctx.position = nir_local_variable_create(impl, glsl_vec_type(2), "position");
    ctx.depth = nir_local_variable_create(impl, glsl_float_type(), "depth");
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       ctx.color[k] = nir_local_variable_create(impl, vec4, "color");
@@ -903,10 +928,28 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    bool ds_target = z_channel || s_channel;
    nir_variable *stored_ds = nir_local_variable_create(impl, glsl_uvec4_type(), "stored_ds");
 
+   /* Single-sampled tiles are 4x4 pixels; 4x tiles are 2x2 pixels with lane
+    * = sample * 4 + pixel, so quads stay lanes 4q..4q+3 at one sample. */
+   unsigned samples = state && state->ms ? state->ms->rasterization_samples : 1;
+   if (samples != 1 && samples != 4)
+      return false;
+   unsigned tile_shift = samples > 1 ? 1 : 2;
+   /* Sample-rate shading evaluates inputs at each lane's sample. */
+   bool sample_rate = samples > 1 && (nir->info.fs.uses_sample_shading ||
+                                      (state->ms->sample_shading_enable &&
+                                       state->ms->min_sample_shading * samples > 1.0f));
    nir_def *lane = nir_load_subgroup_invocation(b);
-   nir_def *lx = nir_ior(b, nir_iand_imm(b, lane, 1), nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 2));
-   nir_def *ly = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 1),
-                         nir_iand_imm(b, nir_ushr_imm(b, lane, 2), 2));
+   nir_def *lx, *ly, *sample;
+   if (samples > 1) {
+      lx = nir_iand_imm(b, lane, 1);
+      ly = nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 1);
+      sample = nir_ushr_imm(b, lane, 2);
+   } else {
+      lx = nir_ior(b, nir_iand_imm(b, lane, 1), nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 2));
+      ly = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 1),
+                   nir_iand_imm(b, nir_ushr_imm(b, lane, 2), 2));
+      sample = nir_imm_int(b, 0);
+   }
    unsigned trailer = apex_program_trailer(program);
    nir_variable *t_var = nir_local_variable_create(impl, glsl_uint_type(), "tile");
    nir_store_var(b, t_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
@@ -915,9 +958,10 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *y0 = draw_word(b, program, APEX_DRAW_SCISSOR + 1);
    nir_def *x1 = draw_word(b, program, APEX_DRAW_SCISSOR + 2);
    nir_def *y1 = draw_word(b, program, APEX_DRAW_SCISSOR + 3);
-   nir_def *tx0 = nir_ushr_imm(b, x0, 2), *ty0 = nir_ushr_imm(b, y0, 2);
-   nir_def *tw = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, x1, 3), 2), tx0);
-   nir_def *th = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, y1, 3), 2), ty0);
+   unsigned tile = 1u << tile_shift;
+   nir_def *tx0 = nir_ushr_imm(b, x0, tile_shift), *ty0 = nir_ushr_imm(b, y0, tile_shift);
+   nir_def *tw = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, x1, tile - 1), tile_shift), tx0);
+   nir_def *th = nir_isub(b, nir_ushr_imm(b, nir_iadd_imm(b, y1, tile - 1), tile_shift), ty0);
    /* A job whose chunk range starts past the draw's chunks has no work. */
    nir_def *empty = nir_ior(b, nir_ior(b, nir_uge(b, x0, x1), nir_uge(b, y0, y1)),
                             nir_uge(b, draw_word(b, program, APEX_DRAW_CHUNK_RANGE),
@@ -928,26 +972,28 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *t = loop_counter(b, t_var, tiles);
    nir_def *ty = nir_udiv(b, t, tw);
    nir_def *tx = nir_isub(b, t, nir_imul(b, ty, tw));
-   nir_def *tile_x = nir_ishl_imm(b, nir_iadd(b, tx0, tx), 2);
-   nir_def *tile_y = nir_ishl_imm(b, nir_iadd(b, ty0, ty), 2);
+   nir_def *tile_x = nir_ishl_imm(b, nir_iadd(b, tx0, tx), tile_shift);
+   nir_def *tile_y = nir_ishl_imm(b, nir_iadd(b, ty0, ty), tile_shift);
    nir_def *px = nir_iadd(b, tile_x, lx), *py = nir_iadd(b, tile_y, ly);
    /* Rows of the scissor stay inside every attachment; each row is padded to
     * whole tiles, so a tile's texels there may be read and rewritten. */
    nir_def *row = nir_iand(b, nir_uge(b, py, y0), nir_ult(b, py, y1));
    nir_def *inside = nir_iand(b, row, nir_iand(b, nir_uge(b, px, x0), nir_ult(b, px, x1)));
 
-   /* Current attachment contents of this lane's pixel. */
+   /* Current attachment contents of this lane's sample: samples of a pixel
+    * are consecutive texels. */
+   nir_def *vx = nir_iadd(b, nir_imul_imm(b, px, samples), sample);
    struct texel_target color_target[APEX_DRAW_MAX_COLOR], ds;
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
       if (!stored[k])
          continue;
       unsigned slot = APEX_DRAW_COLOR + k * APEX_DRAW_COLOR_WORDS;
-      color_target[k] = texel_target(b, draw_address(b, program, slot), draw_word(b, program, slot + 2),
-                                     px, py, formats[k]);
+      color_target[k] = texel_target(b, layer_base(b, program, slot, k), draw_word(b, program, slot + 2),
+                                     vx, py, formats[k]);
    }
    if (ds_target)
-      ds = texel_target(b, draw_address(b, program, APEX_DRAW_DEPTH_TARGET),
-                        draw_word(b, program, APEX_DRAW_DEPTH_TARGET + 2), px, py, ds_format);
+      ds = texel_target(b, layer_base(b, program, APEX_DRAW_DEPTH_TARGET, APEX_DRAW_MAX_COLOR),
+                        draw_word(b, program, APEX_DRAW_DEPTH_TARGET + 2), vx, py, ds_format);
    nir_def *zero4 = nir_imm_zero(b, 4, 32);
    nir_push_if(b, row);
    nir_def *loaded[APEX_DRAW_MAX_COLOR] = {0};
@@ -1003,14 +1049,32 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *record = address_add(b, first, nir_imul_imm(b, s, APEX_PRIM_WORDS * 4));
 #define FIELD(word) load_word(b, address_add(b, record, nir_imm_int(b, (word) * 4)))
    nir_def *overlap = nir_iand(b,
-      nir_iand(b, nir_ult(b, FIELD(APEX_PRIM_BOX), nir_iadd_imm(b, tile_x, 4)),
+      nir_iand(b, nir_ult(b, FIELD(APEX_PRIM_BOX), nir_iadd_imm(b, tile_x, tile)),
                   nir_ult(b, tile_x, FIELD(APEX_PRIM_BOX + 2))),
-      nir_iand(b, nir_ult(b, FIELD(APEX_PRIM_BOX + 1), nir_iadd_imm(b, tile_y, 4)),
+      nir_iand(b, nir_ult(b, FIELD(APEX_PRIM_BOX + 1), nir_iadd_imm(b, tile_y, tile)),
                   nir_ult(b, tile_y, FIELD(APEX_PRIM_BOX + 3))));
+   /* Only this job's layer. */
+   overlap = nir_iand(b, overlap, nir_ieq(b, nir_ushr_imm(b, FIELD(APEX_PRIM_FLAGS), 20),
+                                          draw_word(b, program, APEX_DRAW_LAYER)));
    nir_push_if(b, overlap);
-   nir_def *qx = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, px, 8), 128));
-   nir_def *qy = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, py, 8), 128));
-   nir_def *edge[3];
+   /* Coverage and depth use the standard sample positions (Q8); attributes
+    * interpolate at the pixel center. */
+   nir_def *sx = nir_imm_int(b, 128), *sy = nir_imm_int(b, 128);
+   if (samples > 1) {
+      static const int positions[4][2] = {{96, 32}, {224, 96}, {32, 160}, {160, 224}};
+      sx = nir_imm_int(b, positions[3][0]), sy = nir_imm_int(b, positions[3][1]);
+      for (int i = 2; i >= 0; i--) {
+         nir_def *is = nir_ieq_imm(b, sample, i);
+         sx = nir_bcsel(b, is, nir_imm_int(b, positions[i][0]), sx);
+         sy = nir_bcsel(b, is, nir_imm_int(b, positions[i][1]), sy);
+      }
+   }
+   nir_def *qx = nir_i2i64(b, nir_iadd(b, nir_ishl_imm(b, px, 8), sx));
+   nir_def *qy = nir_i2i64(b, nir_iadd(b, nir_ishl_imm(b, py, 8), sy));
+   nir_def *cx = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, px, 8), 128));
+   nir_def *cy = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, py, 8), 128));
+   nir_def *edge[3], *center[3];
+   nir_def *multisample = draw_word(b, program, APEX_DRAW_MULTISAMPLE);
    /* The box is clipped to the primitive's viewport scissor. */
    nir_def *covered = nir_iand(b, inside,
       nir_iand(b, nir_iand(b, nir_uge(b, px, FIELD(APEX_PRIM_BOX)), nir_ult(b, px, FIELD(APEX_PRIM_BOX + 2))),
@@ -1020,17 +1084,24 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
       nir_def *c = nir_pack_64_2x32_split(b, FIELD(w + 2), FIELD(w + 3));
       edge[e] = nir_iadd(b, nir_iadd(b, nir_imul(b, nir_i2i64(b, FIELD(w)), qx),
                                          nir_imul(b, nir_i2i64(b, FIELD(w + 1)), qy)), c);
+      center[e] = samples > 1 && !sample_rate ?
+         nir_iadd(b, nir_iadd(b, nir_imul(b, nir_i2i64(b, FIELD(w)), cx),
+                              nir_imul(b, nir_i2i64(b, FIELD(w + 1)), cy)), c) : edge[e];
       covered = nir_iand(b, covered, nir_ige_imm(b, edge[e], 0));
    }
+   /* The pipeline sample mask removes samples. */
+   covered = nir_iand(b, covered, nir_ine_imm(b, nir_iand(b, nir_ushr(b, multisample, sample),
+                                                          nir_imm_int(b, 1)), 0));
    nir_push_if(b, nir_vote_any(b, 1, covered));
    nir_def *reciprocal = FIELD(APEX_PRIM_RECIPROCAL_AREA);
    nir_def *lambda[3], *weighted[3];
    /* z = z0 + l1 (z1 - z0) + l2 (z2 - z0) is exact for constant depth. */
    nir_def *z = FIELD(APEX_PRIM_Z), *sum = NULL;
    for (unsigned i = 0; i < 3; i++) {
-      lambda[i] = nir_fmul(b, nir_i2f32(b, edge[i]), reciprocal);
       if (i)
-         z = nir_ffma(b, lambda[i], nir_fsub(b, FIELD(APEX_PRIM_Z + i), FIELD(APEX_PRIM_Z)), z);
+         z = nir_ffma(b, nir_fmul(b, nir_i2f32(b, edge[i]), reciprocal),
+                      nir_fsub(b, FIELD(APEX_PRIM_Z + i), FIELD(APEX_PRIM_Z)), z);
+      lambda[i] = nir_fmul(b, nir_i2f32(b, center[i]), reciprocal);
       weighted[i] = nir_fmul(b, lambda[i], FIELD(APEX_PRIM_INV_W + i));
       sum = sum ? nir_fadd(b, sum, weighted[i]) : weighted[i];
    }
@@ -1049,8 +1120,19 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    }
    nir_store_var(b, ctx.perspective, nir_vec(b, perspective, 3), 0x7);
    nir_store_var(b, ctx.linear, nir_vec(b, linear, 3), 0x7);
-   nir_store_var(b, ctx.coord, nir_vec4(b, nir_fadd_imm(b, nir_u2f32(b, px), 0.5f),
-                                        nir_fadd_imm(b, nir_u2f32(b, py), 0.5f), z, sum), 0xf);
+   nir_def *position = sample_rate ?
+      nir_vec2(b, nir_fmul_imm(b, nir_u2f32(b, sx), 1.0f / 256), nir_fmul_imm(b, nir_u2f32(b, sy), 1.0f / 256)) :
+      nir_imm_vec2(b, 0.5f, 0.5f);
+   nir_store_var(b, ctx.position, position, 0x3);
+   nir_store_var(b, ctx.coord, nir_vec4(b, nir_fadd(b, nir_u2f32(b, px), nir_channel(b, position, 0)),
+                                        nir_fadd(b, nir_u2f32(b, py), nir_channel(b, position, 1)), z, sum), 0xf);
+   nir_store_var(b, ctx.sample, sample_rate ? sample : nir_imm_int(b, 0), 1);
+   /* gl_SampleMaskIn: this sample at sample rate, else the pixel's samples. */
+   nir_def *mask_in = nir_ishl(b, nir_b2i32(b, covered), sample);
+   if (samples > 1 && !sample_rate)
+      for (unsigned s = 1; s < samples; s++)
+         mask_in = nir_ior(b, mask_in, nir_shuffle(b, mask_in, nir_ixor(b, lane, nir_imm_int(b, s * 4))));
+   nir_store_var(b, ctx.mask_in, mask_in, 1);
    nir_store_var(b, ctx.front, nir_ine_imm(b, nir_iand_imm(b, FIELD(APEX_PRIM_FLAGS), 1), 0), 1);
    nir_store_var(b, ctx.sources, nir_vec3(b, FIELD(APEX_PRIM_SOURCE), FIELD(APEX_PRIM_SOURCE + 1),
                                           FIELD(APEX_PRIM_SOURCE + 2)), 0x7);
@@ -1071,6 +1153,18 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_pop_if(b, shade);
 
    nir_def *live = nir_iand(b, covered, nir_inot(b, nir_load_var(b, ctx.killed)));
+   if (samples > 1) {
+      /* Alpha to coverage keeps the first round(alpha * samples) samples. */
+      nir_def *alpha = nir_fsat(b, nir_channel(b, nir_load_var(b, ctx.color[0]), 3));
+      nir_def *keep = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, alpha, samples)));
+      nir_def *a2c = nir_ine_imm(b, nir_iand_imm(b, multisample, 1u << 16), 0);
+      live = nir_iand(b, live, nir_ior(b, nir_inot(b, a2c), nir_ult(b, sample, keep)));
+   }
+   nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, multisample, 1u << 17), 0));
+   for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
+      nir_store_var(b, ctx.color[k], nir_vector_insert_imm(b, nir_load_var(b, ctx.color[k]),
+                                                           nir_imm_float(b, 1.0f), 3), 0xf);
+   nir_pop_if(b, NULL);
    if (ds_target) {
       /* Stencil test, then depth test; stencil ops follow their outcome. */
       nir_def *control = draw_word(b, program, APEX_DRAW_DEPTH);
@@ -1218,9 +1312,9 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
 
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       if (stored[k])
-         store_texel(b, &color_target[k], nir_load_var(b, stored[k]), lane, inside);
+         store_texel(b, &color_target[k], nir_load_var(b, stored[k]), lane, inside, samples);
    if (ds_target)
-      store_texel(b, &ds, nir_load_var(b, stored_ds), lane, inside);
+      store_texel(b, &ds, nir_load_var(b, stored_ds), lane, inside, samples);
    nir_def *groups = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups));
    nir_store_var(b, t_var, nir_iadd(b, t, groups), 1);
    nir_pop_loop(b, tile_loop);
@@ -1395,6 +1489,14 @@ apex_hash_state(struct vk_physical_device *physical, const struct vk_graphics_pi
                           sizeof(state->rp->depth_attachment_format));
       _mesa_blake3_update(&hash, &state->rp->stencil_attachment_format,
                           sizeof(state->rp->stencil_attachment_format));
+      if (state->ms) {
+         _mesa_blake3_update(&hash, &state->ms->rasterization_samples,
+                             sizeof(state->ms->rasterization_samples));
+         _mesa_blake3_update(&hash, &state->ms->sample_shading_enable,
+                             sizeof(state->ms->sample_shading_enable));
+         _mesa_blake3_update(&hash, &state->ms->min_sample_shading,
+                             sizeof(state->ms->min_sample_shading));
+      }
    }
    _mesa_blake3_final(&hash, out);
 }
@@ -1457,10 +1559,100 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
    return VK_SUCCESS;
 }
 
+/* 4x resolve: float and normalized formats average their samples; integer
+ * and depth/stencil formats take sample 0. Sub-word destinations merge with
+ * word atomics. */
+static nir_shader *
+build_resolve(const struct apex_program *program, enum pipe_format format)
+{
+   nir_builder builder = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &apex_nir_options,
+                                                        "apex_resolve");
+   nir_builder *b = &builder;
+   b->shader->info.workgroup_size[0] = 16;
+   b->shader->info.workgroup_size[1] = b->shader->info.workgroup_size[2] = 1;
+   unsigned trailer = apex_program_trailer(program), bits = util_format_get_blocksizebits(format);
+   nir_def *item = nir_iadd(b, nir_imul_imm(b, root_word(b, trailer), 16),
+                            nir_channel(b, nir_load_global_invocation_id(b, 32), 0));
+   nir_def *width = draw_word(b, program, APEX_RESOLVE_WIDTH);
+   nir_def *rows = draw_word(b, program, APEX_RESOLVE_ROWS);
+   nir_push_if(b, nir_ult(b, item, nir_imul(b, nir_imul(b, width, rows),
+                                            draw_word(b, program, APEX_RESOLVE_LAYERS))));
+   nir_def *line = nir_udiv(b, item, width);
+   nir_def *x = nir_isub(b, item, nir_imul(b, line, width));
+   nir_def *layer = nir_udiv(b, line, rows);
+   nir_def *y = nir_isub(b, line, nir_imul(b, layer, rows));
+   nir_def *src = address_add(b, draw_address(b, program, APEX_RESOLVE_SRC),
+      nir_iadd(b, nir_imul(b, layer, draw_word(b, program, APEX_RESOLVE_SRC_SLICE)),
+                  nir_imul(b, y, draw_word(b, program, APEX_RESOLVE_SRC_ROW))));
+   nir_def *dst_row = address_add(b, draw_address(b, program, APEX_RESOLVE_DST),
+      nir_iadd(b, nir_imul(b, layer, draw_word(b, program, APEX_RESOLVE_DST_SLICE)),
+                  nir_imul(b, y, draw_word(b, program, APEX_RESOLVE_DST_ROW))));
+   bool average = !util_format_is_pure_integer(format) && !util_format_is_depth_or_stencil(format);
+   nir_def *texel = NULL, *sum = NULL;
+   for (unsigned s = 0; s < (average ? 4 : 1); s++) {
+      struct texel_target t = texel_target(b, src, nir_imm_int(b, 0),
+                                           nir_iadd_imm(b, nir_imul_imm(b, x, 4), s), nir_imm_int(b, 0),
+                                           format);
+      texel = load_texel(b, &t);
+      if (average) {
+         nir_def *color = unpack_color(b, format, texel);
+         sum = sum ? nir_fadd(b, sum, color) : color;
+      }
+   }
+   if (average)
+      texel = pack_color(b, format, nir_fmul_imm(b, sum, 0.25f));
+   struct texel_target t = texel_target(b, dst_row, nir_imm_int(b, 0), x, nir_imm_int(b, 0), format);
+   if (bits >= 32) {
+      for (unsigned w = 0; w < bits / 32; w++)
+         store_word(b, nir_channel(b, texel, w), address_add(b, t.address, nir_imm_int(b, w * 4)));
+   } else {
+      nir_def *mask = nir_ishl(b, nir_imm_int(b, BITFIELD_MASK(bits)), t.shift);
+      nir_global_atomic_2x32(b, 32, t.address, nir_inot(b, mask), .atomic_op = nir_atomic_op_iand);
+      nir_global_atomic_2x32(b, 32, t.address, nir_ishl(b, nir_channel(b, texel, 0), t.shift),
+                             .atomic_op = nir_atomic_op_ior);
+   }
+   nir_pop_if(b, NULL);
+   return b->shader;
+}
+
+VkResult
+apex_resolve_program(struct apex_device *device, VkFormat format, struct apex_program **out)
+{
+   if ((unsigned)format >= ARRAY_SIZE(device->resolve))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (device->resolve[format]) {
+      *out = device->resolve[format];
+      return VK_SUCCESS;
+   }
+   struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
+                                            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!program)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   program->table = true;
+   nir_shader *nir = build_resolve(program, vk_format_to_pipe_format(format));
+   VkResult result = apex_program_compile(&device->vk, program, nir);
+   ralloc_free(nir);
+   if (result != VK_SUCCESS) {
+      apex_program_finish(device, program);
+      vk_free(&device->vk.alloc, program);
+      return result;
+   }
+   device->resolve[format] = program;
+   *out = program;
+   return VK_SUCCESS;
+}
+
 void
 apex_graphics_finish(struct apex_device *device)
 {
    apex_bo_finish(device, &device->arena);
+   for (unsigned f = 0; f < ARRAY_SIZE(device->resolve); f++) {
+      if (device->resolve[f]) {
+         apex_program_finish(device, device->resolve[f]);
+         vk_free(&device->vk.alloc, device->resolve[f]);
+         device->resolve[f] = NULL;
+      }
+   }
    for (unsigned i = 0; i < APEX_INTERNAL_COUNT; i++) {
       if (device->internal[i]) {
          apex_program_finish(device, device->internal[i]);

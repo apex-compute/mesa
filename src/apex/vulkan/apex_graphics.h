@@ -28,5 +28,7 @@ void apex_cmd_bind_shaders(struct vk_command_buffer *cmd, uint32_t count,
 /* Device-owned internal programs, compiled on first use. */
 VkResult apex_internal_program(struct apex_device *device, enum apex_internal which,
                                struct apex_program **out);
+VkResult apex_resolve_program(struct apex_device *device, VkFormat format,
+                              struct apex_program **out);
 void apex_graphics_finish(struct apex_device *device);
 #endif

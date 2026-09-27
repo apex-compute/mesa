@@ -97,6 +97,8 @@ struct apex_device {
    /* Indirect draw scratch and parameter block, created on first use under
     * memory_mutex (see APEX_ARENA_* in apex_draw.h). */
    struct apex_bo arena;
+   /* 4x resolve programs by format, compiled on first use. */
+   struct apex_program *resolve[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1];
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
