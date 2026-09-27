@@ -367,52 +367,6 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
-static bool
-lower_global(nir_builder *b, nir_intrinsic_instr *i, void *data)
-{
-   bool store = i->intrinsic == nir_intrinsic_store_global;
-   bool atomic = i->intrinsic == nir_intrinsic_global_atomic;
-   if (!store && !atomic && i->intrinsic != nir_intrinsic_load_global)
-      return false;
-   struct descriptor_lowering *ctx = data;
-   if ((store ? i->src[0].ssa->bit_size : i->def.bit_size) != 32 ||
-       i->num_components > 4 || (!atomic && (nir_intrinsic_align_mul(i) < 4 ||
-       nir_intrinsic_align_offset(i) % 4))) {
-      ctx->invalid = true;
-      return false;
-   }
-   b->cursor = nir_before_instr(&i->instr);
-   nir_def *address = nir_unpack_64_2x32(b, i->src[store ? 1 : 0].ssa);
-   nir_def *values[4];
-   for (unsigned c = 0; c < i->num_components; c++) {
-      if (store && !(nir_intrinsic_write_mask(i) & (1u << c)))
-         continue;
-      nir_def *component = nir_build_addr_iadd(b, address, nir_address_format_2x32bit_global,
-                                              nir_var_mem_global, nir_imm_int(b, c * 4));
-      if (store)
-         nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), component,
-                               .align_mul = 4, .access = nir_intrinsic_access(i));
-      else if (atomic)
-         values[c] = nir_global_atomic_2x32(b, 32, component, i->src[1].ssa,
-            .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
-      else
-         values[c] = nir_load_global_2x32(b, 1, 32, component,
-                                         .align_mul = 4, .access = nir_intrinsic_access(i));
-   }
-   if (!store)
-      nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
-   nir_instr_remove(&i->instr);
-   return true;
-}
-
-static nir_mem_access_size_align
-global_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits,
-                   uint32_t align_mul, uint32_t align_offset, bool constant,
-                   enum gl_access_qualifier access, const void *data)
-{
-   return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32, .align = 4};
-}
-
 bool
 apex_program_layout(struct apex_program *program, uint32_t set_count,
                     struct vk_descriptor_set_layout *const *sets,
@@ -453,13 +407,6 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
    nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
    nir_shader_intrinsics_pass(nir, lower_image, nir_metadata_none, &ctx);
    nir_shader_intrinsics_pass(nir, lower_push_constant, nir_metadata_none, &ctx);
-   const nir_lower_mem_access_bit_sizes_options access = {
-      .callback = global_access_size, .modes = nir_var_mem_global,
-      .may_lower_unaligned_stores_to_atomics = true,
-   };
-   NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &access);
-   nir_shader_intrinsics_pass(nir, lower_global, nir_metadata_none, &ctx);
-   NIR_PASS(_, nir, nir_lower_int64);
    NIR_PASS(_, nir, nir_lower_system_values);
    return !ctx.invalid;
 }

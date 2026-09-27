@@ -107,104 +107,70 @@ pub fn compile(
         }
     }
     if control {
-        for (&id, v) in values.iter_mut() {
-            if v.0 == Class::S {
-                // Scalar writes are unmasked. A definition kills the old
-                // value, allowing iteration-local masks to reuse registers.
-                let mut uses = Vec::with_capacity(ops.len());
-                let mut defs = Vec::with_capacity(ops.len());
-                for o in ops {
-                    let r = roles(o.op, o.imm)?;
-                    defs.push(r[0].is_some() && o.args[0] == id);
-                    uses.push((1..4).any(|f| r[f].is_some() && o.args[f] == id));
-                }
-                let mut live = vec![false; ops.len() + 1];
-                loop {
-                    let mut changed = false;
-                    for (pc, o) in ops.iter().enumerate().rev() {
-                        let out = match o.op {
-                            1 | 2 => false,
-                            4 => live[o.imm as usize],
-                            5 => live[o.imm as usize] || live[pc + 1],
-                            _ => live[pc + 1],
-                        };
-                        let input = uses[pc] || (!defs[pc] && out);
-                        changed |= input != live[pc];
-                        live[pc] = input;
-                    }
-                    if !changed {
-                        break;
-                    }
-                }
-                for (pc, &input) in live[..ops.len()].iter().enumerate() {
-                    if input {
-                        v.2 = v.2.min(pc);
-                        v.3 = v.3.max(pc);
-                    }
-                }
-                continue;
-            }
-            // A single definition and all its uses in one unchanged-mask
-            // block need no retention across iterations. Reject incoming
-            // edges into the interval as well as branches/mask writes in it.
-            if v.4 == Some(v.2)
-                && !ops[v.2..=v.3].iter().any(|o| matches!(o.op, 4 | 5 | 6))
-                && !ops
-                    .iter()
-                    .any(|o| matches!(o.op, 4 | 5) && o.imm as usize > v.2 && o.imm as usize <= v.3)
-            {
-                continue;
-            }
-            // Enclose every intersecting vector branch span. A masked value
-            // used early in a loop must survive the backedge after its last
-            // textual use. Iterate for nested/overlapping branch spans.
-            loop {
-                let previous = (v.2, v.3);
-                for (pc, o) in ops.iter().enumerate() {
-                    if matches!(o.op, 4 | 5) {
-                        let lo = pc.min(o.imm as usize);
-                        let hi = pc.max(o.imm as usize);
-                        if v.2 <= hi && v.3 >= lo {
-                            v.2 = v.2.min(lo);
-                            v.3 = v.3.max(hi);
-                        }
-                    }
-                }
-                if previous == (v.2, v.3) {
-                    break;
-                }
+        lifetimes(ops, &mut values)?;
+    }
+    let mut order: Vec<_> = values.iter().map(|(&id, &v)| (id, v)).collect();
+    order.sort_by_key(|&(id, v)| (v.2, id));
+    let mut homes = BTreeMap::new();
+    // Active register intervals: class, register, width, end, value.
+    let mut occupied: Vec<(Class, u8, u8, usize, u32)> = Vec::new();
+    // Spill slots: first word, width, start, end. Disjoint lifetimes share slots.
+    let mut slots: Vec<(u32, u8, usize, usize)> = Vec::new();
+    let reserved = source_private / 4;
+    let mut words = reserved;
+    let mut spill = |n: u8, start: usize, end: usize, words: &mut u32| -> Result<u32, String> {
+        let mut slot = reserved;
+        loop {
+            let clash = slots
+                .iter()
+                .find(|s| slot < s.0 + s.1 as u32 && s.0 < slot + n as u32 && start <= s.3 && s.2 <= end);
+            match clash {
+                Some(s) => slot = s.0 + s.1 as u32,
+                None => break,
             }
         }
-    }
-    let mut order: Vec<_> = values.iter().collect();
-    order.sort_by_key(|(&id, v)| (v.2, id));
-    let mut homes = BTreeMap::new();
-    let mut occupied: Vec<(Class, u8, u8, usize)> = Vec::new();
-    let mut words = source_private / 4;
-    for (&id, &(cl, n, start, end, _)) in order {
+        slots.push((slot, n, start, end));
+        *words = (*words).max(slot.checked_add(n as u32).ok_or("spill size overflow")?);
+        Ok(slot)
+    };
+    for (id, (cl, n, start, end, _)) in order {
         occupied.retain(|v| v.3 >= start);
         let first = if cl == Class::S { 4 } else { 0 };
+        let fits = |r: u8, occupied: &Vec<(Class, u8, u8, usize, u32)>| {
+            r + n <= 52
+                && (n == 1 || r % 2 == 0)
+                && !occupied.iter().any(|v| v.0 == cl && r < v.1 + v.2 && v.1 < r + n)
+        };
         // Rotate preferred bank with SSA identity; reserve 52..63 for reloads and bank repair.
         let free = (first..52)
-            .filter(|r| *r + n <= 52 && (n == 1 || r % 2 == 0))
-            .filter(|r| {
-                !occupied
-                    .iter()
-                    .any(|v| v.0 == cl && *r < v.1 + v.2 && v.1 < *r + n)
-            })
+            .filter(|&r| fits(r, &occupied))
             .min_by_key(|r| ((r % 4 + 4 - (id % 4) as u8) % 4, *r));
-        let home = if let Some(r) = free {
-            occupied.push((cl, r, n, end));
-            Home::Register(r)
+        if let Some(r) = free {
+            occupied.push((cl, r, n, end, id));
+            homes.insert(id, Home::Register(r));
+            continue;
+        }
+        if cl == Class::S {
+            return Err("scalar register pressure exceeds initial profile".into());
+        }
+        // Spill the active vector interval that ends furthest when it outlives
+        // this one and releasing it makes room; otherwise spill this value.
+        let victim = occupied
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.0 == cl && v.3 > end && v.2 == n)
+            .filter(|(_, v)| n == 1 || v.1 % 2 == 0)
+            .max_by_key(|(_, v)| v.3)
+            .map(|(i, _)| i);
+        if let Some(i) = victim {
+            let (_, r, _, victim_end, victim_id) = occupied.remove(i);
+            let (_, _, victim_start, _, _) = values[&victim_id];
+            homes.insert(victim_id, Home::Spill(spill(n, victim_start, victim_end, &mut words)?));
+            occupied.push((cl, r, n, end, id));
+            homes.insert(id, Home::Register(r));
         } else {
-            if cl == Class::S {
-                return Err("scalar register pressure exceeds initial profile".into());
-            }
-            let slot = words;
-            words = words.checked_add(n as u32).ok_or("spill size overflow")?;
-            Home::Spill(slot)
-        };
-        homes.insert(id, home);
+            homes.insert(id, Home::Spill(spill(n, start, end, &mut words)?));
+        }
     }
     let mut native = Vec::new();
     let mut instruction_map = Vec::new();
@@ -378,4 +344,172 @@ pub fn compile(
     }
     p.validate()?;
     Ok(p)
+}
+
+/// Hull intervals from liveness on the linear control-flow graph. Every
+/// branch edge is taken or skipped as a whole wave, so both sides of a masked
+/// region execute in program order. Scalar writes are unmasked and kill. A
+/// single vector definition kills only when every use stays inside each loop
+/// containing it: lanes that leave a loop early keep an older value in the
+/// register. Multi-definition (out-of-SSA) vector values are masked
+/// read-modify-writes: they are live from any reaching definition to any use.
+fn lifetimes(
+    ops: &[Op],
+    values: &mut BTreeMap<u32, (Class, u8, usize, usize, Option<usize>)>,
+) -> Result<(), String> {
+    let n = ops.len();
+    let mut leader = vec![false; n + 1];
+    leader[0] = true;
+    leader[n] = true;
+    for (pc, o) in ops.iter().enumerate() {
+        if matches!(o.op, 4 | 5) {
+            leader[o.imm as usize] = true;
+            leader[pc + 1] = true;
+        } else if matches!(o.op, 1 | 2) {
+            leader[pc + 1] = true;
+        }
+    }
+    let starts: Vec<usize> = (0..=n).filter(|&pc| leader[pc]).collect();
+    let blocks = starts.len() - 1;
+    let mut block_of = vec![0; n + 1];
+    for b in 0..blocks {
+        for pc in starts[b]..starts[b + 1] {
+            block_of[pc] = b;
+        }
+    }
+    block_of[n] = blocks;
+    let mut successors = vec![Vec::new(); blocks];
+    for b in 0..blocks {
+        let last = &ops[starts[b + 1] - 1];
+        let next = (b + 1 < blocks).then_some(b + 1);
+        successors[b] = match last.op {
+            1 | 2 => vec![],
+            4 => vec![block_of[last.imm as usize]],
+            5 => [Some(block_of[last.imm as usize]), next].into_iter().flatten().collect(),
+            _ => next.into_iter().collect(),
+        };
+        successors[b].retain(|&s| s < blocks);
+    }
+    let ids: Vec<u32> = values.keys().copied().collect();
+    let index: BTreeMap<u32, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let words = ids.len().div_ceil(64);
+    let mut defs = vec![Vec::new(); ids.len()];
+    let mut uses = vec![Vec::new(); ids.len()];
+    for (pc, o) in ops.iter().enumerate() {
+        let r = roles(o.op, o.imm)?;
+        if r[0].is_some() {
+            defs[index[&o.args[0]]].push(pc);
+        }
+        for f in 1..4 {
+            if r[f].is_some() {
+                uses[index[&o.args[f]]].push(pc);
+            }
+        }
+    }
+    let loops: Vec<(usize, usize)> = ops
+        .iter()
+        .enumerate()
+        .filter(|(pc, o)| matches!(o.op, 4 | 5) && (o.imm as usize) <= *pc)
+        .map(|(pc, o)| (o.imm as usize, pc))
+        .collect();
+    let kills: Vec<bool> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            values[id].0 == Class::S
+                || (defs[i].len() == 1
+                    && loops.iter().all(|&(h, l)| {
+                        !(h <= defs[i][0] && defs[i][0] <= l)
+                            || uses[i].iter().all(|&u| h <= u && u <= l)
+                    }))
+        })
+        .collect();
+    let set = |bits: &mut Vec<u64>, i: usize| bits[i / 64] |= 1 << (i % 64);
+    let clear = |bits: &mut Vec<u64>, i: usize| bits[i / 64] &= !(1 << (i % 64));
+    let test = |bits: &Vec<u64>, i: usize| bits[i / 64] >> (i % 64) & 1 != 0;
+    let mut gen = vec![vec![0u64; words]; blocks];
+    let mut killed = vec![vec![0u64; words]; blocks];
+    let mut defined = vec![vec![0u64; words]; blocks];
+    for b in 0..blocks {
+        for pc in (starts[b]..starts[b + 1]).rev() {
+            let o = &ops[pc];
+            let r = roles(o.op, o.imm)?;
+            if r[0].is_some() {
+                let i = index[&o.args[0]];
+                set(&mut defined[b], i);
+                if kills[i] {
+                    clear(&mut gen[b], i);
+                    set(&mut killed[b], i);
+                }
+            }
+            for f in 1..4 {
+                if r[f].is_some() {
+                    set(&mut gen[b], index[&o.args[f]]);
+                }
+            }
+        }
+    }
+    let mut live_in = vec![vec![0u64; words]; blocks];
+    let mut live_out = vec![vec![0u64; words]; blocks];
+    loop {
+        let mut changed = false;
+        for b in (0..blocks).rev() {
+            let mut out = vec![0u64; words];
+            for &s in &successors[b] {
+                for w in 0..words {
+                    out[w] |= live_in[s][w];
+                }
+            }
+            let input: Vec<u64> = (0..words).map(|w| gen[b][w] | (out[w] & !killed[b][w])).collect();
+            changed |= input != live_in[b] || out != live_out[b];
+            live_in[b] = input;
+            live_out[b] = out;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut predecessors = vec![Vec::new(); blocks];
+    for b in 0..blocks {
+        for &s in &successors[b] {
+            predecessors[s].push(b);
+        }
+    }
+    let mut reach_in = vec![vec![0u64; words]; blocks];
+    let mut reach_out = vec![vec![0u64; words]; blocks];
+    loop {
+        let mut changed = false;
+        for b in 0..blocks {
+            let mut input = vec![0u64; words];
+            for &p in &predecessors[b] {
+                for w in 0..words {
+                    input[w] |= reach_out[p][w];
+                }
+            }
+            let out: Vec<u64> = (0..words).map(|w| input[w] | defined[b][w]).collect();
+            changed |= input != reach_in[b] || out != reach_out[b];
+            reach_in[b] = input;
+            reach_out[b] = out;
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let v = values.get_mut(id).unwrap();
+        for &pc in defs[i].iter().chain(&uses[i]) {
+            v.2 = v.2.min(pc);
+            v.3 = v.3.max(pc);
+        }
+        for b in 0..blocks {
+            if test(&live_in[b], i) && test(&reach_in[b], i) {
+                v.2 = v.2.min(starts[b]);
+                v.3 = v.3.max(starts[b]);
+            }
+            if test(&live_out[b], i) && test(&reach_out[b], i) {
+                v.3 = v.3.max(starts[b + 1] - 1);
+            }
+        }
+    }
+    Ok(())
 }

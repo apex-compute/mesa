@@ -15,8 +15,8 @@ const struct nir_shader_compiler_options apex_nir_options = {
    .lower_bitfield_extract = true, .lower_bitfield_insert = true,
    .lower_ifind_msb = true, .lower_find_lsb = true,
    .lower_pack_32_2x16_split = true, .lower_unpack_32_2x16_split = true,
-   .lower_int64_options = nir_lower_iadd64 | nir_lower_conv64 |
-      nir_lower_logic64 | nir_lower_imul64 | nir_lower_shift64,
+   /* Int64 uses paired words throughout. */
+   .lower_int64_options = ~0,
 };
 
 static uint32_t value(nir_def *def, unsigned component)
@@ -298,6 +298,53 @@ static int atomic_op(nir_atomic_op op)
    }
 }
 
+/* 64-bit global addresses become source-neutral paired words. */
+static bool
+lower_global(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   bool store = i->intrinsic == nir_intrinsic_store_global;
+   bool atomic = i->intrinsic == nir_intrinsic_global_atomic;
+   if (!store && !atomic && i->intrinsic != nir_intrinsic_load_global)
+      return false;
+   bool *invalid = data;
+   if ((store ? i->src[0].ssa->bit_size : i->def.bit_size) != 32 ||
+       i->num_components > 4 || (!atomic && (nir_intrinsic_align_mul(i) < 4 ||
+       nir_intrinsic_align_offset(i) % 4))) {
+      *invalid = true;
+      return false;
+   }
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *address = nir_unpack_64_2x32(b, i->src[store ? 1 : 0].ssa);
+   nir_def *values[4];
+   for (unsigned c = 0; c < i->num_components; c++) {
+      if (store && !(nir_intrinsic_write_mask(i) & (1u << c)))
+         continue;
+      nir_def *component = nir_build_addr_iadd(b, address, nir_address_format_2x32bit_global,
+                                              nir_var_mem_global, nir_imm_int(b, c * 4));
+      if (store)
+         nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), component,
+                               .align_mul = 4, .access = nir_intrinsic_access(i));
+      else if (atomic)
+         values[c] = nir_global_atomic_2x32(b, 32, component, i->src[1].ssa,
+            .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
+      else
+         values[c] = nir_load_global_2x32(b, 1, 32, component,
+                                         .align_mul = 4, .access = nir_intrinsic_access(i));
+   }
+   if (!store)
+      nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
+   nir_instr_remove(&i->instr);
+   return true;
+}
+
+static nir_mem_access_size_align
+global_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits,
+                   uint32_t align_mul, uint32_t align_offset, bool constant,
+                   enum gl_access_qualifier access, const void *data)
+{
+   return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32, .align = 4};
+}
+
 struct loop_masks { uint32_t live, iteration; struct loop_masks *parent; };
 struct control_state {
    struct util_dynarray *ops;
@@ -360,6 +407,17 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global, nir_address_format_64bit_global);
+   const nir_lower_mem_access_bit_sizes_options access = {
+      .callback = global_access_size, .modes = nir_var_mem_global | nir_var_function_temp,
+      .may_lower_unaligned_stores_to_atomics = true,
+   };
+   NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &access);
+   bool invalid_global = false;
+   nir_shader_intrinsics_pass(nir, lower_global, nir_metadata_none, &invalid_global);
+   if (invalid_global) return fail(output, "unsupported global memory access width");
+   NIR_PASS(_, nir, nir_lower_int64);
+   NIR_PASS(_, nir, nir_lower_64bit_phis);
    NIR_PASS(_, nir, nir_lower_system_values);
    const nir_lower_compute_system_values_options geometry = {
       .lower_cs_local_id_to_index = true,

@@ -42,13 +42,15 @@ int main(int argc, char **argv)
    glsl_type_singleton_init_or_ref();
    struct spirv_capabilities caps = {
       .Shader = true, .GroupNonUniform = true, .GroupNonUniformBallot = true,
-      .GroupNonUniformShuffle = true, .ShaderClockKHR = true,
+      .GroupNonUniformShuffle = true, .ShaderClockKHR = true, .Int64 = true,
+      .PhysicalStorageBufferAddresses = true,
    };
    struct spirv_to_nir_options spv = {
       .environment = NIR_SPIRV_VULKAN, .capabilities = &caps,
       .ssbo_addr_format = nir_address_format_32bit_index_offset,
       .ubo_addr_format = nir_address_format_32bit_index_offset,
       .shared_addr_format = nir_address_format_32bit_offset,
+      .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .skip_os_break_in_debug_build = true,
    };
    nir_shader *nir = spirv_to_nir(words, size / 4, NULL, MESA_SHADER_COMPUTE,

@@ -1,0 +1,154 @@
+#version 450
+// Triangle setup: one invocation per input primitive of every instance.
+// Assembles source vertices, clips against w >= 2^-126, the x/y guard band,
+// z >= 0 and z <= w, fans the polygon, snaps to Q16.8, culls and writes
+// edge equations with the top-left rule. See apex_draw.h for record layout.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_draw.h"
+layout(local_size_x = 64) in;
+// The internal program's data root: one zero sentinel row, then the trailer.
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint TRAILER = 8u;
+const uint DRAW = TRAILER + 6u;
+
+uint draw(uint i) { return root[DRAW + i]; }
+uint64_t address(uint i) { return uint64_t(draw(i)) | (uint64_t(draw(i + 1u)) << 32); }
+
+vec4 P[10];
+vec3 B[10];
+
+// Guard-band scale keeps snapped coordinates within +/-30000 pixels.
+float plane_distance(uint plane, vec4 v, vec2 guard)
+{
+   if (plane == 0u) return v.w - 1.17549435e-38;
+   if (plane == 1u) return v.x + guard.x * v.w;
+   if (plane == 2u) return guard.x * v.w - v.x;
+   if (plane == 3u) return v.y + guard.y * v.w;
+   if (plane == 4u) return guard.y * v.w - v.y;
+   if (plane == 5u) return v.z;
+   return v.w - v.z;
+}
+
+void main()
+{
+   uint prims = draw(APEX_DRAW_PRIM_COUNT);
+   uint g = root[TRAILER] * 64u + gl_GlobalInvocationID.x;
+   if (g >= prims * draw(APEX_DRAW_INSTANCE_COUNT))
+      return;
+   uint instance = g / prims, p = g - instance * prims;
+   uint topology = draw(APEX_DRAW_TOPOLOGY);
+   uvec3 tuple = topology == 5u ? uvec3(p + 1u, p + 2u, 0u) :
+                 topology == 4u ? ((p & 1u) != 0u ? uvec3(p, p + 2u, p + 1u) : uvec3(p, p + 1u, p + 2u)) :
+                 uvec3(3u * p, 3u * p + 1u, 3u * p + 2u);
+   uvec3 source = tuple + instance * draw(APEX_DRAW_VERTEX_COUNT);
+   Words vertices = Words(address(APEX_DRAW_VERTEX_LO));
+   uint stride = draw(APEX_DRAW_VERTEX_STRIDE);
+   for (uint i = 0u; i < 3u; i++) {
+      uint base = source[i] * stride;
+      P[i] = uintBitsToFloat(uvec4(vertices.w[base], vertices.w[base + 1u],
+                                   vertices.w[base + 2u], vertices.w[base + 3u]));
+      B[i] = vec3(i == 0u ? 1.0 : 0.0, i == 1u ? 1.0 : 0.0, i == 2u ? 1.0 : 0.0);
+   }
+   vec4 viewport = uintBitsToFloat(uvec4(draw(APEX_DRAW_VIEWPORT), draw(APEX_DRAW_VIEWPORT + 1u),
+                                         draw(APEX_DRAW_VIEWPORT + 2u), draw(APEX_DRAW_VIEWPORT + 3u)));
+   float min_depth = uintBitsToFloat(draw(APEX_DRAW_VIEWPORT + 4u));
+   float max_depth = uintBitsToFloat(draw(APEX_DRAW_VIEWPORT + 5u));
+   vec2 scale = viewport.zw * 0.5, offset = viewport.xy + scale;
+   vec2 guard = vec2(30000.0) / (abs(scale) + abs(offset) + 1.0);
+
+   uint n = 3u;
+   for (uint plane = 0u; plane < 7u && n != 0u; plane++) {
+      vec4 Q[10];
+      vec3 C[10];
+      uint m = 0u;
+      for (uint i = 0u; i < n; i++) {
+         uint j = i + 1u == n ? 0u : i + 1u;
+         float di = plane_distance(plane, P[i], guard);
+         float dj = plane_distance(plane, P[j], guard);
+         bool in_i = di >= 0.0, in_j = dj >= 0.0;
+         if (in_i) {
+            Q[m] = P[i]; C[m] = B[i]; m++;
+         }
+         if (in_i != in_j) {
+            float t = di / (di - dj);
+            Q[m] = P[i] + t * (P[j] - P[i]);
+            C[m] = B[i] + t * (B[j] - B[i]);
+            m++;
+         }
+      }
+      n = m < 3u ? 0u : m;
+      for (uint i = 0u; i < n; i++) {
+         P[i] = Q[i]; B[i] = C[i];
+      }
+   }
+
+   ivec2 q[10];
+   float z[10], inv_w[10];
+   for (uint i = 0u; i < n; i++) {
+      inv_w[i] = 1.0 / P[i].w;
+      vec3 ndc = P[i].xyz * inv_w[i];
+      q[i] = ivec2(roundEven((ndc.xy * scale + offset) * 256.0));
+      z[i] = ndc.z * (max_depth - min_depth) + min_depth;
+   }
+
+   Words records = Words(address(APEX_DRAW_PRIM_LO));
+   uint record = g * APEX_SUBPRIMS * APEX_PRIM_WORDS;
+   uint count = 0u;
+   uint cull = draw(APEX_DRAW_CULL);
+   bool ccw = draw(APEX_DRAW_FRONT_FACE) == 0u;
+   ivec4 scissor = ivec4(draw(APEX_DRAW_SCISSOR), draw(APEX_DRAW_SCISSOR + 1u),
+                         draw(APEX_DRAW_SCISSOR + 2u), draw(APEX_DRAW_SCISSOR + 3u));
+   for (uint k = 1u; k + 1u < n; k++) {
+      uint v[3] = uint[3](0u, k, k + 1u);
+      int64_t area = int64_t(q[v[1]].x - q[v[0]].x) * int64_t(q[v[2]].y - q[v[0]].y) -
+                     int64_t(q[v[2]].x - q[v[0]].x) * int64_t(q[v[1]].y - q[v[0]].y);
+      if (area == 0l)
+         continue;
+      // Vulkan's signed area is -area/2 in framebuffer coordinates.
+      bool front = ccw ? area < 0l : area > 0l;
+      if ((cull & (front ? 1u : 2u)) != 0u)
+         continue;
+      if (area < 0l) {
+         uint t = v[1]; v[1] = v[2]; v[2] = t;
+         area = -area;
+      }
+      ivec2 lo = min(min(q[v[0]], q[v[1]]), q[v[2]]), hi = max(max(q[v[0]], q[v[1]]), q[v[2]]);
+      // Pixel centers x*256+128 inside [lo, hi].
+      ivec2 first = max((lo - 128 + 255) >> 8, scissor.xy);
+      ivec2 last = min(((hi - 128) >> 8) + 1, scissor.zw);
+      if (any(greaterThanEqual(first, last)))
+         continue;
+      uint r = record + count * APEX_PRIM_WORDS;
+      for (uint e = 0u; e < 3u; e++) {
+         ivec2 a = q[v[(e + 1u) % 3u]], b = q[v[(e + 2u) % 3u]];
+         int dx = b.x - a.x, dy = b.y - a.y;
+         int64_t c = int64_t(dy) * int64_t(a.x) - int64_t(dx) * int64_t(a.y);
+         if (!(dy < 0 || (dy == 0 && dx > 0)))
+            c -= 1l;
+         records.w[r + APEX_PRIM_EDGE + e * 4u] = uint(a.y - b.y);
+         records.w[r + APEX_PRIM_EDGE + e * 4u + 1u] = uint(dx);
+         records.w[r + APEX_PRIM_EDGE + e * 4u + 2u] = uint(c);
+         records.w[r + APEX_PRIM_EDGE + e * 4u + 3u] = uint(c >> 32);
+      }
+      records.w[r + APEX_PRIM_BOX] = uint(first.x);
+      records.w[r + APEX_PRIM_BOX + 1u] = uint(first.y);
+      records.w[r + APEX_PRIM_BOX + 2u] = uint(last.x);
+      records.w[r + APEX_PRIM_BOX + 3u] = uint(last.y);
+      records.w[r + APEX_PRIM_RECIPROCAL_AREA] = floatBitsToUint(1.0 / float(area));
+      for (uint i = 0u; i < 3u; i++) {
+         records.w[r + APEX_PRIM_Z + i] = floatBitsToUint(z[v[i]]);
+         records.w[r + APEX_PRIM_INV_W + i] = floatBitsToUint(inv_w[v[i]]);
+         for (uint j = 0u; j < 3u; j++)
+            records.w[r + APEX_PRIM_WEIGHTS + i * 3u + j] = floatBitsToUint(B[v[i]][j]);
+         records.w[r + APEX_PRIM_SOURCE + i] = source[i];
+      }
+      records.w[r + APEX_PRIM_FLAGS] = front ? 1u : 0u;
+      records.w[r + APEX_PRIM_ID] = p;
+      count++;
+   }
+   records.w[record + APEX_PRIM_COUNT] = count;
+}
