@@ -6,7 +6,8 @@
 #include <stdio.h>
 
 const struct nir_shader_compiler_options apex_nir_options = {
-   .lower_fdiv = true, .lower_flrp32 = true,
+   .lower_flrp32 = true, .lower_fpow = true, .lower_fmod = true, .lower_fsat = true,
+   .lower_scmp = true, .lower_fdph = true, .lower_fisnormal = true, .lower_ffract = true,
    .lower_usub_sat = true,
    .lower_bit_count = true, .lower_bitfield_reverse = true, .lower_mul_high = true,
    .lower_mul_2x32_64 = true,
@@ -396,6 +397,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
       NIR_PASS(progress, nir, nir_lower_phis_to_scalar, NULL, NULL);
+      NIR_PASS(progress, nir, apex_lower_float_library);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_minmax_sign, lower_fp32_minmax_sign, NULL);
       NIR_PASS(progress, nir, nir_shader_lower_instructions, fp32_comparison, lower_fp32_comparison, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
@@ -491,11 +493,25 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else if (instr->type == nir_instr_type_alu) {
             nir_alu_instr *a = nir_instr_as_alu(instr);
             unsigned op = alu_op(a->op);
-            if (a->op == nir_op_b2i32) {
+            if (a->op == nir_op_b2i32 || a->op == nir_op_b2f32) {
+               /* Booleans are all-one masks here; select 1 or 1.0f bits. */
                uint32_t one = temporary++;
-               emit(&ops, 0x20, one, 0, 0, 0, 1);
+               emit(&ops, 0x20, one, 0, 0, 0, a->op == nir_op_b2i32 ? 1 : 0x3f800000u);
                emit(&ops, 0x25, value(&a->def, 0),
                     value(a->src[0].src.ssa, a->src[0].swizzle[0]), one, 0, 0);
+               continue;
+            }
+            if (a->op == nir_op_f2u32) {
+               /* Native F2U requires a finite in-range operand. SPIR-V leaves
+                * other results undefined; map them to zero instead of a fault.
+                * Unsigned order on the bits admits exactly +0 <= x < 2^32. */
+               uint32_t limit = temporary++, inside = temporary++, zero = temporary++;
+               uint32_t operand = temporary++;
+               emit(&ops, 0x20, limit, 0, 0, 0, 0x4f800000u);
+               emit(&ops, 0x2a, inside, value(a->src[0].src.ssa, a->src[0].swizzle[0]), limit, 0, 0);
+               emit(&ops, 0x20, zero, 0, 0, 0, 0);
+               emit(&ops, 0x2e, operand, inside, value(a->src[0].src.ssa, a->src[0].swizzle[0]), zero, 0);
+               emit(&ops, 0x34, value(&a->def, 0), operand, 0, 0, 0);
                continue;
             }
             if (a->op == nir_op_ineg) {

@@ -155,3 +155,7 @@ apex_sync_test = executable('apex-sync-test', 'sync_test.c',
   link_language : 'cpp', install : false,
 )
 test('apex-sync', apex_sync_test, suite : ['apex'])
+# Explicit hardware numeric gates drive this runner with host references.
+apex_run = executable('apex-run', 'run.c',
+  include_directories : inc_include, dependencies : dep_dl, install : false,
+)

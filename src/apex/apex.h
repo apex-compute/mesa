@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef APEX_H
 #define APEX_H
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 struct nir_shader;
@@ -23,4 +24,6 @@ int apex_emit(const struct apex_op *, size_t, uint32_t shared, uint32_t private_
 int apex_tool(const char *mode, const char *input, const char *output);
 /* Mutates caller-owned NIR; the caller retains its lifetime and GLSL type ref. */
 int apex_from_nir(struct nir_shader *, struct apex_compile_result *);
+/* Lowers FP32 rounding, reciprocal, division, roots, exp2/log2 and sin/cos. */
+bool apex_lower_float_library(struct nir_shader *);
 #endif

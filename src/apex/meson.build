@@ -3,7 +3,7 @@
 add_languages('rust', required : true)
 apex_rust = import('rust')
 apex_rs = static_library('apex_rs', 'lib.rs', rust_abi : 'c')
-apex_nir = static_library('apex_nir', 'from_nir.c',
+apex_nir = static_library('apex_nir', ['from_nir.c', 'float.c'],
   include_directories : [inc_include, inc_src],
   dependencies : [idep_nir, idep_mesautil],
 )
