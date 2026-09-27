@@ -1049,7 +1049,7 @@ run_images(struct vk_physical_device *physical, const uint32_t *spirv, size_t si
                       vk_descriptor_set_layout_from_handle(other)->blake3, BLAKE3_OUT_LEN));
          v->DestroyDescriptorSetLayout(dev, other, NULL);
       }
-      binding.descriptorType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+      binding.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
       VkDescriptorSetLayout unsupported;
       CHECK(v->CreateDescriptorSetLayout(dev, &li, NULL, &unsupported) == VK_ERROR_FEATURE_NOT_PRESENT && !unsupported);
    }

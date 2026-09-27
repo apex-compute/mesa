@@ -62,8 +62,8 @@ struct apex_descriptor_pool {
    struct vk_object_base base;
    struct list_head sets;
    uint32_t capacity, allocated;
-   uint64_t descriptors[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
-   uint64_t used[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
+   uint64_t descriptors[APEX_DESCRIPTOR_BUCKETS];
+   uint64_t used[APEX_DESCRIPTOR_BUCKETS];
 };
 struct apex_descriptor_set {
    struct vk_object_base base;
@@ -929,6 +929,23 @@ apex_DestroySampler(VkDevice dev, VkSampler handle, const VkAllocationCallbacks 
       vk_sampler_destroy(&device->vk, alloc, sampler);
 }
 
+/* Set storage elements and table rows of one binding; `count` is the API
+ * descriptorCount (bytes for inline uniform blocks). */
+static uint64_t
+binding_elements(VkDescriptorType type, uint32_t count)
+{
+   return type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
+      DIV_ROUND_UP(count, sizeof(((struct apex_descriptor_set *)0)->descriptors[0])) : count;
+}
+
+static uint64_t
+binding_rows(VkDescriptorType type, uint32_t count)
+{
+   return type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
+      (count ? 1 + DIV_ROUND_UP(count, sizeof(union apex_descriptor)) : 0) :
+      (uint64_t)count * apex_descriptor_slots(type);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateInfo *info,
                                const VkAllocationCallbacks *alloc, VkDescriptorSetLayout *out)
@@ -948,15 +965,16 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       const VkDescriptorSetLayoutBinding *b = &info->pBindings[i];
       VkDescriptorBindingFlags flags = binding_flags && binding_flags->bindingCount ?
          binding_flags->pBindingFlags[i] : 0;
-      bool type_ok = b->descriptorType <= VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+      bool type_ok = apex_descriptor_bucket(b->descriptorType) < APEX_DESCRIPTOR_BUCKETS;
+      bool inline_block = b->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
       if (b->binding >= APEX_MAX_BINDINGS || !type_ok ||
-          (uint64_t)b->descriptorCount * apex_descriptor_slots(b->descriptorType) >
-             APEX_MAX_DESCRIPTORS - slots ||
+          (inline_block && b->descriptorCount > APEX_MAX_INLINE_BYTES) ||
+          binding_rows(b->descriptorType, b->descriptorCount) > APEX_MAX_DESCRIPTORS - slots ||
           (flags & ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
           (device->transport == APEX_TRANSPORT_NATIVE && b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))
          return VK_ERROR_FEATURE_NOT_PRESENT;
-      descriptors += b->descriptorCount;
-      slots += b->descriptorCount * apex_descriptor_slots(b->descriptorType);
+      descriptors += binding_elements(b->descriptorType, b->descriptorCount);
+      slots += binding_rows(b->descriptorType, b->descriptorCount);
       if (b->pImmutableSamplers && (b->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
                                     b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))
          immutable += b->descriptorCount;
@@ -984,11 +1002,12 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    for (unsigned i = 0; i < info->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *binding = &info->pBindings[i];
       unsigned b = binding->binding;
-      layout->bindings[b].count = binding->descriptorCount;
+      bool inline_block = binding->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+      layout->bindings[b].count = inline_block ? !!binding->descriptorCount : binding->descriptorCount;
+      layout->bindings[b].bytes = inline_block ? binding->descriptorCount : 0;
       layout->bindings[b].type = binding->descriptorType;
       layout->bindings[b].stages = binding->stageFlags;
-      layout->counts[layout->bindings[b].type] +=
-         layout->bindings[b].count;
+      layout->counts[apex_descriptor_bucket(binding->descriptorType)] += binding->descriptorCount;
       layout->bindings[b].flags = binding_flags && binding_flags->bindingCount ?
          binding_flags->pBindingFlags[i] : 0;
       /* Immutable samplers are copied: the layout outlives the handles. */
@@ -1004,8 +1023,9 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    for (unsigned b = 0; b < count; b++) {
       layout->bindings[b].offset = offset;
       layout->bindings[b].slot = slot;
-      offset += layout->bindings[b].count;
-      slot += layout->bindings[b].count * apex_descriptor_slots(layout->bindings[b].type);
+      unsigned api_count = layout->bindings[b].bytes ? layout->bindings[b].bytes : layout->bindings[b].count;
+      offset += binding_elements(layout->bindings[b].type, api_count);
+      slot += binding_rows(layout->bindings[b].type, api_count);
       if (vk_descriptor_type_is_dynamic(layout->bindings[b].type))
          layout->vk.dynamic_descriptor_count += layout->bindings[b].count;
    }
@@ -1028,12 +1048,12 @@ apex_CreateDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo *info,
    if (info->flags & ~(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT |
                         VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT))
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   uint64_t descriptors[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1] = {0};
+   uint64_t descriptors[APEX_DESCRIPTOR_BUCKETS] = {0};
    for (unsigned i = 0; i < info->poolSizeCount; i++) {
-      VkDescriptorType type = info->pPoolSizes[i].type;
-      if ((unsigned)type >= ARRAY_SIZE(descriptors))
+      unsigned bucket = apex_descriptor_bucket(info->pPoolSizes[i].type);
+      if (bucket >= ARRAY_SIZE(descriptors))
          return VK_ERROR_FEATURE_NOT_PRESENT;
-      descriptors[type] += info->pPoolSizes[i].descriptorCount;
+      descriptors[bucket] += info->pPoolSizes[i].descriptorCount;
    }
    struct apex_descriptor_pool *pool = vk_object_zalloc(&device->vk, alloc,
       sizeof(*pool), VK_OBJECT_TYPE_DESCRIPTOR_POOL);
@@ -1099,7 +1119,7 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
    VK_FROM_HANDLE(apex_descriptor_pool, pool, info->descriptorPool);
    for (unsigned i = 0; i < info->descriptorSetCount; i++)
       out[i] = VK_NULL_HANDLE;
-   uint64_t descriptors[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1] = {0};
+   uint64_t descriptors[APEX_DESCRIPTOR_BUCKETS] = {0};
    for (unsigned i = 0; i < info->descriptorSetCount; i++) {
       const struct apex_set_layout *layout =
          (const void *)vk_descriptor_set_layout_from_handle(info->pSetLayouts[i]);
@@ -1139,6 +1159,12 @@ write_set(struct apex_descriptor_set *set, uint32_t binding, uint32_t element, u
           VkDescriptorType type, const void *data, size_t stride)
 {
    assert(binding < set->layout->binding_count && type == set->layout->bindings[binding].type);
+   if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      /* `element` and `count` are byte offset and size. */
+      assert(element + count <= set->layout->bindings[binding].bytes);
+      memcpy((uint8_t *)&set->descriptors[set->layout->bindings[binding].offset] + element, data, count);
+      return;
+   }
    unsigned start = set->layout->bindings[binding].offset + element;
    assert(start + count <= set->layout->descriptor_count);
    for (unsigned d = 0; d < count; d++) {
@@ -1166,6 +1192,13 @@ static void
 write_descriptors(struct apex_descriptor_set *set, const VkWriteDescriptorSet *w)
 {
    switch (w->descriptorType) {
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
+      const VkWriteDescriptorSetInlineUniformBlock *block =
+         vk_find_struct_const(w->pNext, WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK);
+      write_set(set, w->dstBinding, w->dstArrayElement, block->dataSize, w->descriptorType,
+                block->pData, 0);
+      break;
+   }
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
       write_set(set, w->dstBinding, w->dstArrayElement, w->descriptorCount, w->descriptorType,
@@ -1237,6 +1270,12 @@ apex_UpdateDescriptorSets(VkDevice dev, uint32_t write_count, const VkWriteDescr
    for (unsigned i = 0; i < copy_count; i++) {
       VK_FROM_HANDLE(apex_descriptor_set, src, copies[i].srcSet);
       VK_FROM_HANDLE(apex_descriptor_set, dst, copies[i].dstSet);
+      const struct apex_binding_layout *source = &src->layout->bindings[copies[i].srcBinding];
+      if (source->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         write_set(dst, copies[i].dstBinding, copies[i].dstArrayElement, copies[i].descriptorCount,
+                   source->type, (uint8_t *)&src->descriptors[source->offset] + copies[i].srcArrayElement, 0);
+         continue;
+      }
       unsigned from = src->layout->bindings[copies[i].srcBinding].offset + copies[i].srcArrayElement;
       unsigned to = dst->layout->bindings[copies[i].dstBinding].offset + copies[i].dstArrayElement;
       assert(from + copies[i].descriptorCount <= src->layout->descriptor_count &&
@@ -3158,6 +3197,12 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
                continue;
             if (!set || memcmp(set->layout->vk.blake3, layout->vk.blake3, BLAKE3_OUT_LEN))
                goto out;
+            if (binding->bytes) {
+               /* The buffer row is completed with the table address below. */
+               memcpy(&rows[row + 1], &set->descriptors[d], binding->bytes);
+               rows[row].buffer.bytes = util_cpu_to_le32(binding->bytes);
+               continue;
+            }
             if (!write_descriptor(&rows[row], binding, e, layout, set, bound->offsets[d],
                                   &set->descriptors[d]))
                goto out;
@@ -3180,6 +3225,17 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
    result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, 0, table);
    if (result != VK_SUCCESS)
       goto out;
+   for (unsigned s = 0; s < program->set_count; s++) {
+      const struct apex_set_layout *layout = program->set_layouts[s];
+      for (unsigned b = 0; layout && b < layout->binding_count; b++) {
+         unsigned row = program->set_offsets[s] + layout->bindings[b].slot;
+         if (!layout->bindings[b].bytes || !BITSET_TEST(program->used_descriptors, row))
+            continue;
+         uint64_t va = table->va + (row + 1) * sizeof(union apex_descriptor);
+         rows[row].buffer.low = util_cpu_to_le32(va);
+         rows[row].buffer.high = util_cpu_to_le32(va >> 32);
+      }
+   }
    memcpy(table->map, rows, bytes);
    result = bo_transfer(device, table, APEX_DRM_TRANSFER_TO_LOCAL, 0, bytes);
 out:

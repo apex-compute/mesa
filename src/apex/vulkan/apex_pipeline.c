@@ -40,7 +40,9 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       VkDescriptorType dynamic_type = nir_intrinsic_desc_type(i) == nir_descriptor_type_uniform_buffer ?
          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-      if (layout->bindings[binding].type != type && layout->bindings[binding].type != dynamic_type) {
+      if (layout->bindings[binding].type != type && layout->bindings[binding].type != dynamic_type &&
+          (type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+           layout->bindings[binding].type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)) {
          ctx->invalid = true;
          return false;
       }

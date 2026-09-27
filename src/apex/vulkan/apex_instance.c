@@ -19,7 +19,7 @@
 
 /* Development protocol only. This compute subset is not a conformant Vulkan
  * device. The library/manifest are uninstalled and instance creation is opt-in. */
-#define APEX_DEVELOPMENT_API VK_API_VERSION_1_2
+#define APEX_DEVELOPMENT_API VK_API_VERSION_1_3
 
 struct apex_physical_device {
    struct vk_physical_device vk;
@@ -331,6 +331,22 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .subgroupBroadcastDynamicId = true,
       .samplerFilterMinmax = true,
       .bufferDeviceAddress = true,
+      /* Vulkan 1.3. */
+      .robustImageAccess = true,
+      .inlineUniformBlock = true,
+      .pipelineCreationCacheControl = true,
+      .privateData = true,
+      .shaderDemoteToHelperInvocation = true,
+      .shaderTerminateInvocation = true,
+      .subgroupSizeControl = true,
+      .computeFullSubgroups = true,
+      .synchronization2 = true,
+      .shaderZeroInitializeWorkgroupMemory = true,
+      .dynamicRendering = true,
+      .shaderIntegerDotProduct = true,
+      .maintenance4 = true,
+      .vulkanMemoryModel = true,
+      .vulkanMemoryModelDeviceScope = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
@@ -429,6 +445,18 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
+      /* Vulkan 1.3. */
+      .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
+      .maxComputeWorkgroupSubgroups = multiwave ? 16 : 1,
+      .maxInlineUniformBlockSize = APEX_MAX_INLINE_BYTES,
+      .maxInlineUniformTotalSize = APEX_MAX_INLINE_BYTES,
+      .maxPerStageDescriptorInlineUniformBlocks = 4,
+      .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 4,
+      .maxDescriptorSetInlineUniformBlocks = 4,
+      .maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 4,
+      .storageTexelBufferOffsetAlignmentBytes = 4,
+      .uniformTexelBufferOffsetAlignmentBytes = 4,
+      .maxBufferSize = APEX_MAX_ALLOCATION,
    };
    /* Opaque-fd compatibility is the flat GEM byte layout, revision 1. */
    memcpy(properties.driverUUID, "Apex GEM bytes 1", VK_UUID_SIZE);

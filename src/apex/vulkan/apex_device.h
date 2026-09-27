@@ -22,21 +22,32 @@ enum apex_internal {
 /* Largest allocation: the per-client page tables map about 1 GiB. */
 #define APEX_MAX_ALLOCATION (1024ull * 1024 * 1024)
 #define APEX_MAX_BINDINGS 1024
+#define APEX_MAX_INLINE_BYTES 4096
+/* Pool accounting buckets: core types, then inline uniform block bytes. */
+#define APEX_DESCRIPTOR_BUCKETS (VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 2)
+static inline unsigned
+apex_descriptor_bucket(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1 :
+          (unsigned)type <= VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ? type : APEX_DESCRIPTOR_BUCKETS;
+}
 #define APEX_MAX_PUSH_CONSTANTS 256
 #define APEX_EXTERNAL_MEMORY_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | \
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
 /* `offset` indexes set storage by array element; `slot` indexes table rows,
  * apex_descriptor_slots() per element. Immutable sampler rows start at
- * `immutable` in the layout's sampler array (~0 when absent). */
+ * `immutable` in the layout's sampler array (~0 when absent). An inline
+ * uniform block is one element of `bytes` bytes: set storage holds the bytes
+ * and the table holds a buffer row followed by the data rows. */
 struct apex_binding_layout {
-   uint32_t offset, slot, count, flags, immutable;
+   uint32_t offset, slot, count, flags, immutable, bytes;
    VkDescriptorType type;
    VkShaderStageFlags stages;
 };
 struct apex_set_layout {
    struct vk_descriptor_set_layout vk;
    uint32_t binding_count, descriptor_count, slot_count;
-   uint32_t counts[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
+   uint32_t counts[APEX_DESCRIPTOR_BUCKETS];
    uint32_t (*samplers)[8];
    struct apex_binding_layout bindings[];
 };
