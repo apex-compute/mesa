@@ -182,6 +182,17 @@ foreach stage : ['vert', 'frag']
     build_by_default : true,
   )
 endforeach
+# Frame-time benchmark for the performance plan's desktop and game scenes.
+apex_bench = executable('apex-bench', 'bench.c',
+  include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
+)
+foreach stage : ['vert', 'frag']
+  custom_target('apex-bench-' + stage,
+    input : 'bench.' + stage, output : 'bench.' + stage + '.spv',
+    command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
+    build_by_default : true,
+  )
+endforeach
 apex_present_test = executable('apex-present-test', 'present_test.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
 )
