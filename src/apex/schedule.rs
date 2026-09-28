@@ -8,6 +8,8 @@ struct Scheduler {
     ready: BTreeMap<Reg, usize>,
     tokens: [Option<Vec<Reg>>; 4],
     stores: u32,
+    // Cycle whose edge writes each scalar register (see scalar_port1_reads).
+    edges: BTreeMap<Reg, usize>,
 }
 impl Scheduler {
     fn live(&self) -> u32 {
@@ -34,10 +36,13 @@ impl Scheduler {
     fn drain(&mut self) {
         self.wait(self.live());
         let end = self.ready.values().copied().max().unwrap_or(0);
-        while self.out.len() < end {
+        // Past every scalar write edge's port-1 hazard cycle as well.
+        let edge = self.edges.values().map(|e| e + 2).max().unwrap_or(0);
+        while self.out.len() < end.max(edge) {
             self.out.push(Inst::new(0));
         }
         self.ready.clear();
+        self.edges.clear();
     }
     fn issue(&mut self, mut i: Inst) {
         let reads = i.regs(false);
@@ -72,6 +77,10 @@ impl Scheduler {
         while self.out.len() < ready {
             self.out.push(Inst::new(0));
         }
+        let port1 = i.scalar_port1_reads();
+        while port1.iter().any(|r| self.edges.get(r).is_some_and(|&e| e + 1 == self.out.len())) {
+            self.out.push(Inst::new(0));
+        }
         if i.asynchronous() {
             if self.live() == 15 {
                 self.wait(1);
@@ -85,6 +94,9 @@ impl Scheduler {
         } else {
             for r in writes {
                 self.ready.insert(r, self.out.len() + i.latency());
+                if r.0 == crate::isa::Class::S {
+                    self.edges.insert(r, self.out.len() + i.latency());
+                }
             }
         }
         self.out.push(i);
@@ -162,6 +174,9 @@ pub fn validate(code: &[Inst]) -> Result<(), String> {
                 }
             }
             continue;
+        }
+        if i.scalar_port1_reads().iter().any(|r| pending.get(r).is_some_and(|&t| t + 1 == cycle)) {
+            return Err(format!("scalar port-1 write-edge read at {cycle}"));
         }
         let touched: Vec<_> = i.regs(false).into_iter().chain(i.regs(true)).collect();
         for r in touched {

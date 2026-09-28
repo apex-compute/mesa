@@ -154,6 +154,28 @@
 #define APEX_RESOLVE_ROWS 9
 #define APEX_RESOLVE_LAYERS 10
 
+/* Internal ETC2/EAC decode job words (in place of the draw block): one
+ * invocation per texel of a width x height x layers region, from its first
+ * block to its first texel in the image's decoded plane. */
+#define APEX_DECODE_SRC 0             /* first block VA lo, hi */
+#define APEX_DECODE_DST 2             /* first decoded texel VA lo, hi */
+#define APEX_DECODE_SRC_ROW 4         /* bytes per block row */
+#define APEX_DECODE_SRC_SLICE 5
+#define APEX_DECODE_DST_ROW 6
+#define APEX_DECODE_DST_SLICE 7
+#define APEX_DECODE_WIDTH 8           /* texels */
+#define APEX_DECODE_HEIGHT 9
+#define APEX_DECODE_LAYERS 10
+#define APEX_DECODE_KIND 11
+/* Block kinds; 16-byte blocks are RGBA8 and both RG11 kinds. */
+#define APEX_ETC2_RGB8 0
+#define APEX_ETC2_RGBA1 1
+#define APEX_ETC2_RGBA8 2
+#define APEX_EAC_R11 3
+#define APEX_EAC_R11_SNORM 4
+#define APEX_EAC_RG11 5
+#define APEX_EAC_RG11_SNORM 6
+
 /* Query slots: 64-bit value, 32-bit availability, padding. */
 #define APEX_QUERY_STRIDE 16
 /* Internal query job words (in place of the draw block). */

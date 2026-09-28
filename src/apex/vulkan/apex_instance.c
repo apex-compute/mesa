@@ -138,14 +138,17 @@ apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat form
    VkFormatFeatureFlags2 buffer = apex_format_features(format, true);
    /* Legacy flags hold bits 0..30; higher bits exist only in FormatFeatureFlags2. */
    const VkFormatFeatureFlags2 legacy = 0x7fffffffull;
+   /* ETC2/EAC images are optimal-tiling only. */
+   VkFormatFeatureFlags2 linear = apex_decoded_format(format, NULL) ? 0 : features;
    properties->formatProperties = (VkFormatProperties) {
-      .linearTilingFeatures = (VkFormatFeatureFlags)(features & legacy),
+      .linearTilingFeatures = (VkFormatFeatureFlags)(linear & legacy),
       .optimalTilingFeatures = (VkFormatFeatureFlags)(features & legacy),
       .bufferFeatures = (VkFormatFeatureFlags)(buffer & legacy),
    };
    VkFormatProperties3 *props3 = vk_find_struct(properties->pNext, FORMAT_PROPERTIES_3);
    if (props3) {
-      props3->linearTilingFeatures = props3->optimalTilingFeatures = features;
+      props3->linearTilingFeatures = linear;
+      props3->optimalTilingFeatures = features;
       props3->bufferFeatures = buffer;
    }
 }
@@ -287,6 +290,45 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_push_descriptor = true,
       .KHR_descriptor_update_template = true,
       .EXT_shader_viewport_index_layer = true,
+      /* Promoted to Vulkan 1.1-1.3. */
+      .KHR_bind_memory2 = true,
+      .KHR_maintenance1 = true,
+      .KHR_maintenance2 = true,
+      .KHR_maintenance3 = true,
+      .KHR_maintenance4 = true,
+      .KHR_relaxed_block_layout = true,
+      .KHR_create_renderpass2 = true,
+      .KHR_depth_stencil_resolve = true,
+      .KHR_driver_properties = true,
+      .KHR_image_format_list = true,
+      .KHR_imageless_framebuffer = true,
+      .KHR_separate_depth_stencil_layouts = true,
+      .KHR_shader_float_controls = true,
+      .KHR_shader_subgroup_extended_types = true,
+      .KHR_spirv_1_4 = true,
+      .KHR_uniform_buffer_standard_layout = true,
+      .KHR_buffer_device_address = true,
+      .KHR_vulkan_memory_model = true,
+      .EXT_host_query_reset = true,
+      .EXT_sampler_filter_minmax = true,
+      .EXT_separate_stencil_usage = true,
+      .EXT_private_data = true,
+      .EXT_inline_uniform_block = true,
+      .KHR_dynamic_rendering = true,
+      .KHR_synchronization2 = true,
+      .EXT_pipeline_creation_cache_control = true,
+      .EXT_subgroup_size_control = true,
+      .EXT_shader_demote_to_helper_invocation = true,
+      .KHR_shader_terminate_invocation = true,
+      .KHR_zero_initialize_workgroup_memory = true,
+      .KHR_shader_integer_dot_product = true,
+      .EXT_image_robustness = true,
+      .KHR_copy_commands2 = true,
+      .KHR_format_feature_flags2 = true,
+      .EXT_texel_buffer_alignment = true,
+      .KHR_shader_non_semantic_info = true,
+      .EXT_extended_dynamic_state = true,
+      .EXT_extended_dynamic_state2 = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
@@ -347,6 +389,10 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maintenance4 = true,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
+      .textureCompressionETC2 = true,
+      .texelBufferAlignment = true,
+      .extendedDynamicState = true,
+      .extendedDynamicState2 = true,
    };
    const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {

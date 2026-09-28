@@ -415,9 +415,15 @@ create_compute_pipeline(struct vk_device *device,
    const VkPipelineCreateFlags2KHR supported =
       VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT |
       VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-      VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT;
+      VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT |
+      VK_PIPELINE_CREATE_2_ALLOW_DERIVATIVES_BIT | VK_PIPELINE_CREATE_2_DERIVATIVE_BIT |
+      VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT;
+   /* Subgroups are always full and 16 wide. */
+   const VkPipelineShaderStageCreateFlags stage_flags =
+      VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT |
+      VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
    if ((flags & ~supported) || info->stage.stage != VK_SHADER_STAGE_COMPUTE_BIT ||
-       info->stage.flags)
+       (info->stage.flags & ~stage_flags))
       return VK_ERROR_FEATURE_NOT_PRESENT;
 
    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroup =

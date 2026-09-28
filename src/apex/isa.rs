@@ -141,6 +141,24 @@ impl Inst {
         i.validate()?;
         Ok(i)
     }
+    /// Scalar sources read through the second port of their bank: the
+    /// second distinct register of a bank. Image ad35ea65 implements that
+    /// port as block RAM, which returns the old word when the register is
+    /// written on the edge that decodes this instruction.
+    pub fn scalar_port1_reads(self) -> Vec<Reg> {
+        let mut seen: Vec<Reg> = Vec::new();
+        let mut port1 = Vec::new();
+        for r in self.regs(false) {
+            if r.0 != Class::S || seen.contains(&r) {
+                continue;
+            }
+            if seen.iter().any(|s| s.1 % 4 == r.1 % 4) {
+                port1.push(r);
+            }
+            seen.push(r);
+        }
+        port1
+    }
     pub fn bank_legal(self) -> bool {
         let regs: BTreeSet<_> = self.regs(false).into_iter().collect();
         [Class::S, Class::V].iter().all(|cl| {

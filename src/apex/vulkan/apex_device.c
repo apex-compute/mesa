@@ -52,7 +52,9 @@ struct apex_buffer {
 struct apex_image {
    struct vk_image vk;
    struct apex_memory *memory;
-   VkDeviceSize offset, size;
+   /* ETC2/EAC images append a decoded plane at `decoded` bytes, laid out as
+    * an image of the decoded format. */
+   VkDeviceSize offset, size, decoded;
    struct {
       VkDeviceSize offset;
       uint32_t row_stride, slice_stride;
@@ -631,6 +633,10 @@ apex_format_features(VkFormat format, bool buffer)
       return 0;
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
                                           VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   /* ETC2/EAC images sample their decoded plane. */
+   if (apex_decoded_format(format, NULL))
+      return buffer ? 0 : transfer | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
    const VkFormatFeatureFlags2 color = transfer | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
    enum pipe_format pformat = vk_format_to_pipe_format(format);
    /* Storage texels encode and decode through the format words: the plain
@@ -729,7 +735,9 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
    if (!features || info->type > VK_IMAGE_TYPE_3D ||
        (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
        (info->flags & ~flags) || (info->usage & ~usage) ||
-       ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && info->type != VK_IMAGE_TYPE_2D))
+       ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && info->type != VK_IMAGE_TYPE_2D) ||
+       (apex_decoded_format(info->format, NULL) &&
+        (info->type != VK_IMAGE_TYPE_2D || info->tiling != VK_IMAGE_TILING_OPTIMAL)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
@@ -757,12 +765,16 @@ static VkDeviceSize
 image_layout(const VkImageCreateInfo *info, struct apex_image *image)
 {
    VkDeviceSize size = 0;
+   VkFormat format = info->format;
    for (unsigned l = 0; l < info->mipLevels; l++) {
-      /* Multisampled texels store their samples consecutively. */
+      /* Multisampled texels store their samples consecutively. Rows of
+       * compressed formats hold blocks. */
       /* Rows pad to whole fragment tiles: 4 pixels, or 2 pixels of 4 samples. */
-      uint32_t row = align(u_minify(info->extent.width, l) * vk_format_get_blocksize(info->format) *
-                           info->samples, info->samples > 1 ? 128 : 64);
-      uint32_t slice = row * u_minify(info->extent.height, l);
+      uint32_t width = DIV_ROUND_UP(u_minify(info->extent.width, l), vk_format_get_blockwidth(format));
+      uint32_t height = DIV_ROUND_UP(u_minify(info->extent.height, l), vk_format_get_blockheight(format));
+      uint32_t row = align(width * vk_format_get_blocksize(format) * info->samples,
+                           info->samples > 1 ? 128 : 64);
+      uint32_t slice = row * height;
       if (image) {
          image->levels[l].offset = size;
          image->levels[l].row_stride = row;
@@ -771,6 +783,15 @@ image_layout(const VkImageCreateInfo *info, struct apex_image *image)
       /* Each level holds all layers, or all depth slices of a 3D image. */
       size += (uint64_t)slice * (info->imageType == VK_IMAGE_TYPE_3D ?
                                  u_minify(info->extent.depth, l) : info->arrayLayers);
+   }
+   VkFormat decoded = apex_decoded_format(format, NULL);
+   if (decoded) {
+      VkImageCreateInfo plane = *info;
+      plane.format = decoded;
+      size = align64(size, 64);
+      if (image)
+         image->decoded = size;
+      size += image_layout(&plane, NULL);
    }
    return size;
 }
@@ -2721,8 +2742,63 @@ image_address(const struct apex_image *image, unsigned level, unsigned layer, Vk
 {
    return image->memory->storage->bo.va + image->offset + image->levels[level].offset +
           (uint64_t)layer * image->levels[level].slice_stride +
-          (uint64_t)offset.y * image->levels[level].row_stride +
-          (uint64_t)offset.x * image_pixel_bytes(image);
+          (uint64_t)(offset.y / vk_format_get_blockheight(image->vk.format)) * image->levels[level].row_stride +
+          (uint64_t)(offset.x / vk_format_get_blockwidth(image->vk.format)) * image_pixel_bytes(image);
+}
+
+/* Texel extent in whole blocks of `format`. */
+static VkExtent3D
+block_extent(VkFormat format, VkExtent3D extent)
+{
+   return (VkExtent3D){DIV_ROUND_UP(extent.width, vk_format_get_blockwidth(format)),
+                       DIV_ROUND_UP(extent.height, vk_format_get_blockheight(format)), extent.depth};
+}
+
+/* Re-decodes an ETC2/EAC region (texels, clamped to the level) into the
+ * image's decoded plane after its blocks change. */
+static void
+record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, unsigned level,
+              unsigned layer, unsigned layers, VkOffset3D offset, VkExtent3D extent)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   uint32_t kind;
+   VkFormat decoded = apex_decoded_format(image->vk.format, &kind);
+   if (!decoded)
+      return;
+   uint32_t width = MIN2(extent.width, u_minify(image->vk.extent.width, level) - offset.x);
+   uint32_t height = MIN2(extent.height, u_minify(image->vk.extent.height, level) - offset.y);
+   struct apex_program *program;
+   VkResult result = apex_internal_program(device, APEX_INTERNAL_ETC2, &program);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   /* The decoded plane repeats this image's layout in the decoded format. */
+   struct apex_image plane = {0};
+   const VkImageCreateInfo info = {
+      .imageType = image->vk.image_type, .format = decoded, .extent = image->vk.extent,
+      .mipLevels = image->vk.mip_levels, .arrayLayers = image->vk.array_layers, .samples = 1,
+   };
+   image_layout(&info, &plane);
+   uint64_t base = image->memory->storage->bo.va + image->offset + image->decoded;
+   uint32_t bytes = vk_format_get_blocksize(decoded);
+   uint64_t src = image_address(image, level, layer, offset);
+   uint64_t dst = base + plane.levels[level].offset + (uint64_t)layer * plane.levels[level].slice_stride +
+                  (uint64_t)offset.y * plane.levels[level].row_stride + (uint64_t)offset.x * bytes;
+   uint32_t words[APEX_DRAW_WORDS] = {
+      [APEX_DECODE_SRC] = src, [APEX_DECODE_SRC + 1] = src >> 32,
+      [APEX_DECODE_DST] = dst, [APEX_DECODE_DST + 1] = dst >> 32,
+      [APEX_DECODE_SRC_ROW] = image->levels[level].row_stride,
+      [APEX_DECODE_SRC_SLICE] = image->levels[level].slice_stride,
+      [APEX_DECODE_DST_ROW] = plane.levels[level].row_stride,
+      [APEX_DECODE_DST_SLICE] = plane.levels[level].slice_stride,
+      [APEX_DECODE_WIDTH] = width, [APEX_DECODE_HEIGHT] = height, [APEX_DECODE_LAYERS] = layers,
+      [APEX_DECODE_KIND] = kind,
+   };
+   uint32_t groups = DIV_ROUND_UP((uint64_t)width * height * layers, 16);
+   uint32_t limit = MIN2(program->max_workgroups, 1024);
+   for (uint32_t first = 0; first < groups; first += limit)
+      push_job(cmd, program, NULL, MIN2(groups - first, limit), first, 0, words);
 }
 
 /* Linear image rows use the ordinary cached buffer meta kernels. Neither path
@@ -2855,14 +2931,17 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer,
                           element, ~0u, r->imageExtent, layers);
          continue;
       }
-      if (to_image)
+      VkExtent3D blocks = block_extent(format, r->imageExtent);
+      if (to_image) {
          copy_image_rows(cmd, buffer_va, layout.row_stride_B, layout.image_stride_B,
                          image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
-                         r->imageExtent, layers, image_pixel_bytes(image));
-      else
+                         blocks, layers, image_pixel_bytes(image));
+         record_decode(cmd, image, l, first, layers, r->imageOffset, r->imageExtent);
+      } else {
          copy_image_rows(cmd, image_va, image->levels[l].row_stride, image->levels[l].slice_stride,
                          buffer_va, layout.row_stride_B, layout.image_stride_B,
-                         r->imageExtent, layers, image_pixel_bytes(image));
+                         blocks, layers, image_pixel_bytes(image));
+      }
    }
 }
 
@@ -2898,12 +2977,16 @@ apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
       region_layers(dst, &r->dstSubresource, r->dstOffset, r->extent, &dst_first, &unused);
       /* 2D arrays and 3D images exchange layers for depth slices. */
       layers = MAX2(layers, r->extent.depth);
-      VkExtent3D extent = {r->extent.width, r->extent.height, 1};
+      /* The extent counts source texels; both sides move whole blocks. */
+      VkExtent3D extent = block_extent(src->vk.format, (VkExtent3D){r->extent.width, r->extent.height, 1});
       copy_image_rows(cmd, image_address(src, sl, src_first, r->srcOffset),
                       src->levels[sl].row_stride, src->levels[sl].slice_stride,
                       image_address(dst, dl, dst_first, r->dstOffset),
                       dst->levels[dl].row_stride, dst->levels[dl].slice_stride,
                       extent, layers, image_pixel_bytes(src));
+      record_decode(cmd, dst, dl, dst_first, layers, r->dstOffset,
+                    (VkExtent3D){extent.width * vk_format_get_blockwidth(dst->vk.format),
+                                 extent.height * vk_format_get_blockheight(dst->vk.format), 1});
    }
 }
 
@@ -3086,6 +3169,12 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
             if (!image->memory)
                return false;
             uint64_t va = image->memory->storage->bo.va + image->offset;
+            /* ETC2/EAC views sample the decoded plane. */
+            VkFormat format = apex_decoded_format(view->format, NULL);
+            if (format)
+               va += image->decoded;
+            else
+               format = view->format;
             struct apex_sampled_descriptor d = {
                .low = va, .high = va >> 32,
                .width = image->vk.extent.width, .height = image->vk.extent.height,
@@ -3094,7 +3183,7 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
                .base_layer = view->base_array_layer, .layer_count = view->layer_count,
                .view_type = view->view_type, .samples = image->vk.samples,
             };
-            if (!apex_format_encode(view->format, view->aspects, &view->swizzle, d.format))
+            if (!apex_format_encode(format, view->aspects, &view->swizzle, d.format))
                return false;
             const uint32_t *words = (const uint32_t *)&d;
             for (unsigned w = 0; w < 16; w++)

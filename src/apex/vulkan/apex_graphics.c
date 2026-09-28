@@ -15,6 +15,7 @@
 #include "apex_timestamp_spv.h"
 #include "apex_querycopy_spv.h"
 #include "apex_resolve_spv.h"
+#include "apex_etc2_spv.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
@@ -437,7 +438,7 @@ struct fragment_lowering {
    struct apex_shader *shader;
    nir_variable *perspective, *linear, *coord, *front, *covered, *killed, *sources, *primitive;
    nir_variable *viewport, *sample, *mask_in, *position;
-   nir_variable *color[APEX_DRAW_MAX_COLOR], *depth;
+   nir_variable *color[APEX_DRAW_MAX_COLOR], *depth, *sample_mask;
    bool invalid;
 };
 
@@ -514,14 +515,13 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
          nir_intrinsic_instr *bary = nir_src_as_intrinsic(i->src[0]);
          bool linear = bary && nir_intrinsic_interp_mode(bary) == INTERP_MODE_NOPERSPECTIVE;
          nir_def *weights = nir_load_var(b, linear ? ctx->linear : ctx->perspective);
+         /* a0 + w1 (a1 - a0) + w2 (a2 - a0) is exact for constant attributes. */
          for (unsigned c = 0; c < i->def.num_components; c++) {
-            nir_def *sum = NULL;
-            for (unsigned j = 0; j < 3; j++) {
-               nir_def *term = nir_fmul(b, nir_channel(b, weights, j),
-                  attribute(b, ctx, nir_channel(b, sources, j), location, component + c));
-               sum = sum ? nir_fadd(b, sum, term) : term;
-            }
-            values[c] = sum;
+            nir_def *a[3];
+            for (unsigned j = 0; j < 3; j++)
+               a[j] = attribute(b, ctx, nir_channel(b, sources, j), location, component + c);
+            values[c] = nir_ffma(b, nir_channel(b, weights, 2), nir_fsub(b, a[2], a[0]),
+                                 nir_ffma(b, nir_channel(b, weights, 1), nir_fsub(b, a[1], a[0]), a[0]));
          }
       }
       replacement = nir_vec(b, values, i->def.num_components);
@@ -568,6 +568,11 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       unsigned location = nir_intrinsic_io_semantics(i).location;
       nir_def *value = i->src[0].ssa;
       unsigned component = nir_intrinsic_component(i);
+      if (location == FRAG_RESULT_SAMPLE_MASK) {
+         nir_store_var(b, ctx->sample_mask, nir_channel(b, value, 0), 1);
+         nir_instr_remove(&i->instr);
+         return true;
+      }
       nir_variable *var = location == FRAG_RESULT_DEPTH ? ctx->depth :
          location >= FRAG_RESULT_DATA0 && location < FRAG_RESULT_DATA0 + APEX_DRAW_MAX_COLOR ?
          ctx->color[location - FRAG_RESULT_DATA0] : NULL;
@@ -885,6 +890,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    ctx.mask_in = nir_local_variable_create(impl, glsl_uint_type(), "mask_in");
    ctx.position = nir_local_variable_create(impl, glsl_vec_type(2), "position");
    ctx.depth = nir_local_variable_create(impl, glsl_float_type(), "depth");
+   ctx.sample_mask = nir_local_variable_create(impl, glsl_uint_type(), "sample_mask");
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       ctx.color[k] = nir_local_variable_create(impl, vec4, "color");
    lower_collected(nir, lower_fragment_intrinsic, &ctx);
@@ -1159,6 +1165,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_store_var(b, ctx.viewport, nir_iand_imm(b, nir_ushr_imm(b, FIELD(APEX_PRIM_FLAGS), 16), 0xf), 1);
    nir_store_var(b, ctx.covered, covered, 1);
    nir_store_var(b, ctx.killed, nir_imm_false(b), 1);
+   nir_store_var(b, ctx.sample_mask, nir_imm_int(b, ~0), 1);
    nir_store_var(b, ctx.depth, z, 1);
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
       nir_store_var(b, ctx.color[k], nir_imm_zero(b, 4, 32), 0xf);
@@ -1172,6 +1179,9 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_pop_if(b, shade);
 
    nir_def *live = nir_iand(b, covered, nir_inot(b, nir_load_var(b, ctx.killed)));
+   /* gl_SampleMask removes this lane's sample. */
+   live = nir_iand(b, live, nir_ine_imm(b, nir_iand(b, nir_ushr(b, nir_load_var(b, ctx.sample_mask), sample),
+                                                    nir_imm_int(b, 1)), 0));
    if (samples > 1) {
       /* Alpha to coverage keeps the first round(alpha * samples) samples. */
       nir_def *alpha = nir_fsat(b, nir_channel(b, nir_load_var(b, ctx.color[0]), 3));
@@ -1422,6 +1432,12 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
                             VK_SHADER_STAGE_ALL_GRAPHICS))
       goto fail;
    lower_stage_io(nir);
+   if (info->stage == MESA_SHADER_FRAGMENT) {
+      /* Input attachments fetch at the fragment's pixel and job layer, which
+       * is the view under multiview. */
+      const nir_input_attachment_options options = {0};
+      NIR_PASS(_, nir, nir_lower_input_attachments, &options);
+   }
    if (!apex_program_lower_resources(&shader->program, nir))
       goto fail;
    bool built = info->stage == MESA_SHADER_VERTEX ?
@@ -1549,6 +1565,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
       [APEX_INTERNAL_TIMESTAMP] = {apex_timestamp_spv, ARRAY_SIZE(apex_timestamp_spv)},
       [APEX_INTERNAL_QUERY_COPY] = {apex_querycopy_spv, ARRAY_SIZE(apex_querycopy_spv)},
       [APEX_INTERNAL_RESOLVE] = {apex_resolve_spv, ARRAY_SIZE(apex_resolve_spv)},
+      [APEX_INTERNAL_ETC2] = {apex_etc2_spv, ARRAY_SIZE(apex_etc2_spv)},
    };
    struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
                                             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);

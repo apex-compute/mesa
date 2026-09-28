@@ -1,0 +1,178 @@
+#version 450
+// ETC2/EAC blocks to an image's decoded plane: one invocation per texel.
+// Trailer words after the dispatch parameters (see apex_draw.h): the
+// region's first block and first decoded texel, their row and slice pitches,
+// the region's texel width, height and layers, and the block kind. ETC2
+// decodes to RGBA8 and EAC to 32-bit floats per channel. Ported from Mesa's
+// vk_texcompress_etc2.c, itself based on Granite's etc2.comp and eac.comp.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_draw.h"
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint TRAILER = 8u;
+const uint DECODE = TRAILER + 12u;
+
+uint word(uint i) { return root[DECODE + i]; }
+uint64_t address(uint i) { return uint64_t(word(i)) | (uint64_t(word(i + 1u)) << 32); }
+
+uint flip(uint v) { return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24); }
+
+ivec3 extend(ivec3 v, int bits)
+{
+   return bits == 4 ? v * 0x11 : (v << (8 - bits)) | (v >> (bits - (8 - bits)));
+}
+
+/* Planar colors hold 6, 7 and 6 bits. */
+ivec3 extend676(ivec3 v)
+{
+   return ivec3(extend(v, 6).r, extend(v, 7).g, extend(v, 6).b);
+}
+
+int distance_of(uint i)
+{
+   const int table[8] = int[8](3, 6, 11, 16, 23, 32, 41, 64);
+   return table[i];
+}
+
+int color_modifier(uint i, uint upper)
+{
+   const int table[16] = int[16](2, 8, 5, 17, 9, 29, 13, 42, 18, 60, 24, 80, 33, 106, 47, 183);
+   return table[i * 2u + upper];
+}
+
+// Decodes the 8-byte alpha or EAC block for column-major texel `lin`.
+float decode_alpha(uvec2 raw, uint lin, bool eac, bool is_signed)
+{
+   const uint table[16] = uint[16](0xe852u, 0xc962u, 0xc741u, 0xc531u, 0xb752u, 0xa862u, 0xa763u, 0xa742u,
+                                   0x9751u, 0x9741u, 0x9731u, 0x9641u, 0x9632u, 0x9210u, 0x8753u, 0x8642u);
+   uint y = flip(raw.x), x = flip(raw.y);
+   uint bit = 45u - lin * 3u;
+   int base = int(bitfieldExtract(y, 24, 8));
+   int multiplier = int(bitfieldExtract(y, 20, 4));
+   uint mods = table[bitfieldExtract(y, 16, 4)];
+   if (eac) {
+      base = is_signed ? bitfieldExtract(int(y), 24, 8) * 8 : base * 8 + 4;
+      multiplier = max(multiplier * 8, 1);
+   }
+   uint lsb = bitfieldExtract(bit >= 32u ? y : x, int(bit & 31u), 2);
+   bit += 2u;
+   uint msb = bitfieldExtract(bit >= 32u ? y : x, int(bit & 31u), 1);
+   int mod = int(bitfieldExtract(mods, int(lsb * 4u), 4)) ^ (int(msb) - 1);
+   int a = base + mod * multiplier;
+   if (!eac)
+      return float(clamp(a, 0, 255)) / 255.0;
+   return is_signed ? float(clamp(a, -1023, 1023)) / 1023.0 : float(clamp(a, 0, 2047)) / 2047.0;
+}
+
+// ETC2 RGB of texel (px, py); `alpha1` selects punch-through alpha.
+vec4 decode_color(uvec2 raw, uint px, uint py, bool alpha1, float alpha)
+{
+   uint y = flip(raw.x), x = flip(raw.y);
+   uint lin = px * 4u + py;
+   uint subblock = ((y & 1u) != 0u ? py : px) >> 1;
+   bool punchthrough = alpha1 && (y & 2u) == 0u;
+   bool etc1 = false;
+   ivec3 base = ivec3(0), rgb = ivec3(255, 0, 0);
+   uint msb = (x >> (lin + 15u)) & 2u;
+   uint lsb = (x >> lin) & 1u;
+   if (!alpha1 && (y & 2u) == 0u) {
+      etc1 = true;
+      for (int i = 0; i < 3; i++)
+         base[i] = int((y >> (28u - 8u * uint(i) - subblock * 4u)) & 0xfu);
+      base = extend(base, 4);
+   } else {
+      int rb = int(bitfieldExtract(y, 27, 5)), rd = bitfieldExtract(int(y), 24, 3);
+      int gb = int(bitfieldExtract(y, 19, 5)), gd = bitfieldExtract(int(y), 16, 3);
+      int bb = int(bitfieldExtract(y, 11, 5)), bd = bitfieldExtract(int(y), 8, 3);
+      int r1 = rb + rd, g1 = gb + gd, b1 = bb + bd;
+      if (uint(r1) > 31u) {
+         /* T mode */
+         ivec3 c0 = ivec3(int(bitfieldExtract(y, 24, 2) | (bitfieldExtract(y, 27, 2) << 2)),
+                          int(bitfieldExtract(y, 20, 4)), int(bitfieldExtract(y, 16, 4)));
+         ivec3 c2 = ivec3(int(bitfieldExtract(y, 12, 4)), int(bitfieldExtract(y, 8, 4)),
+                          int(bitfieldExtract(y, 4, 4)));
+         int dist = distance_of((bitfieldExtract(y, 2, 2) << 1) | (y & 1u));
+         uint index = lsb | msb;
+         punchthrough = punchthrough && lsb + msb == 2u;
+         rgb = index == 0u ? extend(c0, 4) : extend(c2, 4) + dist * (2 - int(index));
+      } else if (uint(g1) > 31u) {
+         /* H mode */
+         ivec3 c0 = ivec3(int(bitfieldExtract(y, 27, 4)),
+                          int((bitfieldExtract(y, 24, 3) << 1) | ((y >> 20) & 1u)),
+                          int(bitfieldExtract(y, 15, 3) | ((y >> 16) & 8u)));
+         ivec3 c2 = ivec3(int(bitfieldExtract(y, 11, 4)), int(bitfieldExtract(y, 7, 4)),
+                          int(bitfieldExtract(y, 3, 4)));
+         uint d = (y & 4u) + (y & 1u) * 2u;
+         int d0 = (c0.r << 16) + (c0.g << 8) + c0.b, d2 = (c2.r << 16) + (c2.g << 8) + c2.b;
+         if (uint(d0) >= uint(d2))
+            d += 1u;
+         rgb = extend(msb != 0u ? c2 : c0, 4) + distance_of(d) * (1 - int(lsb) * 2);
+         punchthrough = punchthrough && lsb + msb == 2u;
+      } else if (uint(b1) > 31u) {
+         /* Planar mode */
+         ivec3 o = ivec3(int(bitfieldExtract(y, 25, 6)),
+                         int(bitfieldExtract(y, 17, 6) | ((y >> 18) & 0x40u)),
+                         int((bitfieldExtract(y, 11, 2) << 3) | ((y >> 11) & 0x20u) | bitfieldExtract(y, 7, 3)));
+         ivec3 h = ivec3(int((y & 1u) | (bitfieldExtract(y, 2, 5) << 1)), int(bitfieldExtract(x, 25, 7)),
+                         int(bitfieldExtract(x, 19, 6)));
+         ivec3 v = ivec3(int(bitfieldExtract(x, 13, 6)), int(bitfieldExtract(x, 6, 7)),
+                         int(bitfieldExtract(x, 0, 6)));
+         o = extend676(o);
+         h = extend676(h);
+         v = extend676(v);
+         rgb = o + (((h - o) * int(px) + (v - o) * int(py) + 2) >> 2);
+         punchthrough = false;
+      } else {
+         /* Differential mode */
+         etc1 = true;
+         base = extend(subblock != 0u ? ivec3(r1, g1, b1) : ivec3(rb, gb, bb), 5);
+      }
+   }
+   if (etc1) {
+      uint table_index = bitfieldExtract(y, int(5u - 3u * subblock), 3);
+      int sign = 1 - int(msb);
+      if (punchthrough)
+         sign *= int(lsb);
+      punchthrough = punchthrough && lsb + msb == 2u;
+      rgb = base + color_modifier(table_index, lsb) * sign;
+   }
+   if (punchthrough)
+      return vec4(0.0);
+   return vec4(vec3(clamp(rgb, 0, 255)) / 255.0, alpha);
+}
+
+void main()
+{
+   uint width = word(APEX_DECODE_WIDTH), height = word(APEX_DECODE_HEIGHT);
+   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
+   if (item >= width * height * word(APEX_DECODE_LAYERS))
+      return;
+   uint px = item % width, row = item / width;
+   uint py = row % height, layer = row / height;
+   uint kind = word(APEX_DECODE_KIND);
+   bool wide = kind == APEX_ETC2_RGBA8 || kind >= APEX_EAC_RG11;
+   uint64_t block = address(APEX_DECODE_SRC) + uint64_t(layer) * word(APEX_DECODE_SRC_SLICE) +
+                    uint64_t(py / 4u) * word(APEX_DECODE_SRC_ROW) + uint64_t(px / 4u) * (wide ? 16u : 8u);
+   Words src = Words(block);
+   uvec4 raw = uvec4(src.w[0], src.w[1], wide ? src.w[2] : 0u, wide ? src.w[3] : 0u);
+   uint bx = px & 3u, by = py & 3u, lin = bx * 4u + by;
+   uint64_t texel = address(APEX_DECODE_DST) + uint64_t(layer) * word(APEX_DECODE_DST_SLICE) +
+                    uint64_t(py) * word(APEX_DECODE_DST_ROW);
+   if (kind >= APEX_EAC_R11) {
+      bool is_signed = kind == APEX_EAC_R11_SNORM || kind == APEX_EAC_RG11_SNORM;
+      Words dst = Words(texel + uint64_t(px) * (wide ? 8u : 4u));
+      dst.w[0] = floatBitsToUint(decode_alpha(raw.xy, lin, true, is_signed));
+      if (wide)
+         dst.w[1] = floatBitsToUint(decode_alpha(raw.zw, lin, true, is_signed));
+      return;
+   }
+   float alpha = kind == APEX_ETC2_RGBA8 ? decode_alpha(raw.xy, lin, false, false) : 1.0;
+   vec4 color = decode_color(kind == APEX_ETC2_RGBA8 ? raw.zw : raw.xy, bx, by, kind == APEX_ETC2_RGBA1,
+                             alpha);
+   uvec4 bytes = uvec4(round(clamp(color, 0.0, 1.0) * 255.0));
+   Words(texel + uint64_t(px) * 4u).w[0] = bytes.r | (bytes.g << 8) | (bytes.b << 16) | (bytes.a << 24);
+}

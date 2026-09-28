@@ -51,6 +51,9 @@ struct apex_sampler_descriptor {
 bool apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping *mapping,
                         uint32_t out[3]);
 bool apex_attachment_format_supported(enum pipe_format format);
+/* ETC2/EAC images keep a decoded plane: its format and the decode kind
+ * (APEX_ETC2_* / APEX_EAC_*), or VK_FORMAT_UNDEFINED for other formats. */
+VkFormat apex_decoded_format(VkFormat format, uint32_t *kind);
 void apex_sampler_encode(const VkSamplerCreateInfo *info, const struct vk_sampler *sampler,
                          uint32_t out[8]);
 

@@ -3,6 +3,7 @@
  * (apex_texture.c). A format word triple describes up to four stored channels
  * as bit fields, so one decoder serves every plain format. */
 #include "apex_device.h"
+#include "apex_draw.h"
 #include "apex_format.h"
 #include "util/format/u_format.h"
 #include "vk_format.h"
@@ -134,4 +135,29 @@ apex_attachment_format_supported(enum pipe_format format)
          return false;
    }
    return true;
+}
+
+VkFormat
+apex_decoded_format(VkFormat format, uint32_t *kind)
+{
+   static const struct { VkFormat format, decoded; uint32_t kind; } table[] = {
+      {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM, APEX_ETC2_RGB8},
+      {VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB, APEX_ETC2_RGB8},
+      {VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM, APEX_ETC2_RGBA1},
+      {VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB, APEX_ETC2_RGBA1},
+      {VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM, APEX_ETC2_RGBA8},
+      {VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB, APEX_ETC2_RGBA8},
+      {VK_FORMAT_EAC_R11_UNORM_BLOCK, VK_FORMAT_R32_SFLOAT, APEX_EAC_R11},
+      {VK_FORMAT_EAC_R11_SNORM_BLOCK, VK_FORMAT_R32_SFLOAT, APEX_EAC_R11_SNORM},
+      {VK_FORMAT_EAC_R11G11_UNORM_BLOCK, VK_FORMAT_R32G32_SFLOAT, APEX_EAC_RG11},
+      {VK_FORMAT_EAC_R11G11_SNORM_BLOCK, VK_FORMAT_R32G32_SFLOAT, APEX_EAC_RG11_SNORM},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(table); i++) {
+      if (table[i].format == format) {
+         if (kind)
+            *kind = table[i].kind;
+         return table[i].decoded;
+      }
+   }
+   return VK_FORMAT_UNDEFINED;
 }
