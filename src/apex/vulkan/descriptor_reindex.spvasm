@@ -1,6 +1,6 @@
 ; SPDX-License-Identifier: MIT
-; Select a pointer to one of two descriptor arrays, then index that array.
-; The access chain must reindex the selected descriptor reference.
+; Pass descriptor arrays to a function that indexes them: the callee's access
+; chain must reindex the descriptor reference its parameter carries.
 OpCapability Shader
 OpCapability VariablePointersStorageBuffer
 OpCapability StorageBufferArrayDynamicIndexing
@@ -21,15 +21,10 @@ OpDecorate %alternate DescriptorSet 1
 OpDecorate %alternate Binding 2
 OpDecorate %output DescriptorSet 0
 OpDecorate %output Binding 3
-OpDecorate %row NonUniform
-OpDecorate %other_row NonUniform
-OpDecorate %selected NonUniform
-OpDecorate %other NonUniform
-OpDecorate %a_ptr NonUniform
-OpDecorate %b_ptr NonUniform
+OpDecorate %indexed NonUniform
+OpDecorate %element NonUniform
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
-%bool = OpTypeBool
 %uint = OpTypeInt 32 0
 %zero = OpConstant %uint 0
 %one = OpConstant %uint 1
@@ -44,6 +39,7 @@ OpDecorate %b_ptr NonUniform
 %ptr_block = OpTypePointer StorageBuffer %block
 %ptr_word = OpTypePointer StorageBuffer %uint
 %ptr_input = OpTypePointer Input %uint
+%fn_read = OpTypeFunction %uint %ptr_pair %uint %uint
 %sources = OpVariable %ptr_pair StorageBuffer
 %alternate = OpVariable %ptr_pair StorageBuffer
 %output = OpVariable %ptr_block StorageBuffer
@@ -51,20 +47,13 @@ OpDecorate %b_ptr NonUniform
 %main = OpFunction %void None %fn
 %entry = OpLabel
 %lane = OpLoad %uint %lane_id
-%row_bit = OpBitwiseAnd %uint %lane %two
-%high = OpINotEqual %bool %row_bit %zero
 %column = OpBitwiseAnd %uint %lane %one
 %opposite = OpBitwiseXor %uint %column %one
-%row = OpSelect %ptr_pair %high %sources %alternate
-%other_row = OpSelect %ptr_pair %high %alternate %sources
-%selected = OpAccessChain %ptr_block %row %column
-%other = OpAccessChain %ptr_block %other_row %opposite
 %reverse = OpISub %uint %fifteen %lane
-%a_ptr = OpAccessChain %ptr_word %selected %zero %lane
-%b_ptr = OpAccessChain %ptr_word %other %zero %reverse
-%a = OpLoad %uint %a_ptr
-%b = OpLoad %uint %b_ptr
-%length = OpArrayLength %uint %selected 0
+%a = OpFunctionCall %uint %read %sources %column %lane
+%b = OpFunctionCall %uint %read %alternate %opposite %reverse
+%indexed = OpAccessChain %ptr_block %sources %column
+%length = OpArrayLength %uint %indexed 0
 %sum = OpIAdd %uint %a %b
 %base = OpIMul %uint %lane %four
 %o1 = OpIAdd %uint %base %one
@@ -79,4 +68,13 @@ OpStore %d1 %b
 OpStore %d2 %length
 OpStore %d3 %sum
 OpReturn
+OpFunctionEnd
+%read = OpFunction %uint None %fn_read
+%array = OpFunctionParameter %ptr_pair
+%index = OpFunctionParameter %uint
+%word = OpFunctionParameter %uint
+%read_entry = OpLabel
+%element = OpAccessChain %ptr_word %array %index %zero %word
+%value = OpLoad %uint %element
+OpReturnValue %value
 OpFunctionEnd
