@@ -3,12 +3,14 @@
  * Frame-time benchmark through the public loader: renders offscreen frames of
  * a representative scene and reports per-frame wall time from submit to idle.
  *
- *   apex-bench ICD desktop|game [frames]
+ *   apex-bench ICD desktop|game|bandwidth [frames]
  *
  * desktop: 1920x1080 RGBA8, a full-screen textured background plus eight
  *          blended 640x480 textured windows (compositor-like).
  * game:    1280x720 RGBA8 + D32, a textured, depth-tested grid of 64k
  *          triangles in 64 draws.
+ * bandwidth: streaming read, write and copy between the core and LOCAL over
+ *          32 MiB buffers, in GB/s after subtracting an empty dispatch.
  */
 #include <dlfcn.h>
 #include <math.h>
@@ -50,8 +52,9 @@ now(void)
 int
 main(int argc, char **argv)
 {
-   CHECK(argc >= 3 && (!strcmp(argv[2], "desktop") || !strcmp(argv[2], "game")));
-   const bool game = !strcmp(argv[2], "game");
+   CHECK(argc >= 3 && (!strcmp(argv[2], "desktop") || !strcmp(argv[2], "game") ||
+                       !strcmp(argv[2], "bandwidth")));
+   const bool game = !strcmp(argv[2], "game"), bandwidth = !strcmp(argv[2], "bandwidth");
    const unsigned frames = argc > 3 ? atoi(argv[3]) : 10;
    const uint32_t width = game ? 1280 : 1920, height = game ? 720 : 1080;
    char dir[512];
@@ -63,7 +66,8 @@ main(int argc, char **argv)
       strcpy(dir, ".");
    char path[600];
    size_t vs_size, fs_size;
-   snprintf(path, sizeof(path), "%s/bench.vert.spv", dir);
+   /* The bandwidth mode's compute shader takes the vertex shader's place. */
+   snprintf(path, sizeof(path), "%s/bench.%s.spv", dir, bandwidth ? "comp" : "vert");
    uint32_t *vs_code = read_file(path, &vs_size);
    snprintf(path, sizeof(path), "%s/bench.frag.spv", dir);
    uint32_t *fs_code = read_file(path, &fs_size);
@@ -109,6 +113,106 @@ main(int argc, char **argv)
       if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
          host_type = i;
    CHECK(host_type != UINT32_MAX);
+
+   if (bandwidth) {
+      GD(CreateComputePipelines); GD(CmdDispatch); GD(CmdPushConstants); GD(InvalidateMappedMemoryRanges);
+      const VkDeviceSize bytes = 32 << 20;
+      const uint32_t elements = bytes / 16, groups = 256;
+      VkDeviceMemory allocation;
+      VK(AllocateMemory(device, &(VkMemoryAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = 2 * bytes,
+         .memoryTypeIndex = host_type}, NULL, &allocation));
+      uint32_t *mapped;
+      VK(MapMemory(device, allocation, 0, VK_WHOLE_SIZE, 0, (void **)&mapped));
+      for (uint32_t i = 0; i < bytes / 4; i++)
+         mapped[i] = i * 2654435761u;
+      VK(FlushMappedMemoryRanges(device, 1, &(VkMappedMemoryRange){
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = allocation, .size = VK_WHOLE_SIZE}));
+      VkBuffer buffers[2];
+      for (unsigned i = 0; i < 2; i++) {
+         VK(CreateBuffer(device, &(VkBufferCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT}, NULL, &buffers[i]));
+         VK(BindBufferMemory(device, buffers[i], allocation, i * bytes));
+      }
+      VkDescriptorSetLayout set_layout;
+      VK(CreateDescriptorSetLayout(device, &(VkDescriptorSetLayoutCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2,
+         .pBindings = (VkDescriptorSetLayoutBinding[]){
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT}}}, NULL, &set_layout));
+      VkDescriptorPool pool;
+      VK(CreateDescriptorPool(device, &(VkDescriptorPoolCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1,
+         .pPoolSizes = &(VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}}, NULL, &pool));
+      VkDescriptorSet set;
+      VK(AllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool,
+         .descriptorSetCount = 1, .pSetLayouts = &set_layout}, &set));
+      for (unsigned i = 0; i < 2; i++)
+         UpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i,
+            .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &(VkDescriptorBufferInfo){buffers[i], 0, bytes}}, 0, NULL);
+      VkShaderModule module;
+      VK(CreateShaderModule(device, &(VkShaderModuleCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = vs_size, .pCode = vs_code},
+         NULL, &module));
+      VkPipelineLayout layout;
+      VK(CreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+         .pSetLayouts = &set_layout, .pushConstantRangeCount = 1,
+         .pPushConstantRanges = &(VkPushConstantRange){VK_SHADER_STAGE_COMPUTE_BIT, 0, 8}}, NULL, &layout));
+      VkPipeline pipeline;
+      VK(CreateComputePipelines(device, VK_NULL_HANDLE, 1, &(VkComputePipelineCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"},
+         .layout = layout}, NULL, &pipeline));
+      VkCommandPool command_pool;
+      VK(CreateCommandPool(device, &(VkCommandPoolCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}, NULL, &command_pool));
+      /* Command buffers 0-2 stream read, write and copy; 3 is an empty
+       * dispatch whose time is the host and launch overhead. */
+      VkCommandBuffer commands[4];
+      VK(AllocateCommandBuffers(device, &(VkCommandBufferAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = command_pool,
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 4}, commands));
+      for (unsigned m = 0; m < 4; m++) {
+         const uint32_t parameters[2] = {m == 3 ? 1 : m, m == 3 ? 0 : elements};
+         VK(BeginCommandBuffer(commands[m], &(VkCommandBufferBeginInfo){
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
+         CmdBindPipeline(commands[m], VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+         CmdBindDescriptorSets(commands[m], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+         CmdPushConstants(commands[m], layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, parameters);
+         CmdDispatch(commands[m], m == 3 ? 1 : groups, 1, 1);
+         VK(EndCommandBuffer(commands[m]));
+      }
+      double best[4];
+      for (unsigned m = 0; m < 4; m++) {
+         best[m] = 1e9;
+         for (unsigned f = 0; f < frames; f++) {
+            double start = now();
+            VK(QueueSubmit(queue, 1, &(VkSubmitInfo){
+               .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+               .pCommandBuffers = &commands[m]}, VK_NULL_HANDLE));
+            VK(QueueWaitIdle(queue));
+            best[m] = fmin(best[m], now() - start);
+         }
+      }
+      /* The copy (the last streaming run) leaves dst equal to src. */
+      VK(InvalidateMappedMemoryRanges(device, 1, &(VkMappedMemoryRange){
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = allocation, .size = VK_WHOLE_SIZE}));
+      CHECK(!memcmp(mapped, mapped + bytes / 4, bytes));
+      static const char *names[3] = {"read", "write", "copy"};
+      printf("bandwidth: empty dispatch %.2f ms\n", best[3] * 1e3);
+      for (unsigned m = 0; m < 3; m++) {
+         const double moved = (m == 2 ? 2.0 : 1.0) * bytes, seconds = best[m] - best[3];
+         printf("bandwidth %s: %.1f MiB in %.2f ms (%.2f ms with overhead), %.3f GB/s\n", names[m],
+                moved / (1 << 20), seconds * 1e3, best[m] * 1e3, moved / seconds / 1e9);
+      }
+      return 0;
+   }
 
    /* Geometry: game grid (256 x 128 quads) or desktop quads. */
    const unsigned texture_size = 256;

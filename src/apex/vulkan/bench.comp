@@ -1,0 +1,24 @@
+#version 450
+// Streaming bandwidth between the core and LOCAL: mode 0 reads src (one
+// uvec4 result per invocation keeps the loads live), 1 writes dst, 2 copies.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform Parameters { uint mode, count; } p;
+layout(std430, set = 0, binding = 0) readonly buffer Source { uvec4 src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Destination { uvec4 dst[]; };
+
+void main()
+{
+   uint stride = gl_NumWorkGroups.x * 256u, i = gl_GlobalInvocationID.x;
+   if (p.mode == 0u) {
+      uvec4 sum = uvec4(0u);
+      for (; i < p.count; i += stride)
+         sum ^= src[i];
+      dst[gl_GlobalInvocationID.x] = sum;
+   } else if (p.mode == 1u) {
+      for (; i < p.count; i += stride)
+         dst[i] = uvec4(i);
+   } else {
+      for (; i < p.count; i += stride)
+         dst[i] = src[i];
+   }
+}

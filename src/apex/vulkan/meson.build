@@ -186,7 +186,7 @@ endforeach
 apex_bench = executable('apex-bench', 'bench.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
 )
-foreach stage : ['vert', 'frag']
+foreach stage : ['vert', 'frag', 'comp']
   custom_target('apex-bench-' + stage,
     input : 'bench.' + stage, output : 'bench.' + stage + '.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
