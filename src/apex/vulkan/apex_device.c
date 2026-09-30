@@ -628,8 +628,10 @@ VkFormatFeatureFlags2
 apex_format_features(VkFormat format, bool buffer)
 {
    /* Subsampled and multi-planar YCbCr formats are unsupported, as are
-    * values without a Mesa format (maintenance5 allows any enumerant). */
-   if (format == VK_FORMAT_UNDEFINED || vk_format_get_ycbcr_info(format) ||
+    * values without a Mesa format (maintenance5 allows any enumerant) and
+    * the optional 3-byte D16_UNORM_S8_UINT, whose aspects straddle words. */
+   if (format == VK_FORMAT_UNDEFINED || format == VK_FORMAT_D16_UNORM_S8_UINT ||
+       vk_format_get_ycbcr_info(format) ||
        vk_format_to_pipe_format(format) == PIPE_FORMAT_NONE ||
        (format >= VK_FORMAT_G8B8G8R8_422_UNORM && format <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM))
       return 0;

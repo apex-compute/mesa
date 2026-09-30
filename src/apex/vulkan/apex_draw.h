@@ -195,7 +195,7 @@
 #define APEX_CLEAR_WIDTH 4            /* texels per row */
 #define APEX_CLEAR_ROWS 5
 #define APEX_CLEAR_LAYERS 6
-#define APEX_CLEAR_BYTES 7            /* texel bytes: 1, 2, 4, 8 or 16 */
+#define APEX_CLEAR_BYTES 7            /* texel bytes: 1, 2, 3, 4, 6, 8, 12 or 16 */
 #define APEX_CLEAR_PATTERN 8          /* packed texel, 4 words */
 #define APEX_CLEAR_MASK 12            /* texel bits to write, 4 words */
 

@@ -192,22 +192,28 @@ srgb_to_linear(nir_builder *b, nir_def *c)
 static nir_def *
 decode_texel(nir_builder *b, const struct image_info *i, nir_def *address)
 {
-   /* Texels up to 16 bytes are naturally aligned for 4..16-byte formats;
-    * 1/2-byte texels sit inside one aligned word. */
+   /* Power-of-two texels are naturally aligned (1/2-byte texels sit inside
+    * one word); 3- and 6-byte texels may start mid-word and span words, so
+    * the covering words are loaded and funnel-shifted to the texel start. */
    nir_def *byte = nir_channel(b, address, 0);
    nir_def *misalign = nir_iand_imm(b, byte, 3);
    nir_def *aligned = nir_vec2(b, nir_iand_imm(b, byte, ~3u), nir_channel(b, address, 1));
-   nir_def *words[4], *zero = nir_imm_int(b, 0);
-   for (unsigned k = 0; k < 4; k++) {
-      nir_def *present = nir_ult(b, nir_imm_int(b, k * 4), i->bytes);
+   nir_def *span = nir_iadd(b, i->bytes, misalign);
+   nir_def *raw[5], *words[4], *zero = nir_imm_int(b, 0);
+   for (unsigned k = 0; k < 5; k++) {
+      nir_def *present = nir_ult(b, nir_imm_int(b, k * 4), span);
       nir_push_if(b, present);
       nir_def *loaded = nir_load_global_2x32(b, 1, 32,
          nir_build_addr_iadd_imm(b, aligned, nir_address_format_2x32bit_global, nir_var_mem_global,
                                  k * 4), .align_mul = 4);
       nir_pop_if(b, NULL);
-      words[k] = nir_if_phi(b, loaded, zero);
+      raw[k] = nir_if_phi(b, loaded, zero);
    }
-   words[0] = nir_ushr(b, words[0], nir_ishl_imm(b, misalign, 3));
+   nir_def *shift = nir_ishl_imm(b, misalign, 3);
+   nir_def *carry = nir_isub(b, nir_imm_int(b, 32), shift);
+   for (unsigned k = 0; k < 4; k++)
+      words[k] = nir_bcsel(b, nir_ieq_imm(b, misalign, 0), raw[k],
+                           nir_ior(b, nir_ushr(b, raw[k], shift), nir_ishl(b, raw[k + 1], carry)));
    nir_def *channels[4];
    for (unsigned k = 0; k < 4; k++) {
       nir_def *field = nir_iand_imm(b, nir_ushr_imm(b, i->format[1 + k / 2], 16 * (k % 2)), 0xffff);

@@ -547,7 +547,7 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
 }
 
 /* Offline backend coverage of the software graphics and sampling paths:
- * the primitive setup kernel, a draw pipeline and a compute shader sampling
+ * the internal kernels, a draw pipeline and a compute shader sampling
  * two combined image samplers (fetch, nearest and linear with border
  * replacement). */
 static void
@@ -615,9 +615,12 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
       CHECK(l->offset == (level ? 64 * 48 * 56 : 0) && l->rowPitch == 64 &&
             l->depthPitch == 64u * (48 >> level) && l->size == l->depthPitch * (56 >> level));
    }
-   struct apex_program *setup;
-   CHECK(apex_internal_program(&device, APEX_INTERNAL_SETUP, &setup) == VK_SUCCESS);
-   CHECK(setup->code.size > 48);
+   /* Every internal kernel compiles through the backend. */
+   for (unsigned k = 0; k < APEX_INTERNAL_COUNT; k++) {
+      struct apex_program *internal;
+      CHECK(apex_internal_program(&device, k, &internal) == VK_SUCCESS);
+      CHECK(internal->code.size > 48);
+   }
    test_draw_pipeline(&device, vertex_path, fragment_path);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
