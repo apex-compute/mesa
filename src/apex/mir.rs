@@ -1,593 +1,557 @@
 // SPDX-License-Identifier: MIT
-// Source-neutral SSA values. IDs name typed values, never NIR pointers or opcodes.
-use crate::isa::{Class, Inst, Program};
+// Machine IR: ISA opcodes over typed scalar and vector values. Fields map
+// one-to-one onto the instruction's d, a, b and c; the value table gives each
+// value its class and width in dwords.
+use crate::isa::{self, op, Access, Class, Format, Inst, Kind, Program, EXEC, LITERAL, SCALAR};
 use crate::schedule;
 use std::collections::BTreeMap;
 
+/// f0 <- imm (one dword).
+pub const CONST: u16 = 0x100;
+/// f0 <- f1, dword by dword; a vector source into a scalar reads the first active lane.
+pub const COPY: u16 = 0x101;
+/// Branch target `imm`.
+pub const LABEL: u16 = 0x102;
+/// f0 is the launch register `hi` (defined before the first instruction).
+pub const ENTRY: u16 = 0x103;
+/// Memory access that no store of this program can alias.
+pub const REORDER: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opnd {
+    None,
+    Val { id: u32, off: u8, n: u8 },
+    Phys { code: u8, n: u8 },
+    Raw(u8),
+    Lit(u32),
+}
+impl Opnd {
+    pub fn val(self) -> Option<u32> {
+        match self {
+            Opnd::Val { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+    pub fn n(self) -> u8 {
+        match self {
+            Opnd::Val { n, .. } | Opnd::Phys { n, .. } => n,
+            _ => 1,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Op {
-    pub op: u8,
-    pub args: [u32; 4],
+    pub op: u16,
+    pub f: [Opnd; 4],
+    pub hi: u32,
     pub imm: u32,
+    pub flags: u32,
 }
 impl Op {
-    pub fn new(op: u8, d: u32, a: u32, b: u32, c: u32, imm: u32) -> Self {
-        Self {
-            op,
-            args: [d, a, b, c],
-            imm,
+    pub fn new(op: u16, f: [Opnd; 4]) -> Self {
+        Self { op, f, hi: 0, imm: 0, flags: 0 }
+    }
+    pub fn isa(&self) -> Option<u8> {
+        (self.op < 0x100).then_some(self.op as u8)
+    }
+    pub fn access(&self) -> [Option<Access>; 4] {
+        match self.op {
+            CONST | ENTRY => [Some(Access::Def), None, None, None],
+            COPY => [Some(Access::Def), Some(Access::Use), None, None],
+            LABEL => [None; 4],
+            o => {
+                let kinds = isa::fields(o as u8, self.hi).unwrap_or([Kind::None; 4]);
+                std::array::from_fn(|f| match kinds[f] {
+                    Kind::S(a, _) | Kind::V(a, _) => Some(a),
+                    Kind::Any | Kind::SAny | Kind::OptS(_) | Kind::OptV(_) => Some(Access::Use),
+                    Kind::None | Kind::Raw => None,
+                })
+            }
         }
+    }
+    pub fn defs(&self) -> impl Iterator<Item = u32> + '_ {
+        let a = self.access();
+        (0..4).filter(move |&f| matches!(a[f], Some(Access::Def | Access::DefUse))).filter_map(|f| self.f[f].val())
+    }
+    pub fn uses(&self) -> impl Iterator<Item = u32> + '_ {
+        let a = self.access();
+        (0..4).filter(move |&f| matches!(a[f], Some(Access::Use | Access::DefUse))).filter_map(|f| self.f[f].val())
+    }
+    pub fn writes_exec(&self) -> bool {
+        matches!(self.f[0], Opnd::Phys { code: EXEC, .. }) && self.op != LABEL
+            || matches!(self.isa(), Some(op::S_AND_SAVEEXEC..=op::S_SETEXEC))
+    }
+    pub fn branch(&self) -> bool {
+        matches!(self.isa(), Some(op::S_BRANCH..=op::S_CBRANCH_EXECNZ))
+    }
+    pub fn terminal(&self) -> bool {
+        matches!(self.isa(), Some(op::S_ENDPGM | op::S_TRAP))
+    }
+    /// Ordered with every other memory or export operation.
+    pub fn side_effect(&self) -> bool {
+        match self.isa() {
+            Some(o) => matches!(o, op::GLOBAL_STORE | op::GLOBAL_ATOMIC | op::BUFFER_STORE | op::BUFFER_ATOMIC
+                | op::SCRATCH_STORE | op::SHARED_STORE | op::SHARED_ATOMIC | op::EXP)
+                || isa::format(o) == Some(Format::Control),
+            None => self.op == LABEL,
+        }
+    }
+    pub fn load(&self) -> bool {
+        matches!(self.isa(), Some(op::S_LOAD..=op::GLOBAL_LOAD | op::BUFFER_LOAD | op::SCRATCH_LOAD
+            | op::SHARED_LOAD | op::IMAGE_SAMPLE | op::IMAGE_FETCH))
+    }
+    /// Instructions that bound scheduling regions.
+    pub fn boundary(&self) -> bool {
+        self.op == LABEL || self.op == ENTRY || self.writes_exec()
+            || matches!(self.isa().and_then(isa::format), Some(Format::Control))
     }
 }
-#[derive(Clone, Copy)]
-enum Home {
-    Register(u8),
-    Spill(u32),
-    // A single-definition vector immediate is rebuilt at each use.
-    Remat(u32),
+
+#[derive(Clone, Copy, Debug)]
+pub struct Value {
+    pub class: Class,
+    pub width: u8,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub instructions: u32,
+    pub vector: u32,
+    pub scalar: u32,
+    pub spills: u32,
 }
 
-// MIR-only marker: value args[1] is dead for every lane active here, so the
-// linear liveness of this out-of-SSA register stops at this point.
-const DEAD: u8 = 0xf3;
-
-fn roles(op: u8, imm: u32) -> Result<[Option<(Class, u8)>; 4], String> {
-    if op == DEAD {
-        Ok([None; 4])
-    } else if op == 0xf0 {
-        Ok([Some((Class::V, 2)), Some((Class::V, 1)), None, None])
-    } else if op == 0xf1 {
-        Ok([
-            Some((Class::V, 2)),
-            Some((Class::V, 1)),
-            Some((Class::V, 1)),
-            None,
-        ])
-    } else if op == 0xf2 && imm < 2 {
-        Ok([Some((Class::V, 1)), Some((Class::S, 2)), None, None])
-    } else {
-        Inst {
-            imm,
-            ..Inst::new(op)
-        }
-        .roles()
-    }
-}
-
-pub fn compile(
-    ops: &[Op],
-    shared: u32,
-    source_private: u32,
-    invocations: u32,
-) -> Result<Program, String> {
-    if source_private % 4 != 0 {
-        return Err("unaligned source private size".into());
-    }
-    let mut ops = if ops.iter().all(|o| !matches!(o.op, 4 | 5) || (o.imm as usize) < ops.len()) {
-        coalesce(ops)?
-    } else {
-        ops.to_vec()
-    };
-    // A global load or store immediate is an alias tag, group << 8 | word:
-    // tagged accesses of one group at distinct words never overlap.
-    let tags: Vec<u32> = ops
-        .iter_mut()
-        .map(|o| if matches!(o.op, 0x50 | 0x51) { std::mem::take(&mut o.imm) } else { 0 })
-        .collect();
-    let ops = &ops[..];
-    // Masked vector writes preserve inactive lanes in out-of-SSA phi webs.
-    // Include every definition/use and enclose backedges before reusing homes.
-    let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
-    // Class, width, interval start/end, and the unique definition (if any).
-    let mut values: BTreeMap<u32, (Class, u8, usize, usize, Option<usize>)> = BTreeMap::new();
+fn check(ops: &[Op], values: &[Value]) -> Result<(), String> {
     for (pc, o) in ops.iter().enumerate() {
-        if o.op == 3 {
-            return Err("MIR scheduler owns waits".into());
-        }
-        if matches!(o.op, 4 | 5) && o.imm as usize >= ops.len() {
-            return Err("MIR branch target outside program".into());
-        }
-        let roles = roles(o.op, o.imm)?;
-        for (field, role) in roles.iter().enumerate() {
-            if role.is_none() && o.args[field] != 0 && (o.op, field) != (DEAD, 1) {
-                return Err("reserved MIR operand".into());
+        let fail = |m: &str| Err(format!("MIR op {pc} (0x{:x}): {m}", o.op));
+        let class_of = |x: Opnd| match x {
+            Opnd::Val { id, off, n } => {
+                let v = values.get(id as usize).filter(|_| id != 0)?;
+                (off + n <= v.width).then_some(v.class)
             }
-        }
-        if o.op < 0xf0 {
-            Inst {
-                imm: o.imm,
-                ..Inst::new(o.op)
-            }
-            .validate()?;
-        } else if o.op != 0xf2 && o.imm != 0 {
-            return Err("reserved MIR immediate".into());
-        }
-        if let Some((cl, n)) = roles[0] {
-            if let Some(v) = values.get_mut(&o.args[0]) {
-                if !control || (v.0, v.1) != (cl, n) {
-                    return Err("MIR redefinition/type mismatch".into());
-                }
-                v.3 = pc;
-                v.4 = None;
-            } else {
-                values.insert(o.args[0], (cl, n, pc, pc, Some(pc)));
-            }
-        }
-    }
-    for (pc, o) in ops.iter().enumerate() {
-        for (f, role) in roles(o.op, o.imm)?.iter().enumerate().skip(1) {
-            if let Some((cl, n)) = role {
-                let v = values.get_mut(&o.args[f]).ok_or("undefined MIR value")?;
-                if (v.0, v.1) != (*cl, *n) || (!control && v.2 >= pc) {
-                    return Err("MIR type/order mismatch".into());
-                }
-                v.2 = v.2.min(pc);
-                v.3 = v.3.max(pc);
-            }
-        }
-    }
-    if control {
-        lifetimes(ops, &mut values)?;
-    }
-    let mut order: Vec<_> = values.iter().map(|(&id, &v)| (id, v)).collect();
-    order.sort_by_key(|&(id, v)| (v.2, id));
-    let mut homes = BTreeMap::new();
-    // Active register intervals: class, register, width, end, value.
-    let mut occupied: Vec<(Class, u8, u8, usize, u32)> = Vec::new();
-    // Spill slots: first word, width, start, end. Disjoint lifetimes share slots.
-    let mut slots: Vec<(u32, u8, usize, usize)> = Vec::new();
-    let reserved = source_private / 4;
-    let mut words = reserved;
-    let mut spill = |n: u8, start: usize, end: usize, words: &mut u32| -> Result<u32, String> {
-        let mut slot = reserved;
-        loop {
-            let clash = slots
-                .iter()
-                .find(|s| slot < s.0 + s.1 as u32 && s.0 < slot + n as u32 && start <= s.3 && s.2 <= end);
-            match clash {
-                Some(s) => slot = s.0 + s.1 as u32,
-                None => break,
-            }
-        }
-        slots.push((slot, n, start, end));
-        *words = (*words).max(slot.checked_add(n as u32).ok_or("spill size overflow")?);
-        Ok(slot)
-    };
-    let remat = |id: u32| match values[&id] {
-        (Class::V, 1, _, _, Some(pc)) if ops[pc].op == 0x20 => Some(ops[pc].imm),
-        _ => None,
-    };
-    // Spill cost: each definition and use weighted by loop depth. A reload
-    // costs a load and its wait; a rematerialization one immediate.
-    let loops: Vec<(usize, usize)> = ops
-        .iter()
-        .enumerate()
-        .filter(|(pc, o)| matches!(o.op, 4 | 5) && (o.imm as usize) <= *pc)
-        .map(|(pc, o)| (o.imm as usize, pc))
-        .collect();
-    let mut cost: BTreeMap<u32, u64> = BTreeMap::new();
-    for (pc, o) in ops.iter().enumerate() {
-        let depth = loops.iter().filter(|&&(h, l)| h <= pc && pc <= l).count().min(6);
-        for (f, role) in roles(o.op, o.imm)?.iter().enumerate() {
-            if role.is_some() {
-                *cost.entry(o.args[f]).or_default() += 8u64.pow(depth as u32);
-            }
-        }
-    }
-    // Divide by the interval length: spilling a long, rarely used value
-    // relieves more pressure than spilling a short, busy one.
-    let cost = |id: u32| {
-        let (_, _, start, end, _) = values[&id];
-        (cost[&id] << 20) * if remat(id).is_some() { 1 } else { 2 } / (end - start + 1) as u64
-    };
-    for (id, (cl, n, start, end, _)) in order {
-        occupied.retain(|v| v.3 >= start);
-        let first = if cl == Class::S { 4 } else { 0 };
-        let aligned = |r: u8| r + n <= 52 && (n == 1 || r % 2 == 0);
-        let overlaps = |r: u8, v: &(Class, u8, u8, usize, u32)| v.0 == cl && r < v.1 + v.2 && v.1 < r + n;
-        // Rotate preferred bank with SSA identity; reserve 52..63 for reloads and bank repair.
-        let free = (first..52)
-            .filter(|&r| aligned(r) && !occupied.iter().any(|v| overlaps(r, v)))
-            .min_by_key(|r| ((r % 4 + 4 - (id % 4) as u8) % 4, *r));
-        if let Some(r) = free {
-            occupied.push((cl, r, n, end, id));
-            homes.insert(id, Home::Register(r));
-            continue;
-        }
-        if cl == Class::S {
-            return Err("scalar register pressure exceeds initial profile".into());
-        }
-        // Evict the aligned window whose occupants cost least to spill, then
-        // whose nearest end is latest, unless spilling this value costs less.
-        // A pair may evict two single values.
-        let victim = (first..52)
-            .filter(|&r| aligned(r))
-            .map(|r| {
-                let held = occupied.iter().filter(|v| overlaps(r, v));
-                let price: u64 = held.clone().map(|v| cost(v.4)).sum();
-                (price, std::cmp::Reverse(held.map(|v| v.3).min().unwrap_or(usize::MAX)), r)
-            })
-            .min()
-            .filter(|&(price, nearest, _)| (price, nearest) < (cost(id), std::cmp::Reverse(end)))
-            .map(|(_, _, r)| r);
-        let mut home = |id: u32, n: u8, start: usize, end: usize, words: &mut u32| -> Result<Home, String> {
-            Ok(match remat(id) {
-                Some(imm) => Home::Remat(imm),
-                None => Home::Spill(spill(n, start, end, words)?),
-            })
+            Opnd::Phys { code, .. } => Some(if code < SCALAR { Class::V } else { Class::S }),
+            _ => None,
         };
-        if let Some(r) = victim {
-            for (_, _, victim_n, victim_end, victim_id) in occupied.extract_if(.., |v| overlaps(r, v)).collect::<Vec<_>>() {
-                let (_, _, victim_start, _, _) = values[&victim_id];
-                homes.insert(victim_id, home(victim_id, victim_n, victim_start, victim_end, &mut words)?);
+        for (f, x) in o.f.iter().enumerate() {
+            if let Opnd::Val { .. } = x {
+                if class_of(*x).is_none() {
+                    return fail(&format!("field {f} names an undeclared value or range"));
+                }
             }
-            occupied.push((cl, r, n, end, id));
-            homes.insert(id, Home::Register(r));
-        } else {
-            homes.insert(id, home(id, n, start, end, &mut words)?);
         }
-    }
-    let mut native = Vec::new();
-    let mut native_tags = BTreeMap::new();
-    let mut instruction_map = Vec::new();
-    for (o, &tag) in ops.iter().zip(&tags) {
-        instruction_map.push(native.len());
-        let roles = roles(o.op, o.imm)?;
-        if o.op == DEAD || roles[0].is_some() && matches!(homes[&o.args[0]], Home::Remat(_)) {
-            continue;
-        }
-        let mut fields = [0; 4];
-        let mut stores = Vec::new();
+        let kinds = match o.op {
+            CONST | ENTRY => {
+                if o.f[0].val().is_none() || o.f[0].n() != 1 {
+                    return fail("needs one destination dword");
+                }
+                continue;
+            }
+            COPY => {
+                if o.f[0].n() != o.f[1].n() || class_of(o.f[0]).is_none()
+                    || !matches!(o.f[1], Opnd::Val { .. } | Opnd::Phys { .. } | Opnd::Lit(_))
+                {
+                    return fail("copy widths");
+                }
+                continue;
+            }
+            LABEL => continue,
+            x if x < 0x100 => isa::fields(x as u8, o.hi)?,
+            _ => return fail("unknown opcode"),
+        };
         for f in 0..4 {
-            if let Some((_, n)) = roles[f] {
-                fields[f] = match homes[&o.args[f]] {
-                    Home::Register(r) => r,
-                    // Remat definitions were skipped above, so this is a use.
-                    Home::Remat(imm) => {
-                        let r = 56 + f as u8 * 2;
-                        native.push(Inst {
-                            d: r,
-                            imm,
-                            ..Inst::new(0x20)
-                        });
-                        r
-                    }
-                    Home::Spill(slot) => {
-                        let r = 56 + f as u8 * 2;
-                        for j in 0..n {
-                            if f == 0 {
-                                stores.push(Inst {
-                                    b: r + j,
-                                    imm: slot + j as u32,
-                                    ..Inst::new(0x57)
-                                });
-                            } else {
-                                native.push(Inst {
-                                    d: r + j,
-                                    imm: slot + j as u32,
-                                    ..Inst::new(0x56)
-                                });
-                            }
-                        }
-                        r
-                    }
-                };
+            let x = o.f[f];
+            let class = class_of(x);
+            let ok = match kinds[f] {
+                Kind::None => x == Opnd::None,
+                Kind::Raw => matches!(x, Opnd::Raw(_)),
+                Kind::S(Access::Def, 1) if f == 0 => class == Some(Class::S) && x.n() == 1,
+                Kind::S(_, n) => class == Some(Class::S) && x.n() == n,
+                Kind::V(_, n) => class == Some(Class::V) && x.n() == n,
+                Kind::Any => x.n() == 1 && !matches!(x, Opnd::None | Opnd::Raw(_)),
+                Kind::SAny => x.n() == 1 && matches!(class, Some(Class::S) | None) && !matches!(x, Opnd::None | Opnd::Raw(_)),
+                Kind::OptS(n) => x == Opnd::None || (class == Some(Class::S) && x.n() == n),
+                Kind::OptV(n) => {
+                    let n = if matches!(o.op as u8, op::GLOBAL_LOAD..=op::GLOBAL_ATOMIC) && o.f[2] != Opnd::None { 1 } else { n };
+                    x == Opnd::None || (class == Some(Class::V) && x.n() == n)
+                }
+            };
+            if !ok {
+                return fail(&format!("field {f} does not match {:?}", kinds[f]));
             }
         }
-        let mut i = Inst {
-            op: o.op,
-            d: fields[0],
-            a: fields[1],
-            b: fields[2],
-            c: fields[3],
-            imm: o.imm,
+    }
+    Ok(())
+}
+
+/// Replaces single-dword constants by inline codes or the instruction's literal
+/// where the encoding allows, then materializes the rest.
+fn fold_constants(ops: &mut [Op], values: &[Value]) {
+    let mut constant: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
+    for o in ops.iter() {
+        if o.op == CONST {
+            if let Opnd::Val { id, .. } = o.f[0] {
+                if values[id as usize].width == 1 {
+                    constant.entry(id).and_modify(|e| e.1 += 1).or_insert((o.imm, 1));
+                }
+            }
+        } else {
+            for id in o.defs() {
+                constant.entry(id).and_modify(|e| e.1 += 1).or_insert((0, 2));
+            }
+        }
+    }
+    constant.retain(|_, e| e.1 == 1);
+    for o in ops.iter_mut() {
+        let Some(code) = o.isa() else {
+            if o.op == COPY {
+                if let Some(&(v, _)) = o.f[1].val().and_then(|id| constant.get(&id)) {
+                    o.f[1] = Opnd::Lit(v);
+                }
+            }
+            continue;
         };
-        if o.op == 0xf2 {
-            native.push(Inst {
-                d: i.d,
-                a: i.a + o.imm as u8,
-                ..Inst::new(0x2d)
+        let kinds = isa::fields(code, o.hi).unwrap();
+        let alu = matches!(isa::format(code), Some(Format::Salu | Format::Valu));
+        let mut literal: Option<u32> = None;
+        for f in 1..4 {
+            if !matches!(kinds[f], Kind::Any | Kind::SAny) {
+                continue;
+            }
+            let Some(&(v, _)) = o.f[f].val().and_then(|id| constant.get(&id)) else { continue };
+            if isa::inline_code(v).is_some() {
+                o.f[f] = Opnd::Lit(v);
+            } else if alu && f < 3 && kinds[3] == Kind::None && (o.hi >> 8) & 0x7f == 0
+                && literal.is_none_or(|l| l == v)
+            {
+                literal = Some(v);
+                o.f[f] = Opnd::Lit(v);
+            }
+        }
+    }
+    for o in ops.iter_mut() {
+        if o.op == CONST {
+            o.op = COPY;
+            o.f[1] = Opnd::Lit(o.imm);
+        }
+    }
+}
+
+/// Mark and sweep: an op is needed for its effect or for a needed value.
+fn eliminate_dead(ops: &mut Vec<Op>) {
+    let root = |o: &Op| o.side_effect() || o.writes_exec() || (o.defs().next().is_none() && o.op != COPY);
+    let mut needed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut keep: Vec<bool> = ops.iter().map(root).collect();
+    loop {
+        let mut changed = false;
+        for (i, o) in ops.iter().enumerate() {
+            if !keep[i] && o.defs().any(|d| needed.contains(&d)) {
+                keep[i] = true;
+                changed = true;
+            }
+            if keep[i] {
+                for u in o.uses() {
+                    changed |= needed.insert(u);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut i = 0;
+    ops.retain(|_| {
+        i += 1;
+        keep[i - 1]
+    });
+}
+
+/// Launch registers become values with fixed homes defined before the program.
+fn bind_launch(ops: &mut Vec<Op>, values: &mut Vec<Value>) -> BTreeMap<u32, u8> {
+    let mut fixed = BTreeMap::new();
+    let mut by_code: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut entries = Vec::new();
+    for o in ops.iter_mut() {
+        let access = o.access();
+        for f in 0..4 {
+            let Opnd::Phys { code, n } = o.f[f] else { continue };
+            if code >= isa::EXEC || matches!(access[f], Some(Access::Def | Access::DefUse)) {
+                continue;
+            }
+            // Groups resolve to their first register's value; wider views allocate a group.
+            let id = *by_code.entry(code).or_insert_with(|| {
+                values.push(Value { class: if code < SCALAR { Class::V } else { Class::S }, width: n });
+                let id = values.len() as u32 - 1;
+                fixed.insert(id, if code < SCALAR { code } else { code - SCALAR });
+                entries.push(Op { hi: code as u32, ..Op::new(ENTRY, [Opnd::Val { id, off: 0, n }, Opnd::None, Opnd::None, Opnd::None]) });
+                id
             });
-            native.extend(stores);
+            if values[id as usize].width < n {
+                values[id as usize].width = n;
+                for e in entries.iter_mut().filter(|e| e.f[0].val() == Some(id)) {
+                    e.f[0] = Opnd::Val { id, off: 0, n };
+                }
+            }
+            o.f[f] = Opnd::Val { id, off: 0, n };
+        }
+    }
+    // Overlapping launch groups would need one value; the C side reads each register once.
+    ops.splice(0..0, entries);
+    fixed
+}
+
+/// Merges copy sources and targets that can share registers: a value copied
+/// into part of a group becomes that part, and a copy of a value becomes the
+/// value. The target region must be written only by copies from the source at
+/// the same relative offset, and the source must be written once per dword,
+/// so no read observes a different write after merging.
+fn coalesce(ops: &mut Vec<Op>, values: &[Value], fixed: &mut BTreeMap<u32, u8>) -> Vec<u8> {
+    let n = values.len();
+    let mut align: Vec<u8> = values.iter().map(alignment).collect();
+    let mut parent: Vec<(u32, u32)> = (0..n as u32).map(|i| (i, 0)).collect();
+    fn find(parent: &mut Vec<(u32, u32)>, id: u32) -> (u32, u32) {
+        let (p, o) = parent[id as usize];
+        if p == id {
+            return (id, 0);
+        }
+        let (r, ro) = find(parent, p);
+        parent[id as usize] = (r, o + ro);
+        (r, o + ro)
+    }
+    let width = |id: u32| values[id as usize].width as u32;
+    for c in 0..ops.len() {
+        if ops[c].op != COPY {
             continue;
         }
-        if o.op == 0xf1 {
-            native.extend([
-                Inst {
-                    d: i.d,
-                    a: i.a,
-                    ..Inst::new(0x21)
-                },
-                Inst {
-                    d: i.d + 1,
-                    a: i.b,
-                    ..Inst::new(0x21)
-                },
-            ]);
-            native.extend(stores);
+        let (Opnd::Val { id: d, off: k, .. }, Opnd::Val { id: s, off: j, .. }) = (ops[c].f[0], ops[c].f[1]) else {
+            continue;
+        };
+        if values[d as usize].class != values[s as usize].class {
             continue;
         }
-        if o.op == 0xf0 {
-            native.extend([
-                Inst {
-                    d: i.d,
-                    a: i.a,
-                    ..Inst::new(0x21)
-                },
-                Inst {
-                    d: i.d + 1,
-                    ..Inst::new(0x20)
-                },
-                Inst {
-                    d: 52,
-                    a: 0,
-                    ..Inst::new(0x2d)
-                },
-                Inst {
-                    d: 53,
-                    a: 1,
-                    ..Inst::new(0x2d)
-                },
-                Inst {
-                    d: i.d,
-                    a: i.d,
-                    b: 52,
-                    ..Inst::new(0x2c)
-                },
-            ]);
-            native.extend(stores);
+        let (rd, od) = find(&mut parent, d);
+        let (rs, os) = find(&mut parent, s);
+        if rd == rs {
             continue;
         }
-        if !i.bank_legal() {
-            // Only ternary or pair instructions can exceed the two-read bank budget.
-            // Copy one operand to a reserved bank/pair with legal read geometry.
-            let mut fixed = false;
-            for f in 1..4 {
-                if let Some((cl, n)) = roles[f] {
-                    for r in 52..56 {
-                        if n == 2 && (r % 2 != 0 || r + 1 >= 56) {
-                            continue;
-                        }
-                        let mut candidate = fields;
-                        candidate[f] = r;
-                        let c = Inst {
-                            a: candidate[1],
-                            b: candidate[2],
-                            c: candidate[3],
-                            ..i
-                        };
-                        if c.bank_legal() {
-                            for j in 0..n {
-                                native.push(Inst {
-                                    d: r + j,
-                                    a: fields[f] + j,
-                                    ..Inst::new(if cl == Class::S { 0x11 } else { 0x21 })
-                                });
-                            }
-                            i = c;
-                            fixed = true;
-                            break;
-                        }
-                    }
-                    if fixed {
-                        break;
+        // Source dword x sits at target dword x + delta.
+        let delta = (od + k as u32) as i64 - (os + j as u32) as i64;
+        let (small, big, at) = if width(rs) as i64 + delta <= width(rd) as i64 && delta >= 0 {
+            (rs, rd, delta)
+        } else if width(rd) as i64 - delta <= width(rs) as i64 && delta <= 0 {
+            (rd, rs, -delta)
+        } else {
+            continue;
+        };
+        let at = at as u32;
+        if at % align[small as usize] as u32 != 0 {
+            continue;
+        }
+        let new_fixed = match (fixed.get(&small).copied(), fixed.get(&big).copied()) {
+            (Some(fs), Some(fb)) if fb as u32 + at != fs as u32 => continue,
+            (Some(fs), None) => {
+                if (fs as u32) < at || (fs as u32 - at) % align[big as usize] as u32 != 0 {
+                    continue;
+                }
+                let home = fs as u32 - at;
+                let class = values[big as usize].class;
+                // Other launch values inside the new home must be copied to the matching place.
+                let copies: Vec<(u32, u32, u32)> = ops
+                    .iter()
+                    .filter(|o| o.op == COPY)
+                    .filter_map(|o| match (o.f[0], o.f[1]) {
+                        (Opnd::Val { id: a, off: ao, .. }, Opnd::Val { id: b, off: bo, .. }) => Some((a, ao as u32, b + 0 * bo as u32)),
+                        _ => None,
+                    })
+                    .collect();
+                let clash = fixed.clone().iter().any(|(&id, &h)| {
+                    id != small && values[id as usize].class == class
+                        && (h as u32) < home + width(big) && home < h as u32 + values[id as usize].width as u32
+                        && !copies.iter().any(|&(a, ao, b)| {
+                            let (ra, oa) = find(&mut parent, a);
+                            b == id && ra == big && home + oa + ao == h as u32
+                        })
+                });
+                if clash {
+                    continue;
+                }
+                Some(home as u8)
+            }
+            (_, fb) => fb,
+        };
+        // Region [at, at + width(small)) of big, seen through current roots.
+        let (target, source) = (rd, rs);
+        let coord = |r: u32, x: u32| if r == big { x } else { x + at };
+        let mut writes = vec![0u32; width(big) as usize];
+        let mut ok = true;
+        for o in ops.iter() {
+            let access = o.access();
+            if o.op == COPY {
+                if let (Opnd::Val { id: a, off: ao, .. }, Opnd::Val { id: b, off: bo, .. }) = (o.f[0], o.f[1]) {
+                    let (ra, oa) = find(&mut parent, a);
+                    let (rb, ob) = find(&mut parent, b);
+                    if ra == rb && oa + ao as u32 == ob + bo as u32 {
+                        continue;
                     }
                 }
             }
-            if !fixed {
-                return Err("cannot repair operand banks".into());
+            for f in 0..4 {
+                if !matches!(access[f], Some(Access::Def | Access::DefUse)) {
+                    continue;
+                }
+                let Opnd::Val { id, off, n } = o.f[f] else { continue };
+                let (r, ro) = find(&mut parent, id);
+                if r != target && r != source {
+                    continue;
+                }
+                for x in 0..n as u32 {
+                    let b = coord(r, ro + off as u32 + x);
+                    if b < at || b >= at + width(small) {
+                        continue;
+                    }
+                    if r == target {
+                        // Target writes in the region must be copies from the source.
+                        let copy = o.op == COPY && f == 0 && match o.f[1] {
+                            Opnd::Val { id: sid, off: soff, .. } => {
+                                let (sr, so) = find(&mut parent, sid);
+                                sr == source && coord(source, so + soff as u32 + x) == b
+                            }
+                            _ => false,
+                        };
+                        ok &= copy;
+                    } else {
+                        writes[b as usize] += 1;
+                    }
+                }
             }
         }
-        if tag != 0 {
-            native_tags.insert(native.len(), tag);
+        if !ok || writes.iter().any(|&w| w > 1) {
+            continue;
         }
-        native.push(i);
-        native.extend(stores);
-    }
-    for i in &mut native {
-        if matches!(i.op, 4 | 5) {
-            i.imm =
-                u32::try_from(instruction_map[i.imm as usize]).map_err(|_| "code size overflow")?;
+        parent[small as usize] = (big, at);
+        align[big as usize] = align[big as usize].max(align[small as usize]);
+        if let Some(h) = new_fixed {
+            fixed.insert(big, h);
         }
+        fixed.remove(&small);
     }
-    if native.last().is_none_or(|i| !matches!(i.op, 1 | 2)) {
-        native.push(Inst::new(1));
-    }
-    let code = schedule::schedule_tagged(&native, &native_tags)?;
-    schedule::validate(&code)?;
-    let mut p = Program {
-        code,
-        entry: 0,
-        scalar: 4,
-        vector: 0,
-        shared,
-        private: words.checked_mul(4).ok_or("private bytes overflow")?,
-        invocations,
-    };
-    for i in &p.code {
-        for r in i.regs(false).into_iter().chain(i.regs(true)) {
-            let count = if r.0 == Class::S {
-                &mut p.scalar
-            } else {
-                &mut p.vector
-            };
-            *count = (*count).max(r.1 as u32 + 1);
+    for o in ops.iter_mut() {
+        for f in 0..4 {
+            if let Opnd::Val { id, off, n } = o.f[f] {
+                let (r, ro) = find(&mut parent, id);
+                o.f[f] = Opnd::Val { id: r, off: (ro + off as u32) as u8, n };
+            }
         }
     }
-    p.validate()?;
-    Ok(p)
+    ops.retain(|o| !(o.op == COPY && o.f[0] == o.f[1]));
+    align
 }
 
-/// Removes out-of-SSA vector copies inside one mask region: a copy's single
-/// use reads the source register directly, and a single-use value is defined
-/// straight into the register it is copied to. Loads then write their final
-/// register and overlap instead of waiting at each copy.
-fn coalesce(ops: &[Op]) -> Result<Vec<Op>, String> {
-    let mut ops = ops.to_vec();
-    let roles: Vec<_> = ops.iter().map(|o| roles(o.op, o.imm)).collect::<Result<_, _>>()?;
-    let mut boundary = vec![false; ops.len() + 1];
-    for (pc, o) in ops.iter().enumerate() {
-        if matches!(o.op, 1 | 2 | 4 | 5 | 6 | 7 | 8) {
-            boundary[pc] = true;
-        }
-        if matches!(o.op, 4 | 5) {
-            boundary[o.imm as usize] = true;
-        }
-    }
-    let mut defs: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    let mut uses: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
-    for (pc, (o, r)) in ops.iter().zip(&roles).enumerate() {
-        if r[0].is_some() {
-            defs.entry(o.args[0]).or_default().push(pc);
-        }
-        for f in 1..4 {
-            if r[f].is_some() {
-                uses.entry(o.args[f]).or_default().push((pc, f));
-            }
-        }
-    }
-    let single = |defs: &BTreeMap<u32, Vec<usize>>, id: u32| defs.get(&id).map(Vec::len) == Some(1);
-    // Whether register id is untouched strictly between pcs a and b in one region.
-    let quiet = |ops: &[Op], a: usize, b: usize, id: u32| {
-        (a + 1..=b).all(|pc| !boundary[pc])
-            && (a + 1..b).all(|pc| (0..4).all(|f| roles[pc][f].is_none() || ops[pc].args[f] != id))
-    };
-    let vector = |r: Option<(Class, u8)>| r == Some((Class::V, 1));
-    let mut removed = vec![false; ops.len()];
-    for pc in 0..ops.len() {
-        if ops[pc].op != 0x21 {
-            continue;
-        }
-        let (copy, source) = (ops[pc].args[0], ops[pc].args[1]);
-        if copy == source {
-            continue;
-        }
-        let copy_uses = uses.get(&copy).cloned().unwrap_or_default();
-        // A load_reg copy: forward the register to every use in its region.
-        if single(&defs, copy)
-            && !copy_uses.is_empty()
-            && copy_uses.iter().all(|&(u, _)| u > pc && quiet(&ops, pc, u, source) && !removed[u])
-            && copy_uses.iter().all(|&(u, f)| (1..4).all(|g| g == f || ops[u].args[g] != copy))
-        {
-            for &(u, f) in &copy_uses {
-                ops[u].args[f] = source;
-            }
-            let reads = uses.entry(source).or_default();
-            reads.retain(|&(u, _)| u != pc);
-            reads.extend(copy_uses);
-            removed[pc] = true;
-            continue;
-        }
-        // A store_reg copy: define the single-use source directly into the copy.
-        let source_uses = uses.get(&source).map(Vec::as_slice).unwrap_or_default();
-        if let (true, [(u, _)], Some(&[d])) = (single(&defs, source), source_uses, defs.get(&source).map(Vec::as_slice)) {
-            if *u == pc && d < pc && !removed[d] && vector(roles[d][0]) && quiet(&ops, d, pc, copy)
-                && (1..4).all(|f| roles[d][f].is_none() || ops[d].args[f] != source)
-            {
-                ops[d].args[0] = copy;
-                let writes = defs.get_mut(&copy).unwrap();
-                writes.retain(|&w| w != pc);
-                writes.push(d);
-                removed[pc] = true;
-            }
-        }
-    }
-    let mut map = vec![0; ops.len() + 1];
-    let mut kept = 0;
-    for pc in 0..ops.len() {
-        map[pc] = kept;
-        kept += !removed[pc] as usize;
-    }
-    map[ops.len()] = kept;
-    Ok(ops
-        .into_iter()
-        .zip(removed)
-        .filter(|(_, r)| !r)
-        .map(|(mut o, _)| {
-            if matches!(o.op, 4 | 5) {
-                o.imm = map[o.imm as usize] as u32;
-            }
-            o
-        })
-        .collect())
+struct Interval {
+    start: usize,
+    end: usize,
 }
 
 /// Hull intervals from liveness on the linear control-flow graph. Every
-/// branch edge is taken or skipped as a whole wave, so both sides of a masked
-/// region execute in program order. Scalar writes are unmasked and kill. A
-/// single vector definition kills only when every use stays inside each loop
-/// containing it: lanes that leave a loop early keep an older value in the
-/// register. Multi-definition (out-of-SSA) vector values are masked
-/// read-modify-writes: they are live from any reaching definition to any use.
-fn lifetimes(
-    ops: &[Op],
-    values: &mut BTreeMap<u32, (Class, u8, usize, usize, Option<usize>)>,
-) -> Result<(), String> {
+/// branch edge is taken or skipped by the whole wave, so both sides of a
+/// masked region execute in program order. Scalar writes are unmasked and
+/// kill. A single vector definition kills only when every use stays inside
+/// each loop containing it: lanes that leave a loop early keep an older
+/// value. Multi-definition vector values are masked read-modify-writes and
+/// stay live from any reaching definition to any use.
+fn lifetimes(ops: &[Op], values: &[Value]) -> Result<BTreeMap<u32, Interval>, String> {
     let n = ops.len();
+    let mut labels = BTreeMap::new();
+    for (pc, o) in ops.iter().enumerate() {
+        if o.op == LABEL {
+            labels.insert(o.imm, pc);
+        }
+    }
+    let target = |o: &Op| -> Result<usize, String> {
+        labels.get(&o.imm).copied().ok_or_else(|| format!("undefined label {}", o.imm))
+    };
     let mut leader = vec![false; n + 1];
     leader[0] = true;
     leader[n] = true;
     for (pc, o) in ops.iter().enumerate() {
-        if matches!(o.op, 4 | 5) {
-            leader[o.imm as usize] = true;
-            leader[pc + 1] = true;
-        } else if matches!(o.op, 1 | 2) {
+        if o.op == LABEL {
+            leader[pc] = true;
+        }
+        if o.branch() || o.terminal() {
             leader[pc + 1] = true;
         }
     }
     let starts: Vec<usize> = (0..=n).filter(|&pc| leader[pc]).collect();
     let blocks = starts.len() - 1;
-    let mut block_of = vec![0; n + 1];
+    let mut block_of = vec![blocks; n + 1];
     for b in 0..blocks {
         for pc in starts[b]..starts[b + 1] {
             block_of[pc] = b;
         }
     }
-    block_of[n] = blocks;
     let mut successors = vec![Vec::new(); blocks];
     for b in 0..blocks {
         let last = &ops[starts[b + 1] - 1];
         let next = (b + 1 < blocks).then_some(b + 1);
-        successors[b] = match last.op {
-            1 | 2 => vec![],
-            4 => vec![block_of[last.imm as usize]],
-            5 => [Some(block_of[last.imm as usize]), next].into_iter().flatten().collect(),
-            _ => next.into_iter().collect(),
+        successors[b] = if last.terminal() {
+            vec![]
+        } else if last.isa() == Some(op::S_BRANCH) {
+            vec![block_of[target(last)?]]
+        } else if last.branch() {
+            [Some(block_of[target(last)?]), next].into_iter().flatten().collect()
+        } else {
+            next.into_iter().collect()
         };
         successors[b].retain(|&s| s < blocks);
     }
-    let ids: Vec<u32> = values.keys().copied().collect();
+    let ids: Vec<u32> = {
+        let mut s = std::collections::BTreeSet::new();
+        for o in ops {
+            s.extend(o.defs());
+            s.extend(o.uses());
+        }
+        s.into_iter().collect()
+    };
     let index: BTreeMap<u32, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let words = ids.len().div_ceil(64);
+    let words = ids.len().div_ceil(64).max(1);
     let mut defs = vec![Vec::new(); ids.len()];
     let mut uses = vec![Vec::new(); ids.len()];
     for (pc, o) in ops.iter().enumerate() {
-        let r = roles(o.op, o.imm)?;
-        if r[0].is_some() {
-            defs[index[&o.args[0]]].push(pc);
+        for d in o.defs() {
+            defs[index[&d]].push(pc);
         }
-        for f in 1..4 {
-            if r[f].is_some() {
-                uses[index[&o.args[f]]].push(pc);
+        for u in o.uses() {
+            uses[index[&u]].push(pc);
+        }
+    }
+    let mut loops = Vec::new();
+    for (pc, o) in ops.iter().enumerate() {
+        if o.branch() {
+            let t = target(o)?;
+            if t <= pc {
+                loops.push((t, pc));
             }
         }
     }
-    let loops: Vec<(usize, usize)> = ops
-        .iter()
-        .enumerate()
-        .filter(|(pc, o)| matches!(o.op, 4 | 5) && (o.imm as usize) <= *pc)
-        .map(|(pc, o)| (o.imm as usize, pc))
-        .collect();
     let kills: Vec<bool> = ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
-            values[id].0 == Class::S
+            values[*id as usize].class == Class::S
                 || (defs[i].len() == 1
                     && loops.iter().all(|&(h, l)| {
-                        !(h <= defs[i][0] && defs[i][0] <= l)
-                            || uses[i].iter().all(|&u| h <= u && u <= l)
+                        !(h <= defs[i][0] && defs[i][0] <= l) || uses[i].iter().all(|&u| h <= u && u <= l)
                     }))
+        })
+        .collect();
+    // Partial definitions of a group write only some of its dwords.
+    let partial: Vec<bool> = ids
+        .iter()
+        .map(|id| {
+            ops.iter().any(|o| {
+                let a = o.access();
+                (0..4).any(|f| {
+                    matches!(a[f], Some(Access::Def)) && matches!(o.f[f], Opnd::Val { id: x, n, .. } if x == *id && n < values[*id as usize].width)
+                })
+            })
         })
         .collect();
     let set = |bits: &mut Vec<u64>, i: usize| bits[i / 64] |= 1 << (i % 64);
@@ -599,28 +563,16 @@ fn lifetimes(
     for b in 0..blocks {
         for pc in (starts[b]..starts[b + 1]).rev() {
             let o = &ops[pc];
-            if o.op == DEAD {
-                let i = *index.get(&o.args[1]).ok_or("undefined MIR value")?;
-                if values[&o.args[1]].0 != Class::V {
-                    return Err("MIR type mismatch".into());
-                }
-                clear(&mut gen[b], i);
-                set(&mut killed[b], i);
-                continue;
-            }
-            let r = roles(o.op, o.imm)?;
-            if r[0].is_some() {
-                let i = index[&o.args[0]];
+            for d in o.defs() {
+                let i = index[&d];
                 set(&mut defined[b], i);
-                if kills[i] {
+                if kills[i] && !partial[i] && !o.uses().any(|u| u == d) {
                     clear(&mut gen[b], i);
                     set(&mut killed[b], i);
                 }
             }
-            for f in 1..4 {
-                if r[f].is_some() {
-                    set(&mut gen[b], index[&o.args[f]]);
-                }
+            for u in o.uses() {
+                set(&mut gen[b], index[&u]);
             }
         }
     }
@@ -670,21 +622,392 @@ fn lifetimes(
             break;
         }
     }
+    let mut result = BTreeMap::new();
     for (i, id) in ids.iter().enumerate() {
-        let v = values.get_mut(id).unwrap();
+        let mut v = Interval { start: usize::MAX, end: 0 };
         for &pc in defs[i].iter().chain(&uses[i]) {
-            v.2 = v.2.min(pc);
-            v.3 = v.3.max(pc);
+            v.start = v.start.min(pc);
+            v.end = v.end.max(pc);
         }
         for b in 0..blocks {
             if test(&live_in[b], i) && test(&reach_in[b], i) {
-                v.2 = v.2.min(starts[b]);
-                v.3 = v.3.max(starts[b]);
+                v.start = v.start.min(starts[b]);
+                v.end = v.end.max(starts[b]);
             }
             if test(&live_out[b], i) && test(&reach_out[b], i) {
-                v.3 = v.3.max(starts[b + 1] - 1);
+                v.end = v.end.max(starts[b + 1] - 1);
+            }
+        }
+        result.insert(*id, v);
+    }
+    Ok(result)
+}
+
+fn alignment(v: &Value) -> u8 {
+    match (v.class, v.width) {
+        (_, 1) => 1,
+        (Class::V, 2) => 2,
+        (Class::V, _) => 1,
+        (Class::S, 2 | 3) => 2,
+        (Class::S, _) => 4,
+    }
+}
+
+/// Allocation failure: a message and, for vector pressure, the values live at
+/// the failing point ordered by the end of their intervals (latest first).
+struct Pressure {
+    message: String,
+    live: Vec<u32>,
+}
+impl From<String> for Pressure {
+    fn from(message: String) -> Self {
+        Self { message, live: Vec::new() }
+    }
+}
+impl From<&str> for Pressure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8]) -> Result<(BTreeMap<u32, u8>, Stats), Pressure> {
+    let intervals = lifetimes(ops, values)?;
+    // Coalescing hints: a copy prefers its source's registers, and values
+    // copied into one group prefer consecutive registers.
+    let mut hints: BTreeMap<u32, Vec<(u32, i32)>> = BTreeMap::new();
+    let mut members: BTreeMap<u32, Vec<(u32, i32)>> = BTreeMap::new();
+    // Copies into a group: group -> (source, offset of the source's dword 0, pc).
+    let mut copies: BTreeMap<u32, Vec<(u32, i32, usize)>> = BTreeMap::new();
+    for (pc, o) in ops.iter().enumerate() {
+        if o.op != COPY {
+            continue;
+        }
+        if let (Opnd::Val { id: d, off: od, .. }, Opnd::Val { id: s, off: os, .. }) = (o.f[0], o.f[1]) {
+            copies.entry(d).or_default().push((s, od as i32 - os as i32, pc));
+        }
+        if let (Opnd::Val { id: d, off: od, .. }, Opnd::Val { id: s, off: os, .. }) = (o.f[0], o.f[1]) {
+            if values[d as usize].class == values[s as usize].class && d != s {
+                hints.entry(d).or_default().push((s, os as i32 - od as i32));
+                hints.entry(s).or_default().push((d, od as i32 - os as i32));
+                members.entry(d).or_default().push((s, od as i32 - os as i32));
             }
         }
     }
-    Ok(())
+    // Member x of group g sits at g + dx: home(x) = home(y) + dx - dy.
+    let mut group_of: BTreeMap<u32, (u32, i32)> = BTreeMap::new();
+    for (&g, list) in &members {
+        for &(x, dx) in list {
+            group_of.entry(x).or_insert((g, dx));
+            for &(y, dy) in list {
+                if x != y {
+                    hints.entry(x).or_default().push((y, dx - dy));
+                }
+            }
+        }
+    }
+    let mut order: Vec<u32> = intervals.keys().copied().collect();
+    order.sort_by_key(|id| (intervals[id].start, !fixed.contains_key(id), *id));
+    let mut homes: BTreeMap<u32, u8> = BTreeMap::new();
+    let mut active: Vec<u32> = Vec::new();
+    let mut stats = Stats::default();
+    for id in order {
+        let v = values[id as usize];
+        let iv = &intervals[&id];
+        active.retain(|a| intervals[a].end > iv.start);
+        let limit = if v.class == Class::S { isa::SCALAR_REGISTERS } else { isa::VECTOR_REGISTERS };
+        // A value that dies copying itself into this group at its own place does not conflict.
+        let into = copies.get(&id);
+        let fits = |r: u8, homes: &BTreeMap<u32, u8>| {
+            r as u32 + v.width as u32 <= limit as u32
+                && r % align[id as usize] == 0
+                && !active.iter().any(|a| {
+                    let w = values[*a as usize];
+                    let h = homes[a];
+                    w.class == v.class && r < h + w.width && h < r + v.width
+                        && !into.is_some_and(|list| list.iter().any(|&(s, delta, pc)| {
+                            s == *a && h as i32 == r as i32 + delta && intervals[a].end == pc
+                        }))
+                })
+        };
+        let home = if let Some(&r) = fixed.get(&id) {
+            if !fits(r, &homes) {
+                return Err("launch register conflict".into());
+            }
+            r
+        } else {
+            let hinted = hints.get(&id).into_iter().flatten().find_map(|&(other, delta)| {
+                let h = *homes.get(&other)? as i32 + delta;
+                ((0..=255).contains(&h) && fits(h as u8, &homes)).then_some(h as u8)
+            });
+            // The first member of a group to allocate leaves room for the group.
+            let grouped = || {
+                let &(g, dx) = group_of.get(&id)?;
+                let gw = values[g as usize].width as u32;
+                let ga = align[g as usize] as u32;
+                (0..limit as u32).filter(|b| b % ga == 0 && b + gw <= limit as u32).find_map(|b| {
+                    let free = (0..gw).all(|k| !active.iter().any(|a| {
+                        let w = values[*a as usize];
+                        let h = homes[a] as u32;
+                        w.class == v.class && b + k >= h && b + k < h + w.width as u32
+                    }));
+                    let r = b as i32 + dx;
+                    (free && r >= 0 && fits(r as u8, &homes)).then_some(r as u8)
+                })
+            };
+            match hinted.or_else(grouped).or_else(|| (0..limit).find(|&r| fits(r, &homes))) {
+                Some(r) => r,
+                None => {
+                    let mut live: Vec<u32> = active.iter().copied().chain([id]).filter(|a| values[*a as usize].class == v.class).collect();
+                    live.sort_by_key(|a| std::cmp::Reverse(intervals[a].end));
+                    return Err(Pressure {
+                        message: format!("{} register pressure exceeds {} registers",
+                            if v.class == Class::S { "scalar" } else { "vector" }, limit),
+                        live: if v.class == Class::V { live } else { Vec::new() },
+                    });
+                }
+            }
+        };
+        homes.insert(id, home);
+        active.push(id);
+        let count = if v.class == Class::S { &mut stats.scalar } else { &mut stats.vector };
+        *count = (*count).max(home as u32 + v.width as u32);
+    }
+    Ok((homes, stats))
+}
+
+fn code(x: Opnd, values: &[Value], homes: &BTreeMap<u32, u8>) -> u8 {
+    match x {
+        Opnd::None => 0,
+        Opnd::Val { id, off, .. } => {
+            let r = homes[&id] + off;
+            if values[id as usize].class == Class::S { SCALAR + r } else { r }
+        }
+        Opnd::Phys { code, .. } => code,
+        Opnd::Raw(r) => r,
+        Opnd::Lit(v) => isa::inline_code(v).unwrap_or(LITERAL),
+    }
+}
+
+fn lower(ops: &[Op], values: &[Value], homes: &BTreeMap<u32, u8>) -> Result<Vec<Inst>, String> {
+    let mut out: Vec<Inst> = Vec::new();
+    let mut labels = BTreeMap::new();
+    let mut branches = Vec::new();
+    for o in ops {
+        match o.op {
+            LABEL => {
+                labels.insert(o.imm, out.len());
+            }
+            ENTRY => {}
+            COPY => {
+                let n = o.f[0].n();
+                let dst = code(o.f[0], values, homes);
+                let src = code(o.f[1], values, homes);
+                let lit = if let Opnd::Lit(v) = o.f[1] { v } else { 0 };
+                let scalar = dst >= SCALAR;
+                let from_vector = src < SCALAR && !matches!(o.f[1], Opnd::Lit(_));
+                // Overlapping groups copy away from the overlap.
+                let order: Vec<u8> = if dst > src && !matches!(o.f[1], Opnd::Lit(_)) { (0..n).rev().collect() } else { (0..n).collect() };
+                for k in order {
+                    let (d, a) = (dst + k, if matches!(o.f[1], Opnd::Lit(_)) { src } else { src + k });
+                    if d == a {
+                        continue;
+                    }
+                    let mut i = Inst::new(if !scalar {
+                        op::V_MOV
+                    } else if from_vector {
+                        op::V_READFIRSTLANE
+                    } else {
+                        op::S_MOV
+                    });
+                    i.d = d;
+                    i.a = a;
+                    if a == LITERAL {
+                        i.hi = lit;
+                    }
+                    out.push(i);
+                }
+            }
+            x => {
+                let x = x as u8;
+                let fmt = isa::format(x).unwrap();
+                let kinds = isa::fields(x, o.hi)?;
+                let mut i = Inst { op: x, d: 0, a: 0, b: 0, hi: o.hi };
+                let mut literal = None;
+                for f in 0..4 {
+                    let mut c = code(o.f[f], values, homes);
+                    if o.f[f] == Opnd::None && matches!(kinds[f], Kind::OptS(_) | Kind::OptV(_)) {
+                        c = LITERAL;
+                    }
+                    if let Opnd::Lit(v) = o.f[f] {
+                        if c == LITERAL {
+                            literal = Some(v);
+                        }
+                    }
+                    match f {
+                        0 => i.d = c,
+                        1 => i.a = c,
+                        2 => i.b = c,
+                        _ => {
+                            if matches!(fmt, Format::Salu | Format::Valu | Format::Texture) {
+                                i.hi = (i.hi & !0xff) | c as u32;
+                            }
+                        }
+                    }
+                }
+                if let Some(v) = literal {
+                    i.hi = v;
+                }
+                if i.branch() {
+                    branches.push((out.len(), o.imm));
+                }
+                i.validate().map_err(|e| format!("{}: {e}", isa::disassemble_one(i)))?;
+                out.push(i);
+            }
+        }
+    }
+    if out.last().is_none_or(|i| !matches!(i.op, op::S_ENDPGM | op::S_TRAP | op::S_BRANCH)) {
+        labels.entry(u32::MAX).or_insert(out.len());
+        out.push(Inst::new(op::S_ENDPGM));
+    }
+    for (pc, label) in branches {
+        let t = *labels.get(&label).ok_or("undefined label")?;
+        let t = t.min(out.len() - 1);
+        out[pc].hi = (t as i64 - pc as i64 - 1) as i32 as u32;
+    }
+    Ok(out)
+}
+
+fn dump(title: &str, ops: &[Op]) {
+    if std::env::var_os("APEX_DUMP_MIR").is_some() {
+        eprintln!("-- {title}");
+        for o in ops {
+            let name = o.isa().and_then(|x| isa::NAMES.iter().find(|n| n.0 == x)).map(|n| n.1.to_ascii_lowercase());
+            let name = name.unwrap_or_else(|| ["const", "copy", "label", "entry"][(o.op - 0x100) as usize].into());
+            eprintln!("{name} {:?} hi=0x{:x} imm={}", o.f, o.hi, o.imm);
+        }
+    }
+}
+
+/// The private base pair (launch s20-s21) for spill code, kept for the program.
+fn private_pair(ops: &mut Vec<Op>, values: &mut Vec<Value>, fixed: &mut BTreeMap<u32, u8>, align: &mut Vec<u8>) -> u32 {
+    if let Some((&id, _)) = fixed.iter().find(|(&id, &h)| h == 20 && values[id as usize].class == Class::S && values[id as usize].width == 2) {
+        return id;
+    }
+    values.push(Value { class: Class::S, width: 2 });
+    align.push(2);
+    let id = values.len() as u32 - 1;
+    fixed.insert(id, 20);
+    for k in 0..2 {
+        ops.insert(0, Op { hi: (SCALAR + 20 + k) as u32, ..Op::new(ENTRY, [Opnd::Val { id, off: k, n: 1 }, Opnd::None, Opnd::None, Opnd::None]) });
+    }
+    // Launch values of s20 and s21 read elsewhere become views of the pair.
+    let others: Vec<(u32, u8)> = fixed.iter().filter(|(&o, &h)| o != id && values[o as usize].class == Class::S && (h == 20 || h == 21)).map(|(&o, &h)| (o, h)).collect();
+    for (other, h) in others {
+        fixed.remove(&other);
+        ops.retain(|o| !(o.op == ENTRY && o.f[0].val() == Some(other)));
+        for o in ops.iter_mut() {
+            for f in 0..4 {
+                if let Opnd::Val { id: x, off, n } = o.f[f] {
+                    if x == other {
+                        o.f[f] = Opnd::Val { id, off: off + h - 20, n };
+                    }
+                }
+            }
+        }
+    }
+    id
+}
+
+/// Rewrites every access of `victim` through a short-lived temporary loaded
+/// from and stored to its private slot. Masked writes store only active lanes,
+/// so the slot keeps the masked read-modify-write semantics of the register.
+fn spill(ops: &mut Vec<Op>, values: &mut Vec<Value>, align: &mut Vec<u8>, victim: u32, slot: u32, base: u32) {
+    let width = values[victim as usize].width;
+    let mut out = Vec::with_capacity(ops.len() + 8);
+    let memory = |op: u8, t: u32| Op {
+        hi: ((slot * 4) & 0xfffff) | ((width as u32 - 1) << 20),
+        ..Op::new(op as u16, [Opnd::Val { id: t, off: 0, n: width }, Opnd::None, Opnd::Val { id: base, off: 0, n: 2 }, Opnd::None])
+    };
+    for mut o in ops.drain(..) {
+        let access = o.access();
+        let mut reads = false;
+        let mut writes = false;
+        for f in 0..4 {
+            if o.f[f].val() == Some(victim) {
+                match access[f] {
+                    Some(Access::Def) => {
+                        writes = true;
+                        reads |= o.f[f].n() < width;
+                    }
+                    Some(Access::DefUse) => {
+                        reads = true;
+                        writes = true;
+                    }
+                    _ => reads = true,
+                }
+            }
+        }
+        if !reads && !writes {
+            out.push(o);
+            continue;
+        }
+        values.push(Value { class: Class::V, width });
+        align.push(if width == 2 { 2 } else { 1 });
+        let t = values.len() as u32 - 1;
+        for f in 0..4 {
+            if let Opnd::Val { id, off, n } = o.f[f] {
+                if id == victim {
+                    o.f[f] = Opnd::Val { id: t, off, n };
+                }
+            }
+        }
+        if reads {
+            out.push(memory(op::SCRATCH_LOAD, t));
+        }
+        out.push(o);
+        if writes {
+            out.push(memory(op::SCRATCH_STORE, t));
+        }
+    }
+    *ops = out;
+}
+
+pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) -> Result<(Program, Stats), String> {
+    check(&ops, &values)?;
+    dump("input", &ops);
+    fold_constants(&mut ops, &values);
+    eliminate_dead(&mut ops);
+    let mut fixed = bind_launch(&mut ops, &mut values);
+    let align = coalesce(&mut ops, &values, &mut fixed);
+    eliminate_dead(&mut ops);
+    dump("coalesced", &ops);
+    let mut ops = schedule::schedule(ops, &values);
+    let mut align = align;
+    let mut spilled = 0u32;
+    let mut private_base = None;
+    let (homes, mut stats) = loop {
+        match allocate(&ops, &values, &fixed, &align) {
+            Ok(result) => break result,
+            Err(p) => {
+                // Compute launches spill vector values to private memory.
+                let victim = p.live.iter().copied().find(|&id| {
+                    !fixed.contains_key(&id) && values[id as usize].width <= 4
+                        && ops.iter().any(|o| o.defs().any(|d| d == id))
+                });
+                let Some(victim) = victim.filter(|_| header.stage == isa::Stage::Compute) else {
+                    return Err(p.message + " without spilling");
+                };
+                let base = *private_base.get_or_insert_with(|| private_pair(&mut ops, &mut values, &mut fixed, &mut align));
+                let slot = header.private / 4 + spilled;
+                spilled += values[victim as usize].width as u32;
+                spill(&mut ops, &mut values, &mut align, victim, slot, base);
+            }
+        }
+    };
+    stats.spills = spilled;
+    header.private += 4 * spilled;
+    header.code = lower(&ops, &values, &homes)?;
+    stats.instructions = header.code.len() as u32;
+    header.validate()?;
+    Ok((header, stats))
 }

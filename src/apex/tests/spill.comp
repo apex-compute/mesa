@@ -1,0 +1,22 @@
+#version 450
+// 136 dwords stay live across a uniform branch: allocation spills to private
+// memory and the results must survive the round trip.
+layout(local_size_x = 16) in;
+layout(std430, set = 0, binding = 0) buffer Source { uvec4 src[]; };
+layout(std430, set = 0, binding = 1) buffer Destination { uvec4 dst[]; };
+layout(push_constant) uniform Parameters { uint enable; } p;
+void main()
+{
+   uint l = gl_LocalInvocationIndex;
+   uvec4 a[17], b[17];
+   for (uint k = 0u; k < 17u; k++)
+      a[k] = src[l * 34u + k];
+   for (uint k = 0u; k < 17u; k++)
+      b[k] = src[l * 34u + 17u + k];
+   if (p.enable != 0u) {
+      for (uint k = 0u; k < 17u; k++)
+         dst[l * 34u + k] = b[16u - k] + uvec4(k);
+      for (uint k = 0u; k < 17u; k++)
+         dst[l * 34u + 17u + k] = a[16u - k] ^ uvec4(l);
+   }
+}

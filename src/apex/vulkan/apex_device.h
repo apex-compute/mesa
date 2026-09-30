@@ -54,8 +54,11 @@ struct apex_sampler {
    struct vk_sampler vk;
    uint32_t row[8];
 };
+/* Buffer instructions check each access against bytes; flag bit 0 makes
+ * out-of-range loads read zero and drops out-of-range stores. */
+#define APEX_BUFFER_ROBUST 1u
 struct apex_buffer_descriptor {
-   uint32_t low, high, bytes, reserved;
+   uint32_t low, high, bytes, flags;
 };
 struct apex_image_descriptor {
    uint32_t low, high, width, height, depth, row_stride, slice_stride, reserved;

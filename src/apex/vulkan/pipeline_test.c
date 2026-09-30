@@ -368,7 +368,7 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
    CHECK(p->program.descriptor_count == (multiple ? 2 : 1) && p->program.push_size == (multiple ? 0 : 20));
-   uint64_t padded_private = (uint64_t)word(p->program.code.data + 28) * 16;
+   uint64_t padded_private = (uint64_t)word(p->program.code.data + 24) * 16;
    CHECK(p->program.max_workgroups && p->program.max_workgroups <= 1024);
    CHECK(padded_private * p->program.max_workgroups <= 2097152);
    CHECK(p->program.max_workgroups == 1024 || padded_private * (p->program.max_workgroups + 1) > 2097152);
@@ -875,9 +875,10 @@ int main(int argc, char **argv)
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) == VK_SUCCESS);
    CHECK(mixed[0]);
    struct apex_pipeline *wide = apex_pipeline_from_handle(mixed[0]);
-   CHECK(wide->program.code.size >= 48 && word(wide->program.code.data) == 0x32585041 &&
-         word(wide->program.code.data + 4) == 2 && word(wide->program.code.data + 40) == 32 &&
-         !word(wide->program.code.data + 44));
+   /* Header: magic, compute stage, local size 32x1x1. */
+   CHECK(wide->program.code.size >= 64 && word(wide->program.code.data) == 0x50585041 &&
+         word(wide->program.code.data + 4) == 0 &&
+         word(wide->program.code.data + 16) == (32 | 1 << 9 | 1 << 18));
    if (output) {
       char path[4096];
       CHECK(snprintf(path, sizeof(path), "%s/mesa-wide.apx", output) < sizeof(path));

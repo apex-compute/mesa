@@ -1,217 +1,166 @@
 // SPDX-License-Identifier: MIT
-use crate::isa::{Inst, Reg};
-use std::collections::{BTreeMap, BTreeSet};
+// Pre-allocation list scheduling inside straight-line regions. The core's
+// scoreboard resolves every hazard, so the schedule only orders for latency
+// within register pressure and never pads.
+use crate::isa::{op, Class};
+use crate::mir::{Op, Value, REORDER};
+use std::collections::BTreeMap;
 
-#[derive(Default)]
-struct Scheduler {
-    out: Vec<Inst>,
-    ready: BTreeMap<Reg, usize>,
-    tokens: [Option<Vec<Reg>>; 4],
-    // Alias tag of each live token's access (see mir::compile).
-    tags: [u32; 4],
-    stores: u32,
-    // Cycle whose edge writes each scalar register (see scalar_port1_reads).
-    edges: BTreeMap<Reg, usize>,
+/// Issue-to-dependent latency in cycles (architecture: FMA-class results reach
+/// a dependent about 12 cycles later; loads and texture use nominal hits).
+pub fn latency(o: &Op) -> u32 {
+    let Some(x) = o.isa() else { return 1 };
+    match x {
+        op::V_MUL_LO..=op::V_MUL_HI_I => 6,
+        op::V_ADD_F..=op::V_LDEXP | op::V_CVT_F_U..=op::V_CUBEMA | op::V_INTERP | op::V_INTERP_FLAT => 12,
+        op::V_RCP..=op::V_COS => 16,
+        op::V_CMP_F | op::V_CMP_CLASS => 12,
+        op::V_READLANE..=op::V_MBCNT => 4,
+        0x60..=0xab => 4,
+        op::S_LOAD | op::S_BUFFER_LOAD => 24,
+        op::GLOBAL_LOAD | op::BUFFER_LOAD | op::SCRATCH_LOAD => 80,
+        op::SHARED_LOAD | op::SHARED_ATOMIC => 24,
+        op::IMAGE_SAMPLE | op::IMAGE_FETCH => 60,
+        _ => 2,
+    }
 }
-impl Scheduler {
-    fn live(&self) -> u32 {
-        self.tokens
-            .iter()
-            .enumerate()
-            .fold(0, |v, (t, r)| v | if r.is_some() { 1 << t } else { 0 })
-    }
-    fn wait(&mut self, mask: u32) {
-        if mask == 0 {
-            return;
+
+/// Registers above which a candidate that grows pressure waits.
+const VECTOR_PRESSURE: i32 = 96;
+const SCALAR_PRESSURE: i32 = 64;
+
+pub fn schedule(ops: Vec<Op>, values: &[Value]) -> Vec<Op> {
+    let mut out = Vec::with_capacity(ops.len());
+    let mut region = Vec::new();
+    for o in ops {
+        if o.boundary() {
+            schedule_region(std::mem::take(&mut region), values, &mut out);
+            out.push(o);
+        } else {
+            region.push(o);
         }
-        self.out.push(Inst {
-            imm: mask,
-            ..Inst::new(3)
-        });
-        for t in 0..4 {
-            if mask & (1 << t) != 0 {
-                self.tokens[t] = None;
+    }
+    schedule_region(region, values, &mut out);
+    out
+}
+
+fn schedule_region(ops: Vec<Op>, values: &[Value], out: &mut Vec<Op>) {
+    let n = ops.len();
+    if n < 2 {
+        out.extend(ops);
+        return;
+    }
+    let mut preds: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
+    let mut last_def: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut readers: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut last_side: Option<usize> = None;
+    let mut loads_since: Vec<usize> = Vec::new();
+    for (i, o) in ops.iter().enumerate() {
+        for u in o.uses() {
+            if let Some(&d) = last_def.get(&u) {
+                preds[i].push((d, latency(&ops[d])));
             }
         }
-        self.stores &= !mask;
-    }
-    fn drain(&mut self) {
-        self.wait(self.live());
-        let end = self.ready.values().copied().max().unwrap_or(0);
-        // Past every scalar write edge's port-1 hazard cycle as well.
-        let edge = self.edges.values().map(|e| e + 2).max().unwrap_or(0);
-        while self.out.len() < end.max(edge) {
-            self.out.push(Inst::new(0));
-        }
-        self.ready.clear();
-        self.edges.clear();
-    }
-    fn issue(&mut self, mut i: Inst, tag: u32) {
-        let reads = i.regs(false);
-        let writes = i.regs(true);
-        let touched: Vec<_> = reads.iter().chain(&writes).copied().collect();
-        let mut wait = 0;
-        for (t, r) in self.tokens.iter().enumerate() {
-            if r.as_ref()
-                .is_some_and(|r| r.iter().any(|r| touched.contains(r)))
-            {
-                wait |= 1 << t;
+        for d in o.defs() {
+            if let Some(&p) = last_def.get(&d) {
+                preds[i].push((p, 1));
+            }
+            for &r in readers.get(&d).into_iter().flatten() {
+                if r != i {
+                    preds[i].push((r, 0));
+                }
             }
         }
-        // Preserve potentially aliasing memory order; independent reads overlap,
-        // as do accesses to distinct words of one tagged group.
-        if i.asynchronous() {
-            let distinct = (0..4)
-                .filter(|&t| tag != 0 && self.tags[t] >> 8 == tag >> 8 && self.tags[t] != tag)
-                .fold(0, |m, t| m | 1 << t);
-            if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57 | 0x59) {
-                wait |= self.live() & !distinct;
+        let memory = o.side_effect() || (o.load() && o.flags & REORDER == 0);
+        if memory {
+            if let Some(s) = last_side {
+                preds[i].push((s, 0));
+            }
+            if o.side_effect() {
+                for &l in &loads_since {
+                    preds[i].push((l, 0));
+                }
+                loads_since.clear();
+                last_side = Some(i);
             } else {
-                wait |= self.stores & !distinct;
+                loads_since.push(i);
             }
         }
-        self.wait(wait);
-        if i.control() || i.op == 6 {
-            self.drain();
+        for u in o.uses() {
+            readers.entry(u).or_default().push(i);
         }
-        let ready = touched
+        for d in o.defs() {
+            last_def.insert(d, i);
+            readers.remove(&d);
+        }
+    }
+    let mut succs: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
+    for (i, p) in preds.iter().enumerate() {
+        for &(j, l) in p {
+            succs[j].push((i, l));
+        }
+    }
+    // Critical path to the region end.
+    let mut height = vec![0u32; n];
+    for i in (0..n).rev() {
+        height[i] = latency(&ops[i]) + succs[i].iter().map(|&(s, l)| height[s] + l.saturating_sub(latency(&ops[i]))).max().unwrap_or(0);
+    }
+    // Remaining uses per value inside the region, for pressure.
+    let mut remaining: BTreeMap<u32, usize> = BTreeMap::new();
+    for o in &ops {
+        for u in o.uses() {
+            *remaining.entry(u).or_default() += 1;
+        }
+    }
+    let class = |id: u32| (values[id as usize].class == Class::V) as usize;
+    let width = |id: u32| values[id as usize].width as i32;
+    let mut live: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut pressure = [0i32; 2];
+    let mut waiting: Vec<usize> = preds.iter().map(|p| p.len()).collect();
+    let mut ready_at = vec![0u32; n];
+    let mut ready: Vec<usize> = (0..n).filter(|&i| waiting[i] == 0).collect();
+    let mut cycle = 0u32;
+    let mut slots: Vec<Option<Op>> = ops.into_iter().map(Some).collect();
+    while !ready.is_empty() {
+        let delta = |i: usize, k: usize, slots: &Vec<Option<Op>>, remaining: &BTreeMap<u32, usize>, live: &std::collections::BTreeSet<u32>| -> i32 {
+            let o = slots[i].as_ref().unwrap();
+            let grow: i32 = o.defs().filter(|&d| class(d) == k && !live.contains(&d)).map(width).sum();
+            let free: i32 = o.uses().filter(|&u| class(u) == k && remaining.get(&u) == Some(&1)).map(width).sum();
+            grow - free
+        };
+        let pick = *ready
             .iter()
-            .filter_map(|r| self.ready.get(r))
-            .copied()
-            .max()
-            .unwrap_or(0);
-        while self.out.len() < ready {
-            self.out.push(Inst::new(0));
-        }
-        let port1 = i.scalar_port1_reads();
-        while port1.iter().any(|r| self.edges.get(r).is_some_and(|&e| e + 1 == self.out.len())) {
-            self.out.push(Inst::new(0));
-        }
-        if i.asynchronous() {
-            if self.live() == 15 {
-                self.wait(1);
-            }
-            let t = self.tokens.iter().position(Option::is_none).unwrap();
-            i.c = t as u8;
-            self.tokens[t] = Some(writes.clone());
-            self.tags[t] = tag;
-            if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57 | 0x59) {
-                self.stores |= 1 << t;
-            }
-        } else {
-            for r in writes {
-                self.ready.insert(r, self.out.len() + i.latency());
-                if r.0 == crate::isa::Class::S {
-                    self.edges.insert(r, self.out.len() + i.latency());
-                }
+            .max_by_key(|&&i| {
+                let limits = [SCALAR_PRESSURE, VECTOR_PRESSURE];
+                let over = (0..2).map(|k| {
+                    let d = delta(i, k, &slots, &remaining, &live);
+                    (pressure[k] + d > limits[k] && d > 0) as u32
+                }).sum::<u32>();
+                (std::cmp::Reverse(over), ready_at[i] <= cycle, height[i], std::cmp::Reverse(i))
+            })
+            .unwrap();
+        ready.retain(|&i| i != pick);
+        let o = slots[pick].take().unwrap();
+        cycle = cycle.max(ready_at[pick]) + 1;
+        for u in o.uses() {
+            let r = remaining.get_mut(&u).unwrap();
+            *r -= 1;
+            if *r == 0 && live.remove(&u) {
+                pressure[class(u)] -= width(u);
             }
         }
-        self.out.push(i);
+        for d in o.defs() {
+            if remaining.get(&d).is_some_and(|&r| r > 0) && live.insert(d) {
+                pressure[class(d)] += width(d);
+            }
+        }
+        for &(s, l) in &succs[pick] {
+            ready_at[s] = ready_at[s].max(cycle + l);
+            waiting[s] -= 1;
+            if waiting[s] == 0 {
+                ready.push(s);
+            }
+        }
+        out.push(o);
     }
-}
-
-pub fn schedule(input: &[Inst]) -> Result<Vec<Inst>, String> {
-    schedule_tagged(input, &BTreeMap::new())
-}
-
-/// Schedules with alias tags for global accesses, keyed by input index.
-pub fn schedule_tagged(input: &[Inst], tags: &BTreeMap<usize, u32>) -> Result<Vec<Inst>, String> {
-    let targets: BTreeSet<usize> = input
-        .iter()
-        .filter(|i| matches!(i.op, 4 | 5))
-        .map(|i| i.imm as usize)
-        .collect();
-    if targets.iter().any(|&t| t >= input.len()) {
-        return Err("branch target out of input".into());
-    }
-    let mut s = Scheduler::default();
-    let mut map = vec![0; input.len()];
-    let mut branches = Vec::new();
-    for (pc, &i) in input.iter().enumerate() {
-        i.validate()?;
-        if i.op == 3 {
-            return Err("MIR scheduler owns token waits".into());
-        }
-        if targets.contains(&pc) {
-            s.drain();
-        }
-        map[pc] = s.out.len();
-        if !i.bank_legal() {
-            return Err("allocator left bank conflict".into());
-        }
-        s.issue(i, tags.get(&pc).copied().unwrap_or(0));
-        if matches!(i.op, 4 | 5) {
-            branches.push(s.out.len() - 1);
-        }
-    }
-    for pc in branches {
-        s.out[pc].imm =
-            u32::try_from(map[s.out[pc].imm as usize]).map_err(|_| "code size overflow")?;
-    }
-    Ok(s.out)
-}
-
-// Independent static schedule checker. Branch boundaries must be quiescent;
-// thus the linear check also covers backward edges without assuming trip counts.
-pub fn validate(code: &[Inst]) -> Result<(), String> {
-    let targets: BTreeSet<_> = code
-        .iter()
-        .filter(|i| matches!(i.op, 4 | 5))
-        .map(|i| i.imm as usize)
-        .collect();
-    if targets.iter().any(|&t| t >= code.len())
-        || code.last().is_none_or(|i| !matches!(i.op, 1 | 2 | 4))
-    {
-        return Err("branch/fallthrough outside program".into());
-    }
-    let mut pending: BTreeMap<Reg, usize> = BTreeMap::new();
-    let mut tokens: [Option<Vec<Reg>>; 4] = Default::default();
-    for (cycle, &i) in code.iter().enumerate() {
-        i.validate()?;
-        if !i.bank_legal() {
-            return Err("bank over-subscription".into());
-        }
-        let live = || tokens.iter().any(Option::is_some);
-        if (i.control() || i.op == 6 || targets.contains(&cycle))
-            && (live() || pending.values().any(|&r| r > cycle))
-        {
-            return Err(format!("non-quiescent boundary {cycle}"));
-        }
-        if i.op == 3 {
-            for t in 0..4 {
-                if i.imm & (1 << t) != 0 {
-                    if tokens[t].take().is_none() {
-                        return Err("wait on dead token".into());
-                    }
-                }
-            }
-            continue;
-        }
-        if i.scalar_port1_reads().iter().any(|r| pending.get(r).is_some_and(|&t| t + 1 == cycle)) {
-            return Err(format!("scalar port-1 write-edge read at {cycle}"));
-        }
-        let touched: Vec<_> = i.regs(false).into_iter().chain(i.regs(true)).collect();
-        for r in touched {
-            if pending.get(&r).is_some_and(|&t| t > cycle) {
-                return Err(format!("RAW/WAW at {cycle}"));
-            }
-            if tokens.iter().flatten().any(|v| v.contains(&r)) {
-                return Err("unwaited async result".into());
-            }
-        }
-        if i.asynchronous() {
-            if tokens[i.c as usize].is_some() {
-                return Err("token reuse".into());
-            }
-            tokens[i.c as usize] = Some(i.regs(true));
-        } else {
-            for r in i.regs(true) {
-                pending.insert(r, cycle + i.latency());
-            }
-        }
-    }
-    if tokens.iter().any(Option::is_some) {
-        return Err("live tokens at code end".into());
-    }
-    Ok(())
 }

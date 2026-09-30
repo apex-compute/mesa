@@ -79,37 +79,6 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
-/* Accesses component c of a lowered buffer operation at start. */
-static nir_def *
-buffer_component(nir_builder *b, nir_intrinsic_instr *i, nir_def *start, unsigned c)
-{
-   nir_def *address = nir_build_addr_iadd_imm(b, start, nir_address_format_2x32bit_global,
-                                              nir_var_mem_global, c * 4);
-   switch (i->intrinsic) {
-   case nir_intrinsic_store_ssbo:
-      nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), address,
-                            .align_mul = 4, .access = nir_intrinsic_access(i));
-      return NULL;
-   case nir_intrinsic_ssbo_atomic_swap:
-      return nir_global_atomic_swap_2x32(b, 32, address, i->src[2].ssa, i->src[3].ssa,
-         .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
-   case nir_intrinsic_ssbo_atomic:
-      return nir_global_atomic_2x32(b, 32, address, i->src[2].ssa,
-         .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
-   default:
-      return nir_load_global_2x32(b, 1, 32, address, .align_mul = 4, .access = nir_intrinsic_access(i));
-   }
-}
-
-/* Whether width bytes at the offset where left = range - offset bytes remain
- * fit in the range. Checking offset < range first keeps left from wrapping, and
- * leaves only constants loop-invariant. */
-static nir_def *
-buffer_inside(nir_builder *b, nir_def *started, nir_def *left, unsigned width)
-{
-   return nir_iand(b, started, nir_uge_imm(b, left, width));
-}
-
 static bool
 lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
@@ -133,51 +102,17 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
       return false;
    }
    b->cursor = nir_before_instr(&i->instr);
-   nir_def *row = nir_imul_imm(b, i->src[store ? 1 : 0].ssa, sizeof(union apex_descriptor));
-   nir_def *words[3];
-   /* Submission metadata is immutable; every slot, including the null
-    * sentinel, has backing independent of the application's resource range. */
-   for (unsigned c = 0; c < 3; c++)
-      words[c] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_iadd_imm(b, row, c * 4),
-         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
-   if (size) {
-      nir_def_rewrite_uses(&i->def, words[2]);
-      nir_instr_remove(&i->instr);
-      return true;
-   }
-   nir_def *offset = i->src[store ? 2 : 1].ssa;
-   nir_def *start = nir_build_addr_iadd(b, nir_vec2(b, words[0], words[1]),
-      nir_address_format_2x32bit_global, nir_var_mem_global, offset);
-   nir_def *started = nir_ult(b, offset, words[2]), *left = nir_isub(b, words[2], offset);
-   unsigned mask = store ? nir_intrinsic_write_mask(i) : BITFIELD_MASK(i->num_components);
-   unsigned count = util_last_bit(mask);
-   nir_def *whole[4], *values[4];
-   /* A vector wholly inside the range takes one branch-free path. Others,
-    * including the zero-range null sentinel, bound each component. */
-   if (count > 1) {
-      nir_push_if(b, buffer_inside(b, started, left, count * 4));
-      u_foreach_bit(c, mask)
-         whole[c] = buffer_component(b, i, start, c);
-      nir_push_else(b, NULL);
-   }
-   u_foreach_bit(c, mask) {
-      nir_push_if(b, buffer_inside(b, started, left, c * 4 + 4));
-      nir_def *loaded = buffer_component(b, i, start, c);
-      nir_push_else(b, NULL);
-      nir_def *zero = nir_imm_int(b, 0);
-      nir_pop_if(b, NULL);
-      if (!store)
-         values[c] = nir_if_phi(b, loaded, zero);
-   }
-   if (count > 1) {
-      nir_pop_if(b, NULL);
-      if (!store)
-         for (unsigned c = 0; c < count; c++)
-            values[c] = nir_if_phi(b, whole[c], values[c]);
-   }
-   if (!store)
-      nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
-   nir_instr_remove(&i->instr);
+   nir_src *index = &i->src[store ? 1 : 0];
+   /* The table row holds the buffer descriptor {GPUVA, bytes, flags}; buffer
+    * instructions check each access against it. Every slot, including the
+    * null sentinel, is backed independently of the application's range. */
+   nir_def *row = nir_imul_imm(b, index->ssa, sizeof(union apex_descriptor));
+   nir_def *descriptor = nir_load_ssbo(b, 4, 32, nir_imm_int(b, 0), row, .align_mul = 16,
+      .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
+   if (size)
+      nir_def_replace(&i->def, nir_channel(b, descriptor, 2));
+   else
+      nir_src_rewrite(index, descriptor);
    return true;
 }
 
@@ -230,13 +165,12 @@ lower_workgroup(nir_builder *b, nir_intrinsic_instr *i, void *data)
       replacement = nir_load_var(b, ctx->grid);
       break;
    case nir_intrinsic_load_workgroup_id:
+      /* The launch registers carry the native workgroup, base included. */
+      if (i == ctx->native)
+         return false;
       replacement = nir_load_var(b, ctx->id);
       break;
    case nir_intrinsic_load_base_workgroup_id:
-      /* SPIR-V lowering added the native base to WorkgroupID; the linear
-       * workgroup already includes it. */
-      if (i == ctx->native)
-         return false;
       replacement = nir_imm_zero(b, 3, 32);
       break;
    case nir_intrinsic_load_global_invocation_id: {
@@ -291,7 +225,7 @@ wrap_workgroups(const struct apex_program *program, nir_shader *nir)
    end = nir_bcsel(b, apex_predicate_discarded(b, trailer), nir_imm_int(b, 0), end);
    nir_store_var(b, ctx.grid, grid, 0x7);
    nir_variable *linear = nir_local_variable_create(impl, glsl_uint_type(), "linear");
-   nir_def *native = nir_load_base_workgroup_id(b, 32);
+   nir_def *native = nir_load_workgroup_id(b);
    ctx.native = nir_def_as_intrinsic(native);
    nir_store_var(b, linear, nir_iadd(b, words[0], nir_channel(b, native, 0)), 1);
    nir_loop *loop = nir_push_loop(b);
@@ -430,12 +364,11 @@ apex_program_compile(struct vk_device *device, struct apex_program *program, nir
    if (apex_from_nir(nir, &program->code))
       return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex compile: %s", program->code.diagnostic);
-   uint32_t private_bytes, instructions, vector;
-   memcpy(&private_bytes, program->code.data + 28, sizeof(private_bytes));
-   memcpy(&instructions, program->code.data + 8, sizeof(instructions));
-   memcpy(&vector, program->code.data + 20, sizeof(vector));
-   mesa_logd("Apex program: %u instructions, v%u, %u private bytes/lane, %u invocations",
-             instructions, vector, private_bytes, (unsigned)invocations);
+   uint32_t private_bytes;
+   memcpy(&private_bytes, program->code.data + 24, sizeof(private_bytes));
+   mesa_logd("Apex program: %u instructions, s%u v%u, %u spills, %u private bytes/lane, %u invocations",
+             program->code.instructions, program->code.scalar, program->code.vector,
+             program->code.spills, util_le32_to_cpu(private_bytes), (unsigned)invocations);
    const char *dump = os_get_option("APEX_DUMP_PROGRAMS");
    if (dump) {
       static unsigned serial;

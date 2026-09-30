@@ -3590,7 +3590,8 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
          return false;
       uint64_t va = buffer->memory->storage->bo.va + buffer->offset + info->offset + dynamic;
       rows->buffer = (struct apex_buffer_descriptor) {
-         util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range), 0,
+         util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range),
+         util_cpu_to_le32(APEX_BUFFER_ROBUST),
       };
       return true;
    }
@@ -3634,6 +3635,9 @@ write_table(struct apex_device *device, const struct apex_dispatch *dispatch, vo
    union apex_descriptor *rows = calloc(1, bytes);
    if (!rows)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   /* Null and sentinel rows are empty robust buffers; image rows overwrite. */
+   for (unsigned r = 0; r <= program->descriptor_count; r++)
+      rows[r].buffer.flags = util_cpu_to_le32(APEX_BUFFER_ROBUST);
    memcpy((uint8_t *)rows + push_offset, dispatch->push, program->push_size);
    struct apex_dispatch_parameters *parameters = (void *)((uint8_t *)rows + parameters_offset);
    for (unsigned axis = 0; axis < 3; axis++) {

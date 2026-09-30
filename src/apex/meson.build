@@ -3,14 +3,18 @@
 add_languages('rust', required : true)
 apex_rust = import('rust')
 apex_rs = static_library('apex_rs', 'lib.rs', rust_abi : 'c')
-apex_nir = static_library('apex_nir', ['from_nir.c', 'float.c'],
+apex_nir = static_library('apex_nir', ['from_nir.c'],
   include_directories : [inc_include, inc_src],
   dependencies : [idep_nir, idep_mesautil],
 )
-executable('apex-compile', 'main.c',
+apex_spirv = static_library('apex_spirv', ['spirv.c'],
   include_directories : [inc_include, inc_src],
   dependencies : [idep_vtn, idep_nir, idep_mesautil, dependency('SPIRV-Tools')],
-  link_with : [apex_nir, apex_rs],
+)
+executable('apex-compile', 'main.c',
+  include_directories : [inc_include, inc_src],
+  dependencies : [idep_mesautil],
+  link_with : [apex_spirv, apex_nir, apex_rs],
   link_language : 'cpp',
   install : false,
 )
@@ -23,4 +27,26 @@ apex_compiler_test = executable('apex-compiler-test', 'compiler_test.c',
   install : false,
 )
 test('apex-compiler', apex_compiler_test, suite : ['apex'])
+# Benchmark, triangle and compositor shaders plus the captured GNOME Shell
+# shaders run on the ISA model under the zero-spill gate.
+apex_test_shaders = []
+foreach s : ['vulkan/bench.comp', 'vulkan/bench.vert', 'vulkan/bench.frag',
+             'vulkan/triangle.vert', 'vulkan/triangle.frag', 'tests/compositor.frag',
+             'tests/features.comp', 'tests/spill.comp', 'tests/discard.frag', 'tests/demote.frag']
+  apex_test_shaders += custom_target('apex-test-' + s.underscorify(),
+    input : s, output : '@PLAINNAME@.spv',
+    command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
+               '@INPUT@', '-o', '@OUTPUT@'],
+  )
+endforeach
+apex_shader_test = executable('apex-shader-test', 'shader_test.c',
+  include_directories : [inc_include, inc_src],
+  dependencies : [idep_mesautil, dep_m],
+  link_with : [apex_spirv, apex_nir, apex_rs],
+  link_language : 'cpp',
+  install : false,
+)
+test('apex-shaders', apex_shader_test,
+  args : [meson.current_build_dir(), meson.current_source_dir() / 'tests/gnome'],
+  depends : apex_test_shaders, suite : ['apex'])
 subdir('vulkan')

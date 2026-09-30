@@ -1,0 +1,56 @@
+#version 450
+// Compiler feature coverage on the ISA model: divergent loops with break and
+// continue, subgroup operations, shared memory across four waves, atomics,
+// dynamically indexed private arrays, 64-bit integers, division and exact
+// float operations. apex-shader-test holds the host reference.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Out { uint o[]; };
+layout(std430, set = 0, binding = 1) buffer Counter { uint counter; uint hist[16]; };
+layout(push_constant) uniform Parameters { uint limit; } p;
+shared uint tile[64];
+void main()
+{
+   uint l = gl_LocalInvocationIndex, g = gl_GlobalInvocationID.x;
+   uint base = g * 16u;
+   uint acc = 0u;
+   for (uint k = 0u; k < p.limit; k++) {
+      if ((k + l) % 3u == 0u)
+         continue;
+      acc += k * (l + 1u);
+      if (acc > 500u + l * 7u)
+         break;
+   }
+   o[base + 0u] = acc;
+   o[base + 1u] = subgroupAdd(l);
+   o[base + 2u] = subgroupExclusiveAdd(l + 1u);
+   o[base + 3u] = subgroupBallot((l & 3u) == 1u).x;
+   o[base + 4u] = subgroupShuffle(l * 3u, (gl_SubgroupInvocationID + 5u) & 15u);
+   o[base + 5u] = subgroupAll(l < 60u) ? 1u : 0u;
+   o[base + 6u] = subgroupBroadcastFirst(l);
+   tile[l] = l * l + gl_WorkGroupID.x;
+   barrier();
+   o[base + 7u] = tile[63u - l] + tile[(l + 17u) & 63u];
+   uint old = atomicAdd(counter, 1u);
+   atomicAdd(hist[l & 15u], l);
+   o[base + 8u] = old < 64u * gl_NumWorkGroups.x ? 1u : 0u;
+   uint arr[8];
+   for (uint k = 0u; k < 8u; k++)
+      arr[k] = k * 11u + l;
+   o[base + 9u] = arr[(l * 5u) & 7u] + arr[(l + g) & 7u];
+   uint64_t big = uint64_t(l + 1u) * 0x100000001ul + 12345ul;
+   o[base + 10u] = uint(big >> 17) ^ uint(big >> 40);
+   o[base + 11u] = (l * 977u + 13u) / (l % 7u + 1u) + (l * 31u) % 10u;
+   int s = int(l) - 32;
+   o[base + 12u] = uint(s / 5) + uint(s % 5) * 100u;
+   float x = float(l) * 0.25 - 5.0;
+   o[base + 13u] = floatBitsToUint(floor(x) + abs(x) * 0.5 + min(x, 1.0) + max(x, -2.0));
+   o[base + 14u] = uint(clamp(x, -1.0, 1.0) * 1000.0 + 5000.0);
+   o[base + 15u] = uint(findMSB(l * 1234u + 1u)) | uint(bitCount(l * 77u)) << 8 |
+                   uint(findLSB(l + 64u)) << 16 | (bitfieldReverse(l) >> 24) << 24;
+}

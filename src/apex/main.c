@@ -1,11 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex.h"
-#include "compiler/nir/nir.h"
-#include "compiler/spirv/nir_spirv.h"
-#include "compiler/spirv/spirv.h"
-#include "compiler/spirv/spirv_info.h"
 #include "util/u_math.h"
-#include <spirv-tools/libspirv.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +11,7 @@ int main(int argc, char **argv)
       return apex_tool(argv[1], argv[2], argv[3]);
    if (argc != 3) {
       fprintf(stderr, "usage: apex-compile input.spv output.apx\n"
-              "       apex-compile --mir|--assemble|--disassemble|--validate input output\n");
+              "       apex-compile --assemble|--disassemble|--validate input output\n");
       return 1;
    }
    FILE *f = fopen(argv[1], "rb");
@@ -29,46 +24,18 @@ int main(int argc, char **argv)
    if (!words) { fclose(f); return 1; }
    size_t got = fread(words, 1, size, f);
    fclose(f);
-   if (got != (size_t)size || words[0] != SpvMagicNumber) { free(words); return 1; }
-   spv_context context = spvContextCreate(SPV_ENV_VULKAN_1_1);
-   spv_diagnostic diagnostic = NULL;
-   spv_result_t valid = spvValidateBinary(context, words, size / 4, &diagnostic);
-   if (valid != SPV_SUCCESS) {
-      if (diagnostic) fprintf(stderr, "apex: invalid SPIR-V: %s\n", diagnostic->error);
-   }
-   spvDiagnosticDestroy(diagnostic);
-   spvContextDestroy(context);
-   if (valid != SPV_SUCCESS) { free(words); return 1; }
-   glsl_type_singleton_init_or_ref();
-   struct spirv_capabilities caps = {
-      .Shader = true, .GroupNonUniform = true, .GroupNonUniformBallot = true,
-      .GroupNonUniformShuffle = true, .ShaderClockKHR = true, .Int64 = true,
-      .PhysicalStorageBufferAddresses = true,
-   };
-   struct spirv_to_nir_options spv = {
-      .environment = NIR_SPIRV_VULKAN, .capabilities = &caps,
-      .ssbo_addr_format = nir_address_format_32bit_index_offset,
-      .ubo_addr_format = nir_address_format_32bit_index_offset,
-      .shared_addr_format = nir_address_format_32bit_offset,
-      .phys_ssbo_addr_format = nir_address_format_64bit_global,
-      .skip_os_break_in_debug_build = true,
-   };
-   nir_shader *nir = spirv_to_nir(words, size / 4, NULL, MESA_SHADER_COMPUTE,
-                                "main", &spv, &apex_nir_options);
+   if (got != (size_t)size) { free(words); return 1; }
+   struct apex_compile_result compiled;
+   int result = apex_compile_spirv(words, size / 4, &compiled);
    free(words);
-   struct apex_compile_result compiled = {0};
-   int result = nir ? apex_from_nir(nir, &compiled) : 1;
-   ralloc_free(nir);
-   glsl_type_singleton_decref();
    if (result) {
-      if (compiled.diagnostic[0])
-         fprintf(stderr, "apex: %s\n", compiled.diagnostic);
+      fprintf(stderr, "apex: %s\n", compiled.diagnostic);
    } else {
-      uint32_t h[10];
+      uint32_t h[16];
       memcpy(h, compiled.data, sizeof(h));
-      fprintf(stderr, "apex: %u instructions, s%u v%u, shared %u, private %u/lane\n",
-              util_le32_to_cpu(h[2]), util_le32_to_cpu(h[4]), util_le32_to_cpu(h[5]),
-              util_le32_to_cpu(h[6]), util_le32_to_cpu(h[7]));
+      fprintf(stderr, "apex: %u instructions, s%u v%u, %u spills, shared %u, private %u/lane\n",
+              compiled.instructions, compiled.scalar, compiled.vector, compiled.spills,
+              util_le32_to_cpu(h[5]), util_le32_to_cpu(h[6]));
       f = fopen(argv[2], "wb");
       if (!f) {
          perror(argv[2]);

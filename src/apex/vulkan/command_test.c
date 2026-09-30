@@ -70,7 +70,7 @@ image_exec(struct drm_apex_vm_exec *r)
        * two-row sampled layout (image base, level-0 extent, view range,
        * format words, view type, samples, border swizzle: R32 reads (R, 0, 0, 1)). Row 5: the zero sentinel. */
       CHECK(((uint64_t)util_le32_to_cpu(words[1]) << 32 | util_le32_to_cpu(words[0])) == base + 4224);
-      for (unsigned i = 2; i < 8; i++) CHECK(util_le32_to_cpu(words[i]) == (i == 2 ? 768 : 0));
+      for (unsigned i = 2; i < 8; i++) CHECK(util_le32_to_cpu(words[i]) == (i == 2 ? 768 : i == 3));
       uint32_t format[3];
       CHECK(apex_format_encode(VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT, &(VkComponentMapping){0}, format));
       const uint32_t views[2][4] = {{0, 1, 2, 2}, {1, 1, 1, 2}};
@@ -81,7 +81,7 @@ image_exec(struct drm_apex_vm_exec *r)
             VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 0 | APEX_SWIZZLE_0 << 3 | APEX_SWIZZLE_0 << 6 | APEX_SWIZZLE_1 << 9};
          for (unsigned i = 0; i < 16; i++) CHECK(util_le32_to_cpu(image[i]) == want[i]);
       }
-      for (unsigned i = 40; i < 48; i++) CHECK(!words[i]);
+      for (unsigned i = 40; i < 48; i++) CHECK(util_le32_to_cpu(words[i]) == (i == 43)); /* sentinel */
       for (unsigned i = 0; i < 4; i++) CHECK(words[48 + i] == 0xc0010000 + i);
    } else if (d == 1 || d == 5) {
       /* Internal clear job: texels only, row padding untouched. */
@@ -217,18 +217,21 @@ drm_ioctl(unsigned long request, void *arg)
       CHECK(r->data_va == mock.gems[table].va && mock.gems[table].live);
       CHECK(mock.gems[table].uploads == 1);
       const uint32_t *rows = (const void *)mock.gems[table].local;
-      for (unsigned i = 0; i < 8; i++) CHECK(!rows[i]); /* unused binding 0 */
+      /* Unused binding 0: an empty robust buffer row. */
+      for (unsigned i = 0; i < 8; i++) CHECK(rows[i] == (i == 3 ? util_cpu_to_le32(1) : 0));
       const uint32_t *row = rows + 8; /* shader binding 7, element 0 */
       uint64_t va = (uint64_t)util_le32_to_cpu(row[1]) << 32 | util_le32_to_cpu(row[0]);
       CHECK(va == mock.gems[1].va + starts[d] * 4);
       CHECK(util_le32_to_cpu(row[2]) == sizeof(mock.payload));
-      for (unsigned i = 3; i < 8; i++) CHECK(!row[i]);
+      CHECK(util_le32_to_cpu(row[3]) == 1);
+      for (unsigned i = 4; i < 8; i++) CHECK(!row[i]);
       const uint32_t *extra = rows + 16;
       uint64_t addr = (uint64_t)util_le32_to_cpu(extra[1]) << 32 | util_le32_to_cpu(extra[0]);
       CHECK(addr == mock.gems[1].va + (d == 1 ? 48 : 1088) * 4);
       CHECK(util_le32_to_cpu(extra[2]) == sizeof(mock.payload));
-      for (unsigned i = 3; i < 8; i++) CHECK(!extra[i]);
-      for (unsigned i = 24; i < 56; i++) CHECK(!rows[i]); /* unused set + sentinel */
+      for (unsigned i = 3; i < 8; i++) CHECK(util_le32_to_cpu(extra[i]) == (i == 3));
+      /* Unused set and sentinel: empty robust buffer rows. */
+      for (unsigned i = 24; i < 56; i++) CHECK(util_le32_to_cpu(rows[i]) == (i % 8 == 3));
       CHECK(mock.pipelines[p]->program.push_size == 256);
       for (unsigned i = 0; i < 64; i++) {
          uint32_t expected = i < 4 ? 0 : 0xa5100000 + i * 37;
@@ -473,7 +476,7 @@ run(struct vk_physical_device *physical, const uint32_t *spirv, size_t size, int
       CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipelines[i]) == VK_SUCCESS);
       mock.pipelines[i] = apex_pipeline_from_handle(pipelines[i]);
       if (i < 2 && invocations[0] != 16)
-         CHECK(!memcmp(mock.pipelines[i]->program.code.data, "APX2", 4));
+         CHECK(!memcmp(mock.pipelines[i]->program.code.data, "APXP", 4));
    }
    v->DestroyShaderModule(dev, module, NULL);
    const VkMemoryAllocateInfo mem_info = {
@@ -1247,7 +1250,7 @@ int main(int argc, char **argv)
          run(&physical, spirv, size, fd, -1, APEX_TRANSPORT_DRM, false, false);
       }
       invocations[0] = invocations[1] = 16;
-      printf("PASS Apex Mesa APX2 %s: 17/32/256 invocations, 12 dispatches, later-wave values and retained tails, 2048 words/guards\n",
+      printf("PASS Apex Mesa APXP %s: 17/32/256 invocations, 12 dispatches, later-wave values and retained tails, 2048 words/guards\n",
              multiwave ? "DRM GPUVM execution" : "mock transport (not GPU execution)");
    }
    if (fd >= 0) {
