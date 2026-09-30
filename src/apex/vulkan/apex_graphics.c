@@ -16,9 +16,11 @@
 #include "apex_querycopy_spv.h"
 #include "apex_resolve_spv.h"
 #include "apex_etc2_spv.h"
+#include "apex_xfb_spv.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
+#include "compiler/nir/nir_xfb_info.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "util/format/u_format.h"
 #include "compiler/spirv/spirv_info.h"
@@ -388,6 +390,31 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
                     const struct vk_vertex_input_state *vi)
 {
    assign_vertex_slots(shader, nir);
+   /* Transform feedback outputs as runs of consecutive record words. */
+   const nir_xfb_info *xfb = nir->xfb_info;
+   shader->vertex.xfb_count = 0;
+   memset(shader->vertex.xfb_strides, 0, sizeof(shader->vertex.xfb_strides));
+   for (unsigned b = 0; xfb && b < APEX_DRAW_MAX_XFB_BUFFERS; b++)
+      if (xfb->buffers_written & BITFIELD_BIT(b))
+         shader->vertex.xfb_strides[b] = xfb->buffers[b].stride;
+   for (unsigned o = 0; xfb && o < xfb->output_count; o++) {
+      const nir_xfb_output_info *out = &xfb->outputs[o];
+      int slot = out->location < VARYING_SLOT_MAX ? shader->vertex.slot[out->location] : -1;
+      if (slot < 0 || out->data_is_16bit || xfb->buffer_to_stream[out->buffer])
+         return false;
+      unsigned dword = out->offset / 4, mask = out->component_mask;
+      while (mask) {
+         int first, count;
+         u_bit_scan_consecutive_range(&mask, &first, &count);
+         if (shader->vertex.xfb_count == APEX_DRAW_MAX_XFB_OUTPUTS)
+            return false;
+         shader->vertex.xfb[shader->vertex.xfb_count++] =
+            out->buffer | dword << 2 | (slot + first) << 12 | count << 24;
+         dword += count;
+      }
+   }
+   /* The setup kernel captures them; the launch is a compute program. */
+   nir->xfb_info = NULL;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_cf_list body;
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
@@ -1701,6 +1728,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which,
       [APEX_INTERNAL_QUERY_COPY] = {apex_querycopy_spv, ARRAY_SIZE(apex_querycopy_spv)},
       [APEX_INTERNAL_RESOLVE] = {apex_resolve_spv, ARRAY_SIZE(apex_resolve_spv)},
       [APEX_INTERNAL_ETC2] = {apex_etc2_spv, ARRAY_SIZE(apex_etc2_spv)},
+      [APEX_INTERNAL_XFB] = {apex_xfb_spv, ARRAY_SIZE(apex_xfb_spv)},
    };
    struct apex_program *program = vk_zalloc(&device->vk.alloc, sizeof(*program), 8,
                                             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);

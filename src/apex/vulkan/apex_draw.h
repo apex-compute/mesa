@@ -98,7 +98,21 @@
 /* Clip distances: vertex-record word of the first | clip count << 16 |
  * cull count << 20; cull distances follow the clip distances. */
 #define APEX_DRAW_CLIP 379
-#define APEX_DRAW_WORDS 380
+/* Transform feedback: the state block VA (zero when inactive) holding each
+ * buffer's byte offset; per buffer VA lo, hi, bytes and vertex stride (zero
+ * when unused); then output entries, each buffer [1:0] | destination dword
+ * [11:2] | vertex-record word [23:12] | components [26:24]. */
+#define APEX_DRAW_XFB 380
+#define APEX_DRAW_XFB_BUFFERS 382
+#define APEX_DRAW_XFB_BUFFER_WORDS 4
+#define APEX_DRAW_MAX_XFB_BUFFERS 4
+#define APEX_DRAW_XFB_OUTPUT_COUNT 398
+#define APEX_DRAW_XFB_OUTPUTS 399
+#define APEX_DRAW_MAX_XFB_OUTPUTS 32
+/* Active transform feedback stream query slot VA (zero when none): 32-bit
+ * primitives written and needed in the slot's value words. */
+#define APEX_DRAW_XFB_QUERY 431
+#define APEX_DRAW_WORDS 433
 #define APEX_FRAGMENT_CHUNKS 8        /* bin chunks per fragment job */
 #define APEX_DRAW_DYNAMIC(w) (((w) >= APEX_DRAW_VERTEX_COUNT && (w) <= APEX_DRAW_FIRST_INSTANCE) || \
                               (w) == APEX_DRAW_PRIM_COUNT || (w) == APEX_DRAW_INDEX + 3 || \
@@ -200,7 +214,7 @@
 #define APEX_QUERY_DST 2              /* copy destination VA lo, hi */
 #define APEX_QUERY_DST_STRIDE 4
 #define APEX_QUERY_COUNT 5
-#define APEX_QUERY_FLAGS 6            /* VkQueryResultFlags */
+#define APEX_QUERY_FLAGS 6            /* VkQueryResultFlags | transform feedback pair << 16 */
 
 /* Internal clear job words (in place of the draw block). */
 #define APEX_CLEAR_DST 0              /* first texel VA lo, hi */

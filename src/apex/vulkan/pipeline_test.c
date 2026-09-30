@@ -574,7 +574,7 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
 static void
 test_graphics_programs(struct vk_physical_device *physical, const char *texture_path,
                        const char *vertex_path, const char *fragment_path, const char *clip_path,
-                       const char *clip_fragment_path)
+                       const char *clip_fragment_path, const char *xfb_path)
 {
    struct apex_device device;
    const float priority = 1;
@@ -654,6 +654,7 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
    test_draw_pipeline(&device, vertex_path, fragment_path, false);
    test_draw_pipeline(&device, clip_path, clip_fragment_path, true);
    test_draw_pipeline(&device, clip_path, NULL, true);
+   test_draw_pipeline(&device, xfb_path, fragment_path, false);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkShaderModule module = load_module(v, dev, texture_path);
@@ -689,7 +690,7 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
 
 int main(int argc, char **argv)
 {
-   bool graphics = argc == 7 && !strcmp(argv[1], "--graphics");
+   bool graphics = argc == 8 && !strcmp(argv[1], "--graphics");
    CHECK(graphics || argc == 10 || argc == 11);
    const char *output = argc == 11 ? argv[10] : NULL;
    FILE *f = fopen(graphics ? argv[2] : argv[1], "rb");
@@ -722,7 +723,7 @@ int main(int argc, char **argv)
    (void)vk_physical_device_to_handle(&physical);
    free(spirv);
    if (graphics) {
-      test_graphics_programs(&physical, argv[2], argv[3], argv[4], argv[5], argv[6]);
+      test_graphics_programs(&physical, argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
       vk_physical_device_finish(&physical);
       vk_instance_finish(&instance);
       puts("PASS Apex graphics programs: setup and sampling compile, border colors and swizzles");

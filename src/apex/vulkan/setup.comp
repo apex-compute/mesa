@@ -314,8 +314,40 @@ float strip_counter(uint p, uint start, uint instance, Words vertices, uint stri
    return counter;
 }
 
-void setup(uint g, uint prims)
+// Transform feedback: primitives g below the count that fits every active
+// buffer write their vertices in primitive order at the buffers' offsets.
+uint xfb_fit(uint total, uint verts, Words state)
+{
+   uint fit = total;
+   for (uint b = 0u; b < APEX_DRAW_MAX_XFB_BUFFERS; b++) {
+      uint w = APEX_DRAW_XFB_BUFFERS + b * APEX_DRAW_XFB_BUFFER_WORDS;
+      uint stride = draw(w + 3u), size = draw(w + 2u), base = state.w[b];
+      if (stride != 0u)
+         fit = min(fit, size > base ? (size - base) / (verts * stride) : 0u);
+   }
+   return fit;
+}
 
+void xfb_write(uint g, uint total, uint verts, uvec3 source, Words vertices, uint stride)
+{
+   Words state = Words(address(APEX_DRAW_XFB));
+   if (g >= xfb_fit(total, verts, state))
+      return;
+   uint outputs = draw(APEX_DRAW_XFB_OUTPUT_COUNT);
+   for (uint i = 0u; i < verts; i++) {
+      uint record = source[i] * stride;
+      for (uint e = 0u; e < outputs; e++) {
+         uint entry = draw(APEX_DRAW_XFB_OUTPUTS + e), b = entry & 3u;
+         uint w = APEX_DRAW_XFB_BUFFERS + b * APEX_DRAW_XFB_BUFFER_WORDS;
+         uint64_t at = address(w) + uint64_t(state.w[b]) +
+                       uint64_t((g * verts + i) * draw(w + 3u) + ((entry >> 2) & 1023u) * 4u);
+         for (uint c = 0u; c < ((entry >> 24) & 7u); c++)
+            Words(at + uint64_t(c * 4u)).w[0] = vertices.w[record + ((entry >> 12) & 4095u) + c];
+      }
+   }
+}
+
+void setup(uint g, uint prims)
 {
    uint instance = g / prims, p = g - instance * prims;
    uint topology = draw(APEX_DRAW_TOPOLOGY);
@@ -348,6 +380,9 @@ void setup(uint g, uint prims)
                    topology == 3u ? 3u * p + 2u : p + 2u) + instance * draw(APEX_DRAW_VERTEX_COUNT);
    Words vertices = Words(address(APEX_DRAW_VERTEX_LO));
    uint stride = draw(APEX_DRAW_VERTEX_STRIDE);
+   if (address(APEX_DRAW_XFB) != 0ul && !skip)
+      xfb_write(g, prims * draw(APEX_DRAW_INSTANCE_COUNT), topology == 0u ? 1u : topology <= 2u ? 2u : 3u,
+                source, vertices, stride);
    for (uint i = 0u; i < 3u; i++) {
       uint base = source[i] * stride;
       P[i] = uintBitsToFloat(uvec4(vertices.w[base], vertices.w[base + 1u],

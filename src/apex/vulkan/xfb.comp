@@ -1,0 +1,49 @@
+#version 450
+// Transform feedback bookkeeping after a draw's setup job: advances each
+// active buffer's byte offset in the state block by the primitives that fit
+// (the same count the setup kernel wrote, see setup.comp), and counts
+// primitives written and needed into an active stream query.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_draw.h"
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint TRAILER = 8u;
+const uint DRAW = TRAILER + 12u;
+uint64_t address(uint i) { return uint64_t(root[DRAW + i]) | (uint64_t(root[DRAW + i + 1u]) << 32); }
+// Dynamic words of indirect draws live in the resolved parameter block.
+uint draw(uint i)
+{
+   uint64_t params = address(APEX_DRAW_PARAMS);
+   return APEX_DRAW_DYNAMIC(i) && params != 0ul ? Words(params).w[i] : root[DRAW + i];
+}
+
+void main()
+{
+   uint topology = draw(APEX_DRAW_TOPOLOGY);
+   uint verts = topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
+   Words state = Words(address(APEX_DRAW_XFB));
+   uint fit = draw(APEX_DRAW_PRIM_COUNT) * draw(APEX_DRAW_INSTANCE_COUNT);
+   uint base[APEX_DRAW_MAX_XFB_BUFFERS];
+   for (uint b = 0u; b < APEX_DRAW_MAX_XFB_BUFFERS; b++) {
+      uint w = APEX_DRAW_XFB_BUFFERS + b * APEX_DRAW_XFB_BUFFER_WORDS;
+      uint stride = draw(w + 3u), size = draw(w + 2u);
+      base[b] = state.w[b];
+      if (stride != 0u)
+         fit = min(fit, size > base[b] ? (size - base[b]) / (verts * stride) : 0u);
+   }
+   for (uint b = 0u; b < APEX_DRAW_MAX_XFB_BUFFERS; b++) {
+      uint stride = draw(APEX_DRAW_XFB_BUFFERS + b * APEX_DRAW_XFB_BUFFER_WORDS + 3u);
+      if (stride != 0u)
+         state.w[b] = base[b] + fit * verts * stride;
+   }
+   uint64_t query = address(APEX_DRAW_XFB_QUERY);
+   if (query != 0ul) {
+      Words slot = Words(query);
+      slot.w[0] += fit;
+      slot.w[1] += draw(APEX_DRAW_PRIM_COUNT) * draw(APEX_DRAW_INSTANCE_COUNT);
+   }
+}

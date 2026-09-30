@@ -176,9 +176,16 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    VkPhysicalDeviceBorderColorSwizzleFeaturesEXT swizzle = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT, .pNext = &border,
    };
+   VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, .pNext = &swizzle,
+      .geometryStreams = VK_TRUE,
+   };
+   VkPhysicalDeviceDepthClipEnableFeaturesEXT depth_clip = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &xfb,
+   };
    VkPhysicalDeviceScalarBlockLayoutFeatures scalar = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
-      .pNext = &swizzle,
+      .pNext = &depth_clip,
    };
    VkPhysicalDeviceFeatures2 features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &scalar,
@@ -191,9 +198,13 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
          !provoking.transformFeedbackPreservesProvokingVertex);
    CHECK(border.customBorderColors && border.customBorderColorWithoutFormat);
    CHECK(swizzle.borderColorSwizzle && swizzle.borderColorSwizzleFromImage);
+   CHECK(xfb.transformFeedback && !xfb.geometryStreams && depth_clip.depthClipEnable);
    PROC(GetPhysicalDeviceProperties2KHR, get_properties2);
+   VkPhysicalDeviceTransformFeedbackPropertiesEXT xfb_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
+   };
    VkPhysicalDeviceDrmPropertiesEXT drm_props = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT, .pNext = &xfb_props,
    };
    VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR, .pNext = &drm_props,
@@ -212,6 +223,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_properties2(physical, &properties2);
    CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 1 &&
          robust_props.robustUniformBufferAccessSizeAlignment == 1);
+   CHECK(xfb_props.maxTransformFeedbackStreams == 1 && xfb_props.maxTransformFeedbackBuffers == 4 &&
+         xfb_props.transformFeedbackQueries && !xfb_props.transformFeedbackDraw);
    /* Zink matches its DRM fd's render node against these numbers. */
    CHECK(drm_props.hasRender && drm_props.renderMajor == 1 && drm_props.renderMinor == 3);
    CHECK(drm_props.hasPrimary && drm_props.primaryMajor == 1 && drm_props.primaryMinor == 5);

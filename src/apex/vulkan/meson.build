@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Internal kernels are SPIR-V embedded as C arrays.
 apex_internal_spv = []
-foreach kernel : ['setup', 'bin', 'copy', 'clear', 'timestamp', 'querycopy', 'resolve', 'etc2']
+foreach kernel : ['setup', 'bin', 'copy', 'clear', 'timestamp', 'querycopy', 'resolve', 'etc2', 'xfb']
   apex_internal_spv += custom_target('apex_' + kernel + '_spv',
     input : kernel + '.comp', output : 'apex_' + kernel + '_spv.h',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
@@ -189,9 +189,9 @@ foreach stage : ['vert', 'frag']
   )
 endforeach
 apex_clip_spv = []
-foreach stage : ['vert', 'frag']
-  apex_clip_spv += custom_target('apex-clip-' + stage,
-    input : 'clip.' + stage, output : 'clip.' + stage + '.spv',
+foreach fixture : ['clip.vert', 'clip.frag', 'xfb.vert']
+  apex_clip_spv += custom_target('apex-' + fixture.replace('.', '-'),
+    input : fixture, output : fixture + '.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
   )
 endforeach

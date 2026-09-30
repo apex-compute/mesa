@@ -20,6 +20,10 @@ struct apex_shader {
       int16_t slot[VARYING_SLOT_MAX];
       uint32_t stride;
       uint8_t clip_distances, cull_distances;
+      /* Transform feedback: APEX_DRAW_XFB_OUTPUTS entries and buffer strides. */
+      uint32_t xfb[APEX_DRAW_MAX_XFB_OUTPUTS];
+      uint16_t xfb_strides[APEX_DRAW_MAX_XFB_BUFFERS];
+      uint8_t xfb_count;
    } vertex;
 };
 

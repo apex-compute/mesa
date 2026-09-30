@@ -1,6 +1,7 @@
 #version 450
 // vkCmdCopyQueryPoolResults: one invocation per query. Pool slots hold a
-// 64-bit value then a 32-bit availability word.
+// 64-bit value, or transform feedback's 32-bit primitives written and
+// needed, then a 32-bit availability word.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -26,14 +27,25 @@ void main()
    bool partial = (flags & 8u) != 0u;
    uint available = slot.w[2];
    uint lo = slot.w[0], hi = slot.w[1];
+   bool pair = (flags & 0x10000u) != 0u;
+   uint values = pair ? 2u : 1u;
    if (available != 0u || partial) {
-      dst.w[0] = wide || hi == 0u ? lo : 0xffffffffu;
-      if (wide)
-         dst.w[1] = hi;
+      if (pair) {
+         dst.w[0] = lo;
+         dst.w[wide ? 2u : 1u] = hi;
+         if (wide) {
+            dst.w[1] = 0u;
+            dst.w[3] = 0u;
+         }
+      } else {
+         dst.w[0] = wide || hi == 0u ? lo : 0xffffffffu;
+         if (wide)
+            dst.w[1] = hi;
+      }
    }
    if (with_available) {
-      dst.w[wide ? 2u : 1u] = available;
+      dst.w[wide ? 2u * values : values] = available;
       if (wide)
-         dst.w[3] = 0u;
+         dst.w[2u * values + 1u] = 0u;
    }
 }

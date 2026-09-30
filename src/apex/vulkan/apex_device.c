@@ -134,6 +134,12 @@ struct apex_command_buffer {
    struct { uint64_t va, size; } bindings[APEX_DRAW_MAX_BINDINGS];
    struct { uint64_t va, size; uint32_t bytes; } index;
    uint64_t occlusion; /* active occlusion query slot VA */
+   /* Transform feedback bindings and, while active, the state block of
+    * byte offsets (APEX_DRAW_XFB). */
+   struct {
+      struct { uint64_t va, size; } buffers[APEX_DRAW_MAX_XFB_BUFFERS];
+      uint64_t state, query;
+   } xfb;
    struct {
       VkRect2D area;
       uint32_t color_count;
@@ -556,7 +562,9 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
                                        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
                                        VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
                                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)))
+                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                       VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                                       VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
@@ -1495,6 +1503,7 @@ clear_commands(struct apex_command_buffer *cmd)
    memset(cmd->bindings, 0, sizeof(cmd->bindings));
    memset(&cmd->index, 0, sizeof(cmd->index));
    cmd->occlusion = 0;
+   memset(&cmd->xfb, 0, sizeof(cmd->xfb));
    memset(&cmd->rendering, 0, sizeof(cmd->rendering));
    memset(cmd->push, 0, sizeof(cmd->push));
    memset(cmd->graphics_push, 0, sizeof(cmd->graphics_push));
@@ -2054,6 +2063,56 @@ apex_CmdBindVertexBuffers2(VkCommandBuffer handle, uint32_t first, uint32_t coun
 }
 
 static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer handle, uint32_t first, uint32_t count,
+                                        const VkBuffer *buffers, const VkDeviceSize *offsets,
+                                        const VkDeviceSize *sizes)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   for (uint32_t i = 0; i < count; i++) {
+      VK_FROM_HANDLE(apex_buffer, buffer, buffers[i]);
+      cmd->xfb.buffers[first + i].va = buffer->vk.device_address + offsets[i];
+      cmd->xfb.buffers[first + i].size = sizes && sizes[i] != VK_WHOLE_SIZE ? sizes[i] :
+                                         buffer->vk.size - offsets[i];
+   }
+}
+
+static void copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
+                            uint64_t src_slice, uint64_t dst, uint32_t dst_row, uint64_t dst_slice,
+                            VkExtent3D extent, uint32_t layers, uint32_t pixel);
+
+/* The state block holds each buffer's byte offset: zero, or the counter
+ * buffer's value when resuming. */
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBeginTransformFeedbackEXT(VkCommandBuffer handle, uint32_t first, uint32_t count,
+                                  const VkBuffer *counters, const VkDeviceSize *offsets)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   cmd->xfb.state = record_scratch(cmd, APEX_DRAW_MAX_XFB_BUFFERS * 4);
+   for (uint32_t i = 0; counters && cmd->xfb.state && i < count; i++) {
+      VK_FROM_HANDLE(apex_buffer, counter, counters[i]);
+      if (counter)
+         copy_image_rows(cmd, counter->vk.device_address + (offsets ? offsets[i] : 0), 4, 4,
+                         cmd->xfb.state + (first + i) * 4, 4, 4, (VkExtent3D){1, 1, 1}, 1, 4);
+   }
+}
+
+/* Counter buffers receive each buffer's byte offset. */
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdEndTransformFeedbackEXT(VkCommandBuffer handle, uint32_t first, uint32_t count,
+                                const VkBuffer *counters, const VkDeviceSize *offsets)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   for (uint32_t i = 0; counters && cmd->xfb.state && i < count; i++) {
+      VK_FROM_HANDLE(apex_buffer, counter, counters[i]);
+      if (counter)
+         copy_image_rows(cmd, cmd->xfb.state + (first + i) * 4, 4, 4,
+                         counter->vk.device_address + (offsets ? offsets[i] : 0), 4, 4,
+                         (VkExtent3D){1, 1, 1}, 1, 4);
+   }
+   cmd->xfb.state = 0;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
 apex_CmdBindIndexBuffer2(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
                          VkDeviceSize size, VkIndexType type)
 {
@@ -2340,6 +2399,31 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       draw[APEX_DRAW_BLEND_CONSTANTS + c] = float_bits(dyn->cb.blend_constants[c]);
    draw[APEX_DRAW_OCCLUSION] = cmd->occlusion;
    draw[APEX_DRAW_OCCLUSION + 1] = cmd->occlusion >> 32;
+   /* Transform feedback captures the vertex shader's outputs in setup. */
+   bool xfb = cmd->xfb.state && cmd->vertex->vertex.xfb_count;
+   struct apex_program *xfb_program = NULL;
+   if (xfb) {
+      result = apex_internal_program(device, APEX_INTERNAL_XFB, &xfb_program);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+      draw[APEX_DRAW_XFB] = cmd->xfb.state;
+      draw[APEX_DRAW_XFB + 1] = cmd->xfb.state >> 32;
+      for (unsigned b = 0; b < APEX_DRAW_MAX_XFB_BUFFERS; b++) {
+         uint32_t *words = &draw[APEX_DRAW_XFB_BUFFERS + b * APEX_DRAW_XFB_BUFFER_WORDS];
+         uint32_t stride = cmd->vertex->vertex.xfb_strides[b];
+         words[0] = cmd->xfb.buffers[b].va;
+         words[1] = cmd->xfb.buffers[b].va >> 32;
+         words[2] = MIN2(cmd->xfb.buffers[b].size, UINT32_MAX);
+         words[3] = cmd->xfb.buffers[b].va ? stride : 0;
+      }
+      draw[APEX_DRAW_XFB_OUTPUT_COUNT] = cmd->vertex->vertex.xfb_count;
+      draw[APEX_DRAW_XFB_QUERY] = cmd->xfb.query;
+      draw[APEX_DRAW_XFB_QUERY + 1] = cmd->xfb.query >> 32;
+      memcpy(&draw[APEX_DRAW_XFB_OUTPUTS], cmd->vertex->vertex.xfb,
+             cmd->vertex->vertex.xfb_count * sizeof(uint32_t));
+   }
 
    /* Direct jobs run workgroups [base, base + groups) once. Indirect jobs
     * step a bounded launch through counts resolved when the draw runs. */
@@ -2364,10 +2448,12 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       draw[APEX_DRAW_BIN_COUNTS + 1] = counts >> 32;
       push_job(cmd, resolve, NULL, 1, 0, 1, draw);
       push_job(cmd, vs, cmd->graphics_sets, MIN2(vs->max_workgroups, 1024), 0, UINT32_MAX, draw);
-      if (raster) {
+      if (raster || xfb)
          push_job(cmd, setup, NULL, MIN2(setup->max_workgroups, 1024), 0, UINT32_MAX, draw);
+      if (xfb)
+         push_job(cmd, xfb_program, NULL, 1, 0, 1, draw);
+      if (raster)
          push_job(cmd, binner, NULL, MIN2(binner->max_workgroups, 1024), 0, UINT32_MAX, draw);
-      }
    } else {
       uint32_t limit = MIN2(vs->max_workgroups, 1024);
       uint32_t vertex_groups = DIV_ROUND_UP(vertices, 64);
@@ -2375,7 +2461,7 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
          uint32_t groups = MIN2(vertex_groups - base, limit);
          push_job(cmd, vs, cmd->graphics_sets, groups, base, base + groups, draw);
       }
-      if (!raster || !prims)
+      if (!(raster || xfb) || !prims)
          return;
       uint32_t setup_groups = DIV_ROUND_UP((uint64_t)prims * instance_count, 64);
       limit = MIN2(setup->max_workgroups, 1024);
@@ -2383,6 +2469,10 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
          uint32_t groups = MIN2(setup_groups - base, limit);
          push_job(cmd, setup, NULL, groups, base, base + groups, draw);
       }
+      if (xfb)
+         push_job(cmd, xfb_program, NULL, 1, 0, 1, draw);
+      if (!raster)
+         return;
       /* Smallest bins (one 4-pixel tile up) whose ordered lists fit in 32 MiB. */
       uint64_t total = (uint64_t)prims * instance_count;
       uint32_t chunks = DIV_ROUND_UP(total, APEX_BIN_CHUNK), shift = 2, columns, rows, bin_x0, bin_y0;
@@ -2655,7 +2745,8 @@ apex_CreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->queryType != VK_QUERY_TYPE_OCCLUSION && info->queryType != VK_QUERY_TYPE_TIMESTAMP)
+   if (info->queryType != VK_QUERY_TYPE_OCCLUSION && info->queryType != VK_QUERY_TYPE_TIMESTAMP &&
+       info->queryType != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_query_pool *pool = vk_query_pool_create(&device->vk, info, alloc, sizeof(*pool));
    if (!pool)
@@ -2719,21 +2810,24 @@ apex_GetQueryPoolResults(VkDevice dev, VkQueryPool handle, uint32_t first, uint3
          nanosleep(&(struct timespec){.tv_nsec = 100000}, NULL);
       }
       bool available = slot[2];
-      uint64_t value = slot[0] | (uint64_t)slot[1] << 32;
+      /* Transform feedback slots hold primitives written and needed. */
+      bool pair = pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+      uint64_t values[2] = {pair ? slot[0] : slot[0] | (uint64_t)slot[1] << 32, slot[1]};
+      unsigned n = pair ? 2 : 1, size = flags & VK_QUERY_RESULT_64_BIT ? 8 : 4;
       uint8_t *out = (uint8_t *)data + q * stride;
-      if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-         if (flags & VK_QUERY_RESULT_64_BIT)
-            memcpy(out, &value, 8);
+      for (unsigned v = 0; v < n && (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)); v++) {
+         if (size == 8)
+            memcpy(out + v * 8, &values[v], 8);
          else
-            *(uint32_t *)out = value > UINT32_MAX ? UINT32_MAX : value;
+            *(uint32_t *)(out + v * 4) = values[v] > UINT32_MAX ? UINT32_MAX : values[v];
       }
       if (!available)
          status = VK_NOT_READY;
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
-         if (flags & VK_QUERY_RESULT_64_BIT)
-            *(uint64_t *)(out + 8) = available;
+         if (size == 8)
+            *(uint64_t *)(out + n * 8) = available;
          else
-            *(uint32_t *)(out + 4) = available;
+            *(uint32_t *)(out + n * 4) = available;
       }
    }
    return status;
@@ -2753,18 +2847,25 @@ apex_CmdBeginQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
                              VkQueryControlFlags flags, uint32_t index)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   uint64_t slot = apex_query_pool_from_handle(pool)->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
+   struct apex_query_pool *qp = apex_query_pool_from_handle(pool);
+   uint64_t slot = qp->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
    record_word(cmd, slot, 8, 0);
-   cmd->occlusion = slot;
+   if (qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT)
+      cmd->xfb.query = slot;
+   else
+      cmd->occlusion = slot;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdEndQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t query, uint32_t index)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   cmd->occlusion = 0;
-   record_word(cmd, apex_query_pool_from_handle(pool)->bo.va + (uint64_t)query * APEX_QUERY_STRIDE + 8,
-               4, 1);
+   struct apex_query_pool *qp = apex_query_pool_from_handle(pool);
+   if (qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT)
+      cmd->xfb.query = 0;
+   else
+      cmd->occlusion = 0;
+   record_word(cmd, qp->bo.va + (uint64_t)query * APEX_QUERY_STRIDE + 8, 4, 1);
 }
 
 static void push_job(struct apex_command_buffer *cmd, struct apex_program *program,
@@ -2808,7 +2909,9 @@ apex_CmdCopyQueryPoolResults(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
    uint32_t words[APEX_DRAW_WORDS] = {
       [APEX_QUERY_SLOT] = slot, [APEX_QUERY_SLOT + 1] = slot >> 32,
       [APEX_QUERY_DST] = va, [APEX_QUERY_DST + 1] = va >> 32,
-      [APEX_QUERY_DST_STRIDE] = stride, [APEX_QUERY_COUNT] = count, [APEX_QUERY_FLAGS] = flags,
+      [APEX_QUERY_DST_STRIDE] = stride, [APEX_QUERY_COUNT] = count,
+      [APEX_QUERY_FLAGS] = flags | (uint32_t)(apex_query_pool_from_handle(pool)->vk.query_type ==
+                                              VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) << 16,
    };
    push_job(cmd, program, NULL, DIV_ROUND_UP(count, 16), 0, 0, words);
 }
@@ -3893,6 +3996,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdClearDepthStencilImage = apex_CmdClearDepthStencilImage,
       .CmdBindVertexBuffers2 = apex_CmdBindVertexBuffers2,
       .CmdBindIndexBuffer2 = apex_CmdBindIndexBuffer2,
+      .CmdBindTransformFeedbackBuffersEXT = apex_CmdBindTransformFeedbackBuffersEXT,
+      .CmdBeginTransformFeedbackEXT = apex_CmdBeginTransformFeedbackEXT,
+      .CmdEndTransformFeedbackEXT = apex_CmdEndTransformFeedbackEXT,
       .CmdDraw = apex_CmdDraw, .CmdDrawIndexed = apex_CmdDrawIndexed,
       .CmdDrawIndirect = apex_CmdDrawIndirect, .CmdDrawIndexedIndirect = apex_CmdDrawIndexedIndirect,
       .CmdDrawIndirectCount = apex_CmdDrawIndirectCount,
