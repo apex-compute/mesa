@@ -330,12 +330,20 @@ border_color(nir_builder *b, const struct image_info *img, const struct sampler_
 {
    nir_def *integer = nir_ine_imm(b, nir_iand_imm(b, img->format[0], 1u << 20), 0);
    nir_def *one = nir_bcsel(b, integer, nir_imm_int(b, 1), nir_imm_float(b, 1.0f));
+   /* Normalized formats clamp border components to their range. */
+   nir_def *type = nir_iand_imm(b, nir_ushr_imm(b, img->format[1], 13), 7);
+   nir_def *border[4];
+   for (unsigned k = 0; k < 4; k++)
+      border[k] = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_UNORM), nir_fsat(b, s->border[k]),
+                  nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_SNORM),
+                            nir_fclamp(b, s->border[k], nir_imm_float(b, -1.0f), nir_imm_float(b, 1.0f)),
+                            s->border[k]));
    nir_def *out[4];
    for (unsigned c = 0; c < 4; c++) {
       nir_def *select = nir_iand_imm(b, nir_ushr_imm(b, img->swizzle, 3 * c), 7);
       nir_def *value = nir_bcsel(b, nir_ieq_imm(b, select, APEX_SWIZZLE_1), one, nir_imm_int(b, 0));
       for (unsigned k = 0; k < 4; k++)
-         value = nir_bcsel(b, nir_ieq_imm(b, select, k), s->border[k], value);
+         value = nir_bcsel(b, nir_ieq_imm(b, select, k), border[k], value);
       out[c] = value;
    }
    return nir_vec(b, out, 4);
