@@ -627,8 +627,10 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
 VkFormatFeatureFlags2
 apex_format_features(VkFormat format, bool buffer)
 {
-   /* Subsampled and multi-planar YCbCr formats are unsupported. */
+   /* Subsampled and multi-planar YCbCr formats are unsupported, as are
+    * values without a Mesa format (maintenance5 allows any enumerant). */
    if (format == VK_FORMAT_UNDEFINED || vk_format_get_ycbcr_info(format) ||
+       vk_format_to_pipe_format(format) == PIPE_FORMAT_NONE ||
        (format >= VK_FORMAT_G8B8G8R8_422_UNORM && format <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM))
       return 0;
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
@@ -885,14 +887,16 @@ apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo 
    return VK_SUCCESS;
 }
 
+/* A subresource is one layer of a level, or every depth slice of a 3D level. */
 static void
 subresource_layout(const struct apex_image *image, const VkImageSubresource *subresource,
                    VkSubresourceLayout2 *out)
 {
    unsigned l = subresource->mipLevel;
+   unsigned slices = image->vk.image_type == VK_IMAGE_TYPE_3D ? u_minify(image->vk.extent.depth, l) : 1;
    out->subresourceLayout = (VkSubresourceLayout) {
       .offset = image->levels[l].offset + (uint64_t)image->levels[l].slice_stride * subresource->arrayLayer,
-      .size = image->levels[l].slice_stride,
+      .size = (uint64_t)image->levels[l].slice_stride * slices,
       .rowPitch = image->levels[l].row_stride,
       .arrayPitch = image->levels[l].slice_stride,
       .depthPitch = image->levels[l].slice_stride,
@@ -912,6 +916,8 @@ apex_GetDeviceImageSubresourceLayout(VkDevice dev, const VkDeviceImageSubresourc
                                      VkSubresourceLayout2 *out)
 {
    struct apex_image image;
+   image.vk.image_type = info->pCreateInfo->imageType;
+   image.vk.extent = info->pCreateInfo->extent;
    image_layout(info->pCreateInfo, &image);
    subresource_layout(&image, &info->pSubresource->imageSubresource, out);
 }

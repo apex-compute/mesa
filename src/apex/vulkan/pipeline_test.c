@@ -597,6 +597,24 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
    CHECK(!memcmp(&((struct apex_sampler *)vk_sampler_from_handle(sampler))->row[4],
                  custom.customBorderColor.int32, 16));
    device.vk.dispatch_table.DestroySampler(handle, sampler, NULL);
+   /* A 3D level's subresource spans its depth slices. */
+   const VkImageCreateInfo volume = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_3D, .format = VK_FORMAT_R16_UNORM, .extent = {32, 48, 56},
+      .mipLevels = 2, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_LINEAR, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+   for (unsigned level = 0; level < 2; level++) {
+      const VkImageSubresource2 sub = {.sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0}};
+      const VkDeviceImageSubresourceInfo query = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO,
+         .pCreateInfo = &volume, .pSubresource = &sub};
+      VkSubresourceLayout2 layout = {.sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2};
+      device.vk.dispatch_table.GetDeviceImageSubresourceLayout(handle, &query, &layout);
+      /* Rows pad to 64 bytes: level 0 is 64 x 48 x 56, level 1 64 x 24 x 28 at 172032. */
+      const VkSubresourceLayout *l = &layout.subresourceLayout;
+      CHECK(l->offset == (level ? 64 * 48 * 56 : 0) && l->rowPitch == 64 &&
+            l->depthPitch == 64u * (48 >> level) && l->size == l->depthPitch * (56 >> level));
+   }
    struct apex_program *setup;
    CHECK(apex_internal_program(&device, APEX_INTERNAL_SETUP, &setup) == VK_SUCCESS);
    CHECK(setup->code.size > 48);

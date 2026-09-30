@@ -320,6 +320,12 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
             VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
          format.optimalTilingFeatures == format.linearTilingFeatures && format.bufferFeatures == texel);
+   /* Maintenance5: enumerants beyond the defined formats report nothing. */
+   for (unsigned i = 0; i < 5; i++) {
+      memset(&format, 0xff, sizeof(format));
+      get_format(physical, VK_FORMAT_MAX_ENUM - i, &format);
+      CHECK(!format.linearTilingFeatures && !format.optimalTilingFeatures && !format.bufferFeatures);
+   }
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
