@@ -292,13 +292,13 @@ flag(nir_builder *b, nir_def *flags, unsigned bit)
    return nir_ine_imm(b, nir_iand_imm(b, flags, 1u << bit), 0);
 }
 
-/* Applies a VkSamplerAddressMode to integer texel index `i` in [0, size).
- * Returns the wrapped index; `outside` is set for border texels. */
+/* Applies a VkSamplerAddressMode to integer texel index `i` in [0, size),
+ * given period = i mod 2 * size. Returns the wrapped index; `outside` is set
+ * for border texels. */
 static nir_def *
-wrap(nir_builder *b, nir_def *mode, nir_def *i, nir_def *size, nir_def **outside)
+wrap(nir_builder *b, nir_def *mode, nir_def *i, nir_def *period, nir_def *size, nir_def **outside)
 {
-   nir_def *repeat = nir_imod(b, i, size);
-   nir_def *period = nir_imod(b, i, nir_ishl_imm(b, size, 1));
+   nir_def *repeat = nir_bcsel(b, nir_ilt(b, period, size), period, nir_isub(b, period, size));
    nir_def *mirror = nir_bcsel(b, nir_ilt(b, period, size), period,
                                nir_isub(b, nir_isub(b, nir_ishl_imm(b, size, 1), period), nir_imm_int(b, 1)));
    nir_def *clamp = nir_imin(b, nir_imax(b, i, nir_imm_int(b, 0)), nir_iadd_imm(b, size, -1));
@@ -394,13 +394,15 @@ filter(nir_builder *b, const struct image_info *img, const struct sampler_info *
    nir_def *offset = level_offset(b, img, absolute);
    nir_def *size[3] = {minify(b, img->width, absolute), minify(b, img->height, absolute),
                        minify(b, img->depth, absolute)};
-   nir_def *base[3], *frac[3];
+   nir_def *base[3], *frac[3], *period[3];
    for (unsigned a = 0; a < r->dims; a++) {
       nir_def *t = nir_bcsel(b, unnormalized, r->coord[a], nir_fmul(b, r->coord[a], nir_u2f32(b, size[a])));
       nir_def *shifted = nir_bcsel(b, linear, nir_fadd_imm(b, t, -0.5f), t);
       nir_def *f = nir_ffloor(b, shifted);
       base[a] = nir_iadd(b, nir_f2i32(b, f), r->offset[a] ? r->offset[a] : nir_imm_int(b, 0));
       frac[a] = nir_fsub(b, shifted, f);
+      /* One division per level and axis; each tap steps it by at most one. */
+      period[a] = nir_imod(b, base[a], nir_ishl_imm(b, size[a], 1));
    }
    nir_def *taps = nir_bcsel(b, linear, nir_imm_int(b, 1 << r->dims), nir_imm_int(b, 1));
    nir_store_var(b, tap_var, nir_imm_int(b, 0), 1);
@@ -414,7 +416,10 @@ filter(nir_builder *b, const struct image_info *img, const struct sampler_info *
    for (unsigned a = 0; a < r->dims; a++) {
       nir_def *upper = nir_ine_imm(b, nir_iand_imm(b, nir_ushr_imm(b, t, a), 1), 0);
       nir_def *mode = nir_iand_imm(b, nir_ushr_imm(b, s->flags, 4 + 4 * a), 7);
-      index[a] = wrap(b, mode, nir_iadd(b, base[a], nir_b2i32(b, upper)), size[a], &border);
+      nir_def *next = nir_iadd_imm(b, period[a], 1);
+      next = nir_bcsel(b, nir_ieq(b, next, nir_ishl_imm(b, size[a], 1)), nir_imm_int(b, 0), next);
+      index[a] = wrap(b, mode, nir_iadd(b, base[a], nir_b2i32(b, upper)),
+                      nir_bcsel(b, upper, next, period[a]), size[a], &border);
       nir_def *w = nir_bcsel(b, upper, frac[a], nir_fsub(b, nir_imm_float(b, 1.0f), frac[a]));
       weight = nir_bcsel(b, linear, nir_fmul(b, weight, w), weight);
    }
