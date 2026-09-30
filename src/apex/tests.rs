@@ -430,6 +430,54 @@ fn allocation_and_spilling() {
 }
 
 #[test]
+fn scalar_lane_spills() {
+    // 110 uniform values live at once exceed 96 scalar registers; the excess
+    // lives in vector lanes, including across a region with no active lane.
+    let count = 110u32;
+    let mut values = vec![Value { class: Class::S, width: 1 }];
+    let mut ops = Vec::new();
+    for k in 0..count {
+        values.push(Value { class: Class::S, width: 1 });
+        let d = values.len() as u32 - 1;
+        ops.push(mop(op::S_ADD as u16, [v(d), phys(SCALAR + 16), Opnd::Lit(1000 + 7 * k), Opnd::None]));
+    }
+    values.push(Value { class: Class::S, width: 1 });
+    let saved = values.len() as u32 - 1;
+    ops.push(mop(COPY, [v(saved), phys(isa::EXEC), Opnd::None, Opnd::None]));
+    ops.push(mop(COPY, [phys(isa::EXEC), Opnd::Lit(0), Opnd::None, Opnd::None]));
+    ops.push(Op { imm: 1, ..mop(LABEL, [Opnd::None; 4]) });
+    ops.push(mop(COPY, [phys(isa::EXEC), v(saved), Opnd::None, Opnd::None]));
+    let mut acc = count;
+    for k in (1..count).rev() {
+        values.push(Value { class: Class::S, width: 1 });
+        let d = values.len() as u32 - 1;
+        ops.push(mop(op::S_ADD as u16, [v(d), v(acc), v(k), Opnd::None]));
+        acc = d;
+    }
+    values.push(Value { class: Class::V, width: 1 });
+    let x = values.len() as u32 - 1;
+    values.push(Value { class: Class::S, width: 2 });
+    let root = values.len() as u32 - 1;
+    ops.push(mop(op::V_MOV as u16, [v(x), v(acc), Opnd::None, Opnd::None]));
+    ops.push(mop(COPY, [Opnd::Val { id: root, off: 0, n: 1 }, phys(SCALAR), Opnd::None, Opnd::None]));
+    ops.push(mop(COPY, [Opnd::Val { id: root, off: 1, n: 1 }, phys(SCALAR + 1), Opnd::None, Opnd::None]));
+    ops.push(mop(op::GLOBAL_STORE as u16, [v(x), Opnd::None, Opnd::Val { id: root, off: 0, n: 2 }, Opnd::None]));
+    for stage in [Stage::Compute, Stage::Vertex] {
+        let (p, stats) = mir::compile(ops.clone(), values.clone(), Program::new(stage, vec![])).unwrap();
+        assert!(stats.spills > 0 && stats.scalar <= 96 && p.private == 0);
+        assert!(p.code.iter().any(|i| i.op == op::V_WRITELANE));
+        if stage == Stage::Compute {
+            let mut m = vec![0u8; 64];
+            let mut mem = Memory { regions: vec![Region { gpuva: 0x1000, data: &mut m }] };
+            let user = [0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            Machine::new(&p, &mut mem).compute(&user, [3, 1, 1], 0).unwrap();
+            // The last workgroup (x = 2) writes last.
+            assert_eq!(words(&m, 0, 1), [(0..count).map(|k| 2 + 1000 + 7 * k).sum::<u32>()]);
+        }
+    }
+}
+
+#[test]
 fn divergent_loop_lifetimes() {
     // Lane l leaves the loop after l + 1 trips. x is defined in the loop and
     // read after it, so later loop values must not take its register: lanes

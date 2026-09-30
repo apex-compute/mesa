@@ -776,11 +776,11 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
                 None => {
                     let message = format!("{} register pressure exceeds {} registers",
                         if v.class == Class::S { "scalar" } else { "vector" }, limit);
-                    let Some(temps) = spill.filter(|_| v.class == Class::V) else {
+                    let Some(temps) = spill else {
                         return Err(Pressure { message, live: Vec::new() });
                     };
                     let spillable = |a: u32| !fixed.contains_key(&a) && !temps.contains(&a)
-                        && values[a as usize].class == Class::V;
+                        && values[a as usize].class == v.class;
                     // Evict the latest-ending live values until this one fits.
                     let mut placed = None;
                     loop {
@@ -818,7 +818,7 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
         *count = (*count).max(home as u32 + v.width as u32);
     }
     if !victims.is_empty() {
-        return Err(Pressure { message: "vector register pressure exceeds 128 registers".into(), live: victims });
+        return Err(Pressure { message: "register pressure exceeds the register file".into(), live: victims });
     }
     Ok((homes, stats))
 }
@@ -936,6 +936,57 @@ fn dump(title: &str, ops: &[Op]) {
     }
 }
 
+/// Rewrites every access of scalar `victim` through a temporary read from and
+/// written to lanes `lane..` of the vector register `bank`. Lane moves ignore
+/// `exec`, so the value survives regions where no lane is active.
+fn spill_lanes(ops: &mut Vec<Op>, values: &mut Vec<Value>, align: &mut Vec<u8>, victim: u32, bank: u32, lane: u32) {
+    let width = values[victim as usize].width;
+    let mut out = Vec::with_capacity(ops.len() + 8);
+    for mut o in ops.drain(..) {
+        let access = o.access();
+        let (mut reads, mut writes) = (false, false);
+        for f in 0..4 {
+            if o.f[f].val() == Some(victim) {
+                match access[f] {
+                    Some(Access::Def) => {
+                        writes = true;
+                        reads |= o.f[f].n() < width;
+                    }
+                    Some(Access::DefUse) => (reads, writes) = (true, true),
+                    _ => reads = true,
+                }
+            }
+        }
+        if !reads && !writes {
+            out.push(o);
+            continue;
+        }
+        values.push(Value { class: Class::S, width });
+        align.push(alignment(&values[victim as usize]));
+        let t = values.len() as u32 - 1;
+        for f in 0..4 {
+            if let Opnd::Val { id, off, n } = o.f[f] {
+                if id == victim {
+                    o.f[f] = Opnd::Val { id: t, off, n };
+                }
+            }
+        }
+        let b = Opnd::Val { id: bank, off: 0, n: 1 };
+        if reads {
+            for k in 0..width {
+                out.push(Op::new(op::V_READLANE as u16, [Opnd::Val { id: t, off: k, n: 1 }, b, Opnd::Lit(lane + k as u32), Opnd::None]));
+            }
+        }
+        out.push(o);
+        if writes {
+            for k in 0..width {
+                out.push(Op::new(op::V_WRITELANE as u16, [b, Opnd::Val { id: t, off: k, n: 1 }, Opnd::Lit(lane + k as u32), Opnd::None]));
+            }
+        }
+    }
+    *ops = out;
+}
+
 /// The private base pair (launch s20-s21) for spill code, kept for the program.
 fn private_pair(ops: &mut Vec<Op>, values: &mut Vec<Value>, fixed: &mut BTreeMap<u32, u8>, align: &mut Vec<u8>) -> u32 {
     if let Some((&id, _)) = fixed.iter().find(|(&id, &h)| h == 20 && values[id as usize].class == Class::S && values[id as usize].width == 2) {
@@ -1039,26 +1090,47 @@ pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) ->
     let mut align = align;
     let mut spilled = 0u32;
     let mut private_base = None;
-    // Compute launches spill vector values to private memory.
+    // Compute launches spill vector values to private memory; scalars spill
+    // into lanes of vector registers in every stage.
     let mut temps = std::collections::BTreeSet::new();
+    let (mut lanes, mut bank, mut stats_lanes) = (0u32, 0u32, 0u32);
+    let compute = header.stage == isa::Stage::Compute;
     let (homes, mut stats) = loop {
-        let compute = header.stage == isa::Stage::Compute;
-        match allocate(&ops, &values, &fixed, &align, compute.then_some(&temps)) {
+        match allocate(&ops, &values, &fixed, &align, Some(&temps)) {
             Ok(result) => break result,
             Err(p) if p.live.is_empty() => return Err(p.message + " without spilling"),
             Err(p) => {
-                let base = *private_base.get_or_insert_with(|| private_pair(&mut ops, &mut values, &mut fixed, &mut align));
                 for victim in p.live {
-                    let slot = header.private / 4 + spilled;
-                    spilled += values[victim as usize].width as u32;
                     let first = values.len() as u32;
-                    spill(&mut ops, &mut values, &mut align, victim, slot, base);
+                    let width = values[victim as usize].width as u32;
+                    if values[victim as usize].class == Class::S {
+                        // Scalars spill into lanes of vector registers.
+                        let lane = lanes % 16;
+                        if lane == 0 || lane + width > 16 {
+                            values.push(Value { class: Class::V, width: 1 });
+                            align.push(1);
+                            lanes = lanes.next_multiple_of(16);
+                            bank = values.len() as u32 - 1;
+                            temps.insert(bank);
+                        }
+                        spill_lanes(&mut ops, &mut values, &mut align, victim, bank, lanes % 16);
+                        lanes += width;
+                        stats_lanes += width;
+                    } else {
+                        if !compute {
+                            return Err("vector register pressure exceeds 128 registers without spilling".into());
+                        }
+                        let base = *private_base.get_or_insert_with(|| private_pair(&mut ops, &mut values, &mut fixed, &mut align));
+                        let slot = header.private / 4 + spilled;
+                        spilled += width;
+                        spill(&mut ops, &mut values, &mut align, victim, slot, base);
+                    }
                     temps.extend(first..values.len() as u32);
                 }
             }
         }
     };
-    stats.spills = spilled;
+    stats.spills = spilled + stats_lanes;
     header.private += 4 * spilled;
     header.code = lower(&ops, &values, &homes)?;
     stats.instructions = header.code.len() as u32;

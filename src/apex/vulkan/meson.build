@@ -114,10 +114,13 @@ apex_texture_spv = custom_target('apex-texture-spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default : true,
 )
-apex_bench_compute_spv = custom_target('apex-bench-compute-spv',
-  input : 'bench.comp', output : 'bench_compute.spv',
-  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
-)
+apex_bench_test_spv = []
+foreach stage : ['comp', 'vert', 'frag']
+  apex_bench_test_spv += custom_target('apex-bench-test-' + stage,
+    input : 'bench.' + stage, output : 'bench_test.' + stage + '.spv',
+    command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+  )
+endforeach
 apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
@@ -143,7 +146,7 @@ test('apex-dispatch-spirv', find_program('spirv-val'),
 test('apex-multiple-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_multiple_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
-  args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv, apex_bench_compute_spv], suite : ['apex'])
+  args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv] + apex_bench_test_spv, suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
