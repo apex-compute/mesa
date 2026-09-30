@@ -2552,10 +2552,14 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
     * APEX_TILES_PER_WORKGROUP tiles per workgroup. */
    struct apex_program *fs = cmd->fragment ? &cmd->fragment->program : &cmd->vertex->depth_only->program;
    uint32_t groups = MIN3(tiles, fs->max_workgroups, 1024);
-   /* Direct draws split their chunks across jobs; an indirect draw's count
-    * is unknown here, so one job set walks all of its chunks. */
-   uint32_t step = indirect ? UINT32_MAX : APEX_FRAGMENT_CHUNKS;
-   uint32_t chunks = indirect ? 1 : draw[APEX_DRAW_BIN_CHUNKS];
+   /* Each job set walks APEX_FRAGMENT_CHUNKS bin chunks, bounding a launch's
+    * runtime. An indirect draw's count is resolved on the device, so it
+    * covers the most chunks the arena holds; sets past the resolved count
+    * do nothing. */
+   uint32_t step = APEX_FRAGMENT_CHUNKS;
+   uint32_t chunks = indirect ?
+      DIV_ROUND_UP(APEX_ARENA_PRIM_BYTES / (APEX_SUBPRIMS_FOR(topology) * APEX_PRIM_WORDS * 4), APEX_BIN_CHUNK) :
+      draw[APEX_DRAW_BIN_CHUNKS];
    /* One job set per layer that can hold primitives: the view's layer, every
     * render layer when the vertex shader writes gl_Layer, else layer 0. */
    uint32_t first_layer = view != ~0u ? view : 0;
@@ -2564,7 +2568,7 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       draw[APEX_DRAW_LAYER] = layer;
       for (uint32_t first = 0; first < chunks; first += step) {
          draw[APEX_DRAW_CHUNK_RANGE] = first;
-         draw[APEX_DRAW_CHUNK_RANGE + 1] = indirect ? UINT32_MAX : first + step;
+         draw[APEX_DRAW_CHUNK_RANGE + 1] = first + step;
          for (uint32_t base = 0; base < tiles; base += groups * APEX_TILES_PER_WORKGROUP)
             push_job(cmd, fs, cmd->graphics_sets, MIN2(groups, tiles - base), base,
                      MIN2(tiles, base + groups * APEX_TILES_PER_WORKGROUP), draw);
