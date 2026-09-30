@@ -1,0 +1,38 @@
+#version 450
+// Nested control flow on two waves: a divergent trip count, divergent and
+// uniform branches inside it, an inner loop with a break and an if-else chain.
+layout(local_size_x = 32) in;
+layout(std430, set = 0, binding = 0) buffer Output { uint o[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Input { uint v[]; } src;
+layout(push_constant) uniform Parameters { uint n, mode; } p;
+void main()
+{
+   uint l = gl_LocalInvocationIndex;
+   uint a = 0u, b = 7u;
+   for (uint i = 0u; i < p.n + (l & 3u); i++) {
+      if (((i ^ l) & 1u) == 0u) {
+         a += src.v[(i + l) & 63u];
+         if (p.mode == 1u)
+            b = b * 3u + i;
+         else
+            b ^= a;
+      } else {
+         b += i;
+         for (uint j = 0u; j < (l & 3u); j++) {
+            a += j * b;
+            if (a > 100000u)
+               break;
+         }
+      }
+   }
+   uint c;
+   if (l < 20u)
+      c = a + b;
+   else if (l < 25u)
+      c = a * b;
+   else
+      c = src.v[l];
+   o[l * 3u] = a;
+   o[l * 3u + 1u] = b;
+   o[l * 3u + 2u] = c;
+}

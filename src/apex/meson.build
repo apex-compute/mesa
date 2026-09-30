@@ -32,7 +32,7 @@ test('apex-compiler', apex_compiler_test, suite : ['apex'])
 apex_test_shaders = []
 foreach s : ['vulkan/bench.comp', 'vulkan/bench.vert', 'vulkan/bench.frag',
              'vulkan/triangle.vert', 'vulkan/triangle.frag', 'tests/compositor.frag',
-             'tests/features.comp', 'tests/spill.comp', 'tests/waterfall.comp', 'tests/discard.frag', 'tests/demote.frag']
+             'tests/features.comp', 'tests/spill.comp', 'tests/waterfall.comp', 'tests/control.comp', 'tests/texture.comp', 'tests/discard.frag', 'tests/demote.frag']
   apex_test_shaders += custom_target('apex-test-' + s.underscorify(),
     input : s, output : '@PLAINNAME@.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',

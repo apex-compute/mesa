@@ -492,6 +492,101 @@ static void test_waterfall(const char *dir)
    apex_compile_result_finish(&r);
 }
 
+/* control.comp: host replica of the nested control flow. */
+static void control_reference(uint32_t l, uint32_t n, uint32_t mode, const uint32_t *v, uint32_t out[3])
+{
+   uint32_t a = 0, b = 7;
+   for (uint32_t i = 0; i < n + (l & 3); i++) {
+      if (((i ^ l) & 1) == 0) {
+         a += v[(i + l) & 63];
+         if (mode == 1)
+            b = b * 3 + i;
+         else
+            b ^= a;
+      } else {
+         b += i;
+         for (uint32_t j = 0; j < (l & 3); j++) {
+            a += j * b;
+            if (a > 100000)
+               break;
+         }
+      }
+   }
+   out[0] = a;
+   out[1] = b;
+   out[2] = l < 20 ? a + b : l < 25 ? a * b : v[l];
+}
+static void test_control(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "control.comp.spv", &r);
+   for (uint32_t mode = 0; mode < 2; mode++) {
+      struct world w = {0};
+      uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+      uint8_t *out = region(&w, 0x200000, 32 * 12);
+      uint8_t *in = region(&w, 0x300000, 256);
+      uint32_t v[64];
+      for (unsigned k = 0; k < 64; k++) {
+         v[k] = 0x01000193u * (k + 3) >> 8;
+         put(in + 4 * k, v[k]);
+      }
+      buffer_descriptor(root + slot(0, 0), 0x200000, 32 * 12);
+      buffer_descriptor(root + slot(0, 1), 0x300000, 256);
+      put(root + PUSH, 9);
+      put(root + PUSH + 4, mode);
+      uint32_t user[16];
+      root_user(user);
+      run(&r, &w, user, 1, NULL);
+      for (uint32_t l = 0; l < 32; l++) {
+         uint32_t want[3];
+         control_reference(l, 9, mode, v, want);
+         for (unsigned k = 0; k < 3; k++)
+            CHECK(get(out + 12 * l + 4 * k) == want[k]);
+      }
+      world_free(&w);
+   }
+   apex_compile_result_finish(&r);
+}
+
+/* texture.comp: an 8x4 RGBA8 image with a nearest, repeating sampler. */
+static void test_texture(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "texture.comp.spv", &r);
+   struct world w = {0};
+   uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+   uint8_t *image = region(&w, 0x900000, 64 * 4);
+   uint8_t *out = region(&w, 0x200000, 16 * 64);
+   uint8_t packed[8 * 4 * 4];
+   for (unsigned k = 0; k < sizeof(packed); k++) {
+      packed[k] = (uint8_t)(k * 29 + 5);
+      image[(k / 32) * 64 + k % 32] = packed[k];
+   }
+   image_descriptor(root + slot(0, 0), 0x900000, 8, 4);
+   sampler_descriptor(root + slot(0, 0) + 32);
+   buffer_descriptor(root + slot(0, 1), 0x200000, 16 * 64);
+   uint32_t user[16];
+   root_user(user);
+   run(&r, &w, user, 1, NULL);
+   for (unsigned l = 0; l < 16; l++) {
+      unsigned x = l % 8, y = l / 8;
+      const uint8_t *o = out + 64 * l;
+      for (unsigned c = 0; c < 4; c++) {
+         CHECK(get(o + 4 * c) == bits(packed[(y * 8 + x) * 4 + c] / 255.0f));
+         CHECK(get(o + 16 + 4 * c) == bits(packed[(y * 8 + (x + 1) % 8) * 4 + c] / 255.0f));
+      }
+      /* Gather: green of (i0, j1), (i1, j1), (i1, j0), (i0, j0) with i0 = x, j0 = y. */
+      const unsigned gx[4] = {0, 1, 1, 0}, gy[4] = {1, 1, 0, 0};
+      for (unsigned c = 0; c < 4; c++) {
+         unsigned tx = (x + gx[c]) % 8, ty = (y + gy[c]) % 4;
+         CHECK(get(o + 32 + 4 * c) == bits(packed[(ty * 8 + tx) * 4 + 1] / 255.0f));
+      }
+      CHECK(get(o + 48) == bits(8.0f) && get(o + 52) == bits(4.0f) && get(o + 56) == bits(1.0f));
+   }
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
 /* discard.frag and demote.frag: quads 2-3 have v.x above 0.45. */
 static void test_kill(const char *dir, const char *name, bool demote)
 {
@@ -545,6 +640,8 @@ int main(int argc, char **argv)
    test_features(argv[1]);
    test_spill(argv[1]);
    test_waterfall(argv[1]);
+   test_control(argv[1]);
+   test_texture(argv[1]);
    test_kill(argv[1], "discard.frag.spv", false);
    test_kill(argv[1], "demote.frag.spv", true);
    test_gnome(argv[2]);
