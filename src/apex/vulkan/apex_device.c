@@ -3201,6 +3201,7 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
                .base_level = view->base_mip_level, .levels = view->level_count,
                .base_layer = view->base_array_layer, .layer_count = view->layer_count,
                .view_type = view->view_type, .samples = image->vk.samples,
+               .swizzle = apex_border_swizzle(view->format, view->aspects, &view->swizzle),
             };
             if (!apex_format_encode(format, view->aspects, &view->swizzle, d.format))
                return false;

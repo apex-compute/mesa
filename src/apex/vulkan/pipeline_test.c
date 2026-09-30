@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include "apex_graphics.h"
 #include "apex_pipeline.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
@@ -450,11 +451,108 @@ test_fill(struct vk_physical_device *physical, const char *output)
    apex_device_finish(&device);
 }
 
+/* Offline backend coverage of the software graphics and sampling paths:
+ * the primitive setup kernel and a compute shader sampling two combined
+ * image samplers (fetch, nearest and linear with border replacement). */
+static void
+test_graphics_programs(struct vk_physical_device *physical, const char *texture_path)
+{
+   struct apex_device device;
+   const float priority = 1;
+   const VkDeviceQueueCreateInfo qi = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
+      .pQueuePriorities = &priority,
+   };
+   const VkDeviceCreateInfo di = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+   };
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
+   device.transport = APEX_TRANSPORT_DRM;
+   /* Border swizzles: format components, conversion to RGBA, view mapping. */
+#define SW(r, g, b, a) ((r) | (g) << 3 | (b) << 6 | (a) << 9)
+   const unsigned Z = APEX_SWIZZLE_0, O = APEX_SWIZZLE_1;
+   const VkComponentMapping identity = {0}, reversed = {
+      VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R};
+   CHECK(apex_border_swizzle(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &identity) == SW(0, 1, 2, 3));
+   CHECK(apex_border_swizzle(VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &reversed) == SW(3, 2, 1, 0));
+   CHECK(apex_border_swizzle(VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &identity) == SW(0, Z, Z, O));
+   CHECK(apex_border_swizzle(VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &reversed) == SW(O, Z, Z, 0));
+   CHECK(apex_border_swizzle(VK_FORMAT_A8_UNORM_KHR, VK_IMAGE_ASPECT_COLOR_BIT, &identity) == SW(Z, Z, Z, 3));
+   CHECK(apex_border_swizzle(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_IMAGE_ASPECT_COLOR_BIT, &identity) ==
+         SW(0, 1, 2, O));
+   const VkComponentMapping rrr1 = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                                    VK_COMPONENT_SWIZZLE_ONE};
+   CHECK(apex_border_swizzle(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, &rrr1) == SW(0, 0, 0, O));
+   CHECK(apex_border_swizzle(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, &identity) == SW(0, Z, Z, O));
+#undef SW
+   /* Custom border colors reach the sampler row without a format. */
+   VkDevice handle = apex_device_to_handle(&device);
+   const VkSamplerCustomBorderColorCreateInfoEXT custom = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT,
+      .customBorderColor.int32 = {-3, 7, 1 << 30, -1},
+   };
+   const VkSamplerCreateInfo sampler_info = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .pNext = &custom, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+      .borderColor = VK_BORDER_COLOR_INT_CUSTOM_EXT};
+   VkSampler sampler;
+   CHECK(device.vk.dispatch_table.CreateSampler(handle, &sampler_info, NULL, &sampler) == VK_SUCCESS);
+   CHECK(!memcmp(&((struct apex_sampler *)vk_sampler_from_handle(sampler))->row[4],
+                 custom.customBorderColor.int32, 16));
+   device.vk.dispatch_table.DestroySampler(handle, sampler, NULL);
+   struct apex_program *setup;
+   CHECK(apex_internal_program(&device, APEX_INTERNAL_SETUP, &setup) == VK_SUCCESS);
+   CHECK(setup->code.size > 48);
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   FILE *f = fopen(texture_path, "rb");
+   CHECK(f && !fseek(f, 0, SEEK_END));
+   long bytes = ftell(f);
+   CHECK(bytes > 0 && bytes % 4 == 0);
+   rewind(f);
+   uint32_t *spirv = malloc(bytes);
+   CHECK(spirv && fread(spirv, 1, bytes, f) == bytes && !fclose(f));
+   VkShaderModule module;
+   VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                  .codeSize = bytes, .pCode = spirv};
+   CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
+   free(spirv);
+   VkDescriptorSetLayoutBinding bindings[] = {
+      {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+   };
+   VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                         .bindingCount = 3, .pBindings = bindings};
+   VkDescriptorSetLayout set;
+   CHECK(v->CreateDescriptorSetLayout(dev, &si, NULL, &set) == VK_SUCCESS);
+   VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                    .setLayoutCount = 1, .pSetLayouts = &set};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   VkComputePipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .layout = layout, .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
+   VkPipeline pipeline;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
+   /* Buffer row, two three-row combined descriptors. */
+   CHECK(apex_pipeline_from_handle(pipeline)->program.descriptor_count == 7);
+   v->DestroyPipeline(dev, pipeline, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   v->DestroyDescriptorSetLayout(dev, set, NULL);
+   v->DestroyShaderModule(dev, module, NULL);
+   apex_device_finish(&device);
+}
+
 int main(int argc, char **argv)
 {
-   CHECK(argc == 10 || argc == 11);
+   bool graphics = argc == 3 && !strcmp(argv[1], "--graphics");
+   CHECK(graphics || argc == 10 || argc == 11);
    const char *output = argc == 11 ? argv[10] : NULL;
-   FILE *f = fopen(argv[1], "rb");
+   FILE *f = fopen(graphics ? argv[2] : argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
    CHECK(size > 0 && size % 4 == 0);
@@ -482,6 +580,21 @@ int main(int argc, char **argv)
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
+   free(spirv);
+   if (graphics) {
+      test_graphics_programs(&physical, argv[2]);
+      vk_physical_device_finish(&physical);
+      vk_instance_finish(&instance);
+      puts("PASS Apex graphics programs: setup and sampling compile, border colors and swizzles");
+      return 0;
+   }
+   f = fopen(argv[1], "rb");
+   CHECK(f && fseek(f, 0, SEEK_END) == 0);
+   size = ftell(f);
+   rewind(f);
+   spirv = malloc(size);
+   CHECK(spirv && fread(spirv, 1, size, f) == size);
+   CHECK(fclose(f) == 0);
    struct apex_device device = {.transport = APEX_TRANSPORT_NATIVE};
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,

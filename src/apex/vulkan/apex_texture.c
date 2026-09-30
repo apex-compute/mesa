@@ -60,7 +60,7 @@ struct image_info {
    nir_def *width, *height, *depth, *layers;
    nir_def *base_level, *levels, *base_layer, *layer_count;
    nir_def *format[3];
-   nir_def *bytes, *samples;
+   nir_def *bytes, *samples, *swizzle;
    bool three_d;
 };
 
@@ -69,7 +69,7 @@ load_image(nir_builder *b, nir_def *row, bool three_d)
 {
    struct image_info i = {.three_d = three_d};
    nir_def *w[16];
-   for (unsigned k = 0; k < 15; k++)
+   for (unsigned k = 0; k < 16; k++)
       w[k] = row_word(b, nir_iadd_imm(b, row, k / 8), k % 8);
    i.address = nir_vec2(b, w[0], w[1]);
    i.width = w[2];
@@ -85,6 +85,7 @@ load_image(nir_builder *b, nir_def *row, bool three_d)
    i.format[2] = w[12];
    i.bytes = nir_iand_imm(b, w[10], 31);
    i.samples = w[14];
+   i.swizzle = w[15];
    return i;
 }
 
@@ -315,6 +316,25 @@ wrap(nir_builder *b, nir_def *mode, nir_def *i, nir_def *period, nir_def *size, 
    return result;
 }
 
+/* The border color replaces the format's components before conversion to
+ * RGBA and the view's component mapping (the descriptor's border swizzle),
+ * so opaque black and custom colors follow the view swizzle. */
+static nir_def *
+border_color(nir_builder *b, const struct image_info *img, const struct sampler_info *s)
+{
+   nir_def *integer = nir_ine_imm(b, nir_iand_imm(b, img->format[0], 1u << 20), 0);
+   nir_def *one = nir_bcsel(b, integer, nir_imm_int(b, 1), nir_imm_float(b, 1.0f));
+   nir_def *out[4];
+   for (unsigned c = 0; c < 4; c++) {
+      nir_def *select = nir_iand_imm(b, nir_ushr_imm(b, img->swizzle, 3 * c), 7);
+      nir_def *value = nir_bcsel(b, nir_ieq_imm(b, select, APEX_SWIZZLE_1), one, nir_imm_int(b, 0));
+      for (unsigned k = 0; k < 4; k++)
+         value = nir_bcsel(b, nir_ieq_imm(b, select, k), s->border[k], value);
+      out[c] = value;
+   }
+   return nir_vec(b, out, 4);
+}
+
 /* One texel of level `level` (absolute) at integer x, y, z/layer after
  * addressing; border texels return the sampler border color. */
 static nir_def *
@@ -326,7 +346,7 @@ tap(nir_builder *b, const struct image_info *img, const struct sampler_info *s, 
    nir_def *bytes = nir_iadd(b, offset, nir_iadd(b, nir_imul(b, z, plane),
       nir_iadd(b, nir_imul(b, y, pitch), nir_imul(b, x, img->bytes))));
    nir_push_if(b, border);
-   nir_def *border_value = nir_vec4(b, s->border[0], s->border[1], s->border[2], s->border[3]);
+   nir_def *border_value = border_color(b, img, s);
    nir_push_else(b, NULL);
    nir_def *value = decode_texel(b, img, nir_build_addr_iadd(b, img->address,
       nir_address_format_2x32bit_global, nir_var_mem_global, bytes));

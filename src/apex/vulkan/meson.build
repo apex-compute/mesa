@@ -109,6 +109,11 @@ apex_multiple_spv = custom_target('apex-multiple-spv',
   input : 'multiple.comp', output : 'multiple.spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
 )
+apex_texture_spv = custom_target('apex-texture-spv',
+  input : 'texture.comp', output : 'texture.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
+  build_by_default : true,
+)
 apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
@@ -135,6 +140,7 @@ test('apex-multiple-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_multiple_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
   args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv], suite : ['apex'])
+test('apex-graphics-programs', apex_pipeline_test, args : ['--graphics', apex_texture_spv], suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
@@ -201,11 +207,6 @@ apex_texture_test = executable('apex-texture-test', 'texture_test.c',
 )
 custom_target('apex-ms-texture-spv',
   input : 'ms_texture.comp', output : 'ms_texture.spv',
-  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
-  build_by_default : true,
-)
-custom_target('apex-texture-spv',
-  input : 'texture.comp', output : 'texture.spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default : true,
 )

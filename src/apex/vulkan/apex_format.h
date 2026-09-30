@@ -36,7 +36,8 @@ struct apex_sampled_descriptor {
    uint32_t format[3];
    uint32_t view_type;              /* VkImageViewType */
    uint32_t samples;                /* 1 or 4; samples of a texel are consecutive */
-   uint32_t reserved;
+   uint32_t swizzle;                /* border: 3 bits per RGBA output, 0-3 border
+                                       component, APEX_SWIZZLE_0 or APEX_SWIZZLE_1 */
 };
 
 /* Sampler row: word 0 = mag linear [0], min linear [1], mip linear [2],
@@ -51,6 +52,10 @@ struct apex_sampler_descriptor {
 
 bool apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping *mapping,
                         uint32_t out[3]);
+/* Border color components per output: replacement of the format's
+ * components, conversion to RGBA, then the view's component mapping. */
+uint32_t apex_border_swizzle(VkFormat format, VkImageAspectFlags aspects,
+                             const VkComponentMapping *mapping);
 bool apex_attachment_format_supported(enum pipe_format format);
 /* ETC2/EAC images keep a decoded plane: its format and the decode kind
  * (APEX_ETC2_* / APEX_EAC_*), or VK_FORMAT_UNDEFINED for other formats. */

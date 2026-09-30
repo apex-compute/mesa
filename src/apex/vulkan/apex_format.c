@@ -96,6 +96,32 @@ apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponent
    return true;
 }
 
+uint32_t
+apex_border_swizzle(VkFormat format, VkImageAspectFlags aspects, const VkComponentMapping *mapping)
+{
+   /* Replacement fills the format's components; conversion to RGBA then
+    * supplies zero color and one alpha, and depth or stencil reads red. */
+   bool present[4] = {true, false, false, false};
+   if (!(aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+      const struct util_format_description *desc =
+         util_format_description(vk_format_to_pipe_format(format));
+      for (unsigned c = 0; c < 4; c++)
+         present[c] = desc && desc->swizzle[c] <= PIPE_SWIZZLE_W;
+   }
+   const VkComponentSwizzle view[4] = {mapping->r, mapping->g, mapping->b, mapping->a};
+   uint32_t out = 0;
+   for (unsigned c = 0; c < 4; c++) {
+      VkComponentSwizzle s = view[c] == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_R + c : view[c];
+      uint32_t select = s == VK_COMPONENT_SWIZZLE_ZERO ? APEX_SWIZZLE_0 : APEX_SWIZZLE_1;
+      if (s >= VK_COMPONENT_SWIZZLE_R && s <= VK_COMPONENT_SWIZZLE_A) {
+         unsigned f = s - VK_COMPONENT_SWIZZLE_R;
+         select = present[f] ? f : f == 3 ? APEX_SWIZZLE_1 : APEX_SWIZZLE_0;
+      }
+      out |= select << (3 * c);
+   }
+   return out;
+}
+
 void
 apex_sampler_encode(const VkSamplerCreateInfo *info, const struct vk_sampler *sampler,
                     uint32_t out[8])

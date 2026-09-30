@@ -68,7 +68,7 @@ image_exec(struct drm_apex_vm_exec *r)
        * mip1/layer1 second. Offsets include the nonzero image memory binding. */
       /* Row 0: the storage buffer. Rows 1-4: two storage images in the
        * two-row sampled layout (image base, level-0 extent, view range,
-       * format words, view type, samples). Row 5: the zero sentinel. */
+       * format words, view type, samples, border swizzle: R32 reads (R, 0, 0, 1)). Row 5: the zero sentinel. */
       CHECK(((uint64_t)util_le32_to_cpu(words[1]) << 32 | util_le32_to_cpu(words[0])) == base + 4224);
       for (unsigned i = 2; i < 8; i++) CHECK(util_le32_to_cpu(words[i]) == (i == 2 ? 768 : 0));
       uint32_t format[3];
@@ -78,7 +78,7 @@ image_exec(struct drm_apex_vm_exec *r)
          const uint32_t *image = words + 8 + d * 16;
          const uint32_t want[16] = {base + 256, (base + 256) >> 32, 11, 7, 1, 4,
             views[d][0], views[d][1], views[d][2], views[d][3], format[0], format[1], format[2],
-            VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 0};
+            VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 0 | APEX_SWIZZLE_0 << 3 | APEX_SWIZZLE_0 << 6 | APEX_SWIZZLE_1 << 9};
          for (unsigned i = 0; i < 16; i++) CHECK(util_le32_to_cpu(image[i]) == want[i]);
       }
       for (unsigned i = 40; i < 48; i++) CHECK(!words[i]);
