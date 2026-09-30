@@ -533,6 +533,8 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
    bool three_d = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
    unsigned dims = tex->sampler_dim == GLSL_SAMPLER_DIM_1D ? 1 : three_d ? 3 : 2;
    struct image_info img = load_image(b, image_row, three_d);
+   /* Null descriptors have zero levels: queries return zero, reads zero. */
+   nir_def *null = nir_ieq_imm(b, img.levels, 0);
    nir_def *lod_src = tex_src(tex, nir_tex_src_lod);
    switch (tex->op) {
    case nir_texop_txs: {
@@ -542,7 +544,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       unsigned n = tex->def.num_components;
       if (tex->is_array)
          size[n - 1] = cube ? nir_udiv_imm(b, img.layer_count, 6) : img.layer_count;
-      nir_def_replace(&tex->def, nir_vec(b, size, n));
+      nir_def_replace(&tex->def, nir_bcsel(b, null, nir_imm_zero(b, n, 32), nir_vec(b, size, n)));
       return true;
    }
    case nir_texop_query_levels:
@@ -557,6 +559,8 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
    default:
       break;
    }
+   /* Level arithmetic of null descriptors stays within one level. */
+   img.levels = nir_umax(b, img.levels, nir_imm_int(b, 1));
    nir_def *coord = tex_src(tex, nir_tex_src_coord);
    bool integer = nir_alu_type_get_base_type(tex->dest_type) != nir_type_float;
    if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms) {
@@ -564,7 +568,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       nir_def *level = lod_src ? lod_src : nir_imm_int(b, 0);
       nir_def *absolute = nir_iadd(b, img.base_level, level);
       nir_def *offset_src = tex_src(tex, nir_tex_src_offset);
-      nir_def *index[3], *inside = nir_ult(b, level, img.levels);
+      nir_def *index[3], *inside = nir_iand(b, nir_inot(b, null), nir_ult(b, level, img.levels));
       nir_def *size[3] = {minify(b, img.width, absolute), minify(b, img.height, absolute),
                           minify(b, img.depth, absolute)};
       for (unsigned a = 0; a < dims; a++) {
@@ -668,7 +672,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
    nir_def *max_level = nir_u2f32(b, nir_iadd_imm(b, img.levels, -1));
    if (tex->op == nir_texop_lod) {
       nir_def *level = nir_fmin(b, nir_fmax(b, lambda, nir_imm_float(b, 0.0f)), max_level);
-      nir_def_replace(&tex->def, nir_vec2(b, level, lambda));
+      nir_def_replace(&tex->def, nir_bcsel(b, null, nir_imm_zero(b, 2, 32), nir_vec2(b, level, lambda)));
       return true;
    }
    /* Magnification at lambda <= 0 uses the mag filter; minification the min
@@ -688,11 +692,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       /* Gather reads the four bilinear taps of level 0. */
       nir_def *parts = filter(b, &img, &s, &r, nir_imm_int(b, 0), nir_imm_false(b),
                               nir_imm_float(b, 0.0f), nir_imm_true(b), true, tex->component);
-      nir_def_replace(&tex->def, parts);
+      nir_def_replace(&tex->def, nir_bcsel(b, null, nir_imm_zero(b, 4, 32), parts));
       return true;
    }
    nir_def *weight = nir_fsub(b, level_f, nir_ffloor(b, level_f));
    nir_def *result = filter(b, &img, &s, &r, level0, mip_linear, weight, linear, false, 0);
+   result = nir_bcsel(b, null, nir_imm_zero(b, 4, 32), result);
    if (r.reference)
       result = nir_channel(b, result, 0);
    nir_def_replace(&tex->def, nir_trim_vector(b, result, tex->def.num_components));
@@ -781,10 +786,6 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       ctx->invalid = true;
       return false;
    }
-   if (samples) {
-      nir_def_replace(&i->def, nir_imm_int(b, 1));
-      return true;
-   }
    /* The binding must hold storage images, or texel buffers for buffer images. */
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(i);
    nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(i->src[0]));
@@ -802,7 +803,7 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
    bool array = nir_intrinsic_image_array(i);
    struct image_info img;
    nir_def *inside, *address;
-   nir_def *coord = size ? NULL : i->src[1].ssa;
+   nir_def *coord = size || samples ? NULL : i->src[1].ssa;
    if (dim == GLSL_SAMPLER_DIM_BUF) {
       /* Texel buffers: address, byte range, elements, format words. */
       img = (struct image_info){0};
@@ -822,6 +823,12 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       bool three_d = dim == GLSL_SAMPLER_DIM_3D, cube = dim == GLSL_SAMPLER_DIM_CUBE;
       unsigned dims = dim == GLSL_SAMPLER_DIM_1D ? 1 : three_d ? 3 : 2;
       img = load_image(b, row, three_d);
+      /* Storage images have one sample; null descriptors zero levels. */
+      nir_def *null = nir_ieq_imm(b, img.levels, 0);
+      if (samples) {
+         nir_def_replace(&i->def, nir_b2i32(b, nir_inot(b, null)));
+         return true;
+      }
       nir_def *level = img.base_level;
       nir_def *extent[3] = {minify(b, img.width, level), minify(b, img.height, level),
                             minify(b, img.depth, level)};
@@ -837,11 +844,12 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
          }
          for (unsigned a = n; a < 4; a++)
             out[a] = nir_imm_int(b, 1);
-         nir_def_replace(&i->def, nir_vec(b, out, i->def.num_components));
+         nir_def_replace(&i->def, nir_bcsel(b, null, nir_imm_zero(b, i->def.num_components, 32),
+                                            nir_vec(b, out, i->def.num_components)));
          return true;
       }
       nir_def *index[3];
-      inside = nir_imm_true(b);
+      inside = nir_inot(b, null);
       for (unsigned a = 0; a < 3; a++) {
          index[a] = a < dims ? nir_channel(b, coord, a) : nir_imm_int(b, 0);
          if (a < dims)

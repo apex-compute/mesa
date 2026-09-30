@@ -3145,8 +3145,9 @@ native_command(struct apex_device *device, uint32_t operation)
    return ioctl(device->fd, APEX_IOCTL_NATIVE, &r);
 }
 
-/* Rows for one descriptor element. Unwritten descriptors keep the zero rows;
- * no nullDescriptor feature is advertised and unused bindings are skipped. */
+/* Rows for one descriptor element. Null descriptors and unused bindings keep
+ * the zero rows: buffers and texel buffers of zero bytes and elements, and
+ * images of zero levels, which read zero and discard writes. */
 static bool
 write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *binding,
                  unsigned element, const struct apex_set_layout *layout,

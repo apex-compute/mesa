@@ -25,7 +25,8 @@ enum apex_channel_type {
 
 /* Sampled image descriptor: two 32-byte table rows. The view selects levels
  * and layers of the image's mip-major linear allocation; the shader derives
- * each level's pitch and offset from the level-0 extent. */
+ * each level's pitch and offset from the level-0 extent. A null descriptor
+ * is all zeros: zero levels. */
 struct apex_sampled_descriptor {
    uint32_t low, high;              /* image level 0, layer 0 */
    uint32_t width, height, depth;   /* image level 0 */

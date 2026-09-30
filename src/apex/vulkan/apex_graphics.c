@@ -216,15 +216,17 @@ fetch_attribute(nir_builder *b, struct vertex_lowering *ctx, unsigned location,
                          nir_udiv_imm(b, nir_isub(b, ctx->instance, first_instance), binding->divisor));
    }
    nir_def *byte = nir_iadd_imm(b, nir_imul(b, element, draw_word(b, program, slot + 3)), attr->offset);
-   /* Robust fetch: an attribute beyond the bound range reads zero. */
+   /* Robust fetch: an attribute beyond the bound range, or of a null
+    * binding, reads zero for the format's components; missing G, B and A
+    * are filled with (0, 0, 1). */
    nir_def *inside = nir_uge(b, draw_word(b, program, slot + 2),
                              nir_iadd_imm(b, byte, desc->block.bits / 8));
    nir_def *address = draw_address(b, program, slot);
    nir_def *values[4], *fallback[4];
    /* Phi sources must exist before the if: phis lead their block. */
    for (unsigned c = 0; c < count; c++)
-      fallback[c] = component + c == 3 ? (integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f)) :
-                                         nir_imm_int(b, 0);
+      fallback[c] = desc->swizzle[component + c] == PIPE_SWIZZLE_1 ?
+                    (integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f)) : nir_imm_int(b, 0);
    nir_push_if(b, inside);
    nir_def *fetched[4];
    for (unsigned c = 0; c < 4; c++) {
