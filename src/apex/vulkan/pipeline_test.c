@@ -3,6 +3,7 @@
 #include "apex_pipeline.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
+#include "vk_command_buffer.h"
 #include "vk_common_entrypoints.h"
 #include "vk_device.h"
 #include "vk_instance.h"
@@ -74,11 +75,9 @@ test_descriptors(struct vk_physical_device *physical, const char *path,
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
    };
-   CHECK(apex_device_init(&device, physical, &device_info, NULL, -1,
-                          APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
-   /* Compiler/layout test only: choose the DRM descriptor ABI without a fd.
+   CHECK(apex_device_init(&device, physical, &device_info, NULL, -1) == VK_SUCCESS);
+   /* Compiler/layout test only: an offline device without a fd.
     * No device-memory allocation, submission or ioctl occurs in this test. */
-   device.transport = APEX_TRANSPORT_DRM;
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    if (images) {
@@ -261,8 +260,7 @@ test_rgba(struct vk_physical_device *physical, const char *path)
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
    };
-   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
-   device.transport = APEX_TRANSPORT_DRM;
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1) == VK_SUCCESS);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    FILE *f = fopen(path, "rb");
@@ -318,8 +316,7 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
    };
-   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
-   device.transport = APEX_TRANSPORT_DRM;
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1) == VK_SUCCESS);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    FILE *f = fopen(path, "rb");
@@ -398,9 +395,8 @@ test_fill(struct vk_physical_device *physical, const char *output)
       .queueCount = 1, .pQueuePriorities = &priority};
    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
-   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1) == VK_SUCCESS);
    /* Compile/record only. Supply an address without creating a kernel BO. */
-   device.transport = APEX_TRANSPORT_DRM;
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkBuffer buffer;
@@ -418,8 +414,15 @@ test_fill(struct vk_physical_device *physical, const char *output)
    CHECK(v->AllocateCommandBuffers(dev, &ai, &cmd) == VK_SUCCESS);
    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
    CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
-   v->CmdFillBuffer(cmd, buffer, 4, 196, 0xa5c31e79);
-   v->CmdFillBuffer(cmd, buffer, 256, VK_WHOLE_SIZE, 0xbaadf00d);
+   /* The driver fills and copies through CP packets; Mesa's compute fill
+    * and copy kernels remain the unaligned-SYSTEM path and RTL fixtures. */
+   struct vk_command_buffer *vk_cmd = vk_command_buffer_from_handle(cmd);
+   struct vk_buffer *vk_buffer = vk_buffer_from_handle(buffer);
+   VkDeviceAddressRangeKHR range = vk_device_address_range(vk_buffer, 4, 196);
+   vk_meta_fill_memory(vk_cmd, &device.meta, &range, 0, 0xa5c31e79);
+   range = vk_device_address_range(vk_buffer, 256, VK_WHOLE_SIZE);
+   range.size &= ~3ull;
+   vk_meta_fill_memory(vk_cmd, &device.meta, &range, 0, 0xbaadf00d);
    enum vk_meta_object_key_type key = VK_META_OBJECT_KEY_FILL_BUFFER;
    VkPipeline handle = vk_meta_lookup_pipeline(&device.meta, &key, sizeof(key));
    CHECK(handle);
@@ -432,8 +435,11 @@ test_fill(struct vk_physical_device *physical, const char *output)
       CHECK(f && fwrite(pipeline->program.code.data, 1, pipeline->program.code.size, f) == pipeline->program.code.size && !fclose(f));
    }
    for (unsigned chunk = 1; chunk <= 16; chunk *= 2) {
-      VkBufferCopy region = {.srcOffset = chunk, .dstOffset = 128 + chunk, .size = chunk * 3};
-      v->CmdCopyBuffer(cmd, buffer, buffer, 1, &region);
+      const VkBufferCopy2 region = {.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2,
+         .srcOffset = chunk, .dstOffset = 128 + chunk, .size = chunk * 3};
+      const VkCopyBufferInfo2 copy = {.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+         .srcBuffer = buffer, .dstBuffer = buffer, .regionCount = 1, .pRegions = &region};
+      vk_meta_copy_buffer(vk_cmd, &device.meta, &copy);
       struct { enum vk_meta_object_key_type type; uint32_t chunk; } copy_key = {
          VK_META_OBJECT_KEY_COPY_BUFFER, chunk,
       };
@@ -776,22 +782,7 @@ int main(int argc, char **argv)
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
-   free(spirv);
-   if (graphics) {
-      test_graphics_programs(&physical, argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
-      vk_physical_device_finish(&physical);
-      vk_instance_finish(&instance);
-      puts("PASS Apex graphics programs: setup and sampling compile, border colors and swizzles");
-      return 0;
-   }
-   f = fopen(argv[1], "rb");
-   CHECK(f && fseek(f, 0, SEEK_END) == 0);
-   size = ftell(f);
-   rewind(f);
-   spirv = malloc(size);
-   CHECK(spirv && fread(spirv, 1, size, f) == size);
-   CHECK(fclose(f) == 0);
-   struct apex_device device = {.transport = APEX_TRANSPORT_NATIVE};
+   struct apex_device device = {0};
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,
    };

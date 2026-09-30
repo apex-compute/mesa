@@ -510,9 +510,9 @@ create_compute_pipeline(struct vk_device *device,
    }
    pipeline->vk.stages = VK_SHADER_STAGE_COMPUTE_BIT;
    struct vk_pipeline_layout *layout = vk_pipeline_layout_from_handle(info->layout);
-   if (((struct apex_device *)device)->transport == APEX_TRANSPORT_DRM) {
-      if (!layout)
-         goto unsupported_layout;
+   /* Without a layout the program keeps binding 0 as its raw storage buffer:
+    * the RTL benches' fixtures. Submission requires a descriptor table. */
+   if (layout) {
       pipeline->layout = vk_pipeline_layout_ref(layout);
       if (!apex_program_layout(&pipeline->program, layout->set_count, layout->set_layouts,
                                layout->push_range_count, layout->push_ranges,

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
-#include "apex_native_uapi.h"
 #include "apex_graphics.h"
 #include "apex_draw.h"
 #include "drm-uapi/apex_drm.h"
@@ -87,22 +86,27 @@ struct apex_bound_set {
    uint32_t refs;
    uint32_t offsets[];
 };
+/* One DISPATCH in the command buffer's IB. Submission writes its descriptor
+ * table and patches the program and table GPUVAs at dword `patch` (the
+ * compute-state SET_STATE payload) of the IB copy. */
 struct apex_dispatch {
    struct list_head link;
    struct apex_program *program;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint32_t groups;
+   uint32_t patch;
    struct apex_dispatch_parameters parameters;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    /* Graphics jobs append the draw block after the dispatch parameters. */
    bool graphics;
    uint32_t draw[APEX_DRAW_WORDS];
 };
-struct apex_pending_dispatch {
+/* Submission memory: descriptor tables, then the IB copies, retired when the
+ * batch's SIGNAL reaches `sequence`. */
+struct apex_arena {
    struct list_head link;
-   struct apex_bo table;
-   struct drm_apex_vm_submit args;
-   uint64_t point;
+   struct apex_bo bo;
+   uint64_t sequence;
 };
 /* Recorded device memory created at first submission: snapshots of host
  * bytes (read-only) or zero-filled draw scratch (read-write). */
@@ -119,6 +123,10 @@ struct apex_attachment {
 };
 struct apex_command_buffer {
    struct vk_command_buffer vk;
+   /* Packets in recording order, beginning with a full barrier. `pending`
+    * holds the BARRIER classes of work issued since the last barrier. */
+   struct apex_ib ib;
+   uint32_t pending;
    /* push_sets owns push descriptor sets; pushed[] is the latest per set. */
    struct list_head dispatches, uploads, push_sets;
    struct apex_descriptor_set *pushed[MESA_VK_MAX_DESCRIPTOR_SETS];
@@ -170,16 +178,32 @@ gem_close(struct apex_device *device, uint32_t handle)
    return ioctl(device->fd, DRM_IOCTL_GEM_CLOSE, &args);
 }
 
+/* The status page reports queue faults without an ioctl; QUEUE_STATUS names
+ * the fault and the file's sticky error. */
 static VkResult
 check_status(struct vk_device *vk)
 {
    struct apex_device *device = (void *)vk;
-   struct drm_apex_vm_status status = {0};
-   int ret = ioctl(device->fd, DRM_IOCTL_APEX_VM_STATUS, &status);
-   if (ret || status.error)
-      return vk_device_set_lost(vk, "Apex asynchronous terminal failure (ioctl errno=%d, VM error=%d)",
-                                ret ? errno : 0, status.error);
-   return VK_SUCCESS;
+   const volatile uint32_t *status = device->status_map;
+   if (!(status[APEX_STATUS_STATE / 4] & (APEX_STATUS_FAULTED | APEX_STATUS_RESET)))
+      return VK_SUCCESS;
+   struct drm_apex_queue_status query = {.queue_id = device->queue_id};
+   int ret = ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_STATUS, &query);
+   return vk_device_set_lost(vk, "Apex queue fault (state %#x, status %u, unit %u, address %#" PRIx64
+                             ", errno %d)", ret ? 0 : query.state, query.fault_status,
+                             query.fault_unit, (uint64_t)query.fault_address,
+                             ret ? errno : query.error);
+}
+
+static int
+vm_bind(struct apex_device *device, uint32_t op, uint32_t flags, uint32_t handle,
+        uint64_t va, uint64_t bytes)
+{
+   struct drm_apex_vm_bind_op bind_op = {
+      .op = op, .flags = flags, .handle = handle, .va = va, .bytes = bytes,
+   };
+   struct drm_apex_vm_bind bind = {.ops = (uintptr_t)&bind_op, .op_count = 1};
+   return ioctl(device->fd, DRM_IOCTL_APEX_VM_BIND, &bind);
 }
 
 static VkResult
@@ -205,14 +229,11 @@ gem_create(struct apex_device *device, uint64_t size, uint32_t flags,
 void
 apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
 {
-   /* After async device loss, UNMAP could wait an unsignaled job and prevent file
-    * close from cancelling it. Keep the mapping and VA reserved until close;
-    * the kernel VM retains backing independently of the GEM handle. */
-   if (bo->va && !(device->completion && vk_device_is_lost(&device->vk))) {
-      struct drm_apex_vm_bind bind = {
-         .operation = APEX_DRM_VM_BIND_UNMAP, .va = bo->va, .bytes = bo->size,
-      };
-      if (ioctl(device->fd, DRM_IOCTL_APEX_VM_BIND, &bind)) {
+   /* After device loss, UNMAP could wait on work of the lost queue and delay
+    * file close. Keep the mapping and VA reserved until close; the kernel VM
+    * retains backing independently of the GEM handle. */
+   if (bo->va && !vk_device_is_lost(&device->vk)) {
+      if (vm_bind(device, APEX_VM_UNMAP, 0, 0, bo->va, bo->size)) {
          /* Keep this address reserved until file close if unbind failed. */
          vk_device_set_lost(&device->vk, "Apex VM unbind failed");
       } else {
@@ -234,6 +255,7 @@ bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
           uint32_t gem_flags, uint64_t reserved_va, struct apex_bo *bo)
 {
    bo->size = align64(size, 4096);
+   bo->system = gem_flags & APEX_GEM_SYSTEM;
    uint64_t va = reserved_va;
    VkResult result = gem_create(device, bo->size, gem_flags, &bo->handle, &bo->map);
    if (result != VK_SUCCESS)
@@ -244,15 +266,9 @@ bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
       mtx_unlock(&device->va_mutex);
    }
    result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   if (va) {
-      struct drm_apex_vm_bind bind = {
-         .operation = APEX_DRM_VM_BIND_MAP, .flags = flags, .handle = bo->handle,
-         .va = va, .bytes = bo->size,
-      };
-      if (!ioctl(device->fd, DRM_IOCTL_APEX_VM_BIND, &bind)) {
-         bo->va = va;
-         return VK_SUCCESS;
-      }
+   if (va && !vm_bind(device, APEX_VM_MAP, flags, bo->handle, va, bo->size)) {
+      bo->va = va;
+      return VK_SUCCESS;
    }
 fail:
    if (va) {
@@ -262,17 +278,6 @@ fail:
    }
    apex_bo_finish(device, bo);
    return result;
-}
-
-static VkResult
-bo_transfer(struct apex_device *device, struct apex_bo *bo, uint32_t direction,
-            uint64_t offset, uint64_t bytes)
-{
-   struct drm_apex_gem_transfer transfer = {
-      .handle = bo->handle, .direction = direction, .offset = offset, .bytes = bytes,
-   };
-   return ioctl(device->fd, DRM_IOCTL_APEX_GEM_TRANSFER, &transfer) ?
-      vk_device_set_lost(&device->vk, "Apex memory transfer failed") : VK_SUCCESS;
 }
 
 /* memory_mutex spans FD_TO_HANDLE and lookup through final GEM_CLOSE. PRIME
@@ -321,15 +326,12 @@ import_memory(struct apex_device *device, int fd, uint64_t size,
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto unlock;
    }
-   storage->bo = (struct apex_bo){.handle = prime.handle, .size = extent};
+   /* Foreign dma-bufs import as SYSTEM mappings without CPU access. */
+   storage->bo = (struct apex_bo){.handle = prime.handle, .size = extent, .system = true};
    mtx_lock(&device->va_mutex);
    uint64_t va = util_vma_heap_alloc(&device->va_heap, extent, 4096);
    mtx_unlock(&device->va_mutex);
-   struct drm_apex_vm_bind bind = {
-      .operation = APEX_DRM_VM_BIND_MAP, .flags = APEX_DRM_VM_READ | APEX_DRM_VM_WRITE,
-      .handle = prime.handle, .va = va, .bytes = extent,
-   };
-   if (!va || ioctl(device->fd, DRM_IOCTL_APEX_VM_BIND, &bind)) {
+   if (!va || vm_bind(device, APEX_VM_MAP, APEX_VM_READ | APEX_VM_WRITE, prime.handle, va, extent)) {
       if (va) {
          mtx_lock(&device->va_mutex);
          util_vma_heap_free(&device->va_heap, va, extent);
@@ -364,7 +366,7 @@ apex_GetMemoryFdKHR(VkDevice dev, const VkMemoryGetFdInfoKHR *info, int *fd)
    VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_memory, memory, info->memory);
    *fd = -1;
-   if (!device->prime_coherent || !(info->handleType & APEX_EXTERNAL_MEMORY_TYPES) ||
+   if (!(info->handleType & APEX_EXTERNAL_MEMORY_TYPES) ||
        util_bitcount(info->handleType) != 1 || !(memory->vk.export_handle_types & info->handleType))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    struct drm_prime_handle prime = {
@@ -382,8 +384,7 @@ apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits t
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    properties->memoryTypeBits = 0;
-   if (!device->prime_coherent || type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ||
-       !dma_buf_size(fd))
+   if (type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT || !dma_buf_size(fd))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    mtx_lock(&device->memory_mutex);
    struct drm_prime_handle prime = {.fd = fd};
@@ -393,38 +394,13 @@ apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits t
    mtx_unlock(&device->memory_mutex);
    if (ret)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   properties->memoryTypeBits = 2 | local_memory_types(device);
+   properties->memoryTypeBits = 2; /* Imports are SYSTEM mappings. */
    return VK_SUCCESS;
 }
 
-static uint32_t
-host_memory_types(const struct apex_device *device)
-{
-   return 1 | (device->host_coherent ? 1u << (1 + device->prime_coherent) : 0) |
-          local_memory_types(device);
-}
-
-/* Imported memory has no CPU mapping until the first vkMapMemory. */
-static VkResult
-map_storage(struct apex_device *device, struct apex_memory *memory)
-{
-   struct apex_bo *bo = &memory->storage->bo;
-   VkResult result = VK_SUCCESS;
-   mtx_lock(&device->memory_mutex);
-   if (!bo->map) {
-      struct drm_apex_gem_mmap map = {.handle = bo->handle};
-      void *ptr = MAP_FAILED;
-      if (!ioctl(device->fd, DRM_IOCTL_APEX_GEM_MMAP, &map))
-         ptr = mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd, map.offset);
-      if (ptr == MAP_FAILED)
-         result = VK_ERROR_MEMORY_MAP_FAILED;
-      else
-         bo->map = ptr;
-   }
-   memory->data = bo->map;
-   mtx_unlock(&device->memory_mutex);
-   return result;
-}
+/* Type 0 is LOCAL (BAR2 write-combined), type 1 SYSTEM (cached shmem); both
+ * are host coherent. */
+#define APEX_MEMORY_TYPES 3u
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
@@ -432,7 +408,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->memoryTypeIndex > (unsigned)(2 * device->prime_coherent + device->host_coherent))
+   if (info->memoryTypeIndex > 1)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    bool local = local_memory_types(device) & (1u << info->memoryTypeIndex);
    const VkImportMemoryFdInfoKHR *import = vk_find_struct_const(info->pNext, IMPORT_MEMORY_FD_INFO_KHR);
@@ -443,11 +419,9 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    if ((import && (import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
                    import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ||
        (types & ~APEX_EXTERNAL_MEMORY_TYPES) ||
-       /* Imports use a device-local type. Export also admits explicit-transfer
-        * type 0: after first export shmem is canonical and transfers only wait. */
-       ((import || types) && (!device->prime_coherent ||
-                              (info->memoryTypeIndex != 1 && !local &&
-                               (import || info->memoryTypeIndex != 0)))))
+       /* PRIME exports LOCAL objects; imports are SYSTEM mappings. */
+       (types && !import && info->memoryTypeIndex != 0) ||
+       (import && info->memoryTypeIndex != 1))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    /* Every allocation has a device address; capture/replay is unsupported. */
    const VkMemoryAllocateFlagsInfo *flags = vk_find_struct_const(info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
@@ -471,18 +445,15 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    VkResult result;
    if (import) {
       result = import_memory(device, import->fd, info->allocationSize, &mem->storage);
-   } else if (device->transport == APEX_TRANSPORT_DRM) {
+   } else {
       mem->storage = vk_zalloc(&device->vk.alloc, sizeof(*mem->storage), 8,
                                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!mem->storage) {
          vk_device_memory_destroy(&device->vk, alloc, &mem->vk);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
-      result = bo_create(device, info->allocationSize,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_WRITE,
-                         local ? APEX_DRM_GEM_LOCAL :
-                         device->host_coherent && info->memoryTypeIndex == 1u + device->prime_coherent ?
-                            APEX_DRM_GEM_HOST_COHERENT : 0, 0, &mem->storage->bo);
+      result = bo_create(device, info->allocationSize, APEX_VM_READ | APEX_VM_WRITE,
+                         info->memoryTypeIndex == 1 ? APEX_GEM_SYSTEM : 0, 0, &mem->storage->bo);
       if (result == VK_SUCCESS) {
          mem->data = mem->storage->bo.map;
          mem->storage->refs = 1;
@@ -492,10 +463,6 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
       } else {
          vk_free(&device->vk.alloc, mem->storage);
       }
-   } else {
-      mem->data = vk_zalloc2(&device->vk.alloc, alloc, info->allocationSize, 8,
-                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      result = mem->data ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    if (result != VK_SUCCESS) {
       vk_device_memory_destroy(&device->vk, alloc, &mem->vk);
@@ -514,28 +481,22 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
    VK_FROM_HANDLE(apex_memory, memory, handle);
    if (!memory)
       return;
-   if (device->transport == APEX_TRANSPORT_DRM) {
-      mtx_lock(&device->memory_mutex);
-      if (!--memory->storage->refs) {
-         list_del(&memory->storage->link);
-         apex_bo_finish(device, &memory->storage->bo);
-         vk_free(&device->vk.alloc, memory->storage);
-      }
-      mtx_unlock(&device->memory_mutex);
-   } else {
-      vk_free2(&device->vk.alloc, alloc, memory->data);
+   mtx_lock(&device->memory_mutex);
+   if (!--memory->storage->refs) {
+      list_del(&memory->storage->link);
+      apex_bo_finish(device, &memory->storage->bo);
+      vk_free(&device->vk.alloc, memory->storage);
    }
+   mtx_unlock(&device->memory_mutex);
    vk_device_memory_destroy(&device->vk, alloc, &memory->vk);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_MapMemory2(VkDevice dev, const VkMemoryMapInfo *info, void **out)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_memory, memory, info->memory);
    *out = NULL;
-   if (!(host_memory_types(device) & (1u << memory->vk.memory_type_index)) ||
-       info->flags || info->offset >= memory->vk.size ||
+   if (!memory->data || info->flags || info->offset >= memory->vk.size ||
        (info->size != VK_WHOLE_SIZE && info->size > memory->vk.size - info->offset))
       return VK_ERROR_MEMORY_MAP_FAILED;
    if (!memory->data) {
@@ -553,25 +514,18 @@ apex_UnmapMemory2(VkDevice dev, const VkMemoryUnmapInfo *info)
    return info->flags ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS;
 }
 
+/* Both memory types are host coherent: ranges are only validated. */
 static VkResult
-mapped_memory_ranges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges,
-                     uint32_t direction)
+mapped_memory_ranges(uint32_t count, const VkMappedMemoryRange *ranges)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, memory, ranges[i].memory);
-      if (!(host_memory_types(device) & (1u << memory->vk.memory_type_index)) ||
-          ranges[i].offset >= memory->vk.size)
+      if (!memory->data || ranges[i].offset >= memory->vk.size)
          return VK_ERROR_MEMORY_MAP_FAILED;
       uint64_t bytes = ranges[i].size == VK_WHOLE_SIZE ?
          memory->vk.size - ranges[i].offset : ranges[i].size;
       if (!bytes || bytes > memory->vk.size - ranges[i].offset)
          return VK_ERROR_MEMORY_MAP_FAILED;
-      if (device->transport == APEX_TRANSPORT_DRM && !memory->vk.memory_type_index) {
-         VkResult result = bo_transfer(device, &memory->storage->bo, direction, ranges[i].offset, bytes);
-         if (result != VK_SUCCESS)
-            return result;
-      }
    }
    return VK_SUCCESS;
 }
@@ -579,13 +533,13 @@ mapped_memory_ranges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ra
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_FlushMappedMemoryRanges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges)
 {
-   return mapped_memory_ranges(dev, count, ranges, APEX_DRM_TRANSFER_TO_LOCAL);
+   return mapped_memory_ranges(count, ranges);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_InvalidateMappedMemoryRanges(VkDevice dev, uint32_t count, const VkMappedMemoryRange *ranges)
 {
-   return mapped_memory_ranges(dev, count, ranges, APEX_DRM_TRANSFER_FROM_LOCAL);
+   return mapped_memory_ranges(count, ranges);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -596,8 +550,7 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
    *out = VK_NULL_HANDLE;
    const VkExternalMemoryBufferCreateInfo *external =
       vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
-   if (external && external->handleTypes &&
-       (!device->prime_coherent || (external->handleTypes & ~APEX_EXTERNAL_MEMORY_TYPES)))
+   if (external && (external->handleTypes & ~APEX_EXTERNAL_MEMORY_TYPES))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    if (info->flags || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
        (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
@@ -641,13 +594,9 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_GetDeviceBufferMemoryRequirements(VkDevice dev,
    const VkDeviceBufferMemoryRequirements *info, VkMemoryRequirements2 *out)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
-   const VkExternalMemoryBufferCreateInfo *external =
-      vk_find_struct_const(info->pCreateInfo->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
    out->memoryRequirements = (VkMemoryRequirements) {
       .size = align64(info->pCreateInfo->size, 64), .alignment = 64,
-      .memoryTypeBits = external && external->handleTypes ? (device->prime_coherent ? 2 : 0) :
-                         host_memory_types(device) | (device->prime_coherent ? 2 : 0),
+      .memoryTypeBits = APEX_MEMORY_TYPES,
    };
    VkMemoryDedicatedRequirements *dedicated =
       vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
@@ -661,10 +610,7 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_GetBufferMemoryRequirements2(VkDevice dev, const VkBufferMemoryRequirementsInfo2 *info,
                                  VkMemoryRequirements2 *out)
 {
-   VK_FROM_HANDLE(apex_buffer, buffer, info->buffer);
    vk_common_GetBufferMemoryRequirements2(dev, info, out);
-   if (buffer->external_types)
-      out->memoryRequirements.memoryTypeBits = 2;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -673,8 +619,6 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
       VK_FROM_HANDLE(apex_buffer, buffer, infos[i].buffer);
-      if (buffer->external_types && mem->vk.memory_type_index != 1)
-         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       if (infos[i].memoryOffset % 64 || infos[i].memoryOffset > mem->vk.size ||
           buffer->vk.size > mem->vk.size - infos[i].memoryOffset)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -963,14 +907,7 @@ apex_CreateImage(VkDevice dev, const VkImageCreateInfo *info,
       .usage = info->usage, .flags = info->flags,
    };
    VkImageFormatProperties2 props = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
-   bool supported = device->transport == APEX_TRANSPORT_DRM;
-   /* Each requested handle type must be supported on its own. */
-   for (unsigned t = 0; supported && t < 2; t++) {
-      external_info.handleType = t ? external_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT :
-                                     external_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-      supported = apex_image_format_properties(&format, device->prime_coherent, &props) == VK_SUCCESS;
-   }
-   if (!supported ||
+   if (apex_image_format_properties(&format, &props) != VK_SUCCESS ||
        !(props.imageFormatProperties.sampleCounts & info->samples) ||
        info->mipLevels > props.imageFormatProperties.maxMipLevels ||
        info->arrayLayers > props.imageFormatProperties.maxArrayLayers ||
@@ -1008,12 +945,8 @@ static void
 image_memory_requirements(struct apex_device *device, VkDeviceSize size, bool external,
                           VkMemoryRequirements2 *out)
 {
-   /* Images may also live in device-only PRIME-capable storage; external
-    * images require LOCAL-resident storage so that they scan out in place. */
    out->memoryRequirements = (VkMemoryRequirements) {
-      .size = size, .alignment = 64,
-      .memoryTypeBits = external ? local_memory_types(device) :
-                        host_memory_types(device) | (device->prime_coherent ? 2 : 0),
+      .size = size, .alignment = 64, .memoryTypeBits = APEX_MEMORY_TYPES,
    };
    VkMemoryDedicatedRequirements *dedicated = vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
    if (dedicated) {
@@ -1196,8 +1129,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       if (b->binding >= APEX_MAX_BINDINGS || !type_ok ||
           (inline_block && b->descriptorCount > APEX_MAX_INLINE_BYTES) ||
           binding_rows(b->descriptorType, b->descriptorCount) > APEX_MAX_DESCRIPTORS - slots ||
-          (flags & ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
-          (device->transport == APEX_TRANSPORT_NATIVE && b->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))
+          (flags & ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT))
          return VK_ERROR_FEATURE_NOT_PRESENT;
       descriptors += binding_elements(b->descriptorType, b->descriptorCount);
       slots += binding_rows(b->descriptorType, b->descriptorCount);
@@ -1210,9 +1142,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    }
    if (dynamic && update_after_bind)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   if (device->transport == APEX_TRANSPORT_NATIVE &&
-       (count != 1 || descriptors != 1))
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+
    size_t size = sizeof(struct apex_set_layout) + count * sizeof(struct apex_binding_layout);
    struct apex_set_layout *layout = vk_descriptor_set_layout_zalloc(&device->vk,
       size + immutable * 8 * sizeof(uint32_t), info);
@@ -1559,6 +1489,8 @@ clear_commands(struct apex_command_buffer *cmd)
    memset(&cmd->rendering, 0, sizeof(cmd->rendering));
    memset(cmd->push, 0, sizeof(cmd->push));
    memset(cmd->graphics_push, 0, sizeof(cmd->graphics_push));
+   apex_ib_reset(&cmd->ib);
+   cmd->pending = 0;
 }
 
 static void
@@ -1573,6 +1505,7 @@ destroy_command_buffer(struct vk_command_buffer *vk)
 {
    struct vk_command_pool *pool = vk->pool;
    clear_commands((struct apex_command_buffer *)vk);
+   apex_ib_finish(&((struct apex_command_buffer *)vk)->ib);
    vk_command_buffer_finish(vk);
    vk_free(&pool->alloc, vk);
 }
@@ -1602,6 +1535,7 @@ create_command_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level, 
    list_inithead(&cmd->dispatches);
    list_inithead(&cmd->uploads);
    list_inithead(&cmd->push_sets);
+   apex_ib_init(&cmd->ib);
    cmd->vk.dynamic_graphics_state.vi = &cmd->vertex_input;
    cmd->vk.dynamic_graphics_state.ms.sample_locations = &cmd->sample_locations;
    *out = &cmd->vk;
@@ -1613,6 +1547,8 @@ apex_BeginCommandBuffer(VkCommandBuffer handle, const VkCommandBufferBeginInfo *
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    vk_command_buffer_begin(&cmd->vk, info);
+   /* The IB orders itself after earlier batches' work and host writes. */
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_ALL, APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE);
    return VK_SUCCESS;
 }
 
@@ -1620,7 +1556,46 @@ static VKAPI_ATTR VkResult VKAPI_CALL
 apex_EndCommandBuffer(VkCommandBuffer handle)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   if (cmd->ib.failed)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   else if (cmd->ib.count > 1u << 24)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    return vk_command_buffer_end(&cmd->vk);
+}
+
+/* Work waits for the command buffer's earlier work: jobs share internal
+ * scratch (the draw arena) and today's core runs dispatches in order. */
+static void
+begin_work(struct apex_command_buffer *cmd, uint32_t class)
+{
+   if (cmd->pending)
+      apex_cp_barrier(&cmd->ib, cmd->pending, APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE);
+   cmd->pending = class;
+}
+
+static uint32_t
+program_invocations(const struct apex_program *program)
+{
+   const uint32_t *header = (const void *)program->code.data;
+   return program->code.size >= 48 && header[0] == 0x32585041 ? header[10] : 16;
+}
+
+/* SET_STATE of the compute registers and user data, then DISPATCH of the
+ * job's linear workgroups. The program and table GPUVAs are patched at
+ * submission: program at `patch`, table at `patch` + 12. */
+static void
+emit_dispatch(struct apex_command_buffer *cmd, struct apex_dispatch *dispatch)
+{
+   begin_work(cmd, APEX_CP_CLASS_COMPUTE);
+   const uint32_t compute[10] = {
+      [2] = program_invocations(dispatch->program), [3] = 1, [4] = 1,
+      [5] = dispatch->parameters.base[0],
+   };
+   dispatch->patch = cmd->ib.count + 2;
+   apex_cp_set_state(&cmd->ib, APEX_STATE_COMPUTE_PROGRAM, ARRAY_SIZE(compute), compute);
+   const uint32_t user[3] = {0, 0, dispatch->groups};
+   apex_cp_set_state(&cmd->ib, APEX_STATE_COMPUTE_USER, ARRAY_SIZE(user), user);
+   apex_cp_dispatch(&cmd->ib, dispatch->groups, 1, 1);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1796,6 +1771,7 @@ push_compute(struct apex_command_buffer *cmd, struct apex_dispatch_parameters pa
       if (dispatch->sets[s])
          dispatch->sets[s]->refs++;
    list_addtail(&dispatch->link, &cmd->dispatches);
+   emit_dispatch(cmd, dispatch);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -2232,6 +2208,7 @@ push_job(struct apex_command_buffer *cmd, struct apex_program *program,
             job->sets[s]->refs++;
    }
    list_addtail(&job->link, &cmd->dispatches);
+   emit_dispatch(cmd, job);
 }
 
 static uint32_t
@@ -2252,7 +2229,7 @@ draw_arena(struct apex_device *device, uint64_t *va)
    VkResult result = VK_SUCCESS;
    mtx_lock(&device->memory_mutex);
    if (!device->arena.handle)
-      result = bo_create(device, size, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, 0, &device->arena);
+      result = bo_create(device, size, APEX_VM_READ | APEX_VM_WRITE, 0, 0, &device->arena);
    *va = device->arena.va;
    mtx_unlock(&device->memory_mutex);
    return result;
@@ -2704,20 +2681,11 @@ apex_CmdDrawIndexedIndirectCount(VkCommandBuffer handle, VkBuffer buffer, VkDevi
 
 /* ---- Events and queries --------------------------------------------------- */
 
-/* Small host-readable device words: host-coherent SYSTEM memory when the
- * device has it, otherwise explicit-transfer storage. */
+/* Small host-read device words in cached SYSTEM memory. */
 static VkResult
 host_words_create(struct apex_device *device, uint64_t size, struct apex_bo *bo)
 {
-   return bo_create(device, size, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE,
-                    device->host_coherent ? APEX_DRM_GEM_HOST_COHERENT : 0, 0, bo);
-}
-
-static VkResult
-host_words_sync(struct apex_device *device, struct apex_bo *bo, uint32_t direction,
-                uint64_t offset, uint64_t size)
-{
-   return device->host_coherent ? VK_SUCCESS : bo_transfer(device, bo, direction, offset, size);
+   return bo_create(device, size, APEX_VM_READ | APEX_VM_WRITE, APEX_GEM_SYSTEM, 0, bo);
 }
 
 struct apex_event {
@@ -2758,7 +2726,7 @@ static VkResult
 set_event(struct apex_device *device, struct apex_event *event, uint32_t value)
 {
    *(volatile uint32_t *)event->bo.map = value;
-   return host_words_sync(device, &event->bo, APEX_DRM_TRANSFER_TO_LOCAL, 0, 4);
+   return VK_SUCCESS;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -2767,8 +2735,6 @@ apex_GetEventStatus(VkDevice dev, VkEvent handle)
    VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_event, event, handle);
    VkResult result = vk_device_check_status(&device->vk);
-   if (result == VK_SUCCESS)
-      result = host_words_sync(device, &event->bo, APEX_DRM_TRANSFER_FROM_LOCAL, 0, 4);
    if (result != VK_SUCCESS)
       return result;
    return *(volatile uint32_t *)event->bo.map ? VK_EVENT_SET : VK_EVENT_RESET;
@@ -2786,42 +2752,43 @@ apex_ResetEvent(VkDevice dev, VkEvent handle)
    return set_event(apex_device_from_handle(dev), apex_event_from_handle(handle), 0);
 }
 
-/* Fills one word in recording order; the queue executes jobs in order. */
+/* Writes one dword after the queue's earlier work. */
 static void
-record_word(struct apex_command_buffer *cmd, uint64_t va, uint64_t size, uint32_t value)
+record_word(struct apex_command_buffer *cmd, uint64_t va, uint32_t value)
 {
-   struct apex_device *device = (void *)cmd->vk.base.device;
-   struct apex_pipeline *pipeline = cmd->pipeline;
-   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
-   memcpy(push, cmd->push, sizeof(push));
-   VkDeviceAddressRangeKHR range = {.address = va, .size = size};
-   cmd->meta++;
-   vk_meta_fill_memory(&cmd->vk, &device->meta, &range, 0, value);
-   cmd->meta--;
-   cmd->pipeline = pipeline;
-   memcpy(cmd->push, push, sizeof(push));
+   apex_cp_write(&cmd->ib, va, APEX_CP_AFTER_PRIOR_WORK, 1, &value);
+}
+
+/* Fills words in recording order through the copy engine. */
+static void
+record_fill(struct apex_command_buffer *cmd, uint64_t va, uint64_t size, uint32_t value)
+{
+   begin_work(cmd, APEX_CP_CLASS_COPY);
+   apex_cp_fill(&cmd->ib, va, size, value);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdSetEvent2(VkCommandBuffer handle, VkEvent event, const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   record_word(cmd, apex_event_from_handle(event)->bo.va, 4, 1);
+   record_word(cmd, apex_event_from_handle(event)->bo.va, 1);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdResetEvent2(VkCommandBuffer handle, VkEvent event, VkPipelineStageFlags2 stage)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   record_word(cmd, apex_event_from_handle(event)->bo.va, 4, 0);
+   record_word(cmd, apex_event_from_handle(event)->bo.va, 0);
 }
 
-/* Queue work is in order: device-side signals precede every later wait.
- * Host signals must precede submission of the waiting batch. */
+/* The event's u64 (state word, zero word) is at least one once set. */
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdWaitEvents2(VkCommandBuffer handle, uint32_t count, const VkEvent *events,
                     const VkDependencyInfo *infos)
 {
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   for (uint32_t i = 0; i < count; i++)
+      apex_cp_wait(&cmd->ib, apex_event_from_handle(events[i])->bo.va, 1);
 }
 
 struct apex_query_pool {
@@ -2844,8 +2811,6 @@ apex_CreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo *info,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    VkResult result = host_words_create(device, (uint64_t)MAX2(info->queryCount, 1) * APEX_QUERY_STRIDE,
                                        &pool->bo);
-   if (result == VK_SUCCESS)
-      result = host_words_sync(device, &pool->bo, APEX_DRM_TRANSFER_TO_LOCAL, 0, pool->bo.size);
    if (result != VK_SUCCESS) {
       apex_bo_finish(device, &pool->bo);
       vk_query_pool_destroy(&device->vk, alloc, &pool->vk);
@@ -2869,12 +2834,9 @@ apex_DestroyQueryPool(VkDevice dev, VkQueryPool handle, const VkAllocationCallba
 static VKAPI_ATTR void VKAPI_CALL
 apex_ResetQueryPool(VkDevice dev, VkQueryPool handle, uint32_t first, uint32_t count)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_query_pool, pool, handle);
    memset((uint8_t *)pool->bo.map + (uint64_t)first * APEX_QUERY_STRIDE, 0,
           (uint64_t)count * APEX_QUERY_STRIDE);
-   host_words_sync(device, &pool->bo, APEX_DRM_TRANSFER_TO_LOCAL,
-                   (uint64_t)first * APEX_QUERY_STRIDE, (uint64_t)count * APEX_QUERY_STRIDE);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -2887,12 +2849,8 @@ apex_GetQueryPoolResults(VkDevice dev, VkQueryPool handle, uint32_t first, uint3
    VkResult status = VK_SUCCESS;
    for (uint32_t q = 0; q < count; q++) {
       const volatile uint32_t *slot = (const void *)(slots + (uint64_t)q * APEX_QUERY_STRIDE);
-      uint64_t offset = (uint64_t)(first + q) * APEX_QUERY_STRIDE;
       for (;;) {
          VkResult result = vk_device_check_status(&device->vk);
-         if (result == VK_SUCCESS)
-            result = host_words_sync(device, &pool->bo, APEX_DRM_TRANSFER_FROM_LOCAL, offset,
-                                     APEX_QUERY_STRIDE);
          if (result != VK_SUCCESS)
             return result;
          if (slot[2] || !(flags & VK_QUERY_RESULT_WAIT_BIT))
@@ -2929,7 +2887,7 @@ apex_CmdResetQueryPool(VkCommandBuffer handle, VkQueryPool pool, uint32_t first,
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    if (count)
-      record_word(cmd, apex_query_pool_from_handle(pool)->bo.va + (uint64_t)first * APEX_QUERY_STRIDE,
+      record_fill(cmd, apex_query_pool_from_handle(pool)->bo.va + (uint64_t)first * APEX_QUERY_STRIDE,
                   (uint64_t)count * APEX_QUERY_STRIDE, 0);
 }
 
@@ -2938,25 +2896,19 @@ apex_CmdBeginQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
                              VkQueryControlFlags flags, uint32_t index)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   struct apex_query_pool *qp = apex_query_pool_from_handle(pool);
-   uint64_t slot = qp->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
-   record_word(cmd, slot, 8, 0);
-   if (qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT)
-      cmd->xfb.query = slot;
-   else
-      cmd->occlusion = slot;
+   uint64_t slot = apex_query_pool_from_handle(pool)->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
+   /* Draws on today's core count passed samples into the slot in software;
+    * QUERY_BEGIN/QUERY_END count through the raster back end. */
+   apex_cp_write(&cmd->ib, slot, APEX_CP_AFTER_PRIOR_WORK, 2, (uint32_t[2]){0, 0});
+   cmd->occlusion = slot;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdEndQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t query, uint32_t index)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   struct apex_query_pool *qp = apex_query_pool_from_handle(pool);
-   if (qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT)
-      cmd->xfb.query = 0;
-   else
-      cmd->occlusion = 0;
-   record_word(cmd, qp->bo.va + (uint64_t)query * APEX_QUERY_STRIDE + 8, 4, 1);
+   cmd->occlusion = 0;
+   record_word(cmd, apex_query_pool_from_handle(pool)->bo.va + (uint64_t)query * APEX_QUERY_STRIDE + 8, 1);
 }
 
 static void push_job(struct apex_command_buffer *cmd, struct apex_program *program,
@@ -2968,16 +2920,11 @@ apex_CmdWriteTimestamp2(VkCommandBuffer handle, VkPipelineStageFlags2 stage, VkQ
                         uint32_t query)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   struct apex_device *device = (void *)cmd->vk.base.device;
-   struct apex_program *program;
-   VkResult result = apex_internal_program(device, APEX_INTERNAL_TIMESTAMP, &program);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
-      return;
-   }
    uint64_t slot = apex_query_pool_from_handle(pool)->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
-   uint32_t words[APEX_DRAW_WORDS] = {[APEX_QUERY_SLOT] = slot, [APEX_QUERY_SLOT + 1] = slot >> 32};
-   push_job(cmd, program, NULL, 1, 0, 0, words);
+   /* Value, then availability; both after earlier work unless top of pipe. */
+   apex_cp_timestamp(&cmd->ib, slot, stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT ||
+                     stage == VK_PIPELINE_STAGE_2_NONE ? 0 : APEX_CP_AFTER_PRIOR_WORK);
+   record_word(cmd, slot + 8, 1);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -3046,63 +2993,61 @@ apex_CmdFillBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    VK_FROM_HANDLE(apex_buffer, dst, buffer);
-   struct apex_device *device = (void *)cmd->vk.base.device;
-   if (device->transport != APEX_TRANSPORT_DRM) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
-   }
    VkDeviceAddressRangeKHR range = vk_device_address_range(&dst->vk, offset, size);
    /* VK_WHOLE_SIZE leaves the final incomplete word untouched. */
    range.size &= ~3ull;
-   if (!range.size)
-      return;
-   struct apex_pipeline *pipeline = cmd->pipeline;
-   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
-   memcpy(push, cmd->push, sizeof(push));
-   cmd->meta++;
-   vk_meta_fill_memory(&cmd->vk, &device->meta, &range, dst->vk.address_flags, data);
-   cmd->meta--;
-   cmd->pipeline = pipeline;
-   memcpy(cmd->push, push, sizeof(push));
+   if (range.size)
+      record_fill(cmd, range.address, range.size, data);
 }
 
+static bool
+buffer_system(const struct apex_buffer *buffer)
+{
+   return buffer->memory && buffer->memory->storage->bo.system;
+}
+
+/* The CP copies LOCAL to LOCAL at any alignment and LOCAL to or from SYSTEM
+ * with 64-byte aligned ends; other regions use the compute copy. */
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdCopyBuffer2(VkCommandBuffer handle, const VkCopyBufferInfo2 *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, src, info->srcBuffer);
+   VK_FROM_HANDLE(apex_buffer, dst, info->dstBuffer);
    struct apex_device *device = (void *)cmd->vk.base.device;
-   if (device->transport != APEX_TRANSPORT_DRM) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
+   bool src_system = buffer_system(src), dst_system = buffer_system(dst);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkBufferCopy2 *region = &info->pRegions[i];
+      uint64_t from = src->vk.device_address + region->srcOffset;
+      uint64_t to = dst->vk.device_address + region->dstOffset;
+      bool aligned = !((from | to | region->size) & 63);
+      if (!src_system && !dst_system ? true : src_system != dst_system && aligned) {
+         begin_work(cmd, APEX_CP_CLASS_COPY);
+         apex_cp_copy(&cmd->ib, from, to, region->size);
+         continue;
+      }
+      struct apex_pipeline *pipeline = cmd->pipeline;
+      uint8_t push[APEX_MAX_PUSH_CONSTANTS];
+      memcpy(push, cmd->push, sizeof(push));
+      VkCopyBufferInfo2 one = *info;
+      one.regionCount = 1;
+      one.pRegions = region;
+      vk_meta_copy_buffer(&cmd->vk, &device->meta, &one);
+      cmd->pipeline = pipeline;
+      memcpy(cmd->push, push, sizeof(push));
    }
-   struct apex_pipeline *pipeline = cmd->pipeline;
-   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
-   memcpy(push, cmd->push, sizeof(push));
-   cmd->meta++;
-   vk_meta_copy_buffer(&cmd->vk, &device->meta, info);
-   cmd->meta--;
-   cmd->pipeline = pipeline;
-   memcpy(cmd->push, push, sizeof(push));
 }
 
+/* At most 65536 bytes, a multiple of four: one WRITE after earlier work. */
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
                      VkDeviceSize size, const void *data)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   struct apex_device *device = (void *)cmd->vk.base.device;
-   if (device->transport != APEX_TRANSPORT_DRM) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
-   }
-   struct apex_pipeline *pipeline = cmd->pipeline;
-   uint8_t push[APEX_MAX_PUSH_CONSTANTS];
-   memcpy(push, cmd->push, sizeof(push));
-   cmd->meta++;
-   vk_meta_update_buffer(&cmd->vk, &device->meta, buffer, offset, size, data);
-   cmd->meta--;
-   cmd->pipeline = pipeline;
-   memcpy(cmd->push, push, sizeof(push));
+   VK_FROM_HANDLE(apex_buffer, dst, buffer);
+   if (size)
+      apex_cp_write(&cmd->ib, dst->vk.device_address + offset, APEX_CP_AFTER_PRIOR_WORK,
+                    size / 4, data);
 }
 
 static uint64_t
@@ -3500,20 +3445,57 @@ bind_map_upload(struct vk_command_buffer *vk, struct vk_meta_device *meta,
    return VK_SUCCESS;
 }
 
+/* Graphics runs as compute dispatches on today's core, so graphics stages
+ * also name the compute class. */
+static uint32_t
+barrier_classes(VkPipelineStageFlags2 stages)
+{
+   if (stages & (VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT))
+      return APEX_CP_CLASS_ALL;
+   uint32_t classes = 0;
+   if (stages & (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+                 VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+                 VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT))
+      classes |= APEX_CP_CLASS_COMPUTE | APEX_CP_CLASS_GRAPHICS;
+   if (stages & (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
+                 VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+                 VK_PIPELINE_STAGE_2_BLIT_BIT))
+      classes |= APEX_CP_CLASS_COMPUTE | APEX_CP_CLASS_COPY;
+   return classes;
+}
+
+/* Waits for the source classes and invalidates the clean L1 and texture
+ * caches for device-side destinations; images keep one linear layout. */
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 {
-   /* Every native dispatch below completes allocation release before the next
-    * dispatch acquires its input. Images retain the same linear layout across
-    * layout transitions; buffer and image barriers need no extra operation. */
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VkPipelineStageFlags2 src = 0;
+   VkAccessFlags2 access = 0;
+   for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
+      src |= info->pMemoryBarriers[i].srcStageMask;
+      access |= info->pMemoryBarriers[i].dstAccessMask;
+   }
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
+      src |= info->pBufferMemoryBarriers[i].srcStageMask;
+      access |= info->pBufferMemoryBarriers[i].dstAccessMask;
+   }
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+      src |= info->pImageMemoryBarriers[i].srcStageMask;
+      access |= info->pImageMemoryBarriers[i].dstAccessMask;
+   }
+   uint32_t classes = barrier_classes(src) & cmd->pending;
+   uint32_t cache = access & ~(VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT) ?
+      APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE : 0;
+   if (!classes && !cache)
+      return;
+   apex_cp_barrier(&cmd->ib, classes, cache);
+   cmd->pending &= ~classes;
 }
 
-static int
-native_command(struct apex_device *device, uint32_t operation)
-{
-   struct apex_ioctl_native r = {.operation = operation};
-   return ioctl(device->fd, APEX_IOCTL_NATIVE, &r);
-}
 
 /* Rows for one descriptor element. Null descriptors and unused bindings keep
  * the zero rows: buffers and texel buffers of zero bytes and elements, and
@@ -3612,17 +3594,40 @@ write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *
    }
 }
 
+static uint64_t
+table_bytes(const struct apex_dispatch *dispatch)
+{
+   return apex_program_trailer(dispatch->program) + sizeof(struct apex_dispatch_parameters) +
+          (dispatch->graphics ? sizeof(dispatch->draw) : 0);
+}
+
+/* The program uploads once, on first submission, into LOCAL through BAR2;
+ * the next batch invalidates instruction caches. */
 static VkResult
-drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
-            struct apex_bo *table)
+upload_program(struct apex_device *device, struct apex_program *program)
+{
+   if (program->bo.handle)
+      return VK_SUCCESS;
+   VkResult result = bo_create(device, program->code.size, APEX_VM_READ | APEX_VM_EXEC, 0, 0,
+                               &program->bo);
+   if (result != VK_SUCCESS)
+      return result;
+   memcpy(program->bo.map, program->code.data, program->code.size);
+   device->programs_uploaded = true;
+   return VK_SUCCESS;
+}
+
+/* Writes the dispatch's descriptor table into submission memory at `map`,
+ * GPUVA `va`. */
+static VkResult
+write_table(struct apex_device *device, const struct apex_dispatch *dispatch, void *map, uint64_t va)
 {
    struct apex_program *program = dispatch->program;
    if (!program->table)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    size_t push_offset = (program->descriptor_count + 1) * sizeof(union apex_descriptor);
    size_t parameters_offset = apex_program_trailer(program);
-   size_t bytes = parameters_offset + sizeof(struct apex_dispatch_parameters) +
-                  (dispatch->graphics ? sizeof(dispatch->draw) : 0);
+   size_t bytes = table_bytes(dispatch);
    union apex_descriptor *rows = calloc(1, bytes);
    if (!rows)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3673,20 +3678,7 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
          }
       }
    }
-   if (!program->bo.handle) {
-      result = bo_create(device, program->code.size,
-                         APEX_DRM_VM_READ | APEX_DRM_VM_EXEC, 0, 0, &program->bo);
-      if (result != VK_SUCCESS)
-         goto out;
-      memcpy(program->bo.map, program->code.data, program->code.size);
-      result = bo_transfer(device, &program->bo, APEX_DRM_TRANSFER_TO_LOCAL,
-                           0, program->code.size);
-      if (result != VK_SUCCESS) {
-         apex_bo_finish(device, &program->bo);
-         goto out;
-      }
-   }
-   result = bo_create(device, bytes, APEX_DRM_VM_READ | APEX_DRM_VM_WRITE, 0, 0, table);
+   result = upload_program(device, program);
    if (result != VK_SUCCESS)
       goto out;
    for (unsigned s = 0; s < program->set_count; s++) {
@@ -3695,251 +3687,219 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
          unsigned row = program->set_offsets[s] + layout->bindings[b].slot;
          if (!layout->bindings[b].bytes || !BITSET_TEST(program->used_descriptors, row))
             continue;
-         uint64_t va = table->va + (row + 1) * sizeof(union apex_descriptor);
-         rows[row].buffer.low = util_cpu_to_le32(va);
-         rows[row].buffer.high = util_cpu_to_le32(va >> 32);
+         uint64_t inline_va = va + (row + 1) * sizeof(union apex_descriptor);
+         rows[row].buffer.low = util_cpu_to_le32(inline_va);
+         rows[row].buffer.high = util_cpu_to_le32(inline_va >> 32);
       }
    }
-   memcpy(table->map, rows, bytes);
-   result = bo_transfer(device, table, APEX_DRM_TRANSFER_TO_LOCAL, 0, bytes);
+   memcpy(map, rows, bytes);
 out:
    free(rows);
    return result;
 }
 
-static VkResult
-drm_dispatch(struct apex_device *device, const struct apex_dispatch *dispatch)
-{
-   struct apex_bo table = {0};
-   VkResult result = drm_prepare(device, dispatch, &table);
-   if (result != VK_SUCCESS)
-      goto out;
-   struct drm_apex_vm_exec args = {
-      .program_va = dispatch->program->bo.va,
-      .program_bytes = dispatch->program->code.size,
-      .data_va = table.va,
-      .workgroups = dispatch->groups,
-   };
-   /* No implicit data transfer. Host visibility requires flush/invalidate.
-    * Do not retry EXEC on EINTR: the kernel cancels/drains the accepted job. */
-   result = !ioctl(device->fd, DRM_IOCTL_APEX_VM_EXEC, &args) && args.status == 1 ?
-      VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-out:
-   apex_bo_finish(device, &table);
-   return result;
-}
 
-static VkResult
-dispatch_compute(struct apex_device *device, const struct apex_dispatch *dispatch)
+/* Batches retire at the SIGNAL of their sequence into `retire`. */
+static uint64_t
+retired_sequence(const struct apex_device *device)
 {
-   if (device->transport == APEX_TRANSPORT_DRM)
-      return drm_dispatch(device, dispatch);
-   const VkDescriptorBufferInfo *binding = &dispatch->sets[0]->set->descriptors[0].buffer;
-   VK_FROM_HANDLE(apex_buffer, buffer, binding->buffer);
-   if (!buffer || !buffer->memory || binding->offset >= buffer->vk.size)
-      return VK_ERROR_DEVICE_LOST;
-   uint64_t bytes = binding->range == VK_WHOLE_SIZE ? buffer->vk.size - binding->offset : binding->range;
-   if (!bytes || bytes > buffer->vk.size - binding->offset)
-      return VK_ERROR_DEVICE_LOST;
-   void *data = (uint8_t *)buffer->memory->data + buffer->offset + binding->offset;
-   if (native_command(device, APEX_NATIVE_CREATE))
-      return VK_ERROR_DEVICE_LOST;
-   VkResult result = VK_ERROR_DEVICE_LOST;
-   struct apex_ioctl_native program = {
-      .operation = APEX_NATIVE_ALLOC, .kind = APEX_NATIVE_PROGRAM,
-      .user_ptr = (uintptr_t)dispatch->program->code.data, .bytes = dispatch->program->code.size,
-   };
-   struct apex_ioctl_native allocation = {.operation = APEX_NATIVE_ALLOC, .bytes = bytes};
-   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &program) ||
-       ioctl(device->fd, APEX_IOCTL_NATIVE, &allocation))
-      goto out;
-   struct apex_ioctl_native transfer = {
-      .operation = APEX_NATIVE_UPLOAD, .handle = allocation.handle,
-      .user_ptr = (uintptr_t)data, .bytes = bytes,
-   };
-   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &transfer) || native_command(device, APEX_NATIVE_START))
-      goto out;
-   struct apex_ioctl_native submit = {
-      .operation = APEX_NATIVE_SUBMIT, .kind = APEX_NATIVE_COMPUTE,
-      .handle = program.handle, .data_handle = allocation.handle,
-      .workgroups = dispatch->groups == 1 ? 0 : dispatch->groups,
-   };
-   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &submit))
-      goto out;
-   uint64_t deadline = os_time_get_nano() + 5000000000ull;
-   for (;;) {
-      struct apex_ioctl_native poll = {.operation = APEX_NATIVE_POLL, .identity = submit.identity};
-      if (ioctl(device->fd, APEX_IOCTL_NATIVE, &poll))
-         goto out;
-      if (poll.status) {
-         if (poll.status != 1)
-            goto out;
-         break;
-      }
-      if (os_time_get_nano() >= deadline)
-         goto out;
-      struct timespec pause = {.tv_nsec = 1000000};
-      nanosleep(&pause, NULL);
-   }
-   if (native_command(device, APEX_NATIVE_STOP))
-      goto out;
-   transfer.operation = APEX_NATIVE_DOWNLOAD;
-   if (ioctl(device->fd, APEX_IOCTL_NATIVE, &transfer))
-      goto out;
-   result = VK_SUCCESS;
-out:
-   if (native_command(device, APEX_NATIVE_CLOSE))
-      result = VK_ERROR_DEVICE_LOST;
-   return result;
+   return *(const volatile uint64_t *)device->retire.map;
 }
 
 static void
-free_pending(struct apex_device *device, struct apex_pending_dispatch *pending)
+retire_arenas(struct apex_device *device)
 {
-   list_del(&pending->link);
-   apex_bo_finish(device, &pending->table);
-   free(pending);
-}
-
-static VkResult
-reap_descriptors(struct apex_device *device)
-{
-   uint64_t completed = 0;
-   struct drm_syncobj_timeline_array query = {
-      .handles = (uintptr_t)&device->completion, .points = (uintptr_t)&completed,
-      .count_handles = 1,
-   };
-   if (ioctl(device->fd, DRM_IOCTL_SYNCOBJ_QUERY, &query))
-      return vk_device_set_lost(&device->vk, "Apex completion query failed");
-   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &device->retired, link) {
-      if (pending->point > completed)
+   uint64_t retired = retired_sequence(device);
+   list_for_each_entry_safe(struct apex_arena, arena, &device->busy_arenas, link) {
+      if (arena->sequence > retired)
          break;
-      free_pending(device, pending);
+      list_del(&arena->link);
+      list_addtail(&arena->link, &device->free_arenas);
    }
-   return vk_device_check_status(&device->vk);
 }
 
-static VkResult
-enqueue(struct apex_device *device, struct drm_apex_vm_submit *args,
-        const struct drm_apex_sync *inputs, unsigned input_count,
-        const struct drm_apex_sync *outputs, unsigned output_count)
+/* Waits for the batch of `sequence` to retire; false on loss or timeout. */
+static bool
+wait_retired(struct apex_device *device, uint64_t sequence, uint64_t timeout_ns)
 {
-   args->inputs = input_count ? (uintptr_t)inputs : 0;
-   args->input_count = input_count;
-   args->outputs = (uintptr_t)outputs;
-   args->output_count = output_count;
-   if (vk_device_check_status(&device->vk) != VK_SUCCESS)
-      return VK_ERROR_DEVICE_LOST;
-   /* Never spin on resource pressure: pending work may depend on this very
-    * submission for progress. An interrupted enqueue is not retried either. */
-   return ioctl(device->fd, DRM_IOCTL_APEX_VM_SUBMIT, args) ?
-      vk_device_set_lost(&device->vk, "Apex asynchronous enqueue failed") : VK_SUCCESS;
+   uint64_t deadline = os_time_get_nano() + timeout_ns;
+   while (retired_sequence(device) < sequence) {
+      if (vk_device_check_status(&device->vk) != VK_SUCCESS || os_time_get_nano() >= deadline)
+         return false;
+      nanosleep(&(struct timespec){.tv_nsec = 20000}, NULL);
+   }
+   return true;
 }
 
-static VkResult
-submit_async(struct apex_device *device, struct vk_queue_submit *submit)
+static void
+destroy_arena(struct apex_device *device, struct apex_arena *arena)
 {
-   struct list_head prepared;
-   list_inithead(&prepared);
-   VkResult result = reap_descriptors(device);
+   list_del(&arena->link);
+   apex_bo_finish(device, &arena->bo);
+   free(arena);
+}
+
+/* Reuses the smallest retired arena that fits, else creates a power-of-two
+ * LOCAL arena; steady-state submission makes no allocation ioctl. */
+static struct apex_arena *
+get_arena(struct apex_device *device, uint64_t bytes)
+{
+   retire_arenas(device);
+   struct apex_arena *best = NULL;
+   list_for_each_entry(struct apex_arena, arena, &device->free_arenas, link)
+      if (arena->bo.size >= bytes && (!best || arena->bo.size < best->bo.size))
+         best = arena;
+   if (best) {
+      list_del(&best->link);
+      return best;
+   }
+   struct apex_arena *arena = calloc(1, sizeof(*arena));
+   if (!arena)
+      return NULL;
+   if (bo_create(device, MAX2(util_next_power_of_two64(bytes), 65536), APEX_VM_READ, 0, 0,
+                 &arena->bo) != VK_SUCCESS) {
+      free(arena);
+      return NULL;
+   }
+   return arena;
+}
+
+/* Writes the command buffer's tables and IB into one arena, patching each
+ * dispatch's program and table GPUVAs into the IB copy. */
+static VkResult
+prepare_command_buffer(struct apex_device *device, struct apex_command_buffer *cmd,
+                       struct apex_arena **out, uint64_t *ib_va)
+{
+   uint64_t bytes = 0;
+   list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link)
+      bytes += align64(table_bytes(dispatch), 64);
+   uint64_t ib_offset = bytes;
+   bytes += (uint64_t)cmd->ib.count * 4;
+   struct apex_arena *arena = get_arena(device, bytes);
+   if (!arena)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   list_addtail(&arena->link, &device->busy_arenas);
+   arena->sequence = UINT64_MAX;
+   uint8_t *map = arena->bo.map;
+   memcpy(map + ib_offset, cmd->ib.words, (size_t)cmd->ib.count * 4);
+   uint32_t *ib = (uint32_t *)(map + ib_offset);
+   uint64_t offset = 0;
+   list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
+      uint64_t table = arena->bo.va + offset;
+      VkResult result = write_table(device, dispatch, map + offset, table);
+      if (result != VK_SUCCESS)
+         return result;
+      uint64_t program = dispatch->program->bo.va;
+      ib[dispatch->patch] = program;
+      ib[dispatch->patch + 1] = program >> 32;
+      ib[dispatch->patch + 12] = table;
+      ib[dispatch->patch + 13] = table >> 32;
+      offset += align64(table_bytes(dispatch), 64);
+   }
+   *out = arena;
+   *ib_va = arena->bo.va + ib_offset;
+   return VK_SUCCESS;
+}
+
+/* One batch on the ring: acquire barrier, a WAIT on kwait for the batch's
+ * syncobj waits, one INDIRECT per command buffer, the retirement SIGNAL and,
+ * for syncobj signals, a KFENCE with its kernel fences. The doorbell store
+ * publishes it; no ioctl runs without syncobj waits or signals. */
+static VkResult
+submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
+{
+   VkResult result = vk_device_check_status(&device->vk);
    if (result != VK_SUCCESS)
       return result;
-   /* MAP/TRANSFER may wait prior jobs. Prepare every immutable table before
-    * publishing this submission's potentially unsignaled dependencies. */
-   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+   uint32_t count = submit->command_buffer_count;
+   uint64_t *ib_va = calloc(MAX2(count, 1), sizeof(*ib_va));
+   uint32_t *ib_dwords = calloc(MAX2(count, 1), sizeof(*ib_dwords));
+   struct apex_arena **arenas = calloc(MAX2(count, 1), sizeof(*arenas));
+   struct apex_ib ring_words;
+   apex_ib_init(&ring_words);
+   result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (!ib_va || !ib_dwords || !arenas)
+      goto out;
+   for (uint32_t i = 0; i < count; i++) {
       struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
-      list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
-         struct apex_pending_dispatch *pending = calloc(1, sizeof(*pending));
-         if (!pending) {
-            result = VK_ERROR_OUT_OF_HOST_MEMORY;
-            goto out;
-         }
-         list_addtail(&pending->link, &prepared);
-         result = drm_prepare(device, dispatch, &pending->table);
-         if (result != VK_SUCCESS)
-            goto out;
-         pending->args = (struct drm_apex_vm_submit) {
-            .program_va = dispatch->program->bo.va,
-            .program_bytes = dispatch->program->code.size,
-            .data_va = pending->table.va, .workgroups = dispatch->groups,
-         };
-      }
+      result = prepare_command_buffer(device, cmd, &arenas[i], &ib_va[i]);
+      if (result != VK_SUCCESS)
+         goto out;
+      ib_dwords[i] = cmd->ib.count;
    }
-   /* The common submit thread already waited for fence publication. Timeline
-    * zero is a no-op, not the binary point-zero interpretation of this UAPI. */
-   for (unsigned i = 0; i < submit->wait_count;) {
-      struct drm_apex_sync inputs[APEX_DRM_MAX_SYNCS];
-      unsigned count = 0;
-      while (i < submit->wait_count && count < ARRAY_SIZE(inputs)) {
-         const struct vk_sync_wait *wait = &submit->waits[i++];
-         if ((wait->sync->flags & VK_SYNC_IS_TIMELINE) && !wait->wait_value)
-            continue;
-         struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(wait->sync);
-         if (!sync) { result = VK_ERROR_FEATURE_NOT_PRESENT; goto out; }
-         inputs[count++] = (struct drm_apex_sync) {
-            .handle = sync->syncobj, .point = wait->wait_value,
-         };
-      }
-      if (!count)
+   uint64_t sequence = device->sequence + 1;
+   /* Every syncobj wait of the batch shares one kwait value. */
+   uint64_t kwait = 0;
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      const struct vk_sync_wait *wait = &submit->waits[i];
+      if ((wait->sync->flags & VK_SYNC_IS_TIMELINE) && !wait->wait_value)
          continue;
-      struct drm_apex_sync done = {.handle = device->completion, .point = device->point + 1};
-      struct drm_apex_vm_submit args = {.flags = APEX_DRM_SUBMIT_SYNC_ONLY};
-      result = enqueue(device, &args, inputs, count, &done, 1);
-      if (result != VK_SUCCESS)
+      struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(wait->sync);
+      if (!sync) {
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
          goto out;
-      device->point = done.point;
-   }
-   /* APEX_DEBUG_JOBS=1 waits for each job and names the first that fails. */
-   static int debug_jobs = -1;
-   if (debug_jobs < 0)
-      debug_jobs = debug_get_bool_option("APEX_DEBUG_JOBS", false);
-   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &prepared, link) {
-      struct drm_apex_sync done = {.handle = device->completion, .point = device->point + 1};
-      result = enqueue(device, &pending->args, NULL, 0, &done, 1);
-      if (result != VK_SUCCESS)
-         goto out;
-      if (debug_jobs) {
-         uint64_t point = done.point;
-         struct drm_syncobj_timeline_wait wait = {
-            .handles = (uintptr_t)&device->completion, .points = (uintptr_t)&point,
-            .count_handles = 1, .timeout_nsec = INT64_MAX,
-            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-         };
-         ioctl(device->fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wait);
-         struct drm_apex_vm_status status = {0};
-         if (ioctl(device->fd, DRM_IOCTL_APEX_VM_STATUS, &status) || status.error)
-            mesa_loge("Apex job failed: program %u bytes, %u workgroups, error %d",
-                      (unsigned)pending->args.program_bytes, pending->args.workgroups, status.error);
       }
-      pending->point = device->point = done.point;
-      list_del(&pending->link);
-      list_addtail(&pending->link, &device->retired);
-   }
-   /* Ordered sync-only jobs join waits and publish all user signals, including
-    * zero-command submissions. Reserve one output for our retirement timeline. */
-   unsigned i = 0;
-   do {
-      struct drm_apex_sync outputs[APEX_DRM_MAX_SYNCS] = {
-         {.handle = device->completion, .point = device->point + 1},
+      if (!kwait)
+         kwait = device->kwait + 1;
+      struct drm_apex_queue_wait args = {
+         .queue_id = device->queue_id, .syncobj = sync->syncobj,
+         .point = wait->wait_value, .value = kwait,
       };
-      unsigned count = 1;
-      while (i < submit->signal_count && count < ARRAY_SIZE(outputs)) {
-         const struct vk_sync_signal *signal = &submit->signals[i++];
-         struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(signal->sync);
-         if (!sync) { result = VK_ERROR_FEATURE_NOT_PRESENT; goto out; }
-         outputs[count++] = (struct drm_apex_sync) {
-            .handle = sync->syncobj, .point = signal->signal_value,
-         };
-      }
-      struct drm_apex_vm_submit args = {.flags = APEX_DRM_SUBMIT_SYNC_ONLY};
-      result = enqueue(device, &args, NULL, 0, outputs, count);
-      if (result != VK_SUCCESS)
+      if (ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_WAIT, &args)) {
+         result = vk_device_set_lost(&device->vk, "Apex queue wait attach failed");
          goto out;
-      device->point = outputs[0].point;
-   } while (i < submit->signal_count);
+      }
+   }
+   if (kwait)
+      device->kwait = kwait;
+   const struct apex_cp_batch batch = {
+      .acquire_cache = device->programs_uploaded ?
+         APEX_CP_CACHE_INSTRUCTION | APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE : 0,
+      .kwait_va = device->status_va + APEX_STATUS_KWAIT, .kwait_value = kwait,
+      .ib_count = count, .ib_va = ib_va, .ib_dwords = ib_dwords,
+      .retire_va = device->retire.va, .sequence = sequence,
+      .kfence = submit->signal_count != 0,
+   };
+   apex_cp_batch(&ring_words, &batch);
+   if (ring_words.failed) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto out;
+   }
+   if (!apex_ring_reserve(&device->ring, ring_words.count, 5000000000ull)) {
+      result = vk_device_set_lost(&device->vk, "Apex ring did not drain");
+      goto out;
+   }
+   apex_ring_write(&device->ring, ring_words.words, ring_words.count);
+   apex_ring_publish(&device->ring);
+   device->sequence = sequence;
+   device->programs_uploaded = false;
+   for (uint32_t i = 0; i < count; i++)
+      arenas[i]->sequence = sequence;
+   result = VK_SUCCESS;
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      const struct vk_sync_signal *signal = &submit->signals[i];
+      struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(signal->sync);
+      struct drm_apex_queue_fence args = {
+         .queue_id = device->queue_id, .syncobj = sync ? sync->syncobj : 0,
+         .seqno = sequence, .point = signal->signal_value,
+      };
+      if (!sync || ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_FENCE, &args)) {
+         result = vk_device_set_lost(&device->vk, "Apex queue fence attach failed");
+         break;
+      }
+   }
 out:
-   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &prepared, link)
-      free_pending(device, pending);
+   /* Arenas of an unpublished batch return to the free list. */
+   for (uint32_t i = 0; arenas && i < count; i++) {
+      if (arenas[i] && arenas[i]->sequence == UINT64_MAX) {
+         list_del(&arenas[i]->link);
+         list_addtail(&arenas[i]->link, &device->free_arenas);
+      }
+   }
+   apex_ib_finish(&ring_words);
+   free(arenas);
+   free(ib_dwords);
+   free(ib_va);
    return result;
 }
 
@@ -3947,7 +3907,7 @@ static VkResult
 submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct apex_device *device = (struct apex_device *)queue->base.device;
-   if (vk_queue_submit_has_bind(submit) || submit->is_protected)
+   if (vk_queue_submit_has_bind(submit) || submit->is_protected || !device->ring.map)
       return vk_queue_set_lost(queue, "unsupported Apex submission");
    for (unsigned i = 0; i < submit->command_buffer_count; i++) {
       struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
@@ -3956,33 +3916,17 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
             continue;
          uint64_t va = upload->reserved_va;
          upload->reserved_va = 0;
-         uint32_t access = APEX_DRM_VM_READ | (upload->scratch ? APEX_DRM_VM_WRITE : 0);
+         uint32_t access = APEX_VM_READ | (upload->scratch ? APEX_VM_WRITE : 0);
          if (bo_create(device, upload->size, access, 0, va, &upload->bo) != VK_SUCCESS)
             return vk_queue_set_lost(queue, "Apex update allocation failed");
          if (upload->scratch)
-            continue;
-         memcpy(upload->bo.map, upload->data, upload->size);
-         if (bo_transfer(device, &upload->bo, APEX_DRM_TRANSFER_TO_LOCAL, 0, upload->size) != VK_SUCCESS)
-            return vk_queue_set_lost(queue, "Apex update upload failed");
+            memset(upload->bo.map, 0, upload->bo.size);
+         else
+            memcpy(upload->bo.map, upload->data, upload->size);
       }
    }
-   if (device->completion) {
-      if (submit_async(device, submit) != VK_SUCCESS)
-         return vk_queue_set_lost(queue, "Apex asynchronous submission failed");
-      return VK_SUCCESS;
-   }
-   if (vk_sync_wait_many(&device->vk, submit->wait_count, submit->waits,
-                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX) != VK_SUCCESS)
-      return vk_queue_set_lost(queue, "Apex dependency wait failed");
-   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
-      struct apex_command_buffer *cmd = (struct apex_command_buffer *)submit->command_buffers[i];
-      list_for_each_entry(struct apex_dispatch, dispatch, &cmd->dispatches, link) {
-         if (dispatch_compute(device, dispatch) != VK_SUCCESS)
-            return vk_queue_set_lost(queue, "Apex dispatch or allocation release failed");
-      }
-   }
-   if (vk_sync_signal_many(&device->vk, submit->signal_count, submit->signals) != VK_SUCCESS)
-      return vk_queue_set_lost(queue, "Apex completion signal failed");
+   if (submit_batch(device, submit) != VK_SUCCESS)
+      return vk_queue_set_lost(queue, "Apex submission failed");
    return VK_SUCCESS;
 }
 
@@ -3990,9 +3934,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL
 apex_QueueWaitIdle(VkQueue handle)
 {
    VK_FROM_HANDLE(vk_queue, queue, handle);
-   if (queue->base.device->physical->supported_sync_types)
+   struct apex_device *device = (void *)queue->base.device;
+   if (device->vk.physical->supported_sync_types)
       return vk_common_QueueWaitIdle(handle);
-   return vk_device_is_lost(queue->base.device) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+   if (device->ring.map && !wait_retired(device, device->sequence, UINT64_MAX))
+      return VK_ERROR_DEVICE_LOST;
+   return vk_device_is_lost(&device->vk) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -4013,10 +3960,61 @@ apex_GetSemaphoreCounterValue(VkDevice dev, VkSemaphore semaphore, uint64_t *val
    return status == VK_SUCCESS ? result : status;
 }
 
+#define APEX_RING_BYTES (64 * 1024)
+
+/* The ring lives in LOCAL (written through BAR2), the retirement word in
+ * SYSTEM; the kernel supplies the status page and doorbell mappings. */
+static VkResult
+create_queue(struct apex_device *device)
+{
+   VkResult result = bo_create(device, APEX_RING_BYTES, APEX_VM_READ, 0, 0, &device->ring_bo);
+   if (result == VK_SUCCESS)
+      result = host_words_create(device, 4096, &device->retire);
+   if (result != VK_SUCCESS)
+      return result;
+   memset(device->retire.map, 0, 8);
+   struct drm_apex_queue_create create = {
+      .ring_va = device->ring_bo.va, .ring_bytes = APEX_RING_BYTES,
+   };
+   if (ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_CREATE, &create))
+      return errno == ENODEV ? VK_ERROR_INCOMPATIBLE_DRIVER : VK_ERROR_INITIALIZATION_FAILED;
+   device->queue_id = create.queue_id;
+   device->status_va = create.status_va;
+   void *status = mmap(NULL, 4096, PROT_READ, MAP_SHARED, device->fd, create.status_offset);
+   void *doorbell = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd,
+                         create.doorbell_offset);
+   device->status_map = status == MAP_FAILED ? NULL : status;
+   device->doorbell_map = doorbell == MAP_FAILED ? NULL : doorbell;
+   if (!device->status_map || !device->doorbell_map)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   device->ring = (struct apex_ring) {
+      .map = device->ring_bo.map, .dwords = APEX_RING_BYTES / 4,
+      .status = device->status_map, .doorbell = device->doorbell_map,
+   };
+   return VK_SUCCESS;
+}
+
+static void
+destroy_queue(struct apex_device *device)
+{
+   if (device->status_va) {
+      struct drm_apex_queue_destroy destroy = {.queue_id = device->queue_id};
+      ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_DESTROY, &destroy);
+   }
+   if (device->status_map)
+      munmap(device->status_map, 4096);
+   if (device->doorbell_map)
+      munmap(device->doorbell_map, 4096);
+   device->status_map = device->doorbell_map = NULL;
+   device->status_va = 0;
+   device->ring = (struct apex_ring){0};
+   apex_bo_finish(device, &device->retire);
+   apex_bo_finish(device, &device->ring_bo);
+}
+
 VkResult
 apex_device_init(struct apex_device *device, struct vk_physical_device *physical,
-                  const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int fd,
-                  enum apex_transport transport)
+                  const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int fd)
 {
    if (info->queueCreateInfoCount != 1)
       return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
@@ -4025,17 +4023,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
        info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
       return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex requires one unflagged queue from family 0");
-   bool async = false, prime_coherent = false, host_coherent = false;
-   if (transport == APEX_TRANSPORT_DRM) {
-      struct drm_apex_info caps = {0};
-      if (ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 2 ||
-          (caps.capabilities & (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM)) !=
-          (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM))
-         return VK_ERROR_INCOMPATIBLE_DRIVER;
-      async = (caps.capabilities & APEX_DRM_CAP_ASYNC) && physical->supported_sync_types;
-      prime_coherent = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT;
-      host_coherent = caps.capabilities & APEX_DRM_CAP_HOST_COHERENT;
-   }
+   struct drm_apex_info caps = {0};
+   if (fd >= 0 && ioctl(fd, DRM_IOCTL_APEX_INFO, &caps))
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
    const struct vk_device_entrypoint_table entrypoints = {
       .CreateComputePipelines = apex_CreateComputePipelines,
       .AllocateMemory = apex_AllocateMemory, .FreeMemory = apex_FreeMemory,
@@ -4128,15 +4118,18 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->vk.shader_ops = &apex_device_shader_ops;
    device->vk.command_buffer_ops = &command_ops;
    device->fd = fd;
-   device->transport = transport;
-   device->prime_coherent = prime_coherent;
-   device->host_coherent = host_coherent;
-   device->completion = 0;
-   device->point = 0;
+   device->queue_id = 0;
+   device->status_va = 0;
+   device->status_map = device->doorbell_map = NULL;
+   device->ring_bo = device->retire = (struct apex_bo){0};
+   device->ring = (struct apex_ring){0};
+   device->sequence = device->kwait = 0;
+   device->programs_uploaded = false;
    memset(device->internal, 0, sizeof(device->internal));
    memset(device->resolve, 0, sizeof(device->resolve));
    device->arena = (struct apex_bo){0};
-   list_inithead(&device->retired);
+   list_inithead(&device->busy_arenas);
+   list_inithead(&device->free_arenas);
    list_inithead(&device->memories);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
       vk_device_finish(&device->vk);
@@ -4148,7 +4141,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    util_vma_heap_init(&device->va_heap, 2 * 1024 * 1024, (1ull << 39) - 2 * 1024 * 1024);
-   if (transport == APEX_TRANSPORT_DRM)
+   if (fd >= 0)
       vk_device_set_drm_fd(&device->vk, fd);
    if (physical->supported_sync_types) {
       device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
@@ -4178,13 +4171,12 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->meta.use_rect_list_pipeline = true;
    device->meta.use_gs_for_layer = false;
    device->queue.driver_submit = submit_queue;
-   if (async) {
-      struct drm_syncobj_create create = {0};
-      if (ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &create)) {
+   if (fd >= 0) {
+      result = create_queue(device);
+      if (result != VK_SUCCESS) {
          apex_device_finish(device);
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
+         return result;
       }
-      device->completion = create.handle;
       device->vk.check_status = check_status;
    }
    if (physical->supported_sync_types) {
@@ -4201,14 +4193,16 @@ void
 apex_device_finish(struct apex_device *device)
 {
    vk_queue_finish(&device->queue);
-   /* UNMAP waits queued jobs and retains unsafe backing on a failed drain. */
-   list_for_each_entry_safe(struct apex_pending_dispatch, pending, &device->retired, link)
-      free_pending(device, pending);
-   if (device->completion) {
-      struct drm_syncobj_destroy destroy = {.handle = device->completion};
-      ioctl(device->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
-   }
+   /* A lost queue keeps its arenas mapped and reserved until file close. */
+   if (device->ring.map && wait_retired(device, device->sequence, 5000000000ull))
+      retire_arenas(device);
+   list_for_each_entry_safe(struct apex_arena, arena, &device->free_arenas, link)
+      destroy_arena(device, arena);
+   list_for_each_entry_safe(struct apex_arena, arena, &device->busy_arenas, link)
+      destroy_arena(device, arena);
+   destroy_queue(device);
    apex_graphics_finish(device);
+
    vk_meta_device_finish(&device->vk, &device->meta);
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->memory_mutex);

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_entrypoints.h"
-#include "drm-uapi/apex_drm.h"
+#include "mock_kernel.h"
 #include "util/macros.h"
 #include <dlfcn.h>
 #include <errno.h>
@@ -18,9 +18,11 @@
 #define PROC(type, name) PFN_vk##type name = (PFN_vk##type)gipa(instance, "vk" #type); CHECK(name)
 
 static int fault, open_count, last_fd;
-static bool mock, coherent, multiwave, host_coherent;
-/* The render node opens as /dev/null (1:3); the primary node is /dev/zero (1:5). */
-static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_PRIMARY] = "/dev/zero", [DRM_NODE_RENDER] = "/apex-test/render"};
+static bool mock;
+/* Each render-node open is a fresh DRM file: a mock kernel on its memfd. */
+static struct mock_kernel kernels[32];
+static unsigned kernel_count;
+static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_RENDER] = "/apex-test/render"};
 static drmPciDeviceInfo pci = {.vendor_id = 0x10ee, .device_id = 0xa15e};
 static drmPciBusInfo bus = {.domain = 0x1234, .bus = 7, .dev = 3, .func = 1};
 static drmDevice drm = {.nodes = nodes, .available_nodes = 1 << DRM_NODE_RENDER | 1 << DRM_NODE_PRIMARY,
@@ -76,28 +78,38 @@ int __wrap_open64(const char *path, int flags, ...)
    if (!strcmp(path, nodes[DRM_NODE_RENDER])) {
       CHECK(mock && flags == (O_RDWR | O_CLOEXEC));
       open_count++;
-      return last_fd = __real_open64("/dev/null", flags);
+      CHECK(kernel_count < ARRAY_SIZE(kernels));
+      mock_kernel_init(&kernels[kernel_count]);
+      return last_fd = kernels[kernel_count++].fd;
    }
    CHECK(!(flags & O_CREAT));
    return __real_open64(path, flags);
 }
 int __wrap_ioctl(int fd, unsigned long request, ...)
 {
-   CHECK(mock && request == DRM_IOCTL_APEX_INFO);
+   CHECK(mock);
    va_list ap;
    va_start(ap, request);
-   struct drm_apex_info *info = va_arg(ap, void *);
+   void *arg = va_arg(ap, void *);
    va_end(ap);
-   CHECK(!info->version && !info->capabilities && !info->max_buffer_bytes);
-   *info = (struct drm_apex_info) {
-      .version = fault == 2 ? 1 : 2,
-      .capabilities = APEX_DRM_CAP_SHMEM | (fault == 3 ? 0 : APEX_DRM_CAP_GPUVM) |
-                      (coherent ? APEX_DRM_CAP_PRIME_COHERENT : 0) |
-                      (host_coherent ? APEX_DRM_CAP_HOST_COHERENT : 0) |
-                      (multiwave ? APEX_DRM_CAP_MULTIWAVE : 0),
-      .max_buffer_bytes = 64 * 1024 * 1024,
-   };
-   return 0;
+   struct mock_kernel *kernel = NULL;
+   for (unsigned i = kernel_count; i-- && !kernel;)
+      if (kernels[i].fd == fd)
+         kernel = &kernels[i];
+   CHECK(kernel);
+   if (request == DRM_IOCTL_APEX_INFO) {
+      const struct drm_apex_info zero = {0};
+      CHECK(!memcmp(arg, &zero, sizeof(zero)));
+      if (fault == 2) {
+         errno = ENOTTY;
+         return -1;
+      }
+      mock_kernel_ioctl(kernel, request, arg);
+      if (fault == 3)
+         ((struct drm_apex_info *)arg)->timestamp_hz = 0;
+      return 0;
+   }
+   return mock_kernel_ioctl(kernel, request, arg);
 }
 
 static void
@@ -153,10 +165,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(props.limits.maxComputeWorkGroupCount[0] == 65535 &&
          props.limits.maxComputeWorkGroupCount[1] == 65535 &&
          props.limits.maxComputeWorkGroupCount[2] == 65535 &&
-         props.limits.maxComputeWorkGroupInvocations == (multiwave ? 256 : 16) &&
-         props.limits.maxComputeWorkGroupSize[0] == (multiwave ? 256 : 16) &&
-         props.limits.maxComputeWorkGroupSize[1] == (multiwave ? 256 : 16) &&
-         props.limits.maxComputeWorkGroupSize[2] == (multiwave ? 64 : 16));
+         props.limits.maxComputeWorkGroupInvocations == 256 &&
+         props.limits.maxComputeWorkGroupSize[0] == 256 &&
+         props.limits.maxComputeWorkGroupSize[1] == 256 &&
+         props.limits.maxComputeWorkGroupSize[2] == 64);
    CHECK(strstr(props.deviceName, "non-conformant"));
    PROC(GetPhysicalDeviceFeatures2KHR, get_features2);
    VkPhysicalDeviceRobustness2FeaturesEXT robustness = {
@@ -254,25 +266,17 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
    get_memory(physical, &mem);
-   CHECK(mem.memoryTypeCount == 1u + 2 * coherent + host_coherent &&
-         mem.memoryHeapCount == 1u + host_coherent);
+   /* LOCAL through BAR2 and cached SYSTEM, both host coherent. */
+   CHECK(mem.memoryTypeCount == 2 && mem.memoryHeapCount == 2);
    CHECK(mem.memoryTypes[0].propertyFlags ==
-         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
-   if (coherent) CHECK(mem.memoryTypes[1].propertyFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-   if (host_coherent) {
-      CHECK(mem.memoryTypes[1 + coherent].propertyFlags ==
-            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
-             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
-      CHECK(mem.memoryTypes[1 + coherent].heapIndex == 1 &&
-            !mem.memoryHeaps[1].flags && mem.memoryHeaps[1].size == 1024ull * 1024 * 1024);
-   }
-   /* LOCAL-resident storage shares the device heap and follows the others. */
-   if (coherent)
-      CHECK(mem.memoryTypes[2 + host_coherent].propertyFlags ==
-            (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
-            mem.memoryTypes[2 + host_coherent].heapIndex == 0 &&
-            (mem.memoryHeaps[0].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT));
+         (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && !mem.memoryTypes[0].heapIndex);
+   CHECK(mem.memoryTypes[1].propertyFlags ==
+         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && mem.memoryTypes[1].heapIndex == 1);
+   CHECK(mem.memoryHeaps[0].flags == VK_MEMORY_HEAP_DEVICE_LOCAL_BIT &&
+         mem.memoryHeaps[0].size == 8ull << 30 && !mem.memoryHeaps[1].flags &&
+         mem.memoryHeaps[1].size == 1024ull * 1024 * 1024);
    PROC(GetPhysicalDeviceExternalBufferPropertiesKHR, get_external);
    VkPhysicalDeviceExternalBufferInfo external = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
@@ -280,10 +284,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    };
    VkExternalBufferProperties external_props = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
    get_external(physical, &external, &external_props);
-   CHECK(external_props.externalMemoryProperties.externalMemoryFeatures == (coherent ?
-      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT : 0));
-   CHECK(external_props.externalMemoryProperties.compatibleHandleTypes == (coherent ?
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : 0));
+   CHECK(external_props.externalMemoryProperties.externalMemoryFeatures ==
+      (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT));
+   CHECK(external_props.externalMemoryProperties.compatibleHandleTypes ==
+      (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
    CHECK(external_props.externalMemoryProperties.exportFromImportedHandleTypes ==
          external_props.externalMemoryProperties.compatibleHandleTypes);
    external.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
@@ -477,7 +481,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
       VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
    };
-   device_info.enabledExtensionCount = coherent ? 11 : 8;
+   device_info.enabledExtensionCount = ARRAY_SIZE(memory_extensions);
    device_info.ppEnabledExtensionNames = memory_extensions;
    device_info.pNext = &features;
    robustness.robustImageAccess2 = VK_TRUE;
@@ -527,8 +531,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_requirements(device, &buffer_req, &requirements);
    CHECK(requirements.memoryRequirements.size == 128 &&
          requirements.memoryRequirements.alignment == 64 &&
-         requirements.memoryRequirements.memoryTypeBits ==
-            (host_coherent ? (coherent ? 15 : 3) : (coherent ? 7 : 1)));
+         requirements.memoryRequirements.memoryTypeBits == 3);
    CHECK(!dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation);
    destroy_buffer(device, buffer, NULL);
    int fd1 = last_fd;
@@ -554,14 +557,7 @@ int main(int argc, char **argv)
          version.name = fault == 1 ? "foreign-driver" : "apex-display";
          exercise(apex_GetInstanceProcAddr);
       }
-      fault = 0;
-      for (unsigned capabilities = 0; capabilities < 8; capabilities++) {
-         coherent = capabilities & 1;
-         multiwave = capabilities & 2;
-         host_coherent = capabilities & 4;
-         exercise(apex_GetInstanceProcAddr);
-      }
-      puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, cleanup (mock DRM)");
+      puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, queue creation, cleanup (mock DRM)");
    } else {
       CHECK(!setenv("VK_DRIVER_FILES", argv[1], 1));
       /* The real system loader consumes the generated manifest and shared ICD. */

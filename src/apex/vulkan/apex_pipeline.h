@@ -12,7 +12,7 @@
 /* One native program and its descriptor-table layout: rows for every set
  * binding, the zero sentinel row, push constants and an immutable trailer.
  * The owner holds references to the set layouts. The binary uploads lazily
- * on the submit thread. `table` is false only for the native transport. */
+ * on the submit thread. `table` is false only for layout-less fixtures. */
 struct apex_program {
    struct apex_compile_result code;
    struct apex_bo bo;

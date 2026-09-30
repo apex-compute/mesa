@@ -27,8 +27,7 @@
 struct apex_physical_device {
    struct vk_physical_device vk;
    char *render_node;
-   bool prime_coherent;
-   bool host_coherent;
+   uint64_t local_bytes;
    struct vk_sync_type sync_type;
    const struct vk_sync_type *sync_types[2];
    /* Presentation through Mesa's display WSI on the device's primary node. */
@@ -93,42 +92,28 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
                                        VkPhysicalDeviceMemoryProperties2 *properties)
 {
    VK_FROM_HANDLE(apex_physical_device, device, physical);
+   /* LOCAL maps BAR2 write-combined; SYSTEM is cached shmem reached over PCIe. */
    properties->memoryProperties = (VkPhysicalDeviceMemoryProperties) {
-      .memoryTypeCount = device->prime_coherent ? 2 : 1,
-      .memoryTypes[0] = {.propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT},
-      .memoryTypes[1] = {.propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT},
-      .memoryHeapCount = 1,
-      .memoryHeaps[0] = {.size = APEX_MAX_ALLOCATION,
-                        .flags = device->prime_coherent ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0},
+      .memoryTypeCount = 2,
+      .memoryTypes[0] = {.propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT},
+      .memoryTypes[1] = {.propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                         .heapIndex = 1},
+      .memoryHeapCount = 2,
+      .memoryHeaps[0] = {.size = device->local_bytes, .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT},
+      .memoryHeaps[1] = {.size = APEX_MAX_ALLOCATION},
    };
-   VkPhysicalDeviceMemoryProperties *mem = &properties->memoryProperties;
-   if (device->host_coherent) {
-      mem->memoryTypes[mem->memoryTypeCount++] = (VkMemoryType) {
-         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-         .heapIndex = mem->memoryHeapCount++,
-      };
-      mem->memoryHeaps[1] = (VkMemoryHeap) {.size = APEX_MAX_ALLOCATION};
-   }
-   /* LOCAL-resident storage: a write-combined BAR2 view, and the only
-    * storage of external images, which therefore scan out in place. */
-   if (device->prime_coherent)
-      mem->memoryTypes[mem->memoryTypeCount++] = (VkMemoryType) {
-         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-      };
 }
 
 VKAPI_ATTR void VKAPI_CALL
 apex_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physical,
    const VkPhysicalDeviceExternalBufferInfo *info, VkExternalBufferProperties *properties)
 {
-   VK_FROM_HANDLE(apex_physical_device, device, physical);
    properties->externalMemoryProperties = (VkExternalMemoryProperties){0};
-   if (!device->prime_coherent || info->flags ||
+   if (info->flags ||
        (info->usage & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) ||
        (info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
@@ -233,7 +218,7 @@ apex_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       close(fd);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
-   VkResult result = apex_device_init(device, &physical->vk, info, alloc, fd, APEX_TRANSPORT_DRM);
+   VkResult result = apex_device_init(device, &physical->vk, info, alloc, fd);
    if (result != VK_SUCCESS) {
       vk_free2(&physical->vk.instance->alloc, alloc, device);
       close(fd);
@@ -282,9 +267,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    bool matches = version && !strcmp(version->name, "apex-display");
    drmFreeVersion(version);
    struct drm_apex_info caps = {0};
-   if (!matches || ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || caps.version != 2 ||
-       (caps.capabilities & (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM)) !=
-       (APEX_DRM_CAP_SHMEM | APEX_DRM_CAP_GPUVM)) {
+   if (!matches || ioctl(fd, DRM_IOCTL_APEX_INFO, &caps) || !caps.local_bytes ||
+       !caps.timestamp_hz || !caps.queues_per_file) {
       close(fd);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
@@ -308,15 +292,12 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &apex_physical_device_entrypoints, true);
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &wsi_physical_device_entrypoints, false);
    const struct vk_device_extension_table extensions = {
-      .KHR_swapchain = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .KHR_swapchain = true,
       .KHR_get_memory_requirements2 = true,
       .KHR_dedicated_allocation = true,
-      .KHR_external_memory = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
-      .KHR_external_memory_fd = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
-      .EXT_external_memory_dma_buf = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
-      .EXT_image_drm_format_modifier = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
-      /* Swapchain images take MUTABLE_FORMAT and a view format list. */
-      .KHR_swapchain_mutable_format = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .KHR_external_memory = true,
+      .KHR_external_memory_fd = true,
+      .EXT_external_memory_dma_buf = true,
       /* Mesa's DRM syncobj type supplies opaque-FD and sync-file payloads. */
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
@@ -486,7 +467,6 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,
    };
-   const bool multiwave = caps.capabilities & APEX_DRM_CAP_MULTIWAVE;
    struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,
       .vendorID = 0x10ee, .deviceID = 0xa15e,
@@ -509,9 +489,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxComputeSharedMemorySize = 32768,
       /* Recording splits dispatches into native chunks. */
       .maxComputeWorkGroupCount = {65535, 65535, 65535},
-      .maxComputeWorkGroupInvocations = multiwave ? 256 : 16,
-      .maxComputeWorkGroupSize = {multiwave ? 256 : 16,
-                                  multiwave ? 256 : 16, multiwave ? 64 : 16},
+      .maxComputeWorkGroupInvocations = 256,
+      .maxComputeWorkGroupSize = {256,
+                                  256, 64},
       .maxImageDimension1D = 4096, .maxImageDimension2D = 4096, .maxImageDimension3D = 2048,
       .maxImageDimensionCube = 4096, .maxImageArrayLayers = 256,
       .maxTexelBufferElements = 1 << 27,
@@ -559,7 +539,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .nonCoherentAtomSize = 1,
       .optimalBufferCopyOffsetAlignment = 64,
       /* Device timebase: 250 MHz on both profiles. */
-      .timestampPeriod = 4.0f, .timestampComputeAndGraphics = true,
+      .timestampPeriod = 1e9f / caps.timestamp_hz, .timestampComputeAndGraphics = true,
       .optimalBufferCopyRowPitchAlignment = 64,
       /* Descriptor bounds are checked without rounding, per 32-bit component. */
       .robustStorageBufferAccessSizeAlignment = 1,
@@ -587,7 +567,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
       /* Vulkan 1.3. */
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
-      .maxComputeWorkgroupSubgroups = multiwave ? 16 : 1,
+      .maxComputeWorkgroupSubgroups = 16,
       .maxInlineUniformBlockSize = APEX_MAX_INLINE_BYTES,
       .maxInlineUniformTotalSize = APEX_MAX_INLINE_BYTES,
       .maxPerStageDescriptorInlineUniformBlocks = 4,
@@ -643,8 +623,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    physical->sync_type = sync_type;
-   physical->prime_coherent = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT;
-   physical->host_coherent = caps.capabilities & APEX_DRM_CAP_HOST_COHERENT;
+   physical->local_bytes = MIN2(caps.visible_bytes ? caps.visible_bytes : caps.local_bytes,
+                                caps.local_bytes);
    physical->sync_types[0] = &physical->sync_type;
    physical->vk.supported_sync_types = physical->sync_types;
    /* KMS scans swapchain images out of their LOCAL-resident memory; the

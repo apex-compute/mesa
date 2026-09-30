@@ -11,7 +11,7 @@ foreach kernel : ['setup', 'bin', 'copy', 'clear', 'timestamp', 'querycopy', 're
   )
 endforeach
 apex_pipeline = static_library('apex_pipeline',
-  ['apex_pipeline.c', 'apex_device.c', 'apex_graphics.c', 'apex_format.c', 'apex_texture.c', apex_internal_spv],
+  ['apex_pipeline.c', 'apex_device.c', 'apex_cp.c', 'apex_graphics.c', 'apex_format.c', 'apex_texture.c', apex_internal_spv],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, idep_nir],
 )
@@ -140,15 +140,14 @@ test('apex-multiple-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_multiple_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
   args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv], suite : ['apex'])
-apex_command_test = executable('apex-command-test', 'command_test.c',
+apex_cp_test = executable('apex-cp-test', 'cp_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
 )
-test('apex-command', apex_command_test, args : [apex_pipeline_spv], suite : ['apex'])
-test('apex-image-command', apex_command_test, args : [apex_images_spv, '--images'], suite : ['apex'])
+test('apex-cp', apex_cp_test, args : [apex_pipeline_spv], suite : ['apex'])
 apex_external_memory_test = executable('apex-external-memory-test', 'external_memory_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
@@ -157,14 +156,6 @@ apex_external_memory_test = executable('apex-external-memory-test', 'external_me
   link_language : 'cpp', install : false,
 )
 test('apex-external-memory', apex_external_memory_test, suite : ['apex'])
-apex_async_test = executable('apex-async-test', 'async_test.c',
-  include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
-  link_with : [apex_pipeline, apex_nir, apex_rs],
-  link_args : ['-Wl,--wrap=ioctl'],
-  link_language : 'cpp', install : false,
-)
-test('apex-async', apex_async_test, args : [apex_pipeline_spv], suite : ['apex'])
 apex_sync_test = executable('apex-sync-test', 'sync_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],

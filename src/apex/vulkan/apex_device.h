@@ -7,10 +7,8 @@
 #include "vk_meta.h"
 #include "vk_sampler.h"
 #include "apex_format.h"
-#include "apex_draw.h"
+#include "apex_cp.h"
 #include "util/vma.h"
-
-enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
 
 enum apex_internal {
    APEX_INTERNAL_SETUP, APEX_INTERNAL_BIN, APEX_INTERNAL_COPY, APEX_INTERNAL_CLEAR, APEX_INTERNAL_TIMESTAMP, APEX_INTERNAL_QUERY_COPY,
@@ -89,30 +87,35 @@ struct apex_bo {
    void *map;
    uint64_t va, size;
    uint32_t handle;
+   bool system;
 };
 
-/* Internal single-queue device. The caller owns fd through device teardown.
- * DRM callers supply physical->supported_sync_types from vk_drm_syncobj_get_type.
- * The native qualification path may omit sync types and submit synchronously.
- */
+/* Internal single-queue device on one user-mode ring. A negative fd builds an
+ * offline device for compiler tests: no memory, queue or submission. */
 struct apex_device {
    struct vk_device vk;
    struct vk_device_dispatch_table cmd_dispatch;
    struct vk_queue queue;
    struct vk_meta_device meta;
    int fd;
-   enum apex_transport transport;
-   bool prime_coherent;
-   bool host_coherent;
    struct util_vma_heap va_heap;
    mtx_t va_mutex;
    /* Serializes PRIME handle lookup and final backing destruction. */
    mtx_t memory_mutex;
    struct list_head memories;
-   /* Submit-thread-owned descriptor retirement and private completion timeline. */
-   uint32_t completion;
-   uint64_t point;
-   struct list_head retired;
+   /* Queue: ring, read-only status page and doorbell page. The submit thread
+    * owns sequence, kwait, the arenas and ring.wptr. */
+   uint32_t queue_id;
+   uint64_t status_va;
+   void *status_map, *doorbell_map;
+   struct apex_bo ring_bo;
+   struct apex_ring ring;
+   /* SIGNAL target retiring batch arenas without an interrupt. */
+   struct apex_bo retire;
+   uint64_t sequence, kwait;
+   struct list_head busy_arenas, free_arenas;
+   /* A program upload since the last batch invalidates instruction caches. */
+   bool programs_uploaded;
    /* Internal programs, compiled on first use. */
    struct apex_program *internal[APEX_INTERNAL_COUNT];
    /* Indirect draw scratch and parameter block, created on first use under
@@ -134,7 +137,6 @@ bool apex_format_modifier_supported(VkFormat format);
 VkResult apex_device_init(struct apex_device *device,
                           struct vk_physical_device *physical,
                           const VkDeviceCreateInfo *info,
-                          const VkAllocationCallbacks *alloc, int fd,
-                          enum apex_transport transport);
+                          const VkAllocationCallbacks *alloc, int fd);
 void apex_device_finish(struct apex_device *device);
 #endif
