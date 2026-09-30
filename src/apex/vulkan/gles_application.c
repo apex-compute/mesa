@@ -5,9 +5,13 @@
  *                                    primary or render node is NODE; renders
  *                                    a clear and a textured triangle into an
  *                                    FBO and checks pixels.
- *   apex-gles-application gbm NODE   GBM allocation, CPU mapping, and EGL on
- *                                    the GBM platform rendering into a GBM
- *                                    buffer imported as an EGLImage. */
+ *   apex-gles-application gbm NODE   GBM allocation (implicit and explicit
+ *                                    LINEAR modifier), CPU mapping, and EGL
+ *                                    on the GBM platform rendering into a GBM
+ *                                    buffer imported as an EGLImage.
+ *   apex-gles-application caps NODE  Desktop GL and GLES 3 contexts on the
+ *                                    device: versions and the extensions
+ *                                    Mesa requires for GLES 3.0 and 3.1. */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -214,7 +218,7 @@ run_egl(const char *node)
 
 #define GBM_FUNCTIONS(X) X(gbm_create_device) X(gbm_device_destroy) X(gbm_device_get_backend_name) \
    X(gbm_bo_create) X(gbm_bo_destroy) X(gbm_bo_get_fd) X(gbm_bo_get_stride) X(gbm_bo_get_modifier) \
-   X(gbm_bo_map) X(gbm_bo_unmap)
+   X(gbm_bo_map) X(gbm_bo_unmap) X(gbm_bo_create_with_modifiers2)
 #define DECLARE(f) static __typeof__(f) *p_##f;
 
 GBM_FUNCTIONS(DECLARE)
@@ -222,14 +226,23 @@ GBM_FUNCTIONS(DECLARE)
 /* Allocation, mapping and, for rendering buffers, an EGLImage render target
  * whose clear must reach the buffer's memory. */
 static void
-gbm_case(struct gbm_device *device, EGLDisplay display, uint32_t usage, const char *name)
+gbm_case(struct gbm_device *device, EGLDisplay display, uint32_t usage, bool explicit_linear,
+         const char *name)
 {
-   struct gbm_bo *bo = p_gbm_bo_create(device, SIZE, SIZE, GBM_FORMAT_ABGR8888, usage);
+   /* An explicit modifier list selects Zink's VK_EXT_image_drm_format_modifier path. */
+   static const uint64_t linear = 0; /* DRM_FORMAT_MOD_LINEAR */
+   struct gbm_bo *bo = explicit_linear ?
+      p_gbm_bo_create_with_modifiers2(device, SIZE, SIZE, GBM_FORMAT_ABGR8888, &linear, 1, usage) :
+      p_gbm_bo_create(device, SIZE, SIZE, GBM_FORMAT_ABGR8888, usage);
    char what[128];
    snprintf(what, sizeof(what), "%s: gbm_bo_create", name);
    check(bo, what);
    if (!bo)
       return;
+   if (explicit_linear) {
+      snprintf(what, sizeof(what), "%s: modifier is DRM_FORMAT_MOD_LINEAR", name);
+      check(p_gbm_bo_get_modifier(bo) == linear, what);
+   }
    int fd = p_gbm_bo_get_fd(bo);
    uint32_t stride = p_gbm_bo_get_stride(bo);
    printf("     fd %d stride %u modifier 0x%llx\n", fd, stride,
@@ -325,9 +338,22 @@ run_gbm(const char *node)
    check(display != EGL_NO_DISPLAY, "GBM platform display");
    if (display != EGL_NO_DISPLAY && !gles2_context(display, NULL))
       display = EGL_NO_DISPLAY;
-   gbm_case(device, display, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING, "linear rendering");
-   gbm_case(device, display, GBM_BO_USE_LINEAR | GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING,
+   if (display != EGL_NO_DISPLAY) {
+      PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_modifiers =
+         (PFNEGLQUERYDMABUFMODIFIERSEXTPROC)eglGetProcAddress("eglQueryDmaBufModifiersEXT");
+      EGLuint64KHR modifiers[16];
+      EGLint count = 0;
+      bool linear = false;
+      if (query_modifiers && query_modifiers(display, GBM_FORMAT_ABGR8888, 16, modifiers, NULL, &count))
+         for (EGLint i = 0; i < count; i++)
+            linear |= modifiers[i] == 0;
+      printf("     %d dma-buf modifiers for ABGR8888\n", count);
+      check(linear, "eglQueryDmaBufModifiersEXT lists DRM_FORMAT_MOD_LINEAR");
+   }
+   gbm_case(device, display, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING, false, "linear rendering");
+   gbm_case(device, display, GBM_BO_USE_LINEAR | GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING, false,
             "linear scanout");
+   gbm_case(device, display, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING, true, "LINEAR modifier");
    if (display != EGL_NO_DISPLAY)
       eglTerminate(display);
    p_gbm_device_destroy(device);
@@ -335,14 +361,98 @@ run_gbm(const char *node)
    return failures != 0;
 }
 
+/* Extensions of Mesa's GLES 3.0 and 3.1 version checks (compute_version_es2)
+ * that have extension strings; the rest are implied by these or limits. */
+static const char *const es30_extensions[] = {
+   "GL_ARB_half_float_vertex", "GL_ARB_internalformat_query", "GL_ARB_map_buffer_range",
+   "GL_ARB_shader_texture_lod", "GL_OES_texture_float", "GL_OES_texture_half_float",
+   "GL_OES_texture_half_float_linear", "GL_ARB_texture_rg", "GL_ARB_depth_buffer_float",
+   "GL_ARB_framebuffer_object", "GL_EXT_packed_float", "GL_EXT_texture_array",
+   "GL_EXT_texture_shared_exponent", "GL_EXT_texture_sRGB", "GL_EXT_transform_feedback",
+   "GL_ARB_draw_instanced", "GL_ARB_instanced_arrays", "GL_ARB_uniform_buffer_object",
+   "GL_EXT_texture_snorm", "GL_ARB_ES3_compatibility", "GL_OES_depth_texture_cube_map",
+   "GL_ARB_vertex_type_2_10_10_10_rev",
+};
+/* Additional GL 3.0 features (compute_version). */
+static const char *const gl30_extensions[] = {
+   "GL_NV_conditional_render", "GL_ARB_color_buffer_float", "GL_ARB_texture_float",
+   "GL_EXT_texture_integer", "GL_ARB_framebuffer_sRGB", "GL_EXT_draw_buffers2",
+   "GL_EXT_texture_compression_rgtc",
+};
+static const char *const es31_extensions[] = {
+   "GL_ARB_arrays_of_arrays", "GL_ARB_compute_shader", "GL_ARB_shader_storage_buffer_object",
+   "GL_ARB_shader_atomic_counters", "GL_ARB_shader_image_load_store", "GL_ARB_draw_indirect",
+   "GL_ARB_explicit_uniform_location", "GL_ARB_framebuffer_no_attachments",
+   "GL_ARB_shading_language_packing", "GL_ARB_stencil_texturing", "GL_ARB_texture_multisample",
+   "GL_ARB_texture_gather", "GL_MESA_shader_integer_functions", "GL_EXT_shader_integer_mix",
+};
+
+static int
+run_caps(const char *node)
+{
+   PFNEGLQUERYDEVICESEXTPROC query_devices =
+      (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
+   PFNEGLQUERYDEVICESTRINGEXTPROC query_string =
+      (PFNEGLQUERYDEVICESTRINGEXTPROC)eglGetProcAddress("eglQueryDeviceStringEXT");
+   EGLDeviceEXT devices[16], device = EGL_NO_DEVICE_EXT;
+   EGLint count = 0;
+   if (query_devices && query_string)
+      query_devices(16, devices, &count);
+   for (EGLint i = 0; i < count && device == EGL_NO_DEVICE_EXT; i++) {
+      const char *extensions = query_string(devices[i], EGL_EXTENSIONS);
+      const char *render = extension(extensions, "EGL_EXT_device_drm_render_node") ?
+         query_string(devices[i], EGL_DRM_RENDER_NODE_FILE_EXT) : NULL;
+      const char *primary = extension(extensions, "EGL_EXT_device_drm") ?
+         query_string(devices[i], EGL_DRM_DEVICE_FILE_EXT) : NULL;
+      if ((render && !strcmp(render, node)) || (primary && !strcmp(primary, node)))
+         device = devices[i];
+   }
+   check(device != EGL_NO_DEVICE_EXT, "EGL device for the node");
+   if (device == EGL_NO_DEVICE_EXT)
+      return 1;
+   EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, device, NULL);
+   EGLint major, minor;
+   check(display != EGL_NO_DISPLAY && eglInitialize(display, &major, &minor), "eglInitialize");
+   /* GLES 3: the highest version the context reports. */
+   eglBindAPI(EGL_OPENGL_ES_API);
+   const EGLint es3[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE};
+   EGLContext context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, es3);
+   printf("     GLES 3 context: %s\n", context != EGL_NO_CONTEXT ? "created" : "unavailable");
+   if (context != EGL_NO_CONTEXT)
+      eglDestroyContext(display, context);
+   /* Desktop GL compatibility context: its extension string names Mesa's
+    * internal features. */
+   check(eglBindAPI(EGL_OPENGL_API), "eglBindAPI(EGL_OPENGL_API)");
+   context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, NULL);
+   check(context != EGL_NO_CONTEXT && eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context),
+         "desktop GL context");
+   if (context == EGL_NO_CONTEXT)
+      return 1;
+   const GLubyte *(*get_string)(GLenum) = (const GLubyte *(*)(GLenum))eglGetProcAddress("glGetString");
+   const char *extensions = (const char *)get_string(GL_EXTENSIONS);
+   printf("     GL_RENDERER %s\n     GL_VERSION  %s\n", get_string(GL_RENDERER), get_string(GL_VERSION));
+   for (unsigned i = 0; i < sizeof(es30_extensions) / sizeof(es30_extensions[0]); i++)
+      if (!extension(extensions, es30_extensions[i]))
+         printf("     missing for GLES 3.0 / GL 3.x: %s\n", es30_extensions[i]);
+   for (unsigned i = 0; i < sizeof(gl30_extensions) / sizeof(gl30_extensions[0]); i++)
+      if (!extension(extensions, gl30_extensions[i]))
+         printf("     missing for GL 3.0: %s\n", gl30_extensions[i]);
+   for (unsigned i = 0; i < sizeof(es31_extensions) / sizeof(es31_extensions[0]); i++)
+      if (!extension(extensions, es31_extensions[i]))
+         printf("     missing for GLES 3.1: %s\n", es31_extensions[i]);
+   eglTerminate(display);
+   return failures != 0;
+}
+
 int
 main(int argc, char **argv)
 {
-   if (argc != 3 || (strcmp(argv[1], "egl") && strcmp(argv[1], "gbm"))) {
-      fprintf(stderr, "usage: %s egl|gbm DRM-NODE\n", argv[0]);
+   if (argc != 3 || (strcmp(argv[1], "egl") && strcmp(argv[1], "gbm") && strcmp(argv[1], "caps"))) {
+      fprintf(stderr, "usage: %s egl|gbm|caps DRM-NODE\n", argv[0]);
       return 2;
    }
-   int result = !strcmp(argv[1], "egl") ? run_egl(argv[2]) : run_gbm(argv[2]);
+   int result = !strcmp(argv[1], "egl") ? run_egl(argv[2]) :
+                !strcmp(argv[1], "gbm") ? run_gbm(argv[2]) : run_caps(argv[2]);
    puts(result ? "FAIL" : "PASS");
    return result;
 }
