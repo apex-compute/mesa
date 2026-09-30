@@ -23,7 +23,12 @@
 #define APEX_DRAW_HEIGHT 12
 #define APEX_DRAW_PROVOKING 13        /* VkProvokingVertexModeEXT */
 #define APEX_DRAW_INDEX_SIZE 14       /* bound index bytes: indices beyond read zero */
-/* Words 15..18 are unused; viewports live at APEX_DRAW_VIEWPORTS. */
+#define APEX_DRAW_LOGIC_OP 15         /* VkLogicOp | enable << 4 */
+/* VkPolygonMode | line quad << 4 (1 parallelogram, 2 rectangle, 3 smooth
+ * rectangle) | stipple enable << 8. */
+#define APEX_DRAW_RASTER 16
+#define APEX_DRAW_LINE_STIPPLE 17     /* factor | pattern << 16 */
+#define APEX_DRAW_LINE_WIDTH 18       /* FP32 */
 #define APEX_DRAW_SCISSOR 19          /* union of the scissors below: x0, y0, x1, y1 exclusive */
 #define APEX_DRAW_CULL 23             /* VkCullModeFlags */
 #define APEX_DRAW_FRONT_FACE 24       /* VkFrontFace */
@@ -90,7 +95,10 @@
 #define APEX_DRAW_VIEW 377
 /* Sample mask bits 0..15, alpha to coverage bit 16, alpha to one bit 17. */
 #define APEX_DRAW_MULTISAMPLE 378
-#define APEX_DRAW_WORDS 379
+/* Clip distances: vertex-record word of the first | clip count << 16 |
+ * cull count << 20; cull distances follow the clip distances. */
+#define APEX_DRAW_CLIP 379
+#define APEX_DRAW_WORDS 380
 #define APEX_FRAGMENT_CHUNKS 8        /* bin chunks per fragment job */
 #define APEX_DRAW_DYNAMIC(w) (((w) >= APEX_DRAW_VERTEX_COUNT && (w) <= APEX_DRAW_FIRST_INSTANCE) || \
                               (w) == APEX_DRAW_PRIM_COUNT || (w) == APEX_DRAW_INDEX + 3 || \
@@ -117,13 +125,18 @@
 #define APEX_PRIM_INV_W 20            /* 1/w per vertex (FP32) */
 #define APEX_PRIM_WEIGHTS 23          /* 3 x 3 FP32: sub-vertex i weight of source vertex j */
 #define APEX_PRIM_SOURCE 32           /* 3 source vertex record indices */
-#define APEX_PRIM_FLAGS 35            /* bit 0 front-facing; bits 16..19 viewport index; bits 20..31 layer */
+/* Bit 0 front-facing, bit 1 stippled line, bit 2 smooth line; bits 16..19
+ * viewport index; bits 20..31 layer. */
+#define APEX_PRIM_FLAGS 35
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */
 #define APEX_PRIM_DEPTH_OFFSET 38     /* depth bias of this triangle (FP32) */
 #define APEX_PRIM_PROVOKING 39        /* provoking vertex record index: flat inputs */
 #define APEX_PRIM_UNION_BOX 40        /* first record only: box of all records, pixels */
-#define APEX_PRIM_WORDS 44
+/* Lines (FP32): window origin x, y; unit direction x, y (the major axis for
+ * parallelograms); stipple counter at the origin; length; half width. */
+#define APEX_PRIM_LINE 44
+#define APEX_PRIM_WORDS 52
 #define APEX_TILES_PER_WORKGROUP 1 /* per fragment job: bounded launch runtime */
 /* A clipped triangle fans into at most 7 records; point and line quads into 2. */
 #define APEX_SUBPRIMS_FOR(topology) ((topology) <= 2u ? 2u : 8u)

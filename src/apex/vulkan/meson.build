@@ -188,8 +188,13 @@ foreach stage : ['vert', 'frag']
     build_by_default : true,
   )
 endforeach
+apex_clip_spv = custom_target('apex-clip-spv',
+  input : 'clip.vert', output : 'clip.vert.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
+)
 test('apex-graphics-programs', apex_pipeline_test,
-  args : ['--graphics', apex_texture_spv, apex_triangle_spv], env : ['NIR_DEBUG=validate'], suite : ['apex'])
+  args : ['--graphics', apex_texture_spv, apex_triangle_spv, apex_clip_spv],
+  env : ['NIR_DEBUG=validate'], suite : ['apex'])
 # Frame-time benchmark for the performance plan's desktop and game scenes.
 apex_bench = executable('apex-bench', 'bench.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,

@@ -13,9 +13,13 @@ struct apex_shader {
    struct vk_shader vk;
    struct apex_program program;
    struct vk_descriptor_set_layout *set_layouts[MESA_VK_MAX_DESCRIPTOR_SETS];
+   /* Vertex shaders of pipelines without a fragment shader: the empty
+    * fragment kernel that rasterizes for depth, stencil and occlusion. */
+   struct apex_shader *depth_only;
    struct {
-      int8_t slot[VARYING_SLOT_MAX];
+      int16_t slot[VARYING_SLOT_MAX];
       uint32_t stride;
+      uint8_t clip_distances, cull_distances;
    } vertex;
 };
 

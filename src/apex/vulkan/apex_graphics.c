@@ -265,8 +265,15 @@ lower_vertex_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       break;
    }
    case nir_intrinsic_store_output: {
-      unsigned location = nir_intrinsic_io_semantics(i).location;
-      int slot = ctx->shader->vertex.slot[location];
+      /* Compact clip/cull distance arrays address their second vec4 slot
+       * through the offset source. */
+      nir_src *offset = nir_get_io_offset_src(i);
+      if (!nir_src_is_const(*offset)) {
+         ctx->invalid = true;
+         return false;
+      }
+      unsigned location = nir_intrinsic_io_semantics(i).location + nir_src_as_uint(*offset);
+      int slot = location < VARYING_SLOT_MAX ? ctx->shader->vertex.slot[location] : -1;
       if (slot < 0) {
          /* Outputs without a consumer-visible slot are discarded. */
          nir_instr_remove(&i->instr);
@@ -341,6 +348,14 @@ assign_vertex_slots(struct apex_shader *shader, const nir_shader *nir)
       shader->vertex.slot[VARYING_SLOT_VIEWPORT] = words++;
    if (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER))
       shader->vertex.slot[VARYING_SLOT_LAYER] = words++;
+   /* Clip then cull distances, one merged compact array (vk_nir). */
+   shader->vertex.clip_distances = nir->info.clip_distance_array_size;
+   shader->vertex.cull_distances = nir->info.cull_distance_array_size;
+   if (shader->vertex.clip_distances + shader->vertex.cull_distances) {
+      shader->vertex.slot[VARYING_SLOT_CLIP_DIST0] = words;
+      shader->vertex.slot[VARYING_SLOT_CLIP_DIST1] = words + 4;
+      words += shader->vertex.clip_distances + shader->vertex.cull_distances;
+   }
    shader->vertex.stride = words;
 }
 
@@ -846,6 +861,23 @@ blend_op(nir_builder *b, nir_def *op, nir_def *s, nir_def *d, nir_def *sf, nir_d
    return nir_bcsel(b, nir_ieq_imm(b, op, 4), nir_fmax(b, s, d), result);
 }
 
+/* VkLogicOp on packed words s (source) and d (destination). */
+static nir_def *
+logic_op(nir_builder *b, nir_def *op, nir_def *s, nir_def *d)
+{
+   nir_def *table[16] = {
+      nir_imm_int(b, 0), nir_iand(b, s, d), nir_iand(b, s, nir_inot(b, d)), s,
+      nir_iand(b, nir_inot(b, s), d), d, nir_ixor(b, s, d), nir_ior(b, s, d),
+      nir_inot(b, nir_ior(b, s, d)), nir_inot(b, nir_ixor(b, s, d)), nir_inot(b, d),
+      nir_ior(b, s, nir_inot(b, d)), nir_inot(b, s), nir_ior(b, nir_inot(b, s), d),
+      nir_inot(b, nir_iand(b, s, d)), nir_imm_int(b, ~0),
+   };
+   nir_def *result = table[0];
+   for (unsigned i = 1; i < 16; i++)
+      result = nir_bcsel(b, nir_ieq_imm(b, op, i), table[i], result);
+   return result;
+}
+
 /* Bits of packed color storage written by API channel mask `mask`. */
 static nir_def *
 write_bits(nir_builder *b, enum pipe_format format, nir_def *mask, unsigned word)
@@ -1127,6 +1159,33 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    /* The pipeline sample mask removes samples. */
    covered = nir_iand(b, covered, nir_ine_imm(b, nir_iand(b, nir_ushr(b, multisample, sample),
                                                           nir_imm_int(b, 1)), 0));
+   /* Lines: the stipple pattern removes fragments by their counter along
+    * the line; smooth lines scale alpha by the pixel's coverage of the
+    * rectangle, estimated from the center's distance to its edges. */
+   nir_def *line_flags = nir_iand_imm(b, FIELD(APEX_PRIM_FLAGS), 6);
+   nir_def *one = nir_imm_float(b, 1.0f), *yes = nir_imm_true(b);
+   nir_push_if(b, nir_ine_imm(b, line_flags, 0));
+   nir_def *rx = nir_fsub(b, nir_fadd_imm(b, nir_u2f32(b, px), 0.5f), FIELD(APEX_PRIM_LINE));
+   nir_def *ry = nir_fsub(b, nir_fadd_imm(b, nir_u2f32(b, py), 0.5f), FIELD(APEX_PRIM_LINE + 1));
+   nir_def *dx = FIELD(APEX_PRIM_LINE + 2), *dy = FIELD(APEX_PRIM_LINE + 3);
+   nir_def *along = nir_ffma(b, rx, dx, nir_fmul(b, ry, dy));
+   nir_def *across = nir_fabs(b, nir_fsub(b, nir_fmul(b, rx, dy), nir_fmul(b, ry, dx)));
+   nir_def *stipple_word = draw_word(b, program, APEX_DRAW_LINE_STIPPLE);
+   nir_def *factor = nir_u2f32(b, nir_umax(b, nir_iand_imm(b, stipple_word, 0xffff), nir_imm_int(b, 1)));
+   nir_def *counter = nir_fmax(b, nir_fadd(b, along, FIELD(APEX_PRIM_LINE + 4)), nir_imm_float(b, 0.0f));
+   nir_def *index = nir_iand_imm(b, nir_f2u32(b, nir_ffloor(b, nir_fdiv(b, counter, factor))), 15);
+   nir_def *stippled = nir_ine_imm(b, nir_iand_imm(b, line_flags, 2), 0);
+   nir_def *pattern_bit = nir_ine_imm(b, nir_iand_imm(b, nir_ushr(b, nir_ushr_imm(b, stipple_word, 16), index), 1), 0);
+   nir_def *keep_line = nir_ior(b, nir_inot(b, stippled), pattern_bit);
+   nir_def *length = FIELD(APEX_PRIM_LINE + 5), *half_width = FIELD(APEX_PRIM_LINE + 6);
+   nir_def *coverage = nir_fmul(b, nir_fsat(b, nir_fsub(b, nir_fadd_imm(b, half_width, 0.5f), across)),
+                                nir_fmul(b, nir_fsat(b, nir_fadd_imm(b, along, 0.5f)),
+                                         nir_fsat(b, nir_fadd_imm(b, nir_fsub(b, length, along), 0.5f))));
+   coverage = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, line_flags, 4), 0), coverage, one);
+   nir_pop_if(b, NULL);
+   nir_def *line_keep = nir_if_phi(b, keep_line, yes);
+   nir_def *line_coverage = nir_if_phi(b, coverage, one);
+   covered = nir_iand(b, covered, line_keep);
    nir_push_if(b, nir_vote_any(b, 1, covered));
    nir_def *reciprocal = FIELD(APEX_PRIM_RECIPROCAL_AREA);
    nir_def *lambda[3], *weighted[3];
@@ -1189,6 +1248,9 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    b->cursor = nir_after_cf_list(&shade->then_list);
    nir_pop_if(b, shade);
 
+   /* Smooth line coverage scales the alpha of color output 0. */
+   nir_store_var(b, ctx.color[0], nir_vector_insert_imm(b, nir_load_var(b, ctx.color[0]),
+      nir_fmul(b, nir_channel(b, nir_load_var(b, ctx.color[0]), 3), line_coverage), 3), 0xf);
    nir_def *live = nir_iand(b, covered, nir_inot(b, nir_load_var(b, ctx.killed)));
    /* gl_SampleMask removes this lane's sample. */
    live = nir_iand(b, live, nir_ine_imm(b, nir_iand(b, nir_ushr(b, nir_load_var(b, ctx.sample_mask), sample),
@@ -1200,10 +1262,12 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
       nir_def *a2c = nir_ine_imm(b, nir_iand_imm(b, multisample, 1u << 16), 0);
       live = nir_iand(b, live, nir_ior(b, nir_inot(b, a2c), nir_ult(b, sample, keep)));
    }
+   /* Alpha to one: normalized and float attachments read alpha 1. */
    nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, multisample, 1u << 17), 0));
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++)
-      nir_store_var(b, ctx.color[k], nir_vector_insert_imm(b, nir_load_var(b, ctx.color[k]),
-                                                           nir_imm_float(b, 1.0f), 3), 0xf);
+      if (!stored[k] || !util_format_is_pure_integer(formats[k]))
+         nir_store_var(b, ctx.color[k], nir_vector_insert_imm(b, nir_load_var(b, ctx.color[k]),
+                                                              nir_imm_float(b, 1.0f), 3), 0xf);
    nir_pop_if(b, NULL);
    if (ds_target) {
       /* Stencil test, then depth test; stencil ops follow their outcome. */
@@ -1319,6 +1383,18 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
          result = nir_if_phi(b, blended, src);
       }
       nir_def *packed = pack_color(b, formats[k], result);
+      /* Logic ops combine the packed source with the stored texel for
+       * integer and normalized formats; float and sRGB pass unchanged. */
+      if (!util_format_is_float(formats[k]) && !util_format_is_srgb(formats[k])) {
+         nir_def *logic = draw_word(b, program, APEX_DRAW_LOGIC_OP);
+         nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, logic, 16), 0));
+         nir_def *op = nir_iand_imm(b, logic, 15), *combined[4];
+         for (unsigned w = 0; w < 4; w++)
+            combined[w] = logic_op(b, op, nir_channel(b, packed, w), nir_channel(b, old, w));
+         nir_def *logical = nir_vec(b, combined, 4);
+         nir_pop_if(b, NULL);
+         packed = nir_if_phi(b, logical, packed);
+      }
       nir_def *mask = nir_iand_imm(b, nir_ushr_imm(b, ops, 16), 0xf);
       nir_def *merged[4];
       for (unsigned w = 0; w < 4; w++) {
@@ -1369,6 +1445,8 @@ apex_shader_destroy(struct vk_device *device, struct vk_shader *vk,
                     const VkAllocationCallbacks *alloc)
 {
    struct apex_shader *shader = container_of(vk, struct apex_shader, vk);
+   if (shader->depth_only)
+      apex_shader_destroy(device, &shader->depth_only->vk, alloc);
    apex_program_finish((struct apex_device *)device, &shader->program);
    for (unsigned s = 0; s < ARRAY_SIZE(shader->set_layouts); s++)
       if (shader->set_layouts[s])
@@ -1475,6 +1553,9 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
              const VkAllocationCallbacks *alloc, struct vk_shader **shaders)
 {
    VkResult result = VK_SUCCESS;
+   bool fragment = false;
+   for (uint32_t i = 0; i < count; i++)
+      fragment |= infos[i].stage == MESA_SHADER_FRAGMENT;
    for (uint32_t i = 0; i < count; i++) {
       if (result != VK_SUCCESS) {
          ralloc_free(infos[i].nir);
@@ -1482,6 +1563,22 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
          continue;
       }
       result = compile_stage(device, &infos[i], state, alloc, &shaders[i]);
+      /* Pipelines without a fragment shader rasterize with an empty one
+       * that the vertex shader owns: depth, stencil and occlusion only. */
+      if (result == VK_SUCCESS && infos[i].stage == MESA_SHADER_VERTEX && !fragment && state && state->rp) {
+         nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &apex_nir_options,
+                                                        "apex_depth_only");
+         struct vk_shader_compile_info empty = {.stage = MESA_SHADER_FRAGMENT, .nir = b.shader};
+         struct vk_shader *depth_only;
+         result = compile_stage(device, &empty, state, alloc, &depth_only);
+         if (result == VK_SUCCESS) {
+            container_of(shaders[i], struct apex_shader, vk)->depth_only =
+               container_of(depth_only, struct apex_shader, vk);
+         } else {
+            apex_shader_destroy(device, shaders[i], alloc);
+            shaders[i] = NULL;
+         }
+      }
    }
    if (result != VK_SUCCESS) {
       for (uint32_t i = 0; i < count; i++)
@@ -1527,7 +1624,10 @@ apex_hash_state(struct vk_physical_device *physical, const struct vk_graphics_pi
    _mesa_blake3_init(&hash);
    if (state && (stages & VK_SHADER_STAGE_VERTEX_BIT) && state->vi)
       _mesa_blake3_update(&hash, state->vi, sizeof(*state->vi));
-   if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT) && state->rp) {
+   /* A vertex shader without a fragment shader owns the depth-only kernel. */
+   if (state && (stages & (VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT)) && state->rp) {
+      bool depth_only = !(stages & VK_SHADER_STAGE_FRAGMENT_BIT);
+      _mesa_blake3_update(&hash, &depth_only, sizeof(depth_only));
       _mesa_blake3_update(&hash, state->rp->color_attachment_formats,
                           sizeof(state->rp->color_attachment_formats));
       _mesa_blake3_update(&hash, &state->rp->color_attachment_count,

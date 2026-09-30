@@ -1,10 +1,14 @@
 #version 450
 // Primitive setup: one invocation per input primitive of every instance.
-// Assembles source vertices, clips against w >= 2^-126, the x/y guard band,
-// z >= 0 and z <= w, snaps to Q16.8 and writes fanned triangles with
-// top-left edge equations. Points become gl_PointSize squares whose source
-// weights carry gl_PointCoord; lines become width-1 parallelograms offset
-// along the minor axis (non-strict lines). See apex_draw.h for record layout.
+// Assembles source vertices, culls by cull distances, clips against
+// w >= 2^-126, the x/y guard band, z >= 0, z <= w and the clip distances,
+// snaps to Q16.8 and writes fanned triangles with top-left edge equations.
+// Points become squares whose source weights carry gl_PointCoord. Lines
+// become quads of the line width: parallelograms offset along the minor
+// axis (default and Bresenham lines) or rectangles (rectangular lines,
+// widened by half a pixel for smooth lines); line records carry the
+// geometry for stipple and smooth coverage. Triangles in line or point
+// polygon mode become their edges or vertices. See apex_draw.h.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -41,20 +45,273 @@ bool restart_at(uint position)
 
 vec4 P[10];
 vec3 B[10];
+// Clip distances of the primitive's three source vertices, per plane.
+vec3 D[8];
 
 // Guard-band scale keeps snapped coordinates within +/-30000 pixels.
-float plane_distance(uint plane, vec4 v, vec2 guard)
+// Planes 7 and up are the clip distances, interpolated by source weights;
+// depth clamp disables the z planes 5 and 6.
+bool g_depth_clamp;
+float plane_distance(uint plane, vec4 v, vec3 b, vec2 guard)
 {
+   if (g_depth_clamp && (plane == 5u || plane == 6u)) return 1.0;
    if (plane == 0u) return v.w - 1.17549435e-38;
    if (plane == 1u) return v.x + guard.x * v.w;
    if (plane == 2u) return guard.x * v.w - v.x;
    if (plane == 3u) return v.y + guard.y * v.w;
    if (plane == 4u) return guard.y * v.w - v.y;
    if (plane == 5u) return v.z;
-   return v.w - v.z;
+   if (plane == 6u) return v.w - v.z;
+   return dot(b, D[plane - 7u]);
+}
+
+// Per-primitive state shared by the emitters.
+uint g_record, g_count, g_flags, g_id, g_provoking, g_planes;
+uvec3 g_source;
+ivec2 g_union_first, g_union_last;
+ivec4 g_scissor;
+vec2 g_scale, g_offset, g_guard;
+float g_min_depth, g_max_depth;
+Words g_records;
+
+// Window position (pixels) and depth of a clip-space vertex.
+vec3 window(vec4 v)
+{
+   vec3 ndc = v.xyz / v.w;
+   return vec3(ndc.xy * g_scale + g_offset, ndc.z * (g_max_depth - g_min_depth) + g_min_depth);
+}
+
+// Depth bias of a triangle with window vertices a, b, c: m * slope + r * constant.
+float depth_bias(vec3 a, vec3 b, vec3 c)
+{
+   vec2 e1 = b.xy - a.xy, e2 = c.xy - a.xy;
+   float dz1 = b.z - a.z, dz2 = c.z - a.z;
+   float det = e1.x * e2.y - e2.x * e1.y;
+   float m = det == 0.0 ? 0.0 : max(abs(dz1 * e2.y - dz2 * e1.y), abs(dz2 * e1.x - dz1 * e2.x)) / abs(det);
+   uint bits = draw(APEX_DRAW_DEPTH_BIAS + 3u);
+   float zmax = max(max(abs(a.z), abs(b.z)), abs(c.z));
+   int exponent = int((floatBitsToUint(zmax) >> 23) & 0xffu) - 23;
+   float resolvable = bits != 0u ? uintBitsToFloat(uint(127 - int(bits)) << 23) :
+                                   uintBitsToFloat(uint(max(exponent, 1)) << 23);
+   float offset = m * uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS + 1u)) +
+                  resolvable * uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS));
+   float bias_clamp = uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS + 2u));
+   return bias_clamp > 0.0 ? min(offset, bias_clamp) : bias_clamp < 0.0 ? max(offset, bias_clamp) : offset;
+}
+
+// Clips P[0..n) (n = 1 point, 2 line, 3 triangle) and, for primitives
+// kept, writes records. `polygon` triangles cull and face by winding;
+// otherwise `front` gives the facing. `bias` applies to every record, or
+// with `fill_bias` each triangle computes its own. `line` > 0 selects the
+// line quad: 1 parallelogram, 2 rectangle, 3 smooth rectangle. `stipple`
+// is the line's stipple counter at P[0] before clipping (< 0 for none).
+void emit(uint n, bool polygon, bool front, float bias, bool fill_bias, uint line,
+          float point_size, float stipple)
+{
+   uint planes = g_planes;
+   vec4 u0 = P[0], u1 = P[1];
+   if (n == 1u) {
+      for (uint plane = 0u; plane < planes; plane++)
+         if (plane_distance(plane, P[0], B[0], g_guard) < 0.0)
+            n = 0u;
+   } else if (n == 2u) {
+      float t0 = 0.0, t1 = 1.0;
+      for (uint plane = 0u; plane < planes; plane++) {
+         float d0 = plane_distance(plane, P[0], B[0], g_guard);
+         float d1 = plane_distance(plane, P[1], B[1], g_guard);
+         if (d0 < 0.0 && d1 < 0.0)
+            t0 = 2.0;
+         else if (d0 < 0.0)
+            t0 = max(t0, d0 / (d0 - d1));
+         else if (d1 < 0.0)
+            t1 = min(t1, d0 / (d0 - d1));
+      }
+      if (t0 > t1) {
+         n = 0u;
+      } else {
+         vec4 p0 = P[0], p1 = P[1];
+         vec3 b0 = B[0], b1 = B[1];
+         P[0] = mix(p0, p1, t0); B[0] = mix(b0, b1, t0);
+         P[1] = mix(p0, p1, t1); B[1] = mix(b0, b1, t1);
+      }
+   }
+   for (uint plane = 0u; plane < planes && n >= 3u; plane++) {
+      vec4 Q[10];
+      vec3 C[10];
+      uint m = 0u;
+      for (uint i = 0u; i < n; i++) {
+         uint j = i + 1u == n ? 0u : i + 1u;
+         float di = plane_distance(plane, P[i], B[i], g_guard);
+         float dj = plane_distance(plane, P[j], B[j], g_guard);
+         bool in_i = di >= 0.0, in_j = dj >= 0.0;
+         if (in_i) {
+            Q[m] = P[i]; C[m] = B[i]; m++;
+         }
+         if (in_i != in_j) {
+            float t = di / (di - dj);
+            Q[m] = P[i] + t * (P[j] - P[i]);
+            C[m] = B[i] + t * (B[j] - B[i]);
+            m++;
+         }
+      }
+      n = m < 3u ? 0u : m;
+      for (uint i = 0u; i < n; i++) {
+         P[i] = Q[i]; B[i] = C[i];
+      }
+   }
+   if (n == 0u)
+      return;
+
+   ivec2 q[10];
+   float z[10], inv_w[10];
+   vec2 f[10];
+   for (uint i = 0u; i < n; i++) {
+      inv_w[i] = 1.0 / P[i].w;
+      vec3 wp = window(P[i]);
+      f[i] = wp.xy;
+      q[i] = ivec2(roundEven(wp.xy * 256.0));
+      z[i] = wp.z;
+   }
+   // Line records: origin, direction and length for stipple and smooth
+   // coverage, and the half width.
+   vec2 origin = vec2(0.0), dir = vec2(0.0);
+   float length = 0.0, half_width = 0.0, stipple_base = 0.0;
+   uint flags = g_flags;
+   if (n == 1u) {
+      // Corners run clockwise from the upper left; weights (1 - s - t, s, t)
+      // of the repeated source vertex give gl_PointCoord (s, t).
+      int h = int(roundEven(clamp(point_size, 1.0, 64.0) * 128.0));
+      for (uint i = 3u; i < 4u; i--) {
+         vec2 st = vec2(i == 1u || i == 2u ? 1.0 : 0.0, i >= 2u ? 1.0 : 0.0);
+         q[i] = q[0] + ivec2(st * float(2 * h)) - h;
+         z[i] = z[0]; inv_w[i] = inv_w[0];
+         B[i] = vec3(1.0 - st.x - st.y, st);
+      }
+      n = 4u;
+   } else if (n == 2u) {
+      float width = uintBitsToFloat(draw(APEX_DRAW_LINE_WIDTH));
+      vec2 d = f[1] - f[0];
+      length = sqrt(dot(d, d));
+      half_width = 0.5 * width;
+      origin = f[0];
+      ivec2 offset, extend = ivec2(0);
+      if (line >= 2u) {
+         // Rectangles span the segment with the line's width across it;
+         // smooth lines widen by half a pixel on every side for coverage.
+         dir = length > 0.0 ? d / length : vec2(1.0, 0.0);
+         float grow = line == 3u ? 0.5 : 0.0;
+         offset = ivec2(roundEven(vec2(-dir.y, dir.x) * (half_width + grow) * 256.0));
+         extend = ivec2(roundEven(dir * grow * 256.0));
+      } else {
+         // Parallelograms offset along the minor axis; stipple counts
+         // fragments along the major axis.
+         bool x_major = abs(d.x) >= abs(d.y);
+         dir = x_major ? vec2(d.x < 0.0 ? -1.0 : 1.0, 0.0) : vec2(0.0, d.y < 0.0 ? -1.0 : 1.0);
+         int h = int(roundEven(half_width * 256.0));
+         offset = x_major ? ivec2(0, h) : ivec2(h, 0);
+      }
+      if (stipple >= 0.0) {
+         // The counter continues from the unclipped start of the segment.
+         vec2 s0 = u0.w > 0.0 ? window(u0).xy : f[0];
+         stipple_base = stipple + (line >= 2u ? distance(s0, f[0]) : abs(dot(f[0] - s0, dir)));
+         flags |= 2u;
+      }
+      if (line == 3u)
+         flags |= 4u;
+      ivec2 a = q[0] - extend, e = q[1] + extend;
+      q[2] = e + offset; z[2] = z[1]; inv_w[2] = inv_w[1]; B[2] = B[1];
+      q[3] = a + offset; z[3] = z[0]; inv_w[3] = inv_w[0]; B[3] = B[0];
+      q[0] = a - offset; q[1] = e - offset;
+      n = 4u;
+   }
+   uint cull = draw(APEX_DRAW_CULL);
+   bool ccw = draw(APEX_DRAW_FRONT_FACE) == 0u;
+   for (uint k = 1u; k + 1u < n; k++) {
+      if (g_count == 8u)
+         break;
+      uint v[3] = uint[3](0u, k, k + 1u);
+      int64_t area = int64_t(q[v[1]].x - q[v[0]].x) * int64_t(q[v[2]].y - q[v[0]].y) -
+                     int64_t(q[v[2]].x - q[v[0]].x) * int64_t(q[v[1]].y - q[v[0]].y);
+      if (area == 0l)
+         continue;
+      // Vulkan's signed area is -area/2 in framebuffer coordinates.
+      bool is_front = polygon ? (ccw ? area < 0l : area > 0l) : front;
+      if (polygon && (cull & (is_front ? 1u : 2u)) != 0u)
+         continue;
+      if (area < 0l) {
+         uint t = v[1]; v[1] = v[2]; v[2] = t;
+         area = -area;
+      }
+      ivec2 lo = min(min(q[v[0]], q[v[1]]), q[v[2]]), hi = max(max(q[v[0]], q[v[1]]), q[v[2]]);
+      // Pixels whose area meets [lo, hi]: any sample position may be inside.
+      ivec2 first = max(lo >> 8, g_scissor.xy);
+      ivec2 last = min((hi >> 8) + 1, g_scissor.zw);
+      if (any(greaterThanEqual(first, last)))
+         continue;
+      uint r = g_record + g_count * APEX_PRIM_WORDS;
+      for (uint e = 0u; e < 3u; e++) {
+         ivec2 a = q[v[(e + 1u) % 3u]], b = q[v[(e + 2u) % 3u]];
+         int dx = b.x - a.x, dy = b.y - a.y;
+         int64_t c = int64_t(dy) * int64_t(a.x) - int64_t(dx) * int64_t(a.y);
+         if (!(dy < 0 || (dy == 0 && dx > 0)))
+            c -= 1l;
+         g_records.w[r + APEX_PRIM_EDGE + e * 4u] = uint(a.y - b.y);
+         g_records.w[r + APEX_PRIM_EDGE + e * 4u + 1u] = uint(dx);
+         g_records.w[r + APEX_PRIM_EDGE + e * 4u + 2u] = uint(c);
+         g_records.w[r + APEX_PRIM_EDGE + e * 4u + 3u] = uint(c >> 32);
+      }
+      g_union_first = min(g_union_first, first);
+      g_union_last = max(g_union_last, last);
+      g_records.w[r + APEX_PRIM_BOX] = uint(first.x);
+      g_records.w[r + APEX_PRIM_BOX + 1u] = uint(first.y);
+      g_records.w[r + APEX_PRIM_BOX + 2u] = uint(last.x);
+      g_records.w[r + APEX_PRIM_BOX + 3u] = uint(last.y);
+      g_records.w[r + APEX_PRIM_RECIPROCAL_AREA] = floatBitsToUint(1.0 / float(area));
+      for (uint i = 0u; i < 3u; i++) {
+         g_records.w[r + APEX_PRIM_Z + i] = floatBitsToUint(z[v[i]]);
+         g_records.w[r + APEX_PRIM_INV_W + i] = floatBitsToUint(inv_w[v[i]]);
+         for (uint j = 0u; j < 3u; j++)
+            g_records.w[r + APEX_PRIM_WEIGHTS + i * 3u + j] = floatBitsToUint(B[v[i]][j]);
+         g_records.w[r + APEX_PRIM_SOURCE + i] = g_source[i];
+      }
+      float offset = bias;
+      if (fill_bias)
+         offset = depth_bias(vec3(vec2(q[v[0]]) / 256.0, z[v[0]]), vec3(vec2(q[v[1]]) / 256.0, z[v[1]]),
+                             vec3(vec2(q[v[2]]) / 256.0, z[v[2]]));
+      g_records.w[r + APEX_PRIM_DEPTH_OFFSET] = floatBitsToUint(offset);
+      g_records.w[r + APEX_PRIM_PROVOKING] = g_provoking;
+      g_records.w[r + APEX_PRIM_FLAGS] = (is_front ? 1u : 0u) | flags;
+      g_records.w[r + APEX_PRIM_ID] = g_id;
+      g_records.w[r + APEX_PRIM_LINE] = floatBitsToUint(origin.x);
+      g_records.w[r + APEX_PRIM_LINE + 1u] = floatBitsToUint(origin.y);
+      g_records.w[r + APEX_PRIM_LINE + 2u] = floatBitsToUint(dir.x);
+      g_records.w[r + APEX_PRIM_LINE + 3u] = floatBitsToUint(dir.y);
+      g_records.w[r + APEX_PRIM_LINE + 4u] = floatBitsToUint(stipple_base);
+      g_records.w[r + APEX_PRIM_LINE + 5u] = floatBitsToUint(length);
+      g_records.w[r + APEX_PRIM_LINE + 6u] = floatBitsToUint(half_width);
+      g_count++;
+   }
+}
+
+// Stipple counter at the start of line strip segment p: the length of the
+// strip's earlier segments, in the line mode's units.
+float strip_counter(uint p, uint start, uint instance, Words vertices, uint stride, uint line)
+{
+   float counter = 0.0;
+   for (uint i = start; i < p; i++) {
+      uint a = (i + instance * draw(APEX_DRAW_VERTEX_COUNT)) * stride, b = a + stride;
+      vec4 va = uintBitsToFloat(uvec4(vertices.w[a], vertices.w[a + 1u], vertices.w[a + 2u], vertices.w[a + 3u]));
+      vec4 vb = uintBitsToFloat(uvec4(vertices.w[b], vertices.w[b + 1u], vertices.w[b + 2u], vertices.w[b + 3u]));
+      if (va.w <= 0.0 || vb.w <= 0.0)
+         continue;
+      vec2 d = window(vb).xy - window(va).xy;
+      counter += line >= 2u ? sqrt(dot(d, d)) : max(abs(d.x), abs(d.y));
+   }
+   return counter;
 }
 
 void setup(uint g, uint prims)
+
 {
    uint instance = g / prims, p = g - instance * prims;
    uint topology = draw(APEX_DRAW_TOPOLOGY);
@@ -107,179 +364,86 @@ void setup(uint g, uint prims)
    uint layer_slot = draw(APEX_DRAW_LAYER_SLOT), view = draw(APEX_DRAW_VIEW);
    uint layer = view != ~0u ? view :
                 layer_slot == ~0u ? 0u : min(vertices.w[provoking * stride + layer_slot], 4095u);
-   // Depth clamp disables the z >= 0 and z <= w planes.
-   uint planes = (draw(APEX_DRAW_DEPTH) & 256u) != 0u ? 5u : 7u;
-   vec2 scale = viewport.zw * 0.5, offset = viewport.xy + scale;
-   vec2 guard = vec2(30000.0) / (abs(scale) + abs(offset) + 1.0);
+   // Depth clamp disables the z >= 0 and z <= w planes; clip distances
+   // follow the fixed planes.
+   uint clip = draw(APEX_DRAW_CLIP);
+   uint clip_slot = clip & 0xffffu, clips = (clip >> 16) & 15u, culls = (clip >> 20) & 15u;
+   g_depth_clamp = (draw(APEX_DRAW_DEPTH) & 256u) != 0u;
+   g_planes = 7u + clips;
+   g_scale = viewport.zw * 0.5;
+   g_offset = viewport.xy + g_scale;
+   g_guard = vec2(30000.0) / (abs(g_scale) + abs(g_offset) + 1.0);
+   g_min_depth = min_depth;
+   g_max_depth = max_depth;
+   g_records = Words(address(APEX_DRAW_PRIM_LO));
+   g_record = g * APEX_SUBPRIMS_FOR(topology) * APEX_PRIM_WORDS;
+   g_count = 0u;
+   g_union_first = ivec2(0x7fffffff);
+   g_union_last = ivec2(-0x7fffffff - 1);
+   uint sw = APEX_DRAW_SCISSORS + vi * 4u;
+   g_scissor = ivec4(draw(sw), draw(sw + 1u), draw(sw + 2u), draw(sw + 3u));
+   g_flags = vi << 16 | layer << 20;
+   g_id = p;
+   g_provoking = provoking;
+   g_source = source;
 
    // Points and lines keep n = 1 or 2 vertices through clipping.
    uint n = skip ? 0u : topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
-   if (n == 1u) {
-      for (uint plane = 0u; plane < planes; plane++)
-         if (plane_distance(plane, P[0], guard) < 0.0)
-            n = 0u;
-   } else if (n == 2u) {
-      float t0 = 0.0, t1 = 1.0;
-      for (uint plane = 0u; plane < planes; plane++) {
-         float d0 = plane_distance(plane, P[0], guard), d1 = plane_distance(plane, P[1], guard);
-         if (d0 < 0.0 && d1 < 0.0)
-            t0 = 2.0;
-         else if (d0 < 0.0)
-            t0 = max(t0, d0 / (d0 - d1));
-         else if (d1 < 0.0)
-            t1 = min(t1, d0 / (d0 - d1));
-      }
-      if (t0 > t1) {
+   for (uint c = 0u; c < clips + culls && n != 0u; c++)
+      for (uint i = 0u; i < 3u; i++)
+         D[c][i] = uintBitsToFloat(vertices.w[source[i] * stride + clip_slot + c]);
+   // A primitive whose vertices all have a negative cull distance is discarded.
+   for (uint c = clips; c < clips + culls && n != 0u; c++) {
+      bool outside = true;
+      for (uint i = 0u; i < n; i++)
+         outside = outside && D[c][i] < 0.0;
+      if (outside)
          n = 0u;
-      } else {
-         vec4 p0 = P[0], p1 = P[1];
-         vec3 b0 = B[0], b1 = B[1];
-         P[0] = mix(p0, p1, t0); B[0] = mix(b0, b1, t0);
-         P[1] = mix(p0, p1, t1); B[1] = mix(b0, b1, t1);
-      }
    }
-   for (uint plane = 0u; plane < planes && n >= 3u; plane++) {
-      vec4 Q[10];
-      vec3 C[10];
-      uint m = 0u;
-      for (uint i = 0u; i < n; i++) {
-         uint j = i + 1u == n ? 0u : i + 1u;
-         float di = plane_distance(plane, P[i], guard);
-         float dj = plane_distance(plane, P[j], guard);
-         bool in_i = di >= 0.0, in_j = dj >= 0.0;
-         if (in_i) {
-            Q[m] = P[i]; C[m] = B[i]; m++;
-         }
-         if (in_i != in_j) {
-            float t = di / (di - dj);
-            Q[m] = P[i] + t * (P[j] - P[i]);
-            C[m] = B[i] + t * (B[j] - B[i]);
-            m++;
-         }
-      }
-      n = m < 3u ? 0u : m;
-      for (uint i = 0u; i < n; i++) {
-         P[i] = Q[i]; B[i] = C[i];
-      }
-   }
-
-   ivec2 q[10];
-   float z[10], inv_w[10];
-   for (uint i = 0u; i < n; i++) {
-      inv_w[i] = 1.0 / P[i].w;
-      vec3 ndc = P[i].xyz * inv_w[i];
-      q[i] = ivec2(roundEven((ndc.xy * scale + offset) * 256.0));
-      z[i] = ndc.z * (max_depth - min_depth) + min_depth;
-   }
-   bool polygon = topology >= 3u;
-   if (n == 1u) {
-      // Corners run clockwise from the upper left; weights (1 - s - t, s, t)
-      // of the repeated source vertex give gl_PointCoord (s, t).
-      uint size_slot = draw(APEX_DRAW_POINT_SIZE);
-      float size = size_slot == ~0u ? 1.0 :
-                   uintBitsToFloat(vertices.w[source[0] * stride + size_slot]);
-      int h = int(roundEven(clamp(size, 1.0, 64.0) * 128.0));
-      for (uint i = 3u; i < 4u; i--) {
-         vec2 st = vec2(i == 1u || i == 2u ? 1.0 : 0.0, i >= 2u ? 1.0 : 0.0);
-         q[i] = q[0] + ivec2(st * float(2 * h)) - h;
-         z[i] = z[0]; inv_w[i] = inv_w[0];
-         B[i] = vec3(1.0 - st.x - st.y, st);
-      }
-      n = 4u;
-   } else if (n == 2u) {
-      ivec2 d = q[1] - q[0];
-      ivec2 minor = abs(d.x) >= abs(d.y) ? ivec2(0, 128) : ivec2(128, 0);
-      q[2] = q[1] + minor; z[2] = z[1]; inv_w[2] = inv_w[1]; B[2] = B[1];
-      q[3] = q[0] + minor; z[3] = z[0]; inv_w[3] = inv_w[0]; B[3] = B[0];
-      q[0] -= minor; q[1] -= minor;
-      n = 4u;
-   }
-
-   Words records = Words(address(APEX_DRAW_PRIM_LO));
-   uint record = g * APEX_SUBPRIMS_FOR(topology) * APEX_PRIM_WORDS;
-   uint count = 0u;
-   ivec2 union_first = ivec2(0x7fffffff), union_last = ivec2(-0x7fffffff - 1);
-   uint cull = draw(APEX_DRAW_CULL);
-   bool ccw = draw(APEX_DRAW_FRONT_FACE) == 0u;
-   uint sw = APEX_DRAW_SCISSORS + vi * 4u;
-   ivec4 scissor = ivec4(draw(sw), draw(sw + 1u), draw(sw + 2u), draw(sw + 3u));
-   for (uint k = 1u; k + 1u < n; k++) {
-      uint v[3] = uint[3](0u, k, k + 1u);
-      int64_t area = int64_t(q[v[1]].x - q[v[0]].x) * int64_t(q[v[2]].y - q[v[0]].y) -
-                     int64_t(q[v[2]].x - q[v[0]].x) * int64_t(q[v[1]].y - q[v[0]].y);
-      if (area == 0l)
-         continue;
-      // Vulkan's signed area is -area/2 in framebuffer coordinates.
-      bool front = !polygon || (ccw ? area < 0l : area > 0l);
-      if (polygon && (cull & (front ? 1u : 2u)) != 0u)
-         continue;
-      if (area < 0l) {
-         uint t = v[1]; v[1] = v[2]; v[2] = t;
-         area = -area;
-      }
-      ivec2 lo = min(min(q[v[0]], q[v[1]]), q[v[2]]), hi = max(max(q[v[0]], q[v[1]]), q[v[2]]);
-      // Pixels whose area meets [lo, hi]: any sample position may be inside.
-      ivec2 first = max(lo >> 8, scissor.xy);
-      ivec2 last = min((hi >> 8) + 1, scissor.zw);
-      if (any(greaterThanEqual(first, last)))
-         continue;
-      uint r = record + count * APEX_PRIM_WORDS;
-      for (uint e = 0u; e < 3u; e++) {
-         ivec2 a = q[v[(e + 1u) % 3u]], b = q[v[(e + 2u) % 3u]];
-         int dx = b.x - a.x, dy = b.y - a.y;
-         int64_t c = int64_t(dy) * int64_t(a.x) - int64_t(dx) * int64_t(a.y);
-         if (!(dy < 0 || (dy == 0 && dx > 0)))
-            c -= 1l;
-         records.w[r + APEX_PRIM_EDGE + e * 4u] = uint(a.y - b.y);
-         records.w[r + APEX_PRIM_EDGE + e * 4u + 1u] = uint(dx);
-         records.w[r + APEX_PRIM_EDGE + e * 4u + 2u] = uint(c);
-         records.w[r + APEX_PRIM_EDGE + e * 4u + 3u] = uint(c >> 32);
-      }
-      union_first = min(union_first, first);
-      union_last = max(union_last, last);
-      records.w[r + APEX_PRIM_BOX] = uint(first.x);
-      records.w[r + APEX_PRIM_BOX + 1u] = uint(first.y);
-      records.w[r + APEX_PRIM_BOX + 2u] = uint(last.x);
-      records.w[r + APEX_PRIM_BOX + 3u] = uint(last.y);
-      records.w[r + APEX_PRIM_RECIPROCAL_AREA] = floatBitsToUint(1.0 / float(area));
-      for (uint i = 0u; i < 3u; i++) {
-         records.w[r + APEX_PRIM_Z + i] = floatBitsToUint(z[v[i]]);
-         records.w[r + APEX_PRIM_INV_W + i] = floatBitsToUint(inv_w[v[i]]);
-         for (uint j = 0u; j < 3u; j++)
-            records.w[r + APEX_PRIM_WEIGHTS + i * 3u + j] = floatBitsToUint(B[v[i]][j]);
-         records.w[r + APEX_PRIM_SOURCE + i] = source[i];
-      }
-      // Depth bias: m * slope + r * constant with the maximum depth slope m
-      // and the minimum resolvable difference r of the depth format.
+   uint mode = draw(APEX_DRAW_RASTER);
+   uint polygon_mode = topology >= 3u ? mode & 3u : 0u, line = (mode >> 4) & 3u;
+   bool stippled = (mode & 256u) != 0u;
+   uint size_slot = draw(APEX_DRAW_POINT_SIZE);
+   float point_size = size_slot == ~0u ? 1.0 : uintBitsToFloat(vertices.w[source[0] * stride + size_slot]);
+   bool bias = topology >= 3u && (draw(APEX_DRAW_DEPTH) & 8u) != 0u;
+   if (n == 3u && polygon_mode != 0u) {
+      // Line and point polygon modes: face and cull by the triangle's
+      // winding in homogeneous space (sign of det[x y w] times the w signs
+      // and the viewport orientation), then draw its edges or vertices.
+      float det = determinant(mat3(P[0].xyw, P[1].xyw, P[2].xyw));
+      float orient = det * sign(P[0].w * P[1].w * P[2].w) * sign(g_scale.x * g_scale.y);
+      if (orient == 0.0)
+         n = 0u;
+      bool front = draw(APEX_DRAW_FRONT_FACE) == 0u ? orient < 0.0 : orient > 0.0;
+      if ((draw(APEX_DRAW_CULL) & (front ? 1u : 2u)) != 0u)
+         n = 0u;
       float offset = 0.0;
-      if (polygon && (draw(APEX_DRAW_DEPTH) & 8u) != 0u) {
-         vec2 e1 = vec2(q[v[1]] - q[v[0]]) / 256.0, e2 = vec2(q[v[2]] - q[v[0]]) / 256.0;
-         float dz1 = z[v[1]] - z[v[0]], dz2 = z[v[2]] - z[v[0]];
-         float det = e1.x * e2.y - e2.x * e1.y;
-         float m = max(abs(dz1 * e2.y - dz2 * e1.y), abs(dz2 * e1.x - dz1 * e2.x)) / abs(det);
-         uint bits = draw(APEX_DRAW_DEPTH_BIAS + 3u);
-         float zmax = max(max(abs(z[v[0]]), abs(z[v[1]])), abs(z[v[2]]));
-         int exponent = int((floatBitsToUint(zmax) >> 23) & 0xffu) - 23;
-         float resolvable = bits != 0u ? uintBitsToFloat(uint(127 - int(bits)) << 23) :
-                                         uintBitsToFloat(uint(max(exponent, 1)) << 23);
-         offset = m * uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS + 1u)) +
-                  resolvable * uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS));
-         float bias_clamp = uintBitsToFloat(draw(APEX_DRAW_DEPTH_BIAS + 2u));
-         offset = bias_clamp > 0.0 ? min(offset, bias_clamp) :
-                  bias_clamp < 0.0 ? max(offset, bias_clamp) : offset;
+      if (n != 0u && bias && P[0].w > 0.0 && P[1].w > 0.0 && P[2].w > 0.0)
+         offset = depth_bias(window(P[0]), window(P[1]), window(P[2]));
+      vec4 V[3] = vec4[3](P[0], P[1], P[2]);
+      for (uint e = 0u; e < 3u && n != 0u; e++) {
+         uint j = e == 2u ? 0u : e + 1u;
+         P[0] = V[e]; B[0] = vec3(e == 0u ? 1.0 : 0.0, e == 1u ? 1.0 : 0.0, e == 2u ? 1.0 : 0.0);
+         P[1] = V[j]; B[1] = vec3(j == 0u ? 1.0 : 0.0, j == 1u ? 1.0 : 0.0, j == 2u ? 1.0 : 0.0);
+         if (polygon_mode == 1u)
+            emit(2u, false, front, offset, false, line, 1.0, stippled ? 0.0 : -1.0);
+         else
+            emit(1u, false, front, offset, false, 0u, 1.0, -1.0);
       }
-      records.w[r + APEX_PRIM_DEPTH_OFFSET] = floatBitsToUint(offset);
-      records.w[r + APEX_PRIM_PROVOKING] = provoking;
-      records.w[r + APEX_PRIM_FLAGS] = (front ? 1u : 0u) | vi << 16 | layer << 20;
-      records.w[r + APEX_PRIM_ID] = p;
-      count++;
+   } else if (n != 0u) {
+      float stipple = -1.0;
+      if (stippled && n == 2u)
+         stipple = topology == 2u ? strip_counter(p, start, instance, vertices, stride, line) : 0.0;
+      emit(n, topology >= 3u, true, 0.0, bias, n == 2u ? line : 0u, point_size, stipple);
    }
+   uint record = g_record, count = g_count;
+   Words records = g_records;
    records.w[record + APEX_PRIM_COUNT] = count;
    bool empty = count == 0u;
-   records.w[record + APEX_PRIM_UNION_BOX] = empty ? 0u : uint(union_first.x);
-   records.w[record + APEX_PRIM_UNION_BOX + 1u] = empty ? 0u : uint(union_first.y);
-   records.w[record + APEX_PRIM_UNION_BOX + 2u] = empty ? 0u : uint(union_last.x);
-   records.w[record + APEX_PRIM_UNION_BOX + 3u] = empty ? 0u : uint(union_last.y);
+   records.w[record + APEX_PRIM_UNION_BOX] = empty ? 0u : uint(g_union_first.x);
+   records.w[record + APEX_PRIM_UNION_BOX + 1u] = empty ? 0u : uint(g_union_first.y);
+   records.w[record + APEX_PRIM_UNION_BOX + 2u] = empty ? 0u : uint(g_union_last.x);
+   records.w[record + APEX_PRIM_UNION_BOX + 3u] = empty ? 0u : uint(g_union_last.y);
 }
 
 // Workgroups base + launch index, stepping by the launch count below the

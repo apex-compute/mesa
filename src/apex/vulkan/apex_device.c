@@ -2024,13 +2024,14 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    default: prims = vertex_count >= 3 ? vertex_count - 2 : 0; break;
    }
    /* With rasterizer discard only vertex shading runs: the fragment stage,
-    * viewports and polygon mode are unused. */
+    * viewports and polygon mode are unused. Without a fragment shader the
+    * vertex shader's depth-only kernel rasterizes. */
    bool discard = dyn->rs.rasterizer_discard_enable;
    if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || !cmd->vertex ||
-       (!discard && (!cmd->fragment || !dyn->vp.viewport_count ||
+       (!discard && ((!cmd->fragment && !cmd->vertex->depth_only) || !dyn->vp.viewport_count ||
                      dyn->vp.viewport_count > APEX_DRAW_MAX_VIEWPORTS ||
                      dyn->vp.scissor_count < dyn->vp.viewport_count ||
-                     dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL)) ||
+                     dyn->rs.polygon_mode > VK_POLYGON_MODE_POINT)) ||
        (indexed && !cmd->index.bytes)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -2086,6 +2087,16 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    draw[APEX_DRAW_PRIM_COUNT] = prims;
    draw[APEX_DRAW_TOPOLOGY] = topology;
    draw[APEX_DRAW_PROVOKING] = dyn->rs.provoking_vertex;
+   /* Default and Bresenham lines are minor-axis parallelograms. */
+   uint32_t line = dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR ? 2 :
+                   dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR ? 3 : 1;
+   draw[APEX_DRAW_RASTER] = dyn->rs.polygon_mode | line << 4 | (uint32_t)dyn->rs.line.stipple.enable << 8;
+   draw[APEX_DRAW_LINE_STIPPLE] = dyn->rs.line.stipple.factor | (uint32_t)dyn->rs.line.stipple.pattern << 16;
+   draw[APEX_DRAW_LINE_WIDTH] = float_bits(dyn->rs.line.width);
+   draw[APEX_DRAW_LOGIC_OP] = dyn->cb.logic_op | (uint32_t)dyn->cb.logic_op_enable << 4;
+   int clip_slot = cmd->vertex->vertex.slot[VARYING_SLOT_CLIP_DIST0];
+   draw[APEX_DRAW_CLIP] = clip_slot < 0 ? 0 : clip_slot | cmd->vertex->vertex.clip_distances << 16 |
+                          cmd->vertex->vertex.cull_distances << 20;
    /* The framebuffer is the smallest bound attachment. */
    uint32_t width = 4096, height = 4096;
    for (unsigned k = 0; k <= APEX_DRAW_MAX_COLOR; k++) {
@@ -2196,7 +2207,9 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       draw[APEX_DRAW_BLEND + k * 2] = a->src_color_blend_factor | a->dst_color_blend_factor << 8 |
          a->src_alpha_blend_factor << 16 | a->dst_alpha_blend_factor << 24;
       draw[APEX_DRAW_BLEND + k * 2 + 1] = a->color_blend_op | a->alpha_blend_op << 8 |
-         (enabled ? a->write_mask : 0) << 16 | (uint32_t)a->blend_enable << 24;
+         (enabled ? a->write_mask : 0) << 16 |
+         /* Logic ops disable blending of every attachment. */
+         (uint32_t)(a->blend_enable && !dyn->cb.logic_op_enable) << 24;
    }
    for (unsigned c = 0; c < 4; c++)
       draw[APEX_DRAW_BLEND_CONSTANTS + c] = float_bits(dyn->cb.blend_constants[c]);
@@ -2282,7 +2295,7 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       return;
    /* The launch watchdog bounds each workgroup: a fragment job walks at most
     * APEX_TILES_PER_WORKGROUP tiles per workgroup. */
-   struct apex_program *fs = &cmd->fragment->program;
+   struct apex_program *fs = cmd->fragment ? &cmd->fragment->program : &cmd->vertex->depth_only->program;
    uint32_t groups = MIN3(tiles, fs->max_workgroups, 1024);
    /* Direct draws split their chunks across jobs; an indirect draw's count
     * is unknown here, so one job set walks all of its chunks. */

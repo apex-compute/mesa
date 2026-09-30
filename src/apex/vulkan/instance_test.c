@@ -221,7 +221,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
          !maintenance5_props.earlyFragmentMultisampleCoverageAfterSampleCounting &&
          maintenance5_props.depthStencilSwizzleOneSupport && !maintenance5_props.polygonModePointSize &&
          maintenance5_props.nonStrictSinglePixelWideLinesUseParallelogram &&
-         !maintenance5_props.nonStrictWideLinesUseParallelogram);
+         maintenance5_props.nonStrictWideLinesUseParallelogram);
    PROC(EnumerateDeviceExtensionProperties, enumerate_extensions);
    VkExtensionProperties extensions[128];
    uint32_t extension_count = ARRAY_SIZE(extensions);
