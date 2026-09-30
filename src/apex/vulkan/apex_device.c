@@ -405,8 +405,13 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
        ((import || types) && (!device->prime_coherent ||
                               (info->memoryTypeIndex != 1 && (import || info->memoryTypeIndex != 0)))))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   /* Every allocation has a device address; capture/replay is unsupported. */
+   const VkMemoryAllocateFlagsInfo *flags = vk_find_struct_const(info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
+   if (flags && (flags->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
    vk_foreach_struct_const(sType, ext, info->pNext) {
       if (sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO &&
+          sType != VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO &&
           sType != VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR &&
           sType != VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO &&
           sType != VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA)
@@ -550,7 +555,8 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
                                        VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
-                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)))
+                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)

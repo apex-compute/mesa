@@ -171,7 +171,15 @@ int main(void)
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
    CHECK(fcntl(import.fd, F_GETFD) == -1 && errno == EBADF);
    import.fd = dup(objects[0]);
+   /* Zink allocates with device addresses; capture/replay is unsupported. */
+   VkMemoryAllocateFlagsInfo flags = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &import,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT};
+   ai.pNext = &flags;
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_ERROR_FEATURE_NOT_PRESENT);
+   CHECK(fcntl(import.fd, F_GETFD) >= 0);
+   flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_SUCCESS);
+   ai.pNext = &import;
    CHECK(fcntl(import.fd, F_GETFD) == -1 && errno == EBADF);
    CHECK(live == 1 && binds == 1 && !maps && closes == before);
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, objects[0], &props) == VK_SUCCESS);
@@ -181,7 +189,7 @@ int main(void)
    VkExternalMemoryBufferCreateInfo external = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
       .handleTypes = APEX_EXTERNAL_MEMORY_TYPES};
    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
-      .size = 193, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+      .size = 193, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
    VkBuffer buffers[2];
    for (unsigned i = 0; i < 2; i++) {
       CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[i]) == VK_SUCCESS);
