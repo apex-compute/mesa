@@ -667,9 +667,9 @@ apex_format_features(VkFormat format, bool buffer)
    const VkFormatFeatureFlags2 color = transfer | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
    enum pipe_format pformat = vk_format_to_pipe_format(format);
    /* Storage texels encode and decode through the format words: the plain
-    * formats the fragment kernel can write, except sRGB. */
+    * formats the fragment kernel can write, except sRGB and B10G11R11. */
    bool storage = !vk_format_is_depth_or_stencil(format) && !util_format_is_srgb(pformat) &&
-                  apex_attachment_format_supported(pformat);
+                  pformat != PIPE_FORMAT_R11G11B10_FLOAT && apex_attachment_format_supported(pformat);
    bool storage_atomic = format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
    if (buffer) {
       const struct util_format_description *desc = util_format_description(pformat);

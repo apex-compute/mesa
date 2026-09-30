@@ -150,21 +150,25 @@ apex_sampler_encode(const VkSamplerCreateInfo *info, const struct vk_sampler *sa
 }
 
 /* Color attachments: plain formats of 8 to 128 bits whose channels are
- * normalized or pure integers of up to 32 bits, FP16 or FP32, each within
- * one word (see the fragment kernel in apex_graphics.c). */
+ * normalized or pure integers of up to 32 bits, FP16, FP32 or unsigned
+ * 11/10-bit floats, each within one word (see the fragment kernel in
+ * apex_graphics.c). */
 bool
 apex_attachment_format_supported(enum pipe_format format)
 {
    const struct util_format_description *desc = util_format_description(format);
-   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.width != 1 ||
-       desc->block.height != 1 || desc->block.bits < 8 || desc->block.bits > 128 ||
-       !util_is_power_of_two_nonzero(desc->block.bits))
+   /* R11G11B10 is described as an "other" layout with plain channel fields. */
+   if (!desc || (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN && format != PIPE_FORMAT_R11G11B10_FLOAT) ||
+       desc->block.width != 1 || desc->block.height != 1 || desc->block.bits < 8 ||
+       desc->block.bits > 128 || !util_is_power_of_two_nonzero(desc->block.bits))
       return false;
    for (unsigned c = 0; c < desc->nr_channels; c++) {
       const struct util_format_channel_description *ch = &desc->channel[c];
       bool integer = (ch->type == UTIL_FORMAT_TYPE_UNSIGNED || ch->type == UTIL_FORMAT_TYPE_SIGNED) &&
                      (ch->normalized || ch->pure_integer);
-      bool fp = ch->type == UTIL_FORMAT_TYPE_FLOAT && (ch->size == 16 || ch->size == 32);
+      /* Unsigned 11- and 10-bit floats: B10G11R11. */
+      bool fp = ch->type == UTIL_FORMAT_TYPE_FLOAT &&
+                (ch->size == 16 || ch->size == 32 || ch->size == 11 || ch->size == 10);
       if ((ch->type != UTIL_FORMAT_TYPE_VOID && !integer && !fp) || ch->shift % 32 + ch->size > 32)
          return false;
    }

@@ -62,7 +62,8 @@ bool apex_lower_textures(struct apex_program *program, struct nir_shader *nir);
 /* FP16 bits in the low half of a 32-bit value to FP32 bits, and back. */
 nir_def *apex_half_to_float(nir_builder *b, nir_def *h);
 nir_def *apex_small_float_to_float(nir_builder *b, nir_def *v, unsigned mantissa);
-nir_def *apex_float_to_half(nir_builder *b, nir_def *f);
+/* FP32 to FP16 (mantissa 10, signed) or unsigned 11/10-bit floats. */
+nir_def *apex_float_to_small(nir_builder *b, nir_def *f, unsigned mantissa, bool sign);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 apex_CreateComputePipelines(VkDevice device, VkPipelineCache cache,

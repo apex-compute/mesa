@@ -340,6 +340,13 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       get_format(physical, VK_FORMAT_MAX_ENUM - i, &format);
       CHECK(!format.linearTilingFeatures && !format.optimalTilingFeatures && !format.bufferFeatures);
    }
+   /* B10G11R11 renders and blends (GL 3.0 / GLES 3.0 EXT_packed_float); no storage. */
+   get_format(physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &format);
+   CHECK((format.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
+         (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+         !(format.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |

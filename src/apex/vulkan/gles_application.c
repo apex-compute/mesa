@@ -365,13 +365,17 @@ run_gbm(const char *node)
  * that have extension strings; the rest are implied by these or limits. */
 static const char *const es30_extensions[] = {
    "GL_ARB_half_float_vertex", "GL_ARB_internalformat_query", "GL_ARB_map_buffer_range",
-   "GL_ARB_shader_texture_lod", "GL_OES_texture_float", "GL_OES_texture_half_float",
-   "GL_OES_texture_half_float_linear", "GL_ARB_texture_rg", "GL_ARB_depth_buffer_float",
+   "GL_ARB_shader_texture_lod", "GL_ARB_texture_rg", "GL_ARB_depth_buffer_float",
    "GL_ARB_framebuffer_object", "GL_EXT_packed_float", "GL_EXT_texture_array",
    "GL_EXT_texture_shared_exponent", "GL_EXT_texture_sRGB", "GL_EXT_transform_feedback",
    "GL_ARB_draw_instanced", "GL_ARB_instanced_arrays", "GL_ARB_uniform_buffer_object",
-   "GL_EXT_texture_snorm", "GL_ARB_ES3_compatibility", "GL_OES_depth_texture_cube_map",
+   "GL_EXT_texture_snorm", "GL_ARB_ES3_compatibility",
    "GL_ARB_vertex_type_2_10_10_10_rev",
+};
+/* GLES-only names of the GLES 3.0 check, read from a GLES 2 context. */
+static const char *const es30_es_extensions[] = {
+   "GL_OES_texture_float", "GL_OES_texture_half_float", "GL_OES_texture_half_float_linear",
+   "GL_OES_depth_texture_cube_map",
 };
 /* Additional GL 3.0 features (compute_version). */
 static const char *const gl30_extensions[] = {
@@ -420,6 +424,16 @@ run_caps(const char *node)
    printf("     GLES 3 context: %s\n", context != EGL_NO_CONTEXT ? "created" : "unavailable");
    if (context != EGL_NO_CONTEXT)
       eglDestroyContext(display, context);
+   const EGLint es2[] = {EGL_CONTEXT_MAJOR_VERSION, 2, EGL_NONE};
+   context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, es2);
+   if (context != EGL_NO_CONTEXT && eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)) {
+      const char *es_extensions = (const char *)glGetString(GL_EXTENSIONS);
+      for (unsigned i = 0; i < sizeof(es30_es_extensions) / sizeof(es30_es_extensions[0]); i++)
+         if (!extension(es_extensions, es30_es_extensions[i]))
+            printf("     missing for GLES 3.0: %s\n", es30_es_extensions[i]);
+      eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+      eglDestroyContext(display, context);
+   }
    /* Desktop GL compatibility context: its extension string names Mesa's
     * internal features. */
    check(eglBindAPI(EGL_OPENGL_API), "eglBindAPI(EGL_OPENGL_API)");

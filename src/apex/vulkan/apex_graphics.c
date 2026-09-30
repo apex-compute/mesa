@@ -726,7 +726,8 @@ unpack_color(nir_builder *b, enum pipe_format format, nir_def *words)
       const struct util_format_channel_description *ch = &desc->channel[swizzle];
       nir_def *raw = channel_bits(b, words, ch);
       if (ch->type == UTIL_FORMAT_TYPE_FLOAT) {
-         channels[s] = ch->size == 16 ? apex_half_to_float(b, raw) : raw;
+         channels[s] = ch->size == 16 ? apex_half_to_float(b, raw) :
+                       ch->size < 16 ? apex_small_float_to_float(b, raw, ch->size - 5) : raw;
       } else if (ch->type == UTIL_FORMAT_TYPE_UNSIGNED) {
          channels[s] = nir_fmul_imm(b, nir_u2f32(b, raw), 1.0 / u_uintN_max(ch->size));
       } else {
@@ -762,7 +763,7 @@ pack_color(nir_builder *b, enum pipe_format format, nir_def *color)
       nir_def *v = nir_channel(b, color, s);
       const unsigned bits[1] = {ch->size};
       if (ch->type == UTIL_FORMAT_TYPE_FLOAT)
-         v = ch->size == 16 ? apex_float_to_half(b, v) : v;
+         v = ch->size == 32 ? v : apex_float_to_small(b, v, ch->size - 5, ch->size == 16);
       else if (ch->normalized)
          v = ch->type == UTIL_FORMAT_TYPE_UNSIGNED ? nir_format_float_to_unorm(b, v, bits) :
                                                      nir_format_float_to_snorm(b, v, bits);

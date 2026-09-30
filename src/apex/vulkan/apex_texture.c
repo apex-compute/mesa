@@ -159,23 +159,35 @@ apex_half_to_float(nir_builder *b, nir_def *h)
    return nir_ior(b, value, sign);
 }
 
-/* FP32 to FP16 bits with round-to-nearest-even in the low 16 bits. */
+/* FP32 to a float with a 5-bit exponent (bias 15) and `mantissa` bits,
+ * round-to-nearest-even: FP16 with a sign bit above, or the unsigned 11-
+ * and 10-bit floats, where negative values become zero. */
 nir_def *
-apex_float_to_half(nir_builder *b, nir_def *f)
+apex_float_to_small(nir_builder *b, nir_def *f, unsigned mantissa, bool sign)
 {
-   nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, f, 16), 0x8000);
+   unsigned shift = 23 - mantissa;
    nir_def *abs = nir_iand_imm(b, f, 0x7fffffff);
-   /* Normal results: rebias the exponent, then round 13 mantissa bits away. */
+   /* Normal results: rebias the exponent, then round the low mantissa bits away. */
    nir_def *rebased = nir_iadd_imm(b, abs, -(112 << 23));
-   nir_def *normal = nir_ushr_imm(b, nir_iadd(b, nir_iadd_imm(b, rebased, 0xfff),
-                                              nir_iand_imm(b, nir_ushr_imm(b, rebased, 13), 1)), 13);
-   /* Subnormal results are exact multiples of 2^-24 after rounding. */
-   nir_def *subnormal = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, abs, 16777216.0)));
-   nir_def *nan = nir_ior_imm(b, nir_iand_imm(b, nir_ushr_imm(b, abs, 13), 0x3ff), 0x7e00);
+   nir_def *normal = nir_ushr_imm(b, nir_iadd(b, nir_iadd_imm(b, rebased, (1u << (shift - 1)) - 1),
+                                              nir_iand_imm(b, nir_ushr_imm(b, rebased, shift), 1)), shift);
+   /* Subnormal results are exact multiples of 2^(-14 - mantissa) after rounding. */
+   nir_def *subnormal = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, abs, (double)(1u << (14 + mantissa)))));
+   nir_def *nan = nir_ior_imm(b, nir_iand_imm(b, nir_ushr_imm(b, abs, shift), BITFIELD_MASK(mantissa)),
+                              0x1fu << mantissa | 1u << (mantissa - 1));
    nir_def *result = nir_bcsel(b, nir_ult_imm(b, abs, 0x38800000), subnormal, normal);
-   result = nir_bcsel(b, nir_uge_imm(b, abs, 0x477ff000), nir_imm_int(b, 0x7c00), result);
-   result = nir_bcsel(b, nir_uge_imm(b, abs, 0x7f800001), nan, result);
-   return nir_ior(b, result, sign);
+   /* Finite overflow: FP16 rounds to infinity; the unsigned formats clamp
+    * to their largest finite value, as GL and Mesa's packers define. */
+   nir_def *overflow = sign ? nir_imm_int(b, 0x1fu << mantissa) :
+                              nir_bcsel(b, nir_ieq_imm(b, abs, 0x7f800000), nir_imm_int(b, 0x1fu << mantissa),
+                                        nir_imm_int(b, (0x1fu << mantissa) - 1));
+   result = nir_bcsel(b, nir_uge_imm(b, abs, 0x47800000 - (1u << (22 - mantissa))), overflow, result);
+   nir_def *is_nan = nir_uge_imm(b, abs, 0x7f800001);
+   result = nir_bcsel(b, is_nan, nan, result);
+   if (sign)
+      return nir_ior(b, result, nir_iand_imm(b, nir_ushr_imm(b, f, 31 - (4 + mantissa + 1)),
+                                            1u << (5 + mantissa)));
+   return nir_bcsel(b, nir_iand(b, nir_ilt_imm(b, f, 0), nir_inot(b, is_nan)), nir_imm_int(b, 0), result);
 }
 
 static nir_def *
@@ -767,7 +779,7 @@ encode_texel(nir_builder *b, const struct image_info *i, nir_def *address, nir_d
          nir_imm_float(b, -1.0f)), nir_imm_float(b, 1.0f)), nir_u2f32(b, half))));
       nir_def *uint = nir_umin(b, v, mask);
       nir_def *sint = nir_imin(b, nir_imax(b, v, nir_ineg(b, nir_iadd_imm(b, half, 1))), half);
-      nir_def *fp = nir_bcsel(b, nir_ieq_imm(b, size, 16), apex_float_to_half(b, v), v);
+      nir_def *fp = nir_bcsel(b, nir_ieq_imm(b, size, 16), apex_float_to_small(b, v, 10, true), v);
       nir_def *bits = nir_imm_int(b, 0);
       bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_UNORM), unorm, bits);
       bits = nir_bcsel(b, nir_ieq_imm(b, type, APEX_CHANNEL_SNORM), snorm, bits);

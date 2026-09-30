@@ -9,6 +9,9 @@
 #include "vk_physical_device.h"
 #include "vk_sampler.h"
 #include "util/u_math.h"
+#include "util/format_r11g11b10f.h"
+#include "util/half_float.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -567,6 +570,57 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
          v->DestroyShaderModule(dev, modules[i], NULL);
 }
 
+/* apex_float_to_small against Mesa's reference conversions, through NIR
+ * constant folding. */
+static void
+test_small_floats(void)
+{
+   static const float values[] = {0.0f, 1.0f, 0.5f, 3.14159f, 65000.0f, 1e10f, 6.1e-5f, 3e-6f, 1e-9f,
+                                  -2.0f, INFINITY, 1.0f + 1.0f / 64, 1.0f + 3.0f / 128};
+   const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options, "small_floats");
+   for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
+      nir_def *f = nir_imm_float(&b, values[i]);
+      nir_store_global(&b, apex_float_to_small(&b, f, 10, true), nir_imm_int64(&b, i * 12), .align_mul = 4);
+      nir_store_global(&b, apex_float_to_small(&b, f, 6, false), nir_imm_int64(&b, i * 12 + 4), .align_mul = 4);
+      nir_store_global(&b, apex_float_to_small(&b, f, 5, false), nir_imm_int64(&b, i * 12 + 8), .align_mul = 4);
+   }
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, b.shader, nir_opt_copy_prop);
+      NIR_PASS(progress, b.shader, nir_opt_constant_folding);
+      NIR_PASS(progress, b.shader, nir_opt_dce);
+   } while (progress);
+   unsigned n = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic ||
+             nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_store_global)
+            continue;
+         nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+         CHECK(nir_src_is_const(store->src[0]) && nir_src_is_const(store->src[1]));
+         uint32_t got = nir_src_as_uint(store->src[0]);
+         unsigned at = nir_src_as_uint(store->src[1]), i = at / 12, which = at % 12 / 4;
+         uint32_t rgb = float3_to_r11g11b10f((float[3]){values[i], values[i], values[i]});
+         uint32_t want = which == 0 ? _mesa_float_to_half(values[i]) :
+                         which == 1 ? rgb & 0x7ff : rgb >> 22;
+         if (got != want)
+            fprintf(stderr, "%g mantissa %u: 0x%x, expected 0x%x\n", values[i],
+                    which == 0 ? 10 : which == 1 ? 6 : 5, got, want);
+         CHECK(got == want);
+         n++;
+      }
+   }
+   CHECK(n == 3 * ARRAY_SIZE(values));
+   /* The fragment kernel packs R11G11B10 through its channel fields. */
+   const struct util_format_description *desc = util_format_description(PIPE_FORMAT_R11G11B10_FLOAT);
+   CHECK(desc->nr_channels == 3 && desc->channel[0].shift == 0 && desc->channel[0].size == 11 &&
+         desc->channel[1].shift == 11 && desc->channel[2].shift == 22 && desc->channel[2].size == 10 &&
+         desc->channel[2].type == UTIL_FORMAT_TYPE_FLOAT);
+   ralloc_free(b.shader);
+}
+
 /* Offline backend coverage of the software graphics and sampling paths:
  * the internal kernels, a draw pipeline and a compute shader sampling
  * two combined image samplers (fetch, nearest and linear with border
@@ -588,6 +642,7 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
    };
    CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
    device.transport = APEX_TRANSPORT_DRM;
+   test_small_floats();
    /* Border swizzles: format components, conversion to RGBA, view mapping. */
 #define SW(r, g, b, a) ((r) | (g) << 3 | (b) << 6 | (a) << 9)
    const unsigned Z = APEX_SWIZZLE_0, O = APEX_SWIZZLE_1;
