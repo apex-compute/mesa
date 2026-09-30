@@ -21,8 +21,9 @@
 #define APEX_DRAW_TOPOLOGY 10
 #define APEX_DRAW_WIDTH 11            /* framebuffer extent in pixels */
 #define APEX_DRAW_HEIGHT 12
+#define APEX_DRAW_PROVOKING 13        /* VkProvokingVertexModeEXT */
 #define APEX_DRAW_INDEX_SIZE 14       /* bound index bytes: indices beyond read zero */
-/* Words 13 and 15..18 are unused; viewports live at APEX_DRAW_VIEWPORTS. */
+/* Words 15..18 are unused; viewports live at APEX_DRAW_VIEWPORTS. */
 #define APEX_DRAW_SCISSOR 19          /* union of the scissors below: x0, y0, x1, y1 exclusive */
 #define APEX_DRAW_CULL 23             /* VkCullModeFlags */
 #define APEX_DRAW_FRONT_FACE 24       /* VkFrontFace */
@@ -120,6 +121,7 @@
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */
 #define APEX_PRIM_DEPTH_OFFSET 38     /* depth bias of this triangle (FP32) */
+#define APEX_PRIM_PROVOKING 39        /* provoking vertex record index: flat inputs */
 #define APEX_PRIM_UNION_BOX 40        /* first record only: box of all records, pixels */
 #define APEX_PRIM_WORDS 44
 #define APEX_TILES_PER_WORKGROUP 1 /* per fragment job: bounded launch runtime */

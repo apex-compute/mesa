@@ -2073,6 +2073,7 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    draw[APEX_DRAW_PRIM_HI] = prim_va >> 32;
    draw[APEX_DRAW_PRIM_COUNT] = prims;
    draw[APEX_DRAW_TOPOLOGY] = topology;
+   draw[APEX_DRAW_PROVOKING] = dyn->rs.provoking_vertex;
    /* The framebuffer is the smallest bound attachment. */
    uint32_t width = 4096, height = 4096;
    for (unsigned k = 0; k <= APEX_DRAW_MAX_COLOR; k++) {

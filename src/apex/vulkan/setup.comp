@@ -78,6 +78,13 @@ void setup(uint g, uint prims)
                  topology == 4u ? ((k & 1u) != 0u ? uvec3(p, p + 2u, p + 1u) : uvec3(p, p + 1u, p + 2u)) :
                  uvec3(3u * p, 3u * p + 1u, 3u * p + 2u);
    uvec3 source = tuple + instance * draw(APEX_DRAW_VERTEX_COUNT);
+   // Source 0 is the first vertex of the primitive in API order; the last
+   // vertex is 2p+1 of line lists, p+1 of line strips, 3p+2 of triangle
+   // lists and p+2 of triangle strips and fans.
+   uint provoking = source[0];
+   if (draw(APEX_DRAW_PROVOKING) != 0u && topology != 0u)
+      provoking = (topology == 1u ? 2u * p + 1u : topology == 2u ? p + 1u :
+                   topology == 3u ? 3u * p + 2u : p + 2u) + instance * draw(APEX_DRAW_VERTEX_COUNT);
    Words vertices = Words(address(APEX_DRAW_VERTEX_LO));
    uint stride = draw(APEX_DRAW_VERTEX_STRIDE);
    for (uint i = 0u; i < 3u; i++) {
@@ -86,9 +93,9 @@ void setup(uint g, uint prims)
                                    vertices.w[base + 2u], vertices.w[base + 3u]));
       B[i] = vec3(i == 0u ? 1.0 : 0.0, i == 1u ? 1.0 : 0.0, i == 2u ? 1.0 : 0.0);
    }
-   // The provoking vertex (source 0) selects the viewport and scissor.
+   // The provoking vertex selects the viewport and scissor.
    uint viewport_slot = draw(APEX_DRAW_VIEWPORT_SLOT);
-   uint vi = viewport_slot == ~0u ? 0u : vertices.w[source[0] * stride + viewport_slot];
+   uint vi = viewport_slot == ~0u ? 0u : vertices.w[provoking * stride + viewport_slot];
    if (vi >= draw(APEX_DRAW_VIEWPORT_COUNT))
       vi = 0u;
    uint vw = APEX_DRAW_VIEWPORTS + vi * 6u;
@@ -99,7 +106,7 @@ void setup(uint g, uint prims)
    // gl_Layer selects it.
    uint layer_slot = draw(APEX_DRAW_LAYER_SLOT), view = draw(APEX_DRAW_VIEW);
    uint layer = view != ~0u ? view :
-                layer_slot == ~0u ? 0u : min(vertices.w[source[0] * stride + layer_slot], 4095u);
+                layer_slot == ~0u ? 0u : min(vertices.w[provoking * stride + layer_slot], 4095u);
    // Depth clamp disables the z >= 0 and z <= w planes.
    uint planes = (draw(APEX_DRAW_DEPTH) & 256u) != 0u ? 5u : 7u;
    vec2 scale = viewport.zw * 0.5, offset = viewport.xy + scale;
@@ -262,6 +269,7 @@ void setup(uint g, uint prims)
                   bias_clamp < 0.0 ? max(offset, bias_clamp) : offset;
       }
       records.w[r + APEX_PRIM_DEPTH_OFFSET] = floatBitsToUint(offset);
+      records.w[r + APEX_PRIM_PROVOKING] = provoking;
       records.w[r + APEX_PRIM_FLAGS] = (front ? 1u : 0u) | vi << 16 | layer << 20;
       records.w[r + APEX_PRIM_ID] = p;
       count++;

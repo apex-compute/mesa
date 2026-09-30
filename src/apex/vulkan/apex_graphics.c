@@ -444,7 +444,7 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
  * 2 (l >> 3) + (l>>1 & 1)) of a 4x4 tile: lanes 4q..4q+3 form 2x2 quad q. */
 struct fragment_lowering {
    struct apex_shader *shader;
-   nir_variable *perspective, *linear, *coord, *front, *covered, *killed, *sources, *primitive;
+   nir_variable *perspective, *linear, *coord, *front, *covered, *killed, *sources, *provoking, *primitive;
    nir_variable *viewport, *sample, *mask_in, *position;
    nir_variable *color[APEX_DRAW_MAX_COLOR], *depth, *sample_mask;
    bool invalid;
@@ -516,9 +516,10 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       }
       nir_def *values[4];
       if (i->intrinsic == nir_intrinsic_load_input) {
-         /* Flat inputs take the provoking vertex, source 0. */
+         /* Flat inputs take the provoking vertex. */
+         nir_def *provoking = nir_load_var(b, ctx->provoking);
          for (unsigned c = 0; c < i->def.num_components; c++)
-            values[c] = attribute(b, ctx, nir_channel(b, sources, 0), location, component + c);
+            values[c] = attribute(b, ctx, provoking, location, component + c);
       } else {
          nir_intrinsic_instr *bary = nir_src_as_intrinsic(i->src[0]);
          bool linear = bary && nir_intrinsic_interp_mode(bary) == INTERP_MODE_NOPERSPECTIVE;
@@ -892,6 +893,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    ctx.covered = nir_local_variable_create(impl, glsl_bool_type(), "covered");
    ctx.killed = nir_local_variable_create(impl, glsl_bool_type(), "killed");
    ctx.sources = nir_local_variable_create(impl, glsl_uvec_type(3), "sources");
+   ctx.provoking = nir_local_variable_create(impl, glsl_uint_type(), "provoking");
    ctx.primitive = nir_local_variable_create(impl, glsl_uint_type(), "primitive");
    ctx.viewport = nir_local_variable_create(impl, glsl_uint_type(), "viewport");
    ctx.sample = nir_local_variable_create(impl, glsl_uint_type(), "sample");
@@ -1169,6 +1171,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_store_var(b, ctx.front, nir_ine_imm(b, nir_iand_imm(b, FIELD(APEX_PRIM_FLAGS), 1), 0), 1);
    nir_store_var(b, ctx.sources, nir_vec3(b, FIELD(APEX_PRIM_SOURCE), FIELD(APEX_PRIM_SOURCE + 1),
                                           FIELD(APEX_PRIM_SOURCE + 2)), 0x7);
+   nir_store_var(b, ctx.provoking, FIELD(APEX_PRIM_PROVOKING), 1);
    nir_store_var(b, ctx.primitive, FIELD(APEX_PRIM_ID), 1);
    nir_store_var(b, ctx.viewport, nir_iand_imm(b, nir_ushr_imm(b, FIELD(APEX_PRIM_FLAGS), 16), 0xf), 1);
    nir_store_var(b, ctx.covered, covered, 1);
