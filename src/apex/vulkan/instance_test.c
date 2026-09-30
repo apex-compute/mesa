@@ -229,12 +229,13 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    const char *zink_extensions[] = {VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,
       VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
       VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME,
-      VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME};
+      VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+      VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME};
    for (unsigned i = 0; i < ARRAY_SIZE(zink_extensions); i++) {
       bool found = false;
       for (unsigned e = 0; e < extension_count; e++)
          found |= !strcmp(extensions[e].extensionName, zink_extensions[i]);
-      /* Foreign queue ownership accompanies dma-buf external memory. */
+      /* Foreign queue ownership, modifiers and swapchains accompany dma-buf memory. */
       CHECK(found == (i < 5 || coherent));
    }
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
@@ -333,6 +334,70 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features &&
          format.bufferFeatures == (texel | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT));
    CHECK(props.limits.maxImageDimension2D == 4096 && props.limits.maxImageArrayLayers == 256);
+   /* DRM_FORMAT_MOD_LINEAR only, for linear color formats. */
+   PROC(GetPhysicalDeviceFormatProperties2KHR, get_format2);
+   const VkFormat modifier_formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT,
+                                        VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK};
+   for (unsigned i = 0; i < ARRAY_SIZE(modifier_formats); i++) {
+      VkDrmFormatModifierProperties2EXT modifier2 = {0};
+      VkDrmFormatModifierPropertiesList2EXT list2 = {
+         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT,
+         .drmFormatModifierCount = 1, .pDrmFormatModifierProperties = &modifier2};
+      VkDrmFormatModifierPropertiesListEXT list = {
+         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT, .pNext = &list2};
+      VkFormatProperties2 format2 = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list};
+      get_format2(physical, modifier_formats[i], &format2);
+      CHECK(list.drmFormatModifierCount == !i && list2.drmFormatModifierCount == !i);
+      if (!i)
+         CHECK(!modifier2.drmFormatModifier && modifier2.drmFormatModifierPlaneCount == 1 &&
+               (modifier2.drmFormatModifierTilingFeatures & 0x7fffffff) ==
+               format2.formatProperties.linearTilingFeatures);
+   }
+   /* External images: importable and exportable dma-bufs and opaque fds. */
+   PROC(GetPhysicalDeviceImageFormatProperties2KHR, get_image_format2);
+   VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT};
+   VkPhysicalDeviceExternalImageFormatInfo external_image = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, .pNext = &modifier_info,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+   VkPhysicalDeviceImageFormatInfo2 image_info2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &external_image,
+      .format = VK_FORMAT_R8G8B8A8_UNORM, .type = VK_IMAGE_TYPE_2D,
+      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+   VkExternalImageFormatProperties external_props2 = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+   VkImageFormatProperties2 image_props2 = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+                                            .pNext = &external_props2};
+   CHECK(get_image_format2(physical, &image_info2, &image_props2) ==
+         (coherent ? VK_SUCCESS : VK_ERROR_FORMAT_NOT_SUPPORTED));
+   if (coherent) {
+      CHECK(image_props2.imageFormatProperties.maxMipLevels == 1 &&
+            image_props2.imageFormatProperties.maxArrayLayers == 1);
+      CHECK(external_props2.externalMemoryProperties.externalMemoryFeatures ==
+            (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+            external_props2.externalMemoryProperties.compatibleHandleTypes ==
+            (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
+   }
+   modifier_info.drmFormatModifier = 0x0100000000000001ull;
+   CHECK(get_image_format2(physical, &image_info2, &image_props2) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   external_image.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+   image_info2.tiling = VK_IMAGE_TILING_OPTIMAL;
+   image_info2.format = VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+   image_info2.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+   CHECK(get_image_format2(physical, &image_info2, &image_props2) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   /* Mutable swapchains: storage on an sRGB image through its UNORM view. */
+   const VkFormat view_formats[] = {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM};
+   VkImageFormatListCreateInfo view_list = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+      .viewFormatCount = 2, .pViewFormats = view_formats};
+   image_info2 = (VkPhysicalDeviceImageFormatInfo2) {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &view_list,
+      .format = VK_FORMAT_B8G8R8A8_SRGB, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+   image_props2.pNext = NULL;
+   CHECK(get_image_format2(physical, &image_info2, &image_props2) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   image_info2.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   CHECK(get_image_format2(physical, &image_info2, &image_props2) == VK_SUCCESS);
    PROC(GetPhysicalDeviceImageFormatProperties, get_image_format);
    VkImageFormatProperties image_props;
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,

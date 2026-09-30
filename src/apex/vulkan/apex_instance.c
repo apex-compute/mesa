@@ -3,6 +3,7 @@
 #include "apex_draw.h"
 #include "apex_entrypoints.h"
 #include "drm-uapi/apex_drm.h"
+#include "drm-uapi/drm_fourcc.h"
 #include "vk_alloc.h"
 #include "vk_drm_syncobj.h"
 #include "vk_instance.h"
@@ -153,6 +154,29 @@ apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat form
       props3->optimalTilingFeatures = features;
       props3->bufferFeatures = buffer;
    }
+   /* DRM_FORMAT_MOD_LINEAR, one plane, with the linear tiling features. */
+   bool modifier = apex_format_modifier_supported(format);
+   VkDrmFormatModifierPropertiesListEXT *list =
+      vk_find_struct(properties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+   if (list) {
+      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out, list->pDrmFormatModifierProperties,
+                             &list->drmFormatModifierCount);
+      if (modifier) {
+         vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, p)
+            *p = (VkDrmFormatModifierPropertiesEXT) {DRM_FORMAT_MOD_LINEAR, 1,
+                                                     (VkFormatFeatureFlags)(linear & legacy)};
+      }
+   }
+   VkDrmFormatModifierPropertiesList2EXT *list2 =
+      vk_find_struct(properties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+   if (list2) {
+      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out, list2->pDrmFormatModifierProperties,
+                             &list2->drmFormatModifierCount);
+      if (modifier) {
+         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out, p)
+            *p = (VkDrmFormatModifierProperties2EXT) {DRM_FORMAT_MOD_LINEAR, 1, linear};
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -160,7 +184,8 @@ apex_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physical,
                                             const VkPhysicalDeviceImageFormatInfo2 *info,
                                             VkImageFormatProperties2 *properties)
 {
-   return apex_image_format_properties(info, properties);
+   VK_FROM_HANDLE(apex_physical_device, device, physical);
+   return apex_image_format_properties(info, device->prime_coherent, properties);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -281,6 +306,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_external_memory = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .KHR_external_memory_fd = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .EXT_external_memory_dma_buf = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .EXT_image_drm_format_modifier = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      /* Swapchain images take MUTABLE_FORMAT and a view format list. */
+      .KHR_swapchain_mutable_format = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       /* Mesa's DRM syncobj type supplies opaque-FD and sync-file payloads. */
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,

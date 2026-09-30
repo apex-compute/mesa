@@ -4,6 +4,7 @@
 #include "apex_graphics.h"
 #include "apex_draw.h"
 #include "drm-uapi/apex_drm.h"
+#include "drm-uapi/drm_fourcc.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
 #include "vk_buffer_view.h"
@@ -55,6 +56,8 @@ struct apex_image {
    /* ETC2/EAC images append a decoded plane at `decoded` bytes, laid out as
     * an image of the decoded format. */
    VkDeviceSize offset, size, decoded;
+   /* Explicit DRM plane offset from the memory binding. */
+   VkDeviceSize plane_offset;
    struct {
       VkDeviceSize offset;
       uint32_t row_stride, slice_stride;
@@ -714,43 +717,87 @@ apex_format_features(VkFormat format, bool buffer)
    return features;
 }
 
+/* DRM_FORMAT_MOD_LINEAR is the one modifier: the linear allocation of a
+ * single-level, single-layer 2D color image, which other devices can import. */
+bool
+apex_format_modifier_supported(VkFormat format)
+{
+   return apex_format_features(format, false) && !apex_decoded_format(format, NULL) &&
+          !vk_format_is_depth_or_stencil(format);
+}
+
 VkResult
-apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
-                              VkImageFormatProperties2 *properties)
+apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info, bool prime,
+                             VkImageFormatProperties2 *properties)
 {
    properties->imageFormatProperties = (VkImageFormatProperties){0};
+   VkExternalImageFormatProperties *external_props =
+      vk_find_struct(properties->pNext, EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+   if (external_props)
+      external_props->externalMemoryProperties = (VkExternalMemoryProperties){0};
    VkFormatFeatureFlags2 features = apex_format_features(info->format, false);
+   /* Extended usage needs each usage from one of the view formats. */
+   const VkImageFormatListCreateInfo *view_formats =
+      vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   VkFormatFeatureFlags2 view_features = features;
+   if ((info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) && view_formats)
+      for (unsigned f = 0; f < view_formats->viewFormatCount; f++)
+         if (vk_format_get_blocksize(view_formats->pViewFormats[f]) == vk_format_get_blocksize(info->format))
+            view_features |= apex_format_features(view_formats->pViewFormats[f], false);
+   bool drm = info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   if (drm) {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier =
+         vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+      if (!modifier || modifier->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+          !apex_format_modifier_supported(info->format) || info->type != VK_IMAGE_TYPE_2D ||
+          (info->flags & (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
    VkImageUsageFlags usage = 0;
-   if (features & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-   if (features & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-   if (features & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-   if (features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-   if (features & VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)
+   if (view_features & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   if (view_features & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   if (view_features & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+   if (view_features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   if (view_features & VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)
       usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
    const VkImageCreateFlags flags = VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT |
       VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
       VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-   if (features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)
+   if (view_features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)
       usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-   if (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))
+   if (view_features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))
       usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
    /* 1D images render as one row and 3D images as depth-slice layers. */
    /* Aliased or mutable images share one linear layout for identical parameters. */
    if (!features || info->type > VK_IMAGE_TYPE_3D ||
-       (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL) ||
+       (info->tiling != VK_IMAGE_TILING_LINEAR && info->tiling != VK_IMAGE_TILING_OPTIMAL && !drm) ||
        (info->flags & ~flags) || (info->usage & ~usage) ||
        ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && info->type != VK_IMAGE_TYPE_2D) ||
        (apex_decoded_format(info->format, NULL) &&
         (info->type != VK_IMAGE_TYPE_2D || info->tiling != VK_IMAGE_TILING_OPTIMAL)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   /* External images are PRIME-shared bytes of the same linear allocation,
+    * importable and exportable as opaque fds or dma-bufs. ETC2/EAC images
+    * keep a private decoded plane and stay internal. */
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
-   if (external && external->handleType)
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (external && external->handleType) {
+      if (!prime || apex_decoded_format(info->format, NULL) ||
+          (external->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+           external->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      if (external_props)
+         external_props->externalMemoryProperties = (VkExternalMemoryProperties) {
+            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT |
+                                      VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT,
+            .exportFromImportedHandleTypes = APEX_EXTERNAL_MEMORY_TYPES,
+            .compatibleHandleTypes = APEX_EXTERNAL_MEMORY_TYPES,
+         };
+   }
    bool three_d = info->type == VK_IMAGE_TYPE_3D;
    properties->imageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = {4096, info->type == VK_IMAGE_TYPE_1D ? 1 : 4096, three_d ? 2048 : 1},
-      .maxMipLevels = 13, .maxArrayLayers = three_d ? 1 : 256,
+      .maxMipLevels = drm ? 1 : 13, .maxArrayLayers = three_d || drm ? 1 : 256,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = 1ull << 31,
    };
    /* 4x multisampling: single-level 2D optimal attachments. */
@@ -806,15 +853,67 @@ apex_CreateImage(VkDevice dev, const VkImageCreateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
+   const VkExternalMemoryImageCreateInfo *external =
+      vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   VkExternalMemoryHandleTypeFlags external_types = external ? external->handleTypes : 0;
+   if (external_types & ~APEX_EXTERNAL_MEMORY_TYPES)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   /* DRM tiling selects LINEAR from a list, or takes an explicit layout whose
+    * pitch is the linear allocation's own: the sampler derives pitches from
+    * the extent, so other pitches cannot be sampled. */
+   const VkImageDrmFormatModifierListCreateInfoEXT *modifiers =
+      vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_layout =
+      vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   VkDeviceSize plane_offset = 0;
+   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      bool linear = false;
+      for (unsigned m = 0; modifiers && m < modifiers->drmFormatModifierCount; m++)
+         linear |= modifiers->pDrmFormatModifiers[m] == DRM_FORMAT_MOD_LINEAR;
+      if (explicit_layout) {
+         if (explicit_layout->drmFormatModifier != DRM_FORMAT_MOD_LINEAR)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+         struct apex_image layout;
+         image_layout(info, &layout);
+         const VkSubresourceLayout *plane = explicit_layout->pPlaneLayouts;
+         if (explicit_layout->drmFormatModifierPlaneCount != 1 || plane->offset % 64 ||
+             plane->rowPitch != layout.levels[0].row_stride)
+            return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         plane_offset = plane->offset;
+      } else if (!linear) {
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      }
+   }
+   const VkImageFormatListCreateInfo *view_formats =
+      vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   VkImageFormatListCreateInfo view_list = view_formats ? *view_formats : (VkImageFormatListCreateInfo){0};
+   view_list.pNext = NULL;
+   VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+      .pNext = view_formats ? &view_list : NULL,
+      .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+   };
+   VkPhysicalDeviceExternalImageFormatInfo external_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+      .pNext = &modifier_info,
+   };
    VkPhysicalDeviceImageFormatInfo2 format = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &external_info,
       .format = info->format, .type = info->imageType, .tiling = info->tiling,
       .usage = info->usage, .flags = info->flags,
    };
    VkImageFormatProperties2 props = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
-   if (device->transport != APEX_TRANSPORT_DRM ||
-       apex_image_format_properties(&format, &props) != VK_SUCCESS ||
+   bool supported = device->transport == APEX_TRANSPORT_DRM;
+   /* Each requested handle type must be supported on its own. */
+   for (unsigned t = 0; supported && t < 2; t++) {
+      external_info.handleType = t ? external_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT :
+                                     external_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      supported = apex_image_format_properties(&format, device->prime_coherent, &props) == VK_SUCCESS;
+   }
+   if (!supported ||
        !(props.imageFormatProperties.sampleCounts & info->samples) ||
+       info->mipLevels > props.imageFormatProperties.maxMipLevels ||
+       info->arrayLayers > props.imageFormatProperties.maxArrayLayers ||
        !info->extent.width || !info->extent.height ||
        !info->extent.depth || info->extent.width > 4096 || info->extent.height > 4096 ||
        info->extent.depth > (info->imageType == VK_IMAGE_TYPE_3D ? 2048u : 1u) ||
@@ -829,6 +928,9 @@ apex_CreateImage(VkDevice dev, const VkImageCreateInfo *info,
    if (!image)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    image->size = image_layout(info, image);
+   image->plane_offset = plane_offset;
+   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
    *out = apex_image_to_handle(image);
    return VK_SUCCESS;
 }
@@ -843,12 +945,14 @@ apex_DestroyImage(VkDevice dev, VkImage handle, const VkAllocationCallbacks *all
 }
 
 static void
-image_memory_requirements(struct apex_device *device, VkDeviceSize size, VkMemoryRequirements2 *out)
+image_memory_requirements(struct apex_device *device, VkDeviceSize size, bool external,
+                          VkMemoryRequirements2 *out)
 {
-   /* Images may also live in device-only PRIME-capable storage. */
+   /* Images may also live in device-only PRIME-capable storage, which
+    * external images require. */
    out->memoryRequirements = (VkMemoryRequirements) {
       .size = size, .alignment = 64,
-      .memoryTypeBits = host_memory_types(device) | (device->prime_coherent ? 2 : 0),
+      .memoryTypeBits = (external ? 0 : host_memory_types(device)) | (device->prime_coherent ? 2 : 0),
    };
    VkMemoryDedicatedRequirements *dedicated = vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
    if (dedicated) {
@@ -862,7 +966,14 @@ apex_GetDeviceImageMemoryRequirements(VkDevice dev,
    const VkDeviceImageMemoryRequirements *info, VkMemoryRequirements2 *out)
 {
    VK_FROM_HANDLE(apex_device, device, dev);
-   image_memory_requirements(device, image_layout(info->pCreateInfo, NULL), out);
+   const VkExternalMemoryImageCreateInfo *external =
+      vk_find_struct_const(info->pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_layout =
+      vk_find_struct_const(info->pCreateInfo->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   VkDeviceSize plane_offset = info->pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+      explicit_layout ? explicit_layout->pPlaneLayouts[0].offset : 0;
+   image_memory_requirements(device, plane_offset + image_layout(info->pCreateInfo, NULL),
+                             external && external->handleTypes, out);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -871,7 +982,8 @@ apex_GetImageMemoryRequirements2(VkDevice dev,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_image, image, info->image);
-   image_memory_requirements(device, image->size, out);
+   image_memory_requirements(device, image->plane_offset + image->size,
+                             image->vk.external_handle_types, out);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -880,16 +992,21 @@ apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo 
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
       VK_FROM_HANDLE(apex_image, image, infos[i].image);
-      if (infos[i].memoryOffset % 64 || infos[i].memoryOffset > mem->vk.size ||
-          image->size > mem->vk.size - infos[i].memoryOffset)
+      if (image->vk.external_handle_types && mem->vk.memory_type_index != 1)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      /* The image starts at its explicit DRM plane offset. */
+      VkDeviceSize offset = infos[i].memoryOffset + image->plane_offset;
+      if (infos[i].memoryOffset % 64 || offset > mem->vk.size || image->size > mem->vk.size - offset)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       image->memory = mem;
-      image->offset = infos[i].memoryOffset;
+      image->offset = offset;
    }
    return VK_SUCCESS;
 }
 
-/* A subresource is one layer of a level, or every depth slice of a 3D level. */
+/* A subresource is one layer of a level, or every depth slice of a 3D level;
+ * DRM memory plane 0 is level 0, layer 0. Offsets include an explicit plane
+ * offset. */
 static void
 subresource_layout(const struct apex_image *image, const VkImageSubresource *subresource,
                    VkSubresourceLayout2 *out)
@@ -897,7 +1014,8 @@ subresource_layout(const struct apex_image *image, const VkImageSubresource *sub
    unsigned l = subresource->mipLevel;
    unsigned slices = image->vk.image_type == VK_IMAGE_TYPE_3D ? u_minify(image->vk.extent.depth, l) : 1;
    out->subresourceLayout = (VkSubresourceLayout) {
-      .offset = image->levels[l].offset + (uint64_t)image->levels[l].slice_stride * subresource->arrayLayer,
+      .offset = image->plane_offset + image->levels[l].offset +
+                (uint64_t)image->levels[l].slice_stride * subresource->arrayLayer,
       .size = (uint64_t)image->levels[l].slice_stride * slices,
       .rowPitch = image->levels[l].row_stride,
       .arrayPitch = image->levels[l].slice_stride,
@@ -917,7 +1035,7 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_GetDeviceImageSubresourceLayout(VkDevice dev, const VkDeviceImageSubresourceInfo *info,
                                      VkSubresourceLayout2 *out)
 {
-   struct apex_image image;
+   struct apex_image image = {.plane_offset = 0};
    image.vk.image_type = info->pCreateInfo->imageType;
    image.vk.extent = info->pCreateInfo->extent;
    image_layout(info->pCreateInfo, &image);

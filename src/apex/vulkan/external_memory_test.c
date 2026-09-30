@@ -19,7 +19,7 @@
 
 /* Model PRIME's single handle per dma-buf, including repeated imports that
  * acquire no additional kernel handle reference. No shader execution is mocked. */
-static int objects[8];
+static int objects[16];
 static unsigned object_count, handle_count, live, closes, maps, binds;
 static bool coherent = true, host_coherent, fail_bind, fail_create;
 static uint32_t expected_create_flags;
@@ -246,9 +246,94 @@ int main(void)
       v->FreeMemory(dev, memory[1 - order], NULL);
       CHECK(!live && closes == before + 1);
    }
+   /* External images: PRIME-only memory, dma-buf import, LINEAR modifier. */
+   VkExternalMemoryImageCreateInfo external_image = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+   VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &external_image,
+      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {7, 3, 1},
+      .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_LINEAR,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+   VkImage image;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
+   VkMemoryRequirements image_req;
+   v->GetImageMemoryRequirements(dev, image, &image_req);
+   CHECK(image_req.size == 192 && image_req.memoryTypeBits == 2);
+   VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = image};
+   import = (VkImportMemoryFdInfoKHR) {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+      .pNext = &dedicated, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      .fd = dup(objects[0])};
+   ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &import,
+      .allocationSize = 192, .memoryTypeIndex = 1};
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
+   ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = 4096, .memoryTypeIndex = 0};
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_SUCCESS);
+   VkImage second;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &second) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, second, memory[1], 0) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   v->DestroyImage(dev, second, NULL);
+   v->DestroyImage(dev, image, NULL);
+   const uint64_t linear = 0, other = 0x0100000000000001ull;
+   VkImageDrmFormatModifierListCreateInfoEXT list = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+      .drmFormatModifierCount = 1, .pDrmFormatModifiers = &other};
+   external_image.pNext = &list;
+   image_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   list.pDrmFormatModifiers = &linear;
+   image_info.mipLevels = 2;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+   image_info.mipLevels = 1;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
+   VkImageDrmFormatModifierPropertiesEXT modifier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT, .drmFormatModifier = other};
+   CHECK(v->GetImageDrmFormatModifierPropertiesEXT(dev, image, &modifier) == VK_SUCCESS &&
+         modifier.drmFormatModifier == linear);
+   VkImageSubresource plane = {.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT};
+   VkSubresourceLayout layout;
+   v->GetImageSubresourceLayout(dev, image, &plane, &layout);
+   CHECK(!layout.offset && layout.rowPitch == 64 && layout.size == 192);
+   v->DestroyImage(dev, image, NULL);
+   /* An explicit layout must use the linear pitch; its offset moves the image. */
+   VkSubresourceLayout plane_layout = {.offset = 128, .rowPitch = 128};
+   VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_layout = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+      .drmFormatModifier = linear, .drmFormatModifierPlaneCount = 1, .pPlaneLayouts = &plane_layout};
+   external_image.pNext = &explicit_layout;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+   plane_layout.rowPitch = 64;
+   plane_layout.offset = 96;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+   plane_layout.offset = 128;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
+   v->GetImageMemoryRequirements(dev, image, &image_req);
+   CHECK(image_req.size == 320 && image_req.memoryTypeBits == 2);
+   VkDeviceImageMemoryRequirements device_req = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, .pCreateInfo = &image_info};
+   VkMemoryRequirements2 req2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+   v->GetDeviceImageMemoryRequirements(dev, &device_req, &req2);
+   CHECK(req2.memoryRequirements.size == 320 && req2.memoryRequirements.memoryTypeBits == 2);
+   v->GetImageSubresourceLayout(dev, image, &plane, &layout);
+   CHECK(layout.offset == 128 && layout.rowPitch == 64);
+   CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   v->DestroyImage(dev, image, NULL);
+   v->FreeMemory(dev, memory[1], NULL);
+   v->FreeMemory(dev, memory[0], NULL);
+   CHECK(!live);
+   ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = 8192, .memoryTypeIndex = 1};
+   import.pNext = &export;
    apex_device_finish(&device);
    coherent = false;
    CHECK(apex_device_init(&device, &physical, &di, NULL, fd, APEX_TRANSPORT_DRM) == VK_SUCCESS);
+   image_info.pNext = &external_image;
+   external_image.pNext = NULL;
+   image_info.tiling = VK_IMAGE_TILING_LINEAR;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, objects[0], &props) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
    ai.pNext = &export;
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_FEATURE_NOT_PRESENT);
@@ -300,12 +385,11 @@ int main(void)
       v->GetBufferMemoryRequirements(dev, buffers[0], &req);
       CHECK(req.memoryTypeBits == (coherent ? 7 : 3));
       CHECK(v->BindBufferMemory(dev, buffers[0], memory[0], 4096) == VK_SUCCESS);
-      VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      image_info = (VkImageCreateInfo) {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
          .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R32_UINT,
          .extent = {7, 3, 1}, .mipLevels = 1, .arrayLayers = 1,
          .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
          .usage = VK_IMAGE_USAGE_STORAGE_BIT};
-      VkImage image;
       CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
       v->GetImageMemoryRequirements(dev, image, &req);
       CHECK(req.memoryTypeBits == (coherent ? 7 : 3));
@@ -331,6 +415,6 @@ int main(void)
    for (unsigned i = 0; i < object_count; i++) CHECK(!close(objects[i]));
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
-   puts("PASS Apex external memory: device-only queries, fd ownership, same-file handle dedup, alias offsets, both free orders, failure cleanup (mock PRIME, no GPU execution)");
+   puts("PASS Apex external memory: device-only queries, external images and LINEAR modifiers, fd ownership, same-file handle dedup, alias offsets, both free orders, failure cleanup (mock PRIME, no GPU execution)");
    return 0;
 }

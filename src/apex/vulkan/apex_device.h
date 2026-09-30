@@ -120,8 +120,10 @@ VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 void apex_bo_finish(struct apex_device *device, struct apex_bo *bo);
 
 VkFormatFeatureFlags2 apex_format_features(VkFormat format, bool buffer);
-VkResult apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
+/* `prime` admits external images (APEX_DRM_CAP_PRIME_COHERENT). */
+VkResult apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info, bool prime,
                                       VkImageFormatProperties2 *properties);
+bool apex_format_modifier_supported(VkFormat format);
 
 VkResult apex_device_init(struct apex_device *device,
                           struct vk_physical_device *physical,
