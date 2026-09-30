@@ -194,14 +194,7 @@ int main(int argc, char **argv)
              (properties.memoryTypes[allocate.memoryTypeIndex].propertyFlags & required) == required)
             break;
       }
-      if (allocate.memoryTypeIndex == properties.memoryTypeCount) {
-         DestroyBuffer(device, buffer, NULL);
-         DestroyDevice(device, NULL);
-         DestroyInstance(instance, NULL);
-         CHECK(!dlclose(loader));
-         puts("SKIP Apex application: HOST_COHERENT memory unavailable");
-         return 77;
-      }
+      CHECK(allocate.memoryTypeIndex < properties.memoryTypeCount);
    }
    VkDeviceMemory memory;
    CHECK(AllocateMemory(device, &allocate, NULL, &memory) == VK_SUCCESS);
