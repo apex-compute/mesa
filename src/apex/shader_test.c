@@ -523,14 +523,14 @@ static void test_control(const char *dir)
    for (uint32_t mode = 0; mode < 2; mode++) {
       struct world w = {0};
       uint8_t *root = region(&w, ROOT, ROOT_BYTES);
-      uint8_t *out = region(&w, 0x200000, 32 * 12);
+      uint8_t *out = region(&w, 0x200000, 32 * 16);
       uint8_t *in = region(&w, 0x300000, 256);
       uint32_t v[64];
       for (unsigned k = 0; k < 64; k++) {
          v[k] = 0x01000193u * (k + 3) >> 8;
          put(in + 4 * k, v[k]);
       }
-      buffer_descriptor(root + slot(0, 0), 0x200000, 32 * 12);
+      buffer_descriptor(root + slot(0, 0), 0x200000, 32 * 16);
       buffer_descriptor(root + slot(0, 1), 0x300000, 256);
       put(root + PUSH, 9);
       put(root + PUSH + 4, mode);
@@ -541,7 +541,8 @@ static void test_control(const char *dir)
          uint32_t want[3];
          control_reference(l, 9, mode, v, want);
          for (unsigned k = 0; k < 3; k++)
-            CHECK(get(out + 12 * l + 4 * k) == want[k]);
+            CHECK(get(out + 16 * l + 4 * k) == want[k]);
+         CHECK(get(out + 16 * l + 12) == (l % 5) * 9 + 5);
       }
       world_free(&w);
    }

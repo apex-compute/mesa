@@ -2168,6 +2168,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_opt_dead_cf);
    /* Vectors of loop values build after the loop, not every iteration. */
    NIR_PASS(_, nir, nir_opt_sink, nir_move_copies);
+   /* Values leaving a loop pass through exit phis, so a value that is
+    * uniform inside a loop with a divergent exit becomes divergent there. */
+   NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
    nir_divergence_analysis(nir);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, true);
    NIR_PASS(_, nir, nir_trivialize_registers);

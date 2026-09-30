@@ -32,7 +32,16 @@ void main()
       c = a * b;
    else
       c = src.v[l];
-   o[l * 3u] = a;
-   o[l * 3u + 1u] = b;
-   o[l * 3u + 2u] = c;
+   // A uniform value computed in a loop with a divergent exit is per-lane
+   // after it: each lane sees its own last iteration.
+   uint u = 0u;
+   for (uint k = 0u;; k++) {
+      u = k * p.n + 5u;
+      if (k >= l % 5u)
+         break;
+   }
+   o[l * 4u] = a;
+   o[l * 4u + 1u] = b;
+   o[l * 4u + 2u] = c;
+   o[l * 4u + 3u] = u;
 }
