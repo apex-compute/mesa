@@ -451,11 +451,108 @@ test_fill(struct vk_physical_device *physical, const char *output)
    apex_device_finish(&device);
 }
 
-/* Offline backend coverage of the software graphics and sampling paths:
- * the primitive setup kernel and a compute shader sampling two combined
- * image samplers (fetch, nearest and linear with border replacement). */
+static VkShaderModule
+load_module(const struct vk_device_dispatch_table *v, VkDevice dev, const char *path)
+{
+   FILE *f = fopen(path, "rb");
+   CHECK(f && !fseek(f, 0, SEEK_END));
+   long bytes = ftell(f);
+   CHECK(bytes > 0 && bytes % 4 == 0);
+   rewind(f);
+   uint32_t *spirv = malloc(bytes);
+   CHECK(spirv && fread(spirv, 1, bytes, f) == bytes && !fclose(f));
+   VkShaderModule module;
+   VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                  .codeSize = bytes, .pCode = spirv};
+   CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
+   free(spirv);
+   return module;
+}
+
+/* A dynamic-rendering pipeline builds the vertex kernel (vertex fetch,
+ * indexed and direct paths) and the fragment kernel; NIR validation runs
+ * on every pass in debug builds. */
 static void
-test_graphics_programs(struct vk_physical_device *physical, const char *texture_path)
+test_draw_pipeline(struct apex_device *device, const char *vertex_path, const char *fragment_path)
+{
+   VkDevice dev = apex_device_to_handle(device);
+   const struct vk_device_dispatch_table *v = &device->vk.dispatch_table;
+   VkShaderModule modules[2] = {load_module(v, dev, vertex_path), load_module(v, dev, fragment_path)};
+   const VkPipelineShaderStageCreateInfo stages[2] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = modules[0], .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = modules[1], .pName = "main"},
+   };
+   const VkVertexInputBindingDescription binding = {0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
+   /* RGBA32F position and an RGB8 color whose missing alpha fetch fills. */
+   const VkVertexInputAttributeDescription attributes[2] = {
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R8G8B8_UNORM, 16},
+   };
+   const VkPipelineVertexInputStateCreateInfo vi = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+      .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
+      .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = attributes,
+   };
+   const VkPipelineInputAssemblyStateCreateInfo ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+   };
+   const VkPipelineViewportStateCreateInfo vp = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1, .scissorCount = 1,
+   };
+   const VkPipelineRasterizationProvokingVertexStateCreateInfoEXT provoking = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+      .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
+   };
+   const VkPipelineRasterizationStateCreateInfo rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .pNext = &provoking,
+      .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1.0f,
+   };
+   const VkPipelineMultisampleStateCreateInfo ms = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+   };
+   const VkPipelineColorBlendAttachmentState blend = {.colorWriteMask = 0xf};
+   const VkPipelineColorBlendStateCreateInfo cb = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+      .attachmentCount = 1, .pAttachments = &blend,
+   };
+   const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+   const VkPipelineDynamicStateCreateInfo ds = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+      .dynamicStateCount = 2, .pDynamicStates = dynamic,
+   };
+   const VkFormat color = VK_FORMAT_R8G8B8A8_UNORM;
+   const VkPipelineRenderingCreateInfo rendering = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .colorAttachmentCount = 1, .pColorAttachmentFormats = &color,
+   };
+   const VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   const VkGraphicsPipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering,
+      .stageCount = 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+      .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
+      .pColorBlendState = &cb, .pDynamicState = &ds, .layout = layout,
+   };
+   VkPipeline pipeline;
+   CHECK(v->CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
+   v->DestroyPipeline(dev, pipeline, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   for (unsigned i = 0; i < 2; i++)
+      v->DestroyShaderModule(dev, modules[i], NULL);
+}
+
+/* Offline backend coverage of the software graphics and sampling paths:
+ * the primitive setup kernel, a draw pipeline and a compute shader sampling
+ * two combined image samplers (fetch, nearest and linear with border
+ * replacement). */
+static void
+test_graphics_programs(struct vk_physical_device *physical, const char *texture_path,
+                       const char *vertex_path, const char *fragment_path)
 {
    struct apex_device device;
    const float priority = 1;
@@ -503,20 +600,10 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
    struct apex_program *setup;
    CHECK(apex_internal_program(&device, APEX_INTERNAL_SETUP, &setup) == VK_SUCCESS);
    CHECK(setup->code.size > 48);
+   test_draw_pipeline(&device, vertex_path, fragment_path);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
-   FILE *f = fopen(texture_path, "rb");
-   CHECK(f && !fseek(f, 0, SEEK_END));
-   long bytes = ftell(f);
-   CHECK(bytes > 0 && bytes % 4 == 0);
-   rewind(f);
-   uint32_t *spirv = malloc(bytes);
-   CHECK(spirv && fread(spirv, 1, bytes, f) == bytes && !fclose(f));
-   VkShaderModule module;
-   VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                  .codeSize = bytes, .pCode = spirv};
-   CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
-   free(spirv);
+   VkShaderModule module = load_module(v, dev, texture_path);
    VkDescriptorSetLayoutBinding bindings[] = {
       {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
@@ -549,7 +636,7 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
 
 int main(int argc, char **argv)
 {
-   bool graphics = argc == 3 && !strcmp(argv[1], "--graphics");
+   bool graphics = argc == 5 && !strcmp(argv[1], "--graphics");
    CHECK(graphics || argc == 10 || argc == 11);
    const char *output = argc == 11 ? argv[10] : NULL;
    FILE *f = fopen(graphics ? argv[2] : argv[1], "rb");
@@ -582,7 +669,7 @@ int main(int argc, char **argv)
    (void)vk_physical_device_to_handle(&physical);
    free(spirv);
    if (graphics) {
-      test_graphics_programs(&physical, argv[2]);
+      test_graphics_programs(&physical, argv[2], argv[3], argv[4]);
       vk_physical_device_finish(&physical);
       vk_instance_finish(&instance);
       puts("PASS Apex graphics programs: setup and sampling compile, border colors and swizzles");

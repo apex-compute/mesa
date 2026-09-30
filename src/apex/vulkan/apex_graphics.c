@@ -406,14 +406,14 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_push_if(b, nir_ine_imm(b, index_bytes, 0));
    nir_def *byte = nir_imul(b, nir_iadd(b, position, draw_word(b, program, APEX_DRAW_FIRST_VERTEX)),
                             index_bytes);
-   /* Indices beyond the bound size read zero. */
-   nir_def *bound = draw_word(b, program, APEX_DRAW_INDEX_SIZE);
+   /* Indices beyond the bound size read zero. Phi sources precede the if. */
+   nir_def *bound = draw_word(b, program, APEX_DRAW_INDEX_SIZE), *zero = nir_imm_int(b, 0);
    nir_push_if(b, nir_iand(b, nir_uge(b, bound, index_bytes),
                            nir_uge(b, nir_isub(b, bound, index_bytes), byte)));
    nir_def *loaded = load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_INDEX),
                                               nir_iand_imm(b, byte, ~3u)));
    nir_pop_if(b, NULL);
-   nir_def *word = nir_if_phi(b, loaded, nir_imm_int(b, 0));
+   nir_def *word = nir_if_phi(b, loaded, zero);
    nir_def *mask = nir_bcsel(b, nir_ieq_imm(b, index_bytes, 4), nir_imm_int(b, ~0),
                              nir_bcsel(b, nir_ieq_imm(b, index_bytes, 2), nir_imm_int(b, 0xffff),
                                        nir_imm_int(b, 0xff)));

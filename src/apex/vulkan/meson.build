@@ -140,7 +140,6 @@ test('apex-multiple-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_multiple_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
   args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv], suite : ['apex'])
-test('apex-graphics-programs', apex_pipeline_test, args : ['--graphics', apex_texture_spv], suite : ['apex'])
 apex_command_test = executable('apex-command-test', 'command_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
@@ -181,13 +180,16 @@ apex_run = executable('apex-run', 'run.c',
 apex_graphics_test = executable('apex-graphics-test', 'graphics_test.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
 )
+apex_triangle_spv = []
 foreach stage : ['vert', 'frag']
-  custom_target('apex-triangle-' + stage,
+  apex_triangle_spv += custom_target('apex-triangle-' + stage,
     input : 'triangle.' + stage, output : 'triangle.' + stage + '.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
     build_by_default : true,
   )
 endforeach
+test('apex-graphics-programs', apex_pipeline_test,
+  args : ['--graphics', apex_texture_spv, apex_triangle_spv], env : ['NIR_DEBUG=validate'], suite : ['apex'])
 # Frame-time benchmark for the performance plan's desktop and game scenes.
 apex_bench = executable('apex-bench', 'bench.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
