@@ -729,8 +729,9 @@ apex_format_features(VkFormat format, bool buffer)
       if (!util_format_is_pure_integer(pformat))
          features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
    }
-   /* Blits run through vk_meta: sampled sources, rendered destinations. */
-   if (features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)
+   /* Blits run through vk_meta: sampled sources, rendered destinations.
+    * Scaled formats hold integers read as floats and blit to nothing. */
+   if ((features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT) && !vk_format_is_scaled(format))
       features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
    if (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))
       features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
