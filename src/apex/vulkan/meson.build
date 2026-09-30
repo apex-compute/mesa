@@ -217,3 +217,12 @@ custom_target('apex-ms-texture-spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default : true,
 )
+# Explicit hardware GLES 2 bring-up through Zink: EGL device and GBM modes.
+dep_apex_egl = dependency('egl', required : false)
+dep_apex_glesv2 = dependency('glesv2', required : false)
+if with_gallium_zink and with_egl and with_gbm and dep_apex_egl.found() and dep_apex_glesv2.found()
+  apex_gles_application = executable('apex-gles-application', 'gles_application.c',
+    include_directories : [inc_include, include_directories('../../gbm/main')],
+    dependencies : [dep_apex_egl, dep_apex_glesv2, dep_dl], install : false,
+  )
+endif

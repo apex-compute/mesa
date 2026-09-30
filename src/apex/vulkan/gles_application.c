@@ -1,0 +1,344 @@
+/* SPDX-License-Identifier: MIT */
+/* Hardware bring-up of GLES 2 through Zink on Apex. Explicit use only: it
+ * opens the named DRM node.
+ *   apex-gles-application egl NODE  GLES 2 context on the EGL device whose
+ *                                    primary or render node is NODE; renders
+ *                                    a clear and a textured triangle into an
+ *                                    FBO and checks pixels.
+ *   apex-gles-application gbm NODE   GBM allocation, CPU mapping, and EGL on
+ *                                    the GBM platform rendering into a GBM
+ *                                    buffer imported as an EGLImage. */
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "gbm.h"
+
+#define SIZE 16
+
+static int failures;
+
+static void
+check(bool ok, const char *what)
+{
+   printf("%s %s\n", ok ? "ok  " : "FAIL", what);
+   failures += !ok;
+}
+
+static bool
+near(unsigned value, unsigned expected)
+{
+   return value + 1 >= expected && value <= expected + 1;
+}
+
+static GLuint
+program(void)
+{
+   static const char *vs =
+      "attribute vec2 position;\n"
+      "attribute float u;\n"
+      "varying vec4 constant_color;\n"
+      "varying float gradient;\n"
+      "void main() {\n"
+      "   constant_color = vec4(1.0, 0.0, 0.0, 1.0);\n"
+      "   gradient = u;\n"
+      "   gl_Position = vec4(position, 0.0, 1.0);\n"
+      "}\n";
+   static const char *fs =
+      "precision mediump float;\n"
+      "uniform sampler2D tex;\n"
+      "varying vec4 constant_color;\n"
+      "varying float gradient;\n"
+      "void main() {\n"
+      "   gl_FragColor = vec4(constant_color.r, gradient, texture2D(tex, vec2(0.75, 0.25)).g, 1.0);\n"
+      "}\n";
+   GLuint p = glCreateProgram();
+   const char *sources[2] = {vs, fs};
+   const GLenum types[2] = {GL_VERTEX_SHADER, GL_FRAGMENT_SHADER};
+   for (unsigned i = 0; i < 2; i++) {
+      GLuint s = glCreateShader(types[i]);
+      glShaderSource(s, 1, &sources[i], NULL);
+      glCompileShader(s);
+      GLint ok;
+      glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+      check(ok, i ? "fragment shader compiles" : "vertex shader compiles");
+      glAttachShader(p, s);
+   }
+   glBindAttribLocation(p, 0, "position");
+   glBindAttribLocation(p, 1, "u");
+   glLinkProgram(p);
+   GLint linked;
+   glGetProgramiv(p, GL_LINK_STATUS, &linked);
+   check(linked, "program links");
+   return p;
+}
+
+/* Clear to (0, 0, 64, 255), then the lower-left half triangle writes
+ * (255, round((x + 0.5) / 16 * 255), 255, 255): a constant varying, an
+ * interpolated one and texel (1, 0) of a 2x2 nearest texture. */
+static void
+render_and_check(GLuint framebuffer)
+{
+   glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+   check(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE, "framebuffer complete");
+   static const uint8_t texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+   GLuint texture;
+   glGenTextures(1, &texture);
+   glBindTexture(GL_TEXTURE_2D, texture);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   GLuint p = program();
+   glUseProgram(p);
+   glUniform1i(glGetUniformLocation(p, "tex"), 0);
+   static const float position[] = {-1, -1, 1, -1, -1, 1};
+   static const float u[] = {0, 1, 0};
+   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, position);
+   glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, u);
+   glEnableVertexAttribArray(0);
+   glEnableVertexAttribArray(1);
+   glViewport(0, 0, SIZE, SIZE);
+   glClearColor(0.0f, 0.0f, 64.0f / 255.0f, 1.0f);
+   glClear(GL_COLOR_BUFFER_BIT);
+   glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t pixels[SIZE * SIZE * 4];
+   glReadPixels(0, 0, SIZE, SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+   check(glGetError() == GL_NO_ERROR, "no GL error");
+   const uint8_t *clear = &pixels[(15 * SIZE + 15) * 4];
+   check(clear[0] == 0 && clear[1] == 0 && clear[2] == 64 && clear[3] == 255, "clear color at (15, 15)");
+   bool triangle = true;
+   for (unsigned y = 0; y < SIZE; y++) {
+      for (unsigned x = 0; x + y <= 12; x++) {
+         const uint8_t *px = &pixels[(y * SIZE + x) * 4];
+         unsigned green = (unsigned)((x + 0.5) / 16.0 * 255.0 + 0.5);
+         if (px[0] != 255 || !near(px[1], green) || px[2] != 255 || px[3] != 255) {
+            if (triangle)
+               printf("     (%u, %u) = (%u, %u, %u, %u), expected (255, %u, 255, 255)\n",
+                      x, y, px[0], px[1], px[2], px[3], green);
+            triangle = false;
+         }
+      }
+   }
+   check(triangle, "triangle: constant and interpolated varyings, texture sample");
+}
+
+static bool
+extension(const char *list, const char *name)
+{
+   size_t n = strlen(name);
+   for (const char *p = list; p && (p = strstr(p, name)); p += n)
+      if ((p == list || p[-1] == ' ') && (p[n] == ' ' || !p[n]))
+         return true;
+   return false;
+}
+
+static EGLContext
+gles2_context(EGLDisplay display, EGLConfig *config_out)
+{
+   EGLint major, minor;
+   check(eglInitialize(display, &major, &minor), "eglInitialize");
+   printf("     EGL %d.%d %s\n", major, minor, eglQueryString(display, EGL_VENDOR));
+   eglBindAPI(EGL_OPENGL_ES_API);
+   const EGLint attributes[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, 0, EGL_NONE};
+   EGLConfig config = NULL;
+   EGLint count = 0;
+   eglChooseConfig(display, attributes, &config, 1, &count);
+   const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+   EGLContext context = eglCreateContext(display, count ? config : EGL_NO_CONFIG_KHR,
+                                         EGL_NO_CONTEXT, context_attributes);
+   check(context != EGL_NO_CONTEXT, "GLES 2 context");
+   check(context && eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context),
+         "surfaceless make current");
+   if (context) {
+      printf("     GL_VENDOR   %s\n     GL_RENDERER %s\n     GL_VERSION  %s\n",
+             glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
+   }
+   if (config_out)
+      *config_out = config;
+   return context;
+}
+
+/* The EGL device with NODE as its primary or render node, so the host's
+ * other GPUs are never chosen. */
+static int
+run_egl(const char *node)
+{
+   PFNEGLQUERYDEVICESEXTPROC query_devices =
+      (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
+   PFNEGLQUERYDEVICESTRINGEXTPROC query_string =
+      (PFNEGLQUERYDEVICESTRINGEXTPROC)eglGetProcAddress("eglQueryDeviceStringEXT");
+   if (!query_devices || !query_string) {
+      check(false, "EGL_EXT_device_enumeration and EGL_EXT_device_query");
+      return 1;
+   }
+   EGLDeviceEXT devices[16], device = EGL_NO_DEVICE_EXT;
+   EGLint count = 0;
+   query_devices(16, devices, &count);
+   for (EGLint i = 0; i < count && device == EGL_NO_DEVICE_EXT; i++) {
+      const char *extensions = query_string(devices[i], EGL_EXTENSIONS);
+      const char *primary = extension(extensions, "EGL_EXT_device_drm") ?
+         query_string(devices[i], EGL_DRM_DEVICE_FILE_EXT) : NULL;
+      const char *render = extension(extensions, "EGL_EXT_device_drm_render_node") ?
+         query_string(devices[i], EGL_DRM_RENDER_NODE_FILE_EXT) : NULL;
+      if ((primary && !strcmp(primary, node)) || (render && !strcmp(render, node)))
+         device = devices[i];
+   }
+   check(device != EGL_NO_DEVICE_EXT, "EGL device for the node");
+   if (device == EGL_NO_DEVICE_EXT)
+      return 1;
+   EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, device, NULL);
+   check(display != EGL_NO_DISPLAY, "device platform display");
+   if (display == EGL_NO_DISPLAY || !gles2_context(display, NULL))
+      return 1;
+   GLuint framebuffer, renderbuffer;
+   glGenFramebuffers(1, &framebuffer);
+   glGenRenderbuffers(1, &renderbuffer);
+   glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+   /* GLES 2 guarantees RGBA4; RGBA8 needs OES_rgb8_rgba8. */
+   check(extension((const char *)glGetString(GL_EXTENSIONS), "GL_OES_rgb8_rgba8"), "GL_OES_rgb8_rgba8");
+   glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8_OES, SIZE, SIZE);
+   glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+   render_and_check(framebuffer);
+   eglTerminate(display);
+   return failures != 0;
+}
+
+#define GBM_FUNCTIONS(X) X(gbm_create_device) X(gbm_device_destroy) X(gbm_device_get_backend_name) \
+   X(gbm_bo_create) X(gbm_bo_destroy) X(gbm_bo_get_fd) X(gbm_bo_get_stride) X(gbm_bo_get_modifier) \
+   X(gbm_bo_map) X(gbm_bo_unmap)
+#define DECLARE(f) static __typeof__(f) *p_##f;
+
+GBM_FUNCTIONS(DECLARE)
+
+/* Allocation, mapping and, for rendering buffers, an EGLImage render target
+ * whose clear must reach the buffer's memory. */
+static void
+gbm_case(struct gbm_device *device, EGLDisplay display, uint32_t usage, const char *name)
+{
+   struct gbm_bo *bo = p_gbm_bo_create(device, SIZE, SIZE, GBM_FORMAT_ABGR8888, usage);
+   char what[128];
+   snprintf(what, sizeof(what), "%s: gbm_bo_create", name);
+   check(bo, what);
+   if (!bo)
+      return;
+   int fd = p_gbm_bo_get_fd(bo);
+   uint32_t stride = p_gbm_bo_get_stride(bo);
+   printf("     fd %d stride %u modifier 0x%llx\n", fd, stride,
+          (unsigned long long)p_gbm_bo_get_modifier(bo));
+   snprintf(what, sizeof(what), "%s: dma-buf export", name);
+   check(fd >= 0 && stride >= SIZE * 4, what);
+   uint32_t map_stride = 0;
+   void *data = NULL;
+   uint32_t *words = p_gbm_bo_map(bo, 0, 0, SIZE, SIZE, GBM_BO_TRANSFER_READ_WRITE, &map_stride, &data);
+   snprintf(what, sizeof(what), "%s: CPU map", name);
+   check(words, what);
+   if (words) {
+      for (unsigned y = 0; y < SIZE; y++)
+         for (unsigned x = 0; x < SIZE; x++)
+            words[y * map_stride / 4 + x] = 0x01000000u * y + x;
+      p_gbm_bo_unmap(bo, data);
+      data = NULL;
+      words = p_gbm_bo_map(bo, 0, 0, SIZE, SIZE, GBM_BO_TRANSFER_READ, &map_stride, &data);
+      bool same = words;
+      for (unsigned y = 0; words && y < SIZE; y++)
+         for (unsigned x = 0; x < SIZE; x++)
+            same &= words[y * map_stride / 4 + x] == 0x01000000u * y + x;
+      if (words)
+         p_gbm_bo_unmap(bo, data);
+      snprintf(what, sizeof(what), "%s: CPU writes read back", name);
+      check(same, what);
+   }
+   if (display != EGL_NO_DISPLAY && (usage & GBM_BO_USE_RENDERING) && fd >= 0) {
+      PFNEGLCREATEIMAGEKHRPROC create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+      PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC image_storage =
+         (PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES");
+      uint64_t modifier = p_gbm_bo_get_modifier(bo);
+      const EGLint attributes[] = {
+         EGL_WIDTH, SIZE, EGL_HEIGHT, SIZE, EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_ABGR8888,
+         EGL_DMA_BUF_PLANE0_FD_EXT, fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+         EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)stride,
+         EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(uint32_t)modifier,
+         EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(uint32_t)(modifier >> 32), EGL_NONE,
+      };
+      EGLImageKHR image = create_image ?
+         create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes) : EGL_NO_IMAGE_KHR;
+      snprintf(what, sizeof(what), "%s: EGLImage from the dma-buf", name);
+      check(image != EGL_NO_IMAGE_KHR, what);
+      if (image != EGL_NO_IMAGE_KHR && image_storage) {
+         GLuint framebuffer, renderbuffer;
+         glGenFramebuffers(1, &framebuffer);
+         glGenRenderbuffers(1, &renderbuffer);
+         glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+         image_storage(GL_RENDERBUFFER, image);
+         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+         render_and_check(framebuffer);
+         glFinish();
+         /* ABGR8888 is R, G, B, A in byte order: the clear at (15, 15) is
+          * 0xff400000 and the triangle at (0, 0) is 0xffff08ff. */
+         words = p_gbm_bo_map(bo, 0, 0, SIZE, SIZE, GBM_BO_TRANSFER_READ, &map_stride, &data);
+         bool seen = words && words[15 * map_stride / 4 + 15] == 0xff400000u &&
+                     (words[0] & 0xffff00ffu) == 0xffff00ffu;
+         if (words)
+            p_gbm_bo_unmap(bo, data);
+         snprintf(what, sizeof(what), "%s: rendering reaches the GBM buffer", name);
+         check(seen, what);
+      }
+   }
+   if (fd >= 0)
+      close(fd);
+   p_gbm_bo_destroy(bo);
+}
+
+static int
+run_gbm(const char *node)
+{
+   void *library = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+   check(library, "libgbm.so.1");
+   if (!library)
+      return 1;
+#define RESOLVE(f) p_##f = (__typeof__(f) *)dlsym(library, #f); if (!p_##f) { check(false, #f); return 1; }
+   GBM_FUNCTIONS(RESOLVE)
+   int fd = open(node, O_RDWR | O_CLOEXEC);
+   check(fd >= 0, "open node");
+   if (fd < 0)
+      return 1;
+   struct gbm_device *device = p_gbm_create_device(fd);
+   check(device, "gbm_create_device");
+   if (!device)
+      return 1;
+   printf("     backend %s\n", p_gbm_device_get_backend_name(device));
+   EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, device, NULL);
+   check(display != EGL_NO_DISPLAY, "GBM platform display");
+   if (display != EGL_NO_DISPLAY && !gles2_context(display, NULL))
+      display = EGL_NO_DISPLAY;
+   gbm_case(device, display, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING, "linear rendering");
+   gbm_case(device, display, GBM_BO_USE_LINEAR | GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING,
+            "linear scanout");
+   if (display != EGL_NO_DISPLAY)
+      eglTerminate(display);
+   p_gbm_device_destroy(device);
+   close(fd);
+   return failures != 0;
+}
+
+int
+main(int argc, char **argv)
+{
+   if (argc != 3 || (strcmp(argv[1], "egl") && strcmp(argv[1], "gbm"))) {
+      fprintf(stderr, "usage: %s egl|gbm DRM-NODE\n", argv[0]);
+      return 2;
+   }
+   int result = !strcmp(argv[1], "egl") ? run_egl(argv[2]) : run_gbm(argv[2]);
+   puts(result ? "FAIL" : "PASS");
+   return result;
+}
