@@ -79,6 +79,37 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+/* Accesses component c of a lowered buffer operation at start. */
+static nir_def *
+buffer_component(nir_builder *b, nir_intrinsic_instr *i, nir_def *start, unsigned c)
+{
+   nir_def *address = nir_build_addr_iadd_imm(b, start, nir_address_format_2x32bit_global,
+                                              nir_var_mem_global, c * 4);
+   switch (i->intrinsic) {
+   case nir_intrinsic_store_ssbo:
+      nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), address,
+                            .align_mul = 4, .access = nir_intrinsic_access(i));
+      return NULL;
+   case nir_intrinsic_ssbo_atomic_swap:
+      return nir_global_atomic_swap_2x32(b, 32, address, i->src[2].ssa, i->src[3].ssa,
+         .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
+   case nir_intrinsic_ssbo_atomic:
+      return nir_global_atomic_2x32(b, 32, address, i->src[2].ssa,
+         .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
+   default:
+      return nir_load_global_2x32(b, 1, 32, address, .align_mul = 4, .access = nir_intrinsic_access(i));
+   }
+}
+
+/* Whether bytes offset..offset + width fit in range. Subtract from the range
+ * before comparing: offset + width may wrap. */
+static nir_def *
+buffer_inside(nir_builder *b, nir_def *range, nir_def *offset, unsigned width)
+{
+   return nir_iand(b, nir_uge_imm(b, range, width),
+                   nir_uge(b, nir_iadd_imm(b, range, -(int)width), offset));
+}
+
 static bool
 lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
@@ -111,41 +142,40 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
          .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
    if (size) {
       nir_def_rewrite_uses(&i->def, words[2]);
-   } else {
-      nir_def *base = nir_vec2(b, words[0], words[1]);
-      nir_def *offset = i->src[store ? 2 : 1].ssa;
-      nir_def *values[4];
-      for (unsigned c = 0; c < i->num_components; c++) {
-         if (store && !(nir_intrinsic_write_mask(i) & (1u << c)))
-            continue;
-         /* Subtract from the range before comparing: offset + width may wrap. */
-         nir_def *inside = nir_iand(b, nir_uge_imm(b, words[2], c * 4 + 4),
-            nir_uge(b, nir_iadd_imm(b, words[2], -(int)(c * 4 + 4)), offset));
-         nir_push_if(b, inside);
-         nir_def *address = nir_build_addr_iadd(b, base, nir_address_format_2x32bit_global,
-            nir_var_mem_global, nir_iadd_imm(b, offset, c * 4));
-         nir_def *loaded = NULL;
-         if (store)
-            nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c), address,
-                                 .align_mul = 4, .access = nir_intrinsic_access(i));
-         else if (swap)
-            loaded = nir_global_atomic_swap_2x32(b, 32, address, i->src[2].ssa, i->src[3].ssa,
-               .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
-         else if (atomic)
-            loaded = nir_global_atomic_2x32(b, 32, address, i->src[2].ssa,
-               .atomic_op = nir_intrinsic_atomic_op(i), .access = nir_intrinsic_access(i));
-         else
-            loaded = nir_load_global_2x32(b, 1, 32, address,
-                                        .align_mul = 4, .access = nir_intrinsic_access(i));
-         nir_push_else(b, NULL);
-         nir_def *zero = nir_imm_int(b, 0);
-         nir_pop_if(b, NULL);
-         if (!store)
-            values[c] = nir_if_phi(b, loaded, zero);
-      }
-      if (!store)
-         nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
+      nir_instr_remove(&i->instr);
+      return true;
    }
+   nir_def *offset = i->src[store ? 2 : 1].ssa;
+   nir_def *start = nir_build_addr_iadd(b, nir_vec2(b, words[0], words[1]),
+      nir_address_format_2x32bit_global, nir_var_mem_global, offset);
+   unsigned mask = store ? nir_intrinsic_write_mask(i) : BITFIELD_MASK(i->num_components);
+   unsigned count = util_last_bit(mask);
+   nir_def *whole[4], *values[4];
+   /* A vector wholly inside the range takes one branch-free path. Others,
+    * including the zero-range null sentinel, bound each component. */
+   if (count > 1) {
+      nir_push_if(b, buffer_inside(b, words[2], offset, count * 4));
+      u_foreach_bit(c, mask)
+         whole[c] = buffer_component(b, i, start, c);
+      nir_push_else(b, NULL);
+   }
+   u_foreach_bit(c, mask) {
+      nir_push_if(b, buffer_inside(b, words[2], offset, c * 4 + 4));
+      nir_def *loaded = buffer_component(b, i, start, c);
+      nir_push_else(b, NULL);
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_pop_if(b, NULL);
+      if (!store)
+         values[c] = nir_if_phi(b, loaded, zero);
+   }
+   if (count > 1) {
+      nir_pop_if(b, NULL);
+      if (!store)
+         for (unsigned c = 0; c < count; c++)
+            values[c] = nir_if_phi(b, whole[c], values[c]);
+   }
+   if (!store)
+      nir_def_rewrite_uses(&i->def, nir_vec(b, values, i->num_components));
    nir_instr_remove(&i->instr);
    return true;
 }
