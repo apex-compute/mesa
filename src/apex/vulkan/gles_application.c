@@ -422,8 +422,13 @@ run_caps(const char *node)
    const EGLint es3[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE};
    EGLContext context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, es3);
    printf("     GLES 3 context: %s\n", context != EGL_NO_CONTEXT ? "created" : "unavailable");
-   if (context != EGL_NO_CONTEXT)
+   if (context != EGL_NO_CONTEXT) {
+      if (eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context))
+         printf("     GLES VERSION %s\n     GLSL ES %s\n", glGetString(GL_VERSION),
+                glGetString(GL_SHADING_LANGUAGE_VERSION));
+      eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
       eglDestroyContext(display, context);
+   }
    const EGLint es2[] = {EGL_CONTEXT_MAJOR_VERSION, 2, EGL_NONE};
    context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, es2);
    if (context != EGL_NO_CONTEXT && eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)) {
@@ -444,7 +449,8 @@ run_caps(const char *node)
       return 1;
    const GLubyte *(*get_string)(GLenum) = (const GLubyte *(*)(GLenum))eglGetProcAddress("glGetString");
    const char *extensions = (const char *)get_string(GL_EXTENSIONS);
-   printf("     GL_RENDERER %s\n     GL_VERSION  %s\n", get_string(GL_RENDERER), get_string(GL_VERSION));
+   printf("     GL_RENDERER %s\n     GL_VERSION  %s\n     GLSL        %s\n", get_string(GL_RENDERER),
+          get_string(GL_VERSION), get_string(GL_SHADING_LANGUAGE_VERSION));
    for (unsigned i = 0; i < sizeof(es30_extensions) / sizeof(es30_extensions[0]); i++)
       if (!extension(extensions, es30_extensions[i]))
          printf("     missing for GLES 3.0 / GL 3.x: %s\n", es30_extensions[i]);
