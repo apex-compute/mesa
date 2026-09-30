@@ -1,0 +1,12 @@
+#version 450
+// A non-uniform descriptor index runs one pass per distinct descriptor.
+#extension GL_EXT_nonuniform_qualifier : require
+layout(local_size_x = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer Source { uint v[]; } sources[3];
+layout(std430, set = 0, binding = 3) buffer Destination { uint v[]; } destination;
+void main()
+{
+   uint l = gl_LocalInvocationIndex;
+   uint which = l % 3u;
+   destination.v[l] = sources[nonuniformEXT(which)].v[l] + sources[nonuniformEXT(which)].v.length();
+}

@@ -466,6 +466,32 @@ static void test_spill(const char *dir)
    apex_compile_result_finish(&r);
 }
 
+/* waterfall.comp: three buffers selected per lane. */
+static void test_waterfall(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "waterfall.comp.spv", &r);
+   struct world w = {0};
+   uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+   uint8_t *src = region(&w, 0x200000, 3 * 256);
+   uint8_t *dst = region(&w, 0x300000, 64);
+   for (unsigned b = 0; b < 3; b++) {
+      for (unsigned k = 0; k < 16; k++)
+         put(src + 256 * b + 4 * k, 1000 * (b + 1) + k);
+      buffer_descriptor(root + slot(0, b), 0x200000 + 256 * b, 64 + 16 * b);
+   }
+   buffer_descriptor(root + slot(0, 3), 0x300000, 64);
+   uint32_t user[16];
+   root_user(user);
+   run(&r, &w, user, 1, NULL);
+   for (unsigned l = 0; l < 16; l++) {
+      unsigned b = l % 3;
+      CHECK(get(dst + 4 * l) == 1000 * (b + 1) + l + (64 + 16 * b) / 4);
+   }
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
 /* discard.frag and demote.frag: quads 2-3 have v.x above 0.45. */
 static void test_kill(const char *dir, const char *name, bool demote)
 {
@@ -518,6 +544,7 @@ int main(int argc, char **argv)
    test_fragment(argv[1], "compositor.frag.spv", true, true);
    test_features(argv[1]);
    test_spill(argv[1]);
+   test_waterfall(argv[1]);
    test_kill(argv[1], "discard.frag.spv", false);
    test_kill(argv[1], "demote.frag.spv", true);
    test_gnome(argv[2]);

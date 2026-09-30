@@ -60,6 +60,8 @@ int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_
       .SampledImageArrayDynamicIndexing = true, .StorageBufferArrayDynamicIndexing = true,
       .UniformBufferArrayDynamicIndexing = true, .ShaderNonUniform = true,
       .RuntimeDescriptorArray = true, .ImageGatherExtended = true, .MinLod = true,
+      .StorageBufferArrayNonUniformIndexing = true, .UniformBufferArrayNonUniformIndexing = true,
+      .SampledImageArrayNonUniformIndexing = true, .StorageImageArrayNonUniformIndexing = true,
       .Sampled1D = true, .Image1D = true, .MultiView = true,
       .SampleRateShading = true, .InputAttachment = true, .DrawParameters = true,
    };

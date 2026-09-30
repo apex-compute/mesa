@@ -54,7 +54,6 @@ struct ctx {
    uint32_t out[48];
    uint8_t out_written[48];
    int8_t input_index[VARYING_SLOT_MAX];
-   bool terminates, demotes;
    struct apex_header header;
    bool failed;
    char *diagnostic;
@@ -207,10 +206,6 @@ static uint32_t define(struct ctx *c, nir_def *d, bool vec)
 static void alias(struct ctx *c, nir_def *d, uint32_t operand)
 {
    c->defs[d->index] = (struct def_map){operand & 0xffffff, (operand >> 24) & 7};
-}
-static uint32_t dst(struct ctx *c, nir_def *d, unsigned comp)
-{
-   return def_operand(c, d, comp);
 }
 static bool vec_def(struct ctx *c, nir_def *d) { return c->vector[d->index]; }
 
