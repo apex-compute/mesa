@@ -30,6 +30,10 @@ bool restart_at(uint position)
 {
    uint bytes = draw(APEX_DRAW_INDEX + 2u);
    uint byte = (position + draw(APEX_DRAW_FIRST_VERTEX)) * bytes;
+   // Indices beyond the bound size read zero.
+   uint bound = draw(APEX_DRAW_INDEX_SIZE);
+   if (bound < bytes || byte > bound - bytes)
+      return false;
    uint word = Words(address(APEX_DRAW_INDEX) + uint64_t(byte & ~3u)).w[0];
    uint mask = bytes == 4u ? ~0u : bytes == 2u ? 0xffffu : 0xffu;
    return ((word >> ((byte & 3u) * 8u)) & mask) == mask;

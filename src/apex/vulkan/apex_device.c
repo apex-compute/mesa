@@ -885,19 +885,35 @@ apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo 
    return VK_SUCCESS;
 }
 
-static VKAPI_ATTR void VKAPI_CALL
-apex_GetImageSubresourceLayout(VkDevice dev, VkImage handle,
-   const VkImageSubresource *subresource, VkSubresourceLayout *out)
+static void
+subresource_layout(const struct apex_image *image, const VkImageSubresource *subresource,
+                   VkSubresourceLayout2 *out)
 {
-   VK_FROM_HANDLE(apex_image, image, handle);
    unsigned l = subresource->mipLevel;
-   *out = (VkSubresourceLayout) {
+   out->subresourceLayout = (VkSubresourceLayout) {
       .offset = image->levels[l].offset + (uint64_t)image->levels[l].slice_stride * subresource->arrayLayer,
       .size = image->levels[l].slice_stride,
       .rowPitch = image->levels[l].row_stride,
       .arrayPitch = image->levels[l].slice_stride,
       .depthPitch = image->levels[l].slice_stride,
    };
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_GetImageSubresourceLayout2(VkDevice dev, VkImage handle,
+   const VkImageSubresource2 *subresource, VkSubresourceLayout2 *out)
+{
+   subresource_layout(apex_image_from_handle(handle), &subresource->imageSubresource, out);
+}
+
+/* The layout an image of these parameters would have. */
+static VKAPI_ATTR void VKAPI_CALL
+apex_GetDeviceImageSubresourceLayout(VkDevice dev, const VkDeviceImageSubresourceInfo *info,
+                                     VkSubresourceLayout2 *out)
+{
+   struct apex_image image;
+   image_layout(info->pCreateInfo, &image);
+   subresource_layout(&image, &info->pSubresource->imageSubresource, out);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -2158,6 +2174,7 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
       draw[APEX_DRAW_INDEX + 1] = cmd->index.va >> 32;
       draw[APEX_DRAW_INDEX + 2] = cmd->index.bytes;
       draw[APEX_DRAW_INDEX + 3] = vertex_offset;
+      draw[APEX_DRAW_INDEX_SIZE] = MIN2(cmd->index.size, UINT32_MAX);
       draw[APEX_DRAW_RESTART] = dyn->ia.primitive_restart_enable;
    }
    for (unsigned k = 0; k < APEX_DRAW_MAX_COLOR; k++) {
@@ -3678,7 +3695,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .GetDeviceImageMemoryRequirements = apex_GetDeviceImageMemoryRequirements,
       .GetImageMemoryRequirements2 = apex_GetImageMemoryRequirements2,
       .BindImageMemory2 = apex_BindImageMemory2,
-      .GetImageSubresourceLayout = apex_GetImageSubresourceLayout,
+      .GetImageSubresourceLayout2 = apex_GetImageSubresourceLayout2,
+      .GetDeviceImageSubresourceLayout = apex_GetDeviceImageSubresourceLayout,
       .CreateImageView = apex_CreateImageView, .DestroyImageView = apex_DestroyImageView,
       .CreateSampler = apex_CreateSampler, .DestroySampler = apex_DestroySampler,
       .CreateQueryPool = apex_CreateQueryPool, .DestroyQueryPool = apex_DestroyQueryPool,
