@@ -76,12 +76,12 @@ static bool is_vec(struct ctx *c, uint32_t operand)
 {
    if (!(operand >> 31))
       return (operand >> 30) & 1 && (operand & 0xff) < APEX_SCALAR;
-   return util_dynarray_element(&c->values, struct apex_value, operand & 0xffffff)->cls;
+   return util_dynarray_element(&c->values, struct apex_value, apex_val_id(operand))->cls;
 }
-static unsigned width_of(uint32_t operand) { return ((operand >> 27) & 7) + 1; }
+static unsigned width_of(uint32_t operand) { return operand >> 31 ? apex_val_n(operand) : 1; }
 static uint32_t sub(uint32_t operand, unsigned off, unsigned n)
 {
-   return apex_val(operand & 0xffffff, ((operand >> 24) & 7) + off, n);
+   return apex_val(apex_val_id(operand), apex_val_off(operand) + off, n);
 }
 
 static unsigned emit(struct ctx *c, unsigned op, uint32_t d, uint32_t a, uint32_t b, uint32_t cc,
@@ -205,7 +205,7 @@ static uint32_t define(struct ctx *c, nir_def *d, bool vec)
 }
 static void alias(struct ctx *c, nir_def *d, uint32_t operand)
 {
-   c->defs[d->index] = (struct def_map){operand & 0xffffff, (operand >> 24) & 7};
+   c->defs[d->index] = (struct def_map){apex_val_id(operand), apex_val_off(operand)};
 }
 static bool vec_def(struct ctx *c, nir_def *d) { return c->vector[d->index]; }
 
@@ -517,7 +517,7 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
    case nir_op_pack_64_2x32_split: {
       uint32_t lo = alu_src(c, a, 0), hi = alu_src(c, a, 1);
       if (hi == sub(lo, 1, 1) && is_vec(c, lo) == vec) {
-         alias(c, d, apex_val(lo & 0xffffff, (lo >> 24) & 7, 2));
+         alias(c, d, sub(lo, 0, 2));
          return;
       }
       uint32_t g = define(c, d, vec);
@@ -775,7 +775,7 @@ static void waterfall_end(struct ctx *c, struct waterfall *w)
 static uint32_t vector_data(struct ctx *c, nir_src s, unsigned n)
 {
    uint32_t first = src(c, s, 0);
-   uint32_t g = apex_val(first & 0xffffff, (first >> 24) & 7, n);
+   uint32_t g = sub(first, 0, n);
    if (is_vec(c, first) && s.ssa->num_components == n)
       return g;
    return copy(c, true, g);
@@ -784,9 +784,9 @@ static uint32_t vector_data(struct ctx *c, nir_src s, unsigned n)
 /* An even-aligned pair: a whole two-dword value, else a copy. */
 static uint32_t pair_value(struct ctx *c, uint32_t x)
 {
-   uint32_t id = x & 0xffffff;
-   uint32_t p = apex_val(id, (x >> 24) & 7, 2);
-   if (!((x >> 24) & 7) && util_dynarray_element(&c->values, struct apex_value, id)->width == 2)
+   uint32_t id = apex_val_id(x);
+   uint32_t p = sub(x, 0, 2);
+   if (!apex_val_off(x) && util_dynarray_element(&c->values, struct apex_value, id)->width == 2)
       return p;
    return copy(c, is_vec(c, x), p);
 }
@@ -833,7 +833,8 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
 {
    unsigned n = store ? i->src[0].ssa->num_components : atomic ? 1 : i->def.num_components;
    unsigned bits = store ? i->src[0].ssa->bit_size : i->def.bit_size;
-   if (bits != 32 || n > 4 || (atomic && n != 1)) {
+   /* Loads up to 16 dwords (scalar loads, or four-dword vector pieces). */
+   if (bits != 32 || n > (store || atomic ? 4 : 16) || (atomic && n != 1)) {
       failf(c, "unsupported memory access width: ", nir_intrinsic_infos[i->intrinsic].name);
       return;
    }
@@ -967,9 +968,12 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       emit(c, op, vector_data(c, i->src[0], n), a, b, 0, hi);
    } else {
       uint32_t d = fall ? value(c, true, n) : define(c, &i->def, true);
-      emit(c, op, d, a, b, 0, hi);
-      if (reorder)
-         last(c)->flags = APEX_REORDER;
+      for (unsigned k = 0; k < n; k += 4) {
+         unsigned piece = MIN2(n - k, 4);
+         emit(c, op, sub(d, k, piece), a, b, 0, mem_hi(imm + 4 * k, piece - 1));
+         if (reorder)
+            last(c)->flags = APEX_REORDER;
+      }
       if (fall) {
          uint32_t r = define(c, &i->def, true);
          emit(c, APEX_COPY, r, d, 0, 0, 0);
@@ -1238,26 +1242,19 @@ static unsigned tex_dim(nir_tex_instr *t)
    default: return 7;
    }
 }
-static uint32_t texture_slot(struct ctx *c, nir_tex_instr *t, bool sampler)
+/* Image (backend1) and sampler (backend2) descriptors: eight scalar dwords. */
+static uint32_t texture_descriptor(struct ctx *c, nir_tex_instr *t, bool sampler)
 {
-   int k = nir_tex_instr_src_index(t, sampler ? nir_tex_src_sampler_deref : nir_tex_src_texture_deref);
-   if (k < 0)
-      k = nir_tex_instr_src_index(t, nir_tex_src_texture_deref);
-   if (k < 0) {
-      failf(c, "texture without a deref", NULL);
+   int k = nir_tex_instr_src_index(t, sampler ? nir_tex_src_backend2 : nir_tex_src_backend1);
+   if (k < 0 || t->src[k].src.ssa->num_components != 8) {
+      failf(c, "texture without descriptors", NULL);
       return 0;
    }
-   nir_deref_instr *deref = nir_src_as_deref(t->src[k].src);
-   nir_variable *var = nir_deref_instr_get_variable(deref);
-   unsigned slot = 64 * (1 + 256 * var->data.descriptor_set + var->data.binding);
-   uint32_t offset = 0;
-   if (deref->deref_type == nir_deref_type_array) {
-      if (nir_src_is_const(deref->arr.index))
-         slot += 64 * nir_src_as_uint(deref->arr.index);
-      else
-         offset = scalar(c, op2(c, APEX_S_SHL, false, scalar(c, src(c, deref->arr.index, 0)), constant(c, 6)));
+   if (t->src[k].src.ssa->divergent) {
+      failf(c, "non-uniform texture index", NULL);
+      return 0;
    }
-   return s_load(c, APEX_S_LOAD, root(c), offset, slot + (sampler ? 32 : 0), 8);
+   return scalar(c, sub(src(c, t->src[k].src, 0), 0, 8));
 }
 static void emit_tex(struct ctx *c, nir_tex_instr *t)
 {
@@ -1266,7 +1263,7 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
       failf(c, "unsupported texture dimensionality", NULL);
       return;
    }
-   uint32_t image = texture_slot(c, t, false);
+   uint32_t image = texture_descriptor(c, t, false);
    if (t->op == nir_texop_txs || t->op == nir_texop_query_levels) {
       uint32_t g = define(c, &t->def, false);
       if (t->op == nir_texop_query_levels) {
@@ -1380,7 +1377,7 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
    uint32_t coord_group = value(c, true, count);
    for (unsigned k = 0; k < count; k++)
       emit(c, APEX_COPY, sub(coord_group, k, 1), parts[k], 0, 0, 0);
-   uint32_t sampler = fetch ? 0 : texture_slot(c, t, true);
+   uint32_t sampler = fetch ? 0 : texture_descriptor(c, t, true);
    unsigned results = util_bitcount(mask);
    uint32_t out = value(c, true, results);
    emit(c, fetch ? APEX_IMAGE_FETCH : APEX_IMAGE_SAMPLE, out, coord_group, image, sampler, hi);
@@ -1919,6 +1916,35 @@ static bool lower_slots(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+/* Standalone textures read their image and sampler descriptors from the
+ * slot in NIR, so CSE and LICM share and hoist them. */
+static bool lower_texture_slots(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *t = nir_instr_as_tex(instr);
+   int k = nir_tex_instr_src_index(t, nir_tex_src_texture_deref);
+   if (k < 0)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(t->src[k].src);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   b->cursor = nir_before_instr(instr);
+   nir_def *slot = nir_imm_int(b, 64 * (1 + 256 * var->data.descriptor_set + var->data.binding));
+   if (deref->deref_type == nir_deref_type_array)
+      slot = nir_iadd(b, slot, nir_imul_imm(b, deref->arr.index.ssa, 64));
+   nir_def *words[2];
+   for (unsigned d = 0; d < 2; d++)
+      words[d] = nir_load_ssbo(b, 8, 32, nir_imm_int(b, 0), nir_iadd_imm(b, slot, 32 * d),
+         .align_mul = 32, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
+   nir_tex_instr_remove_src(t, k);
+   int s = nir_tex_instr_src_index(t, nir_tex_src_sampler_deref);
+   if (s >= 0)
+      nir_tex_instr_remove_src(t, s);
+   nir_tex_instr_add_src(t, nir_tex_src_backend1, words[0]);
+   nir_tex_instr_add_src(t, nir_tex_src_backend2, words[1]);
+   return true;
+}
+
 static bool subword_roundtrip(const nir_instr *instr, const void *data)
 {
    if (instr->type != nir_instr_type_alu)
@@ -1981,7 +2007,8 @@ access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits, uint32_t align_mul
    if (align < 4)
       return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32, .align = 4,
                                          .shift = nir_mem_access_shift_method_scalar};
-   return (nir_mem_access_size_align){.num_components = MIN2(bytes / 4, 4) ? MIN2(bytes / 4, 4) : 1,
+   unsigned limit = (access & ACCESS_CAN_REORDER) || op == nir_intrinsic_load_ubo ? 16 : 4;
+   return (nir_mem_access_size_align){.num_components = MAX2(MIN2(bytes / 4, limit), 1),
                                       .bit_size = 32, .align = 4,
                                       .shift = nir_mem_access_shift_method_scalar};
 }
@@ -1991,7 +2018,11 @@ static bool vectorize(unsigned align_mul, unsigned align_offset, unsigned bit_si
                       unsigned num_components, int64_t hole_size, nir_intrinsic_instr *low,
                       nir_intrinsic_instr *high, void *data)
 {
-   return bit_size == 32 && num_components <= 4 && hole_size <= 0 &&
+   /* Read-only loads may become wide scalar loads. */
+   bool constant = nir_intrinsic_infos[low->intrinsic].has_dest &&
+                   (low->intrinsic == nir_intrinsic_load_ubo ||
+                    (nir_intrinsic_has_access(low) && (nir_intrinsic_access(low) & ACCESS_CAN_REORDER)));
+   return bit_size == 32 && num_components <= (constant ? 16 : 4) && hole_size <= 0 &&
           nir_combined_align(align_mul, align_offset) >= 4;
 }
 
@@ -2098,6 +2129,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global, nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_launch, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_slots, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_texture_slots, nir_metadata_control_flow, NULL);
    const nir_lower_mem_access_bit_sizes_options mem = {
       .callback = access_size,
       .modes = nir_var_mem_global | nir_var_function_temp | nir_var_mem_ssbo | nir_var_mem_ubo |

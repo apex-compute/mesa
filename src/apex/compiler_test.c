@@ -184,7 +184,9 @@ int main(int argc, char **argv)
       nir_pop_if(l, NULL);
       nir_store_var(l, index, nir_iadd_imm(l, iteration, 1), 1);
       nir_pop_loop(l, NULL);
-      CHECK(apex_from_nir(s, &a) == 0);
+      if (apex_from_nir(s, &a))
+         fprintf(stderr, "%s\n", a.diagnostic);
+      CHECK(a.data);
       unsigned loads = 0;
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {

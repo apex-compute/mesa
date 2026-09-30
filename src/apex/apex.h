@@ -69,10 +69,15 @@ enum apex_pseudo { APEX_CONST = 0x100, APEX_COPY = 0x101, APEX_LABEL = 0x102 };
 struct apex_op { uint32_t op, f[4], hi, imm, flags; };
 /* cls: 0 scalar, 1 vector; width in dwords. Value 0 is reserved. */
 struct apex_value { uint8_t cls, width; };
+/* Operands: a value (bit 31; dwords off..off+n-1 of value id, n <= 16), a
+ * physical operand code (bit 30) or a raw field (bit 29). */
 static inline uint32_t apex_val(uint32_t id, unsigned off, unsigned n)
 {
-   return 1u << 31 | (n - 1) << 27 | off << 24 | id;
+   return 1u << 31 | (n - 1) << 27 | off << 23 | id;
 }
+static inline uint32_t apex_val_id(uint32_t x) { return x & 0x7fffff; }
+static inline unsigned apex_val_off(uint32_t x) { return (x >> 23) & 15; }
+static inline unsigned apex_val_n(uint32_t x) { return ((x >> 27) & 15) + 1; }
 static inline uint32_t apex_phys(unsigned code) { return 1u << 30 | code; }
 static inline uint32_t apex_raw(unsigned v) { return 1u << 29 | v; }
 #define APEX_SCALAR 128u

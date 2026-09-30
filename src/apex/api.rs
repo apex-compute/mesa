@@ -54,9 +54,9 @@ fn operand(x: u32) -> Opnd {
     if x == 0 {
         Opnd::None
     } else if x >> 31 != 0 {
-        Opnd::Val { id: x & 0xff_ffff, off: ((x >> 24) & 7) as u8, n: ((x >> 27) & 7) as u8 + 1 }
+        Opnd::Val { id: x & 0x7f_ffff, off: ((x >> 23) & 15) as u8, n: ((x >> 27) & 15) as u8 + 1 }
     } else if x >> 30 != 0 {
-        Opnd::Phys { code: x as u8, n: ((x >> 27) & 7) as u8 + 1 }
+        Opnd::Phys { code: x as u8, n: 1 }
     } else {
         Opnd::Raw(x as u8)
     }
