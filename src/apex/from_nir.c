@@ -363,8 +363,14 @@ static int fail(struct apex_compile_result *output, const char *message)
    return 1;
 }
 
+/* Arithmetic leaves only innermost loops: hoisting it out of an enclosing
+ * loop keeps every inner loop's invariants live across all of them. */
 static bool licm_filter(nir_instr *instr, nir_loop *loop, bool dominates_exit)
 {
+   if (instr->type == nir_instr_type_alu)
+      nir_foreach_block_in_cf_node(block, &loop->cf_node)
+         if (nir_block_get_following_loop(block))
+            return false;
    return dominates_exit || nir_instr_can_speculate(instr);
 }
 
