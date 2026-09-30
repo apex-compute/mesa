@@ -63,13 +63,18 @@ pub fn compile(
     if source_private % 4 != 0 {
         return Err("unaligned source private size".into());
     }
-    let coalesced;
-    let ops = if ops.iter().all(|o| !matches!(o.op, 4 | 5) || (o.imm as usize) < ops.len()) {
-        coalesced = coalesce(ops)?;
-        &coalesced[..]
+    let mut ops = if ops.iter().all(|o| !matches!(o.op, 4 | 5) || (o.imm as usize) < ops.len()) {
+        coalesce(ops)?
     } else {
-        ops
+        ops.to_vec()
     };
+    // A global load or store immediate is an alias tag, group << 8 | word:
+    // tagged accesses of one group at distinct words never overlap.
+    let tags: Vec<u32> = ops
+        .iter_mut()
+        .map(|o| if matches!(o.op, 0x50 | 0x51) { std::mem::take(&mut o.imm) } else { 0 })
+        .collect();
+    let ops = &ops[..];
     // Masked vector writes preserve inactive lanes in out-of-SSA phi webs.
     // Include every definition/use and enclose backedges before reusing homes.
     let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
@@ -223,8 +228,9 @@ pub fn compile(
         }
     }
     let mut native = Vec::new();
+    let mut native_tags = BTreeMap::new();
     let mut instruction_map = Vec::new();
-    for o in ops {
+    for (o, &tag) in ops.iter().zip(&tags) {
         instruction_map.push(native.len());
         let roles = roles(o.op, o.imm)?;
         if o.op == DEAD || roles[0].is_some() && matches!(homes[&o.args[0]], Home::Remat(_)) {
@@ -372,6 +378,9 @@ pub fn compile(
                 return Err("cannot repair operand banks".into());
             }
         }
+        if tag != 0 {
+            native_tags.insert(native.len(), tag);
+        }
         native.push(i);
         native.extend(stores);
     }
@@ -384,7 +393,7 @@ pub fn compile(
     if native.last().is_none_or(|i| !matches!(i.op, 1 | 2)) {
         native.push(Inst::new(1));
     }
-    let code = schedule::schedule(&native)?;
+    let code = schedule::schedule_tagged(&native, &native_tags)?;
     schedule::validate(&code)?;
     let mut p = Program {
         code,

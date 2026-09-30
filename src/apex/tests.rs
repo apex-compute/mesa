@@ -205,6 +205,27 @@ fn pressure_and_long_chain() {
 }
 
 #[test]
+fn tagged_stores_to_distinct_words_overlap() {
+    let store = |b| Inst {
+        a: 40,
+        b,
+        ..Inst::new(0x51)
+    };
+    let input = [store(1), store(2), store(3), Inst::new(1)];
+    let waits = |tags: &[(usize, u32)]| {
+        let code = schedule::schedule_tagged(&input, &tags.iter().copied().collect()).unwrap();
+        schedule::validate(&code).unwrap();
+        code.iter().take_while(|i| i.op != 1).filter(|i| i.op == 3).count()
+    };
+    assert_eq!(waits(&[]), 3);
+    // One group, distinct words: only the final drain.
+    assert_eq!(waits(&[(0, 0x100), (1, 0x101), (2, 0x102)]), 1);
+    // The same word, or another group, keeps store order.
+    assert_eq!(waits(&[(0, 0x100), (1, 0x101), (2, 0x101)]), 2);
+    assert_eq!(waits(&[(0, 0x100), (1, 0x201), (2, 0x102)]), 3);
+}
+
+#[test]
 fn copies_coalesce_so_loads_overlap() {
     // Out-of-SSA shape: each load is copied into a register, then read back.
     let ops = [

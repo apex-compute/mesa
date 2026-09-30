@@ -435,6 +435,36 @@ static void register_liveness(nir_function_impl *impl, struct register_liveness 
    }
 }
 
+/* Global addresses root + constant, from nir_build_addr_iadd_imm on a
+ * 2x32 address: lo = root.lo + c, hi = root.hi + carry(lo < root.lo). */
+struct address_root { nir_scalar lo, hi; uint32_t offset; };
+
+static struct address_root address_root(nir_def *address)
+{
+   struct address_root r = {nir_scalar_resolved(address, 0), nir_scalar_resolved(address, 1), 0};
+   if (!nir_scalar_is_alu(r.lo) || nir_scalar_alu_op(r.lo) != nir_op_iadd ||
+       !nir_scalar_is_alu(r.hi) || nir_scalar_alu_op(r.hi) != nir_op_iadd)
+      return r;
+   for (unsigned s = 0; s < 2; s++) {
+      nir_scalar base = nir_scalar_chase_alu_src(r.lo, s), constant = nir_scalar_chase_alu_src(r.lo, !s);
+      if (!nir_scalar_is_const(constant))
+         continue;
+      for (unsigned t = 0; t < 2; t++) {
+         nir_scalar carry = nir_scalar_chase_alu_src(r.hi, !t);
+         if (!nir_scalar_is_alu(carry) || nir_scalar_alu_op(carry) != nir_op_b2i32)
+            continue;
+         nir_scalar below = nir_scalar_chase_alu_src(carry, 0);
+         if (!nir_scalar_is_alu(below) || nir_scalar_alu_op(below) != nir_op_ult32 ||
+             !nir_scalar_equal(nir_scalar_chase_alu_src(below, 0), r.lo) ||
+             !nir_scalar_equal(nir_scalar_chase_alu_src(below, 1), base))
+            continue;
+         return (struct address_root){base, nir_scalar_chase_alu_src(r.hi, t),
+                                      nir_scalar_as_uint(constant)};
+      }
+   }
+   return r;
+}
+
 struct loop_masks { uint32_t live, iteration; struct loop_masks *parent; };
 struct control_state {
    struct util_dynarray *ops;
@@ -443,6 +473,7 @@ struct control_state {
    struct loop_masks *loop;
    struct apex_compile_result *output;
    struct register_liveness registers;
+   uint32_t groups;
 };
 static bool emit_block(struct util_dynarray *ops, nir_block *block, uint32_t *temporary,
                        struct control_state *control);
@@ -642,6 +673,7 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
    struct util_dynarray ops = *output;
    uint32_t temporary = *next_temporary;
    bool result = true;
+   struct { nir_scalar lo[16], hi[16]; uint32_t group[16]; unsigned count; } roots = {0};
    {
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
@@ -894,8 +926,26 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
                    (store && nir_intrinsic_write_mask(i) != 1)) goto unsupported;
                uint32_t pair = temporary++;
                emit(&ops, 0xf1, pair, value(address, 0), value(address, 1), 0, 0);
+               /* Accesses in one block at distinct words from one root address
+                * share a group; the scheduler need not order them. */
+               struct address_root root = address_root(address);
+               uint32_t tag = 0;
+               if (root.offset % 4 == 0 && root.offset < 1024) {
+                  unsigned g = 0;
+                  while (g < roots.count && (!nir_scalar_equal(roots.lo[g], root.lo) ||
+                                             !nir_scalar_equal(roots.hi[g], root.hi)))
+                     g++;
+                  if (g == roots.count && g < ARRAY_SIZE(roots.lo)) {
+                     roots.lo[g] = root.lo;
+                     roots.hi[g] = root.hi;
+                     roots.group[g] = ++control->groups;
+                     roots.count++;
+                  }
+                  if (g < roots.count && roots.group[g] < (1u << 24))
+                     tag = roots.group[g] << 8 | root.offset / 4;
+               }
                emit(&ops, store ? 0x51 : 0x50, store ? 0 : value(&i->def, 0), pair,
-                    store ? value(i->src[0].ssa, 0) : 0, 0, 0);
+                    store ? value(i->src[0].ssa, 0) : 0, 0, tag);
                break;
             }
             case nir_intrinsic_load_ssbo:

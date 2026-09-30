@@ -7,6 +7,8 @@ struct Scheduler {
     out: Vec<Inst>,
     ready: BTreeMap<Reg, usize>,
     tokens: [Option<Vec<Reg>>; 4],
+    // Alias tag of each live token's access (see mir::compile).
+    tags: [u32; 4],
     stores: u32,
     // Cycle whose edge writes each scalar register (see scalar_port1_reads).
     edges: BTreeMap<Reg, usize>,
@@ -44,7 +46,7 @@ impl Scheduler {
         self.ready.clear();
         self.edges.clear();
     }
-    fn issue(&mut self, mut i: Inst) {
+    fn issue(&mut self, mut i: Inst, tag: u32) {
         let reads = i.regs(false);
         let writes = i.regs(true);
         let touched: Vec<_> = reads.iter().chain(&writes).copied().collect();
@@ -56,12 +58,16 @@ impl Scheduler {
                 wait |= 1 << t;
             }
         }
-        // Preserve potentially aliasing memory order; independent reads overlap.
+        // Preserve potentially aliasing memory order; independent reads overlap,
+        // as do accesses to distinct words of one tagged group.
         if i.asynchronous() {
+            let distinct = (0..4)
+                .filter(|&t| tag != 0 && self.tags[t] >> 8 == tag >> 8 && self.tags[t] != tag)
+                .fold(0, |m, t| m | 1 << t);
             if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57 | 0x59) {
-                wait |= self.live();
+                wait |= self.live() & !distinct;
             } else {
-                wait |= self.stores;
+                wait |= self.stores & !distinct;
             }
         }
         self.wait(wait);
@@ -88,6 +94,7 @@ impl Scheduler {
             let t = self.tokens.iter().position(Option::is_none).unwrap();
             i.c = t as u8;
             self.tokens[t] = Some(writes.clone());
+            self.tags[t] = tag;
             if matches!(i.op, 0x51 | 0x52 | 0x54 | 0x55 | 0x57 | 0x59) {
                 self.stores |= 1 << t;
             }
@@ -104,6 +111,11 @@ impl Scheduler {
 }
 
 pub fn schedule(input: &[Inst]) -> Result<Vec<Inst>, String> {
+    schedule_tagged(input, &BTreeMap::new())
+}
+
+/// Schedules with alias tags for global accesses, keyed by input index.
+pub fn schedule_tagged(input: &[Inst], tags: &BTreeMap<usize, u32>) -> Result<Vec<Inst>, String> {
     let targets: BTreeSet<usize> = input
         .iter()
         .filter(|i| matches!(i.op, 4 | 5))
@@ -127,7 +139,7 @@ pub fn schedule(input: &[Inst]) -> Result<Vec<Inst>, String> {
         if !i.bank_legal() {
             return Err("allocator left bank conflict".into());
         }
-        s.issue(i);
+        s.issue(i, tags.get(&pc).copied().unwrap_or(0));
         if matches!(i.op, 4 | 5) {
             branches.push(s.out.len() - 1);
         }
