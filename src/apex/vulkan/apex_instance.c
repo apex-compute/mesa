@@ -14,6 +14,8 @@
 #include "util/os_misc.h"
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <xf86drm.h>
 
@@ -254,6 +256,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
    struct vk_sync_type sync_type = vk_drm_syncobj_get_type(fd);
+   /* VK_EXT_physical_device_drm: device numbers of the render and primary nodes. */
+   struct stat render_stat, primary_stat;
+   bool has_render = !fstat(fd, &render_stat);
+   bool has_primary = (drm->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
+                      !stat(drm->nodes[DRM_NODE_PRIMARY], &primary_stat);
    close(fd);
    const uint32_t required_sync = VK_SYNC_FEATURE_BINARY | VK_SYNC_FEATURE_TIMELINE |
                                   VK_SYNC_FEATURE_CPU_WAIT | VK_SYNC_FEATURE_CPU_RESET |
@@ -282,6 +289,14 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
       .EXT_robustness2 = true,
+      .EXT_physical_device_drm = true,
+      /* Foreign ownership transfers, like external ones, need no operation:
+       * jobs serialize and PRIME memory is coherent at submission. */
+      .EXT_queue_family_foreign = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .KHR_maintenance5 = true,
+      .EXT_provoking_vertex = true,
+      .EXT_custom_border_color = true,
+      .EXT_border_color_swizzle = true,
       .EXT_scalar_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_index_type_uint8 = true,
@@ -334,6 +349,16 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .timelineSemaphore = true,
       .robustBufferAccess = true,
       .robustBufferAccess2 = true,
+      /* Null descriptors are zero rows (see write_descriptor). */
+      .nullDescriptor = true,
+      .maintenance5 = true,
+      .provokingVertexLast = true,
+      /* Border colors need no format; they follow the view's component
+       * mapping (apex_texture.c). */
+      .customBorderColors = true,
+      .customBorderColorWithoutFormat = true,
+      .borderColorSwizzle = true,
+      .borderColorSwizzleFromImage = true,
       .scalarBlockLayout = true,
       .samplerMirrorClampToEdge = true,
       .largePoints = true,
@@ -503,6 +528,24 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .storageTexelBufferOffsetAlignmentBytes = 4,
       .uniformTexelBufferOffsetAlignmentBytes = 4,
       .maxBufferSize = APEX_MAX_ALLOCATION,
+      /* VK_KHR_maintenance5: early-test shaders count samples after the
+       * sample mask and multisample coverage; ONE swizzles of depth/stencil
+       * views read one; lines are parallelograms of width 1 only. */
+      .earlyFragmentMultisampleCoverageAfterSampleCounting = false,
+      .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
+      .depthStencilSwizzleOneSupport = true,
+      .polygonModePointSize = false,
+      .nonStrictSinglePixelWideLinesUseParallelogram = true,
+      .nonStrictWideLinesUseParallelogram = false,
+      .provokingVertexModePerPipeline = true,
+      .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+      .maxCustomBorderColorSamplers = 4000,
+      .drmHasRender = has_render,
+      .drmRenderMajor = has_render ? major(render_stat.st_rdev) : 0,
+      .drmRenderMinor = has_render ? minor(render_stat.st_rdev) : 0,
+      .drmHasPrimary = has_primary,
+      .drmPrimaryMajor = has_primary ? major(primary_stat.st_rdev) : 0,
+      .drmPrimaryMinor = has_primary ? minor(primary_stat.st_rdev) : 0,
    };
    /* Opaque-fd compatibility is the flat GEM byte layout, revision 1. */
    memcpy(properties.driverUUID, "Apex GEM bytes 1", VK_UUID_SIZE);

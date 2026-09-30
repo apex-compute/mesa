@@ -19,10 +19,11 @@
 
 static int fault, open_count, last_fd;
 static bool mock, coherent, multiwave, host_coherent;
-static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_RENDER] = "/apex-test/render"};
+/* The render node opens as /dev/null (1:3); the primary node is /dev/zero (1:5). */
+static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_PRIMARY] = "/dev/zero", [DRM_NODE_RENDER] = "/apex-test/render"};
 static drmPciDeviceInfo pci = {.vendor_id = 0x10ee, .device_id = 0xa15e};
 static drmPciBusInfo bus = {.domain = 0x1234, .bus = 7, .dev = 3, .func = 1};
-static drmDevice drm = {.nodes = nodes, .available_nodes = 1 << DRM_NODE_RENDER,
+static drmDevice drm = {.nodes = nodes, .available_nodes = 1 << DRM_NODE_RENDER | 1 << DRM_NODE_PRIMARY,
                         .bustype = DRM_BUS_PCI, .deviceinfo.pci = &pci, .businfo.pci = &bus};
 static drmVersion version = {.name = "apex-display"};
 
@@ -162,9 +163,22 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
       .robustImageAccess2 = VK_TRUE, .nullDescriptor = VK_TRUE,
    };
+   VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .pNext = &robustness,
+   };
+   VkPhysicalDeviceProvokingVertexFeaturesEXT provoking = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .pNext = &maintenance5,
+      .transformFeedbackPreservesProvokingVertex = VK_TRUE,
+   };
+   VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .pNext = &provoking,
+   };
+   VkPhysicalDeviceBorderColorSwizzleFeaturesEXT swizzle = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT, .pNext = &border,
+   };
    VkPhysicalDeviceScalarBlockLayoutFeatures scalar = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
-      .pNext = &robustness,
+      .pNext = &swizzle,
    };
    VkPhysicalDeviceFeatures2 features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &scalar,
@@ -172,10 +186,25 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_features2(physical, &features);
    CHECK(scalar.scalarBlockLayout);
    CHECK(features.features.robustBufferAccess && robustness.robustBufferAccess2);
-   CHECK(!robustness.robustImageAccess2 && !robustness.nullDescriptor);
+   CHECK(!robustness.robustImageAccess2 && robustness.nullDescriptor);
+   CHECK(maintenance5.maintenance5 && provoking.provokingVertexLast &&
+         !provoking.transformFeedbackPreservesProvokingVertex);
+   CHECK(border.customBorderColors && border.customBorderColorWithoutFormat);
+   CHECK(swizzle.borderColorSwizzle && swizzle.borderColorSwizzleFromImage);
    PROC(GetPhysicalDeviceProperties2KHR, get_properties2);
+   VkPhysicalDeviceDrmPropertiesEXT drm_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
+   };
+   VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR, .pNext = &drm_props,
+   };
+   VkPhysicalDeviceProvokingVertexPropertiesEXT provoking_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT,
+      .pNext = &maintenance5_props,
+   };
    VkPhysicalDeviceRobustness2PropertiesEXT robust_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT,
+      .pNext = &provoking_props,
    };
    VkPhysicalDeviceProperties2 properties2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &robust_props,
@@ -183,6 +212,31 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_properties2(physical, &properties2);
    CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 1 &&
          robust_props.robustUniformBufferAccessSizeAlignment == 1);
+   /* Zink matches its DRM fd's render node against these numbers. */
+   CHECK(drm_props.hasRender && drm_props.renderMajor == 1 && drm_props.renderMinor == 3);
+   CHECK(drm_props.hasPrimary && drm_props.primaryMajor == 1 && drm_props.primaryMinor == 5);
+   CHECK(provoking_props.provokingVertexModePerPipeline &&
+         !provoking_props.transformFeedbackPreservesTriangleFanProvokingVertex);
+   CHECK(maintenance5_props.earlyFragmentSampleMaskTestBeforeSampleCounting &&
+         !maintenance5_props.earlyFragmentMultisampleCoverageAfterSampleCounting &&
+         maintenance5_props.depthStencilSwizzleOneSupport && !maintenance5_props.polygonModePointSize &&
+         maintenance5_props.nonStrictSinglePixelWideLinesUseParallelogram &&
+         !maintenance5_props.nonStrictWideLinesUseParallelogram);
+   PROC(EnumerateDeviceExtensionProperties, enumerate_extensions);
+   VkExtensionProperties extensions[128];
+   uint32_t extension_count = ARRAY_SIZE(extensions);
+   CHECK(enumerate_extensions(physical, NULL, &extension_count, extensions) == VK_SUCCESS);
+   const char *zink_extensions[] = {VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,
+      VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+      VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME,
+      VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME};
+   for (unsigned i = 0; i < ARRAY_SIZE(zink_extensions); i++) {
+      bool found = false;
+      for (unsigned e = 0; e < extension_count; e++)
+         found |= !strcmp(extensions[e].extensionName, zink_extensions[i]);
+      /* Foreign queue ownership accompanies dma-buf external memory. */
+      CHECK(found == (i < 5 || coherent));
+   }
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
    get_memory(physical, &mem);
@@ -328,10 +382,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    device_info.enabledExtensionCount = coherent ? 11 : 8;
    device_info.ppEnabledExtensionNames = memory_extensions;
    device_info.pNext = &features;
-   robustness.nullDescriptor = VK_TRUE;
+   robustness.robustImageAccess2 = VK_TRUE;
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(device == VK_NULL_HANDLE && fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
-   robustness.nullDescriptor = VK_FALSE;
+   robustness.robustImageAccess2 = VK_FALSE;
    /* CTS's compute-only robustness helper can duplicate the sole family.
     * Reject that queue list independently of the supported feature chain. */
    const VkDeviceQueueCreateInfo duplicate_queues[] = {queue, queue};
