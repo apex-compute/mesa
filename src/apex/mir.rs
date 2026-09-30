@@ -27,8 +27,14 @@ enum Home {
     Remat(u32),
 }
 
+// MIR-only marker: value args[1] is dead for every lane active here, so the
+// linear liveness of this out-of-SSA register stops at this point.
+const DEAD: u8 = 0xf3;
+
 fn roles(op: u8, imm: u32) -> Result<[Option<(Class, u8)>; 4], String> {
-    if op == 0xf0 {
+    if op == DEAD {
+        Ok([None; 4])
+    } else if op == 0xf0 {
         Ok([Some((Class::V, 2)), Some((Class::V, 1)), None, None])
     } else if op == 0xf1 {
         Ok([
@@ -78,7 +84,7 @@ pub fn compile(
         }
         let roles = roles(o.op, o.imm)?;
         for (field, role) in roles.iter().enumerate() {
-            if role.is_none() && o.args[field] != 0 {
+            if role.is_none() && o.args[field] != 0 && (o.op, field) != (DEAD, 1) {
                 return Err("reserved MIR operand".into());
             }
         }
@@ -221,7 +227,7 @@ pub fn compile(
     for o in ops {
         instruction_map.push(native.len());
         let roles = roles(o.op, o.imm)?;
-        if roles[0].is_some() && matches!(homes[&o.args[0]], Home::Remat(_)) {
+        if o.op == DEAD || roles[0].is_some() && matches!(homes[&o.args[0]], Home::Remat(_)) {
             continue;
         }
         let mut fields = [0; 4];
@@ -584,6 +590,15 @@ fn lifetimes(
     for b in 0..blocks {
         for pc in (starts[b]..starts[b + 1]).rev() {
             let o = &ops[pc];
+            if o.op == DEAD {
+                let i = *index.get(&o.args[1]).ok_or("undefined MIR value")?;
+                if values[&o.args[1]].0 != Class::V {
+                    return Err("MIR type mismatch".into());
+                }
+                clear(&mut gen[b], i);
+                set(&mut killed[b], i);
+                continue;
+            }
             let r = roles(o.op, o.imm)?;
             if r[0].is_some() {
                 let i = index[&o.args[0]];

@@ -345,6 +345,96 @@ global_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits,
    return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32, .align = 4};
 }
 
+/* Per-lane liveness of out-of-SSA registers. NIR's CFG is the logical,
+ * per-lane one: every write kills there, so a register not live on entry to
+ * a loop iteration holds nothing a later lane reads. The backend's linear CFG
+ * cannot see this, because masked writes never kill on it. */
+struct register_liveness {
+   unsigned count, words;
+   nir_def **registers;
+   nir_loop **scope;       /* innermost loop enclosing every access */
+   BITSET_WORD *live_in;   /* per block */
+};
+
+static nir_loop *enclosing_loop(nir_cf_node *node)
+{
+   for (node = node->parent; node; node = node->parent)
+      if (node->type == nir_cf_node_loop)
+         return nir_cf_node_as_loop(node);
+   return NULL;
+}
+
+static nir_loop *common_loop(nir_loop *a, nir_loop *b)
+{
+   for (nir_loop *x = a; x; x = enclosing_loop(&x->cf_node))
+      for (nir_loop *y = b; y; y = enclosing_loop(&y->cf_node))
+         if (x == y)
+            return x;
+   return NULL;
+}
+
+static void register_liveness(nir_function_impl *impl, struct register_liveness *r, void *mem)
+{
+   nir_index_blocks(impl);
+   r->count = 0;
+   nir_foreach_block(block, impl)
+      nir_foreach_instr(instr, block)
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_decl_reg)
+            r->count++;
+   r->words = BITSET_WORDS(MAX2(r->count, 1));
+   r->registers = rzalloc_array(mem, nir_def *, MAX2(r->count, 1));
+   r->scope = rzalloc_array(mem, nir_loop *, MAX2(r->count, 1));
+   bool *seen = rzalloc_array(mem, bool, MAX2(r->count, 1));
+   unsigned *slot = rzalloc_array(mem, unsigned, impl->ssa_alloc);
+   unsigned n = 0;
+   nir_foreach_block(block, impl)
+      nir_foreach_instr(instr, block)
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_decl_reg) {
+            slot[nir_instr_as_intrinsic(instr)->def.index] = n;
+            r->registers[n++] = &nir_instr_as_intrinsic(instr)->def;
+         }
+   unsigned blocks = impl->num_blocks;
+   BITSET_WORD *gen = rzalloc_array(mem, BITSET_WORD, blocks * r->words);
+   BITSET_WORD *kill = rzalloc_array(mem, BITSET_WORD, blocks * r->words);
+   r->live_in = rzalloc_array(mem, BITSET_WORD, blocks * r->words);
+   nir_foreach_block(block, impl) {
+      BITSET_WORD *g = gen + block->index * r->words, *k = kill + block->index * r->words;
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+         if (i->intrinsic != nir_intrinsic_load_reg && i->intrinsic != nir_intrinsic_store_reg)
+            continue;
+         unsigned x = slot[i->src[i->intrinsic == nir_intrinsic_store_reg].ssa->index];
+         nir_loop *loop = enclosing_loop(&block->cf_node);
+         r->scope[x] = seen[x] ? common_loop(r->scope[x], loop) : loop;
+         seen[x] = true;
+         if (i->intrinsic == nir_intrinsic_store_reg)
+            BITSET_SET(k, x);
+         else if (!BITSET_TEST(k, x))
+            BITSET_SET(g, x);
+      }
+   }
+   for (bool changed = true; changed;) {
+      changed = false;
+      nir_foreach_block_reverse(block, impl) {
+         BITSET_WORD *in = r->live_in + block->index * r->words;
+         for (unsigned w = 0; w < r->words; w++) {
+            BITSET_WORD out = 0;
+            for (unsigned s = 0; s < 2; s++)
+               if (block->successors[s] && block->successors[s]->index < blocks)
+                  out |= r->live_in[block->successors[s]->index * r->words + w];
+            BITSET_WORD value = gen[block->index * r->words + w] |
+                                (out & ~kill[block->index * r->words + w]);
+            changed |= value != in[w];
+            in[w] = value;
+         }
+      }
+   }
+}
+
 struct loop_masks { uint32_t live, iteration; struct loop_masks *parent; };
 struct control_state {
    struct util_dynarray *ops;
@@ -352,6 +442,7 @@ struct control_state {
    uint32_t zero, discard;
    struct loop_masks *loop;
    struct apex_compile_result *output;
+   struct register_liveness registers;
 };
 static bool emit_block(struct util_dynarray *ops, nir_block *block, uint32_t *temporary,
                        struct control_state *control);
@@ -530,12 +621,16 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    }
    struct control_state control = { .ops=&ops, .temporary=&temporary,
                                     .zero=temporary++, .discard=temporary++, .output=output };
+   void *liveness = ralloc_context(NULL);
+   register_liveness(impl, &control.registers, liveness);
    if (exec_list_length(&impl->body)>1)
       emit(&ops, 0x10, control.zero, 0, 0, 0, 0);
-   if (!emit_cf(&control, &impl->body)) goto done;
-   nir_validate_shader(nir, "Apex backend boundary");
-   result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op),
-                      nir->info.shared_size, nir->scratch_size, invocations, output);
+   if (emit_cf(&control, &impl->body)) {
+      nir_validate_shader(nir, "Apex backend boundary");
+      result = apex_emit(util_dynarray_begin(&ops), util_dynarray_num_elements(&ops, struct apex_op),
+                         nir->info.shared_size, nir->scratch_size, invocations, output);
+   }
+   ralloc_free(liveness);
 done:
    util_dynarray_fini(&ops);
    return result;
@@ -671,10 +766,17 @@ static bool emit_block(struct util_dynarray *output, nir_block *block,
          } else if (instr->type == nir_instr_type_intrinsic) {
             nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
             switch (i->intrinsic) {
-            case nir_intrinsic_decl_reg:
+            case nir_intrinsic_decl_reg: {
                if (nir_intrinsic_bit_size(i)!=32 || nir_intrinsic_num_components(i)!=1 ||
                    nir_intrinsic_num_array_elems(i)) goto unsupported;
-               emit(&ops,0x20,value(&i->def,0),0,0,0,0); break;
+               /* Zero only registers that a lane may read before writing. */
+               const struct register_liveness *r = &control->registers;
+               for (unsigned x = 0; x < r->count; x++)
+                  if (r->registers[x] == &i->def &&
+                      BITSET_TEST(r->live_in + block->index * r->words, x))
+                     emit(&ops,0x20,value(&i->def,0),0,0,0,0);
+               break;
+            }
             case nir_intrinsic_load_reg:
                if (i->def.num_components!=1) goto unsupported;
                emit(&ops,0x21,value(&i->def,0),value(i->src[0].ssa,0),0,0,0); break;
@@ -884,6 +986,13 @@ static bool emit_cf(struct control_state *c, struct exec_list *list)
          emit(c->ops,6,saved,c->zero,0,0,0);
          emit(c->ops,0x11,masks.live,saved,0,0,0);
          uint32_t header=util_dynarray_num_elements(c->ops,struct apex_op);
+         /* Registers confined to this loop and dead when an iteration begins
+          * end their backend lifetime at the header. */
+         const struct register_liveness *r = &c->registers;
+         unsigned first = nir_loop_first_block(loop)->index;
+         for (unsigned x = 0; x < r->count; x++)
+            if (r->scope[x] == loop && !BITSET_TEST(r->live_in + first * r->words, x))
+               emit(c->ops,0xf3,0,value(r->registers[x],0),0,0,0);
          emit(c->ops,0x11,masks.iteration,masks.live,0,0,0);
          emit(c->ops,6,c->discard,masks.iteration,0,0,0);
          c->loop=&masks;
