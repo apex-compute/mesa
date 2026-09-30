@@ -184,18 +184,19 @@ fn check(ops: &[Op], values: &[Value]) -> Result<(), String> {
 
 /// Replaces single-dword constants by inline codes or the instruction's literal
 /// where the encoding allows, then materializes the rest.
-fn fold_constants(ops: &mut [Op], values: &[Value]) {
-    let mut constant: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
+fn fold_constants(ops: &mut [Op], _values: &[Value]) {
+    // Dwords written once, by a constant: (value, dword) -> (constant, writes).
+    let mut constant: BTreeMap<(u32, u8), (u32, usize)> = BTreeMap::new();
     for o in ops.iter() {
-        if o.op == CONST {
-            if let Opnd::Val { id, .. } = o.f[0] {
-                if values[id as usize].width == 1 {
-                    constant.entry(id).and_modify(|e| e.1 += 1).or_insert((o.imm, 1));
-                }
+        let access = o.access();
+        for f in 0..4 {
+            if !matches!(access[f], Some(Access::Def | Access::DefUse)) {
+                continue;
             }
-        } else {
-            for id in o.defs() {
-                constant.entry(id).and_modify(|e| e.1 += 1).or_insert((0, 2));
+            let Opnd::Val { id, off, n } = o.f[f] else { continue };
+            for k in 0..n {
+                let (v, w) = if o.op == CONST { (o.imm, 1) } else { (0, 2) };
+                constant.entry((id, off + k)).and_modify(|e| e.1 += w).or_insert((v, w));
             }
         }
     }
@@ -203,8 +204,10 @@ fn fold_constants(ops: &mut [Op], values: &[Value]) {
     for o in ops.iter_mut() {
         let Some(code) = o.isa() else {
             if o.op == COPY {
-                if let Some(&(v, _)) = o.f[1].val().and_then(|id| constant.get(&id)) {
-                    o.f[1] = Opnd::Lit(v);
+                if let Opnd::Val { id, off, n: 1 } = o.f[1] {
+                    if let Some(&(v, _)) = constant.get(&(id, off)) {
+                        o.f[1] = Opnd::Lit(v);
+                    }
                 }
             }
             continue;
@@ -216,7 +219,8 @@ fn fold_constants(ops: &mut [Op], values: &[Value]) {
             if !matches!(kinds[f], Kind::Any | Kind::SAny) {
                 continue;
             }
-            let Some(&(v, _)) = o.f[f].val().and_then(|id| constant.get(&id)) else { continue };
+            let Opnd::Val { id, off, n: 1 } = o.f[f] else { continue };
+            let Some(&(v, _)) = constant.get(&(id, off)) else { continue };
             if isa::inline_code(v).is_some() {
                 o.f[f] = Opnd::Lit(v);
             } else if alu && f < 3 && kinds[3] == Kind::None && (o.hi >> 8) & 0x7f == 0
@@ -542,18 +546,22 @@ fn lifetimes(ops: &[Op], values: &[Value]) -> Result<BTreeMap<u32, Interval>, St
                     }))
         })
         .collect();
-    // Partial definitions of a group write only some of its dwords.
-    let partial: Vec<bool> = ids
-        .iter()
-        .map(|id| {
-            ops.iter().any(|o| {
-                let a = o.access();
-                (0..4).any(|f| {
-                    matches!(a[f], Some(Access::Def)) && matches!(o.f[f], Opnd::Val { id: x, n, .. } if x == *id && n < values[*id as usize].width)
-                })
-            })
-        })
-        .collect();
+    // A value accessed only inside one block whose first access writes it
+    // (spill temporaries, groups assembled for one instruction) never carries
+    // lanes or dwords across blocks: its first write ends the previous contents.
+    let mut first: Vec<Option<(usize, usize, bool)>> = vec![None; ids.len()];
+    let mut local = vec![true; ids.len()];
+    for (pc, o) in ops.iter().enumerate() {
+        let a = o.access();
+        for f in 0..4 {
+            let (Some(access), Opnd::Val { id, .. }) = (a[f], o.f[f]) else { continue };
+            let i = index[&id];
+            match first[i] {
+                None => first[i] = Some((pc, block_of[pc], access == Access::Def && !o.uses().any(|u| u == id))),
+                Some((_, b, _)) => local[i] &= b == block_of[pc],
+            }
+        }
+    }
     let set = |bits: &mut Vec<u64>, i: usize| bits[i / 64] |= 1 << (i % 64);
     let clear = |bits: &mut Vec<u64>, i: usize| bits[i / 64] &= !(1 << (i % 64));
     let test = |bits: &Vec<u64>, i: usize| bits[i / 64] >> (i % 64) & 1 != 0;
@@ -563,10 +571,14 @@ fn lifetimes(ops: &[Op], values: &[Value]) -> Result<BTreeMap<u32, Interval>, St
     for b in 0..blocks {
         for pc in (starts[b]..starts[b + 1]).rev() {
             let o = &ops[pc];
-            for d in o.defs() {
-                let i = index[&d];
+            let a = o.access();
+            for f in 0..4 {
+                let (Some(access @ (Access::Def | Access::DefUse)), Opnd::Val { id, n, .. }) = (a[f], o.f[f]) else { continue };
+                let i = index[&id];
                 set(&mut defined[b], i);
-                if kills[i] && !partial[i] && !o.uses().any(|u| u == d) {
+                let full = access == Access::Def && n == values[id as usize].width && !o.uses().any(|u| u == id);
+                let local_start = local[i] && first[i].is_some_and(|(p, _, write)| p == pc && write);
+                if (kills[i] && full) || local_start {
                     clear(&mut gen[b], i);
                     set(&mut killed[b], i);
                 }
@@ -653,8 +665,8 @@ fn alignment(v: &Value) -> u8 {
     }
 }
 
-/// Allocation failure: a message and, for vector pressure, the values live at
-/// the failing point ordered by the end of their intervals (latest first).
+/// Allocation failure: a message and, when spilling, the vector values chosen
+/// to live in private memory.
 struct Pressure {
     message: String,
     live: Vec<u32>,
@@ -670,7 +682,11 @@ impl From<&str> for Pressure {
     }
 }
 
-fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8]) -> Result<(BTreeMap<u32, u8>, Stats), Pressure> {
+/// Linear scan over lifetime hulls. With `spill`, a vector value that finds
+/// no register evicts the live value whose interval ends last (never a spill
+/// temporary in `spill`), and the scan continues to collect every victim.
+fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8],
+            spill: Option<&std::collections::BTreeSet<u32>>) -> Result<(BTreeMap<u32, u8>, Stats), Pressure> {
     let intervals = lifetimes(ops, values)?;
     // Coalescing hints: a copy prefers its source's registers, and values
     // copied into one group prefer consecutive registers.
@@ -709,6 +725,7 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
     order.sort_by_key(|id| (intervals[id].start, !fixed.contains_key(id), *id));
     let mut homes: BTreeMap<u32, u8> = BTreeMap::new();
     let mut active: Vec<u32> = Vec::new();
+    let mut victims: Vec<u32> = Vec::new();
     let mut stats = Stats::default();
     for id in order {
         let v = values[id as usize];
@@ -717,7 +734,7 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
         let limit = if v.class == Class::S { isa::SCALAR_REGISTERS } else { isa::VECTOR_REGISTERS };
         // A value that dies copying itself into this group at its own place does not conflict.
         let into = copies.get(&id);
-        let fits = |r: u8, homes: &BTreeMap<u32, u8>| {
+        let fits = |r: u8, homes: &BTreeMap<u32, u8>, active: &[u32]| {
             r as u32 + v.width as u32 <= limit as u32
                 && r % align[id as usize] == 0
                 && !active.iter().any(|a| {
@@ -730,17 +747,17 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
                 })
         };
         let home = if let Some(&r) = fixed.get(&id) {
-            if !fits(r, &homes) {
+            if !fits(r, &homes, &active) {
                 return Err("launch register conflict".into());
             }
             r
         } else {
             let hinted = hints.get(&id).into_iter().flatten().find_map(|&(other, delta)| {
                 let h = *homes.get(&other)? as i32 + delta;
-                ((0..=255).contains(&h) && fits(h as u8, &homes)).then_some(h as u8)
+                ((0..=255).contains(&h) && fits(h as u8, &homes, &active)).then_some(h as u8)
             });
             // The first member of a group to allocate leaves room for the group.
-            let grouped = || {
+            let grouped = |active: &[u32]| {
                 let &(g, dx) = group_of.get(&id)?;
                 let gw = values[g as usize].width as u32;
                 let ga = align[g as usize] as u32;
@@ -751,19 +768,47 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
                         w.class == v.class && b + k >= h && b + k < h + w.width as u32
                     }));
                     let r = b as i32 + dx;
-                    (free && r >= 0 && fits(r as u8, &homes)).then_some(r as u8)
+                    (free && r >= 0 && fits(r as u8, &homes, &active)).then_some(r as u8)
                 })
             };
-            match hinted.or_else(grouped).or_else(|| (0..limit).find(|&r| fits(r, &homes))) {
+            match hinted.or_else(|| grouped(&active)).or_else(|| (0..limit).find(|&r| fits(r, &homes, &active))) {
                 Some(r) => r,
                 None => {
-                    let mut live: Vec<u32> = active.iter().copied().chain([id]).filter(|a| values[*a as usize].class == v.class).collect();
-                    live.sort_by_key(|a| std::cmp::Reverse(intervals[a].end));
-                    return Err(Pressure {
-                        message: format!("{} register pressure exceeds {} registers",
-                            if v.class == Class::S { "scalar" } else { "vector" }, limit),
-                        live: if v.class == Class::V { live } else { Vec::new() },
-                    });
+                    let message = format!("{} register pressure exceeds {} registers",
+                        if v.class == Class::S { "scalar" } else { "vector" }, limit);
+                    let Some(temps) = spill.filter(|_| v.class == Class::V) else {
+                        return Err(Pressure { message, live: Vec::new() });
+                    };
+                    let spillable = |a: u32| !fixed.contains_key(&a) && !temps.contains(&a)
+                        && values[a as usize].class == Class::V;
+                    // Evict the latest-ending live values until this one fits.
+                    let mut placed = None;
+                    loop {
+                        // A value that cannot spill itself (a spill temporary) evicts any.
+                        let victim = active.iter().copied().filter(|&a| spillable(a))
+                            .max_by_key(|a| intervals[a].end)
+                            .filter(|a| intervals[a].end > iv.end || !spillable(id));
+                        let Some(victim) = victim else { break };
+                        active.retain(|&a| a != victim);
+                        victims.push(victim);
+                        if let Some(r) = (0..limit).find(|&r| fits(r, &homes, &active)) {
+                            placed = Some(r);
+                            break;
+                        }
+                    }
+                    match placed {
+                        Some(r) => r,
+                        None if spillable(id) => {
+                            victims.push(id);
+                            continue;
+                        }
+                        None => {
+                            return Err(Pressure {
+                                message: format!("{message} (value {id}, width {}, {} live)", v.width, active.len()),
+                                live: Vec::new(),
+                            })
+                        }
+                    }
                 }
             }
         };
@@ -771,6 +816,9 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
         active.push(id);
         let count = if v.class == Class::S { &mut stats.scalar } else { &mut stats.vector };
         *count = (*count).max(home as u32 + v.width as u32);
+    }
+    if !victims.is_empty() {
+        return Err(Pressure { message: "vector register pressure exceeds 128 registers".into(), live: victims });
     }
     Ok((homes, stats))
 }
@@ -924,9 +972,15 @@ fn private_pair(ops: &mut Vec<Op>, values: &mut Vec<Value>, fixed: &mut BTreeMap
 fn spill(ops: &mut Vec<Op>, values: &mut Vec<Value>, align: &mut Vec<u8>, victim: u32, slot: u32, base: u32) {
     let width = values[victim as usize].width;
     let mut out = Vec::with_capacity(ops.len() + 8);
-    let memory = |op: u8, t: u32| Op {
-        hi: ((slot * 4) & 0xfffff) | ((width as u32 - 1) << 20),
-        ..Op::new(op as u16, [Opnd::Val { id: t, off: 0, n: width }, Opnd::None, Opnd::Val { id: base, off: 0, n: 2 }, Opnd::None])
+    // Private accesses move at most four dwords.
+    let memory = |out: &mut Vec<Op>, op: u8, t: u32| {
+        for k in (0..width).step_by(4) {
+            let n = (width - k).min(4);
+            out.push(Op {
+                hi: (((slot + k as u32) * 4) & 0xfffff) | ((n as u32 - 1) << 20),
+                ..Op::new(op as u16, [Opnd::Val { id: t, off: k, n }, Opnd::None, Opnd::Val { id: base, off: 0, n: 2 }, Opnd::None])
+            });
+        }
     };
     for mut o in ops.drain(..) {
         let access = o.access();
@@ -962,11 +1016,11 @@ fn spill(ops: &mut Vec<Op>, values: &mut Vec<Value>, align: &mut Vec<u8>, victim
             }
         }
         if reads {
-            out.push(memory(op::SCRATCH_LOAD, t));
+            memory(&mut out, op::SCRATCH_LOAD, t);
         }
         out.push(o);
         if writes {
-            out.push(memory(op::SCRATCH_STORE, t));
+            memory(&mut out, op::SCRATCH_STORE, t);
         }
     }
     *ops = out;
@@ -985,22 +1039,22 @@ pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) ->
     let mut align = align;
     let mut spilled = 0u32;
     let mut private_base = None;
+    // Compute launches spill vector values to private memory.
+    let mut temps = std::collections::BTreeSet::new();
     let (homes, mut stats) = loop {
-        match allocate(&ops, &values, &fixed, &align) {
+        let compute = header.stage == isa::Stage::Compute;
+        match allocate(&ops, &values, &fixed, &align, compute.then_some(&temps)) {
             Ok(result) => break result,
+            Err(p) if p.live.is_empty() => return Err(p.message + " without spilling"),
             Err(p) => {
-                // Compute launches spill vector values to private memory.
-                let victim = p.live.iter().copied().find(|&id| {
-                    !fixed.contains_key(&id) && values[id as usize].width <= 4
-                        && ops.iter().any(|o| o.defs().any(|d| d == id))
-                });
-                let Some(victim) = victim.filter(|_| header.stage == isa::Stage::Compute) else {
-                    return Err(p.message + " without spilling");
-                };
                 let base = *private_base.get_or_insert_with(|| private_pair(&mut ops, &mut values, &mut fixed, &mut align));
-                let slot = header.private / 4 + spilled;
-                spilled += values[victim as usize].width as u32;
-                spill(&mut ops, &mut values, &mut align, victim, slot, base);
+                for victim in p.live {
+                    let slot = header.private / 4 + spilled;
+                    spilled += values[victim as usize].width as u32;
+                    let first = values.len() as u32;
+                    spill(&mut ops, &mut values, &mut align, victim, slot, base);
+                    temps.extend(first..values.len() as u32);
+                }
             }
         }
     };

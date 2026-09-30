@@ -22,6 +22,7 @@ const struct nir_shader_compiler_options apex_nir_options = {
    .lower_pack_32_2x16_split = true, .lower_unpack_32_2x16_split = true,
    .lower_pack_64_2x32 = true, .lower_pack_split = true, .lower_extract_byte = false,
    .has_bitfield_select = true, .has_ldexp = true, .lower_device_index_to_zero = true,
+   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_int64_options = ~0, .lower_doubles_options = ~0,
    .max_unroll_iterations = 32,
 };
@@ -657,7 +658,7 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
    case nir_op_fadd: fp_op(c, a, APEX_V_ADD_F); return;
    case nir_op_fsub: fp_op(c, a, APEX_V_SUB_F); return;
    case nir_op_fmul: fp_op(c, a, APEX_V_MUL_F); return;
-   case nir_op_ffma: fp_op(c, a, APEX_V_FMA_F); return;
+   case nir_op_ffma: case nir_op_ffma_weak: fp_op(c, a, APEX_V_FMA_F); return;
    case nir_op_fmin: fp_op(c, a, APEX_V_MIN_F); return;
    case nir_op_fmax: fp_op(c, a, APEX_V_MAX_F); return;
    case nir_op_ffloor: fp_op(c, a, APEX_V_FLOOR); return;
@@ -1964,6 +1965,15 @@ access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits, uint32_t align_mul
                                       .shift = nir_mem_access_shift_method_scalar};
 }
 
+/* Adjacent dword accesses merge into 64-128-bit lane (or scalar) accesses. */
+static bool vectorize(unsigned align_mul, unsigned align_offset, unsigned bit_size,
+                      unsigned num_components, int64_t hole_size, nir_intrinsic_instr *low,
+                      nir_intrinsic_instr *high, void *data)
+{
+   return bit_size == 32 && num_components <= 4 && hole_size <= 0 &&
+          nir_combined_align(align_mul, align_offset) >= 4;
+}
+
 static int fail(struct apex_compile_result *output, const char *message)
 {
    snprintf(output->diagnostic, sizeof(output->diagnostic), "%s", message);
@@ -2116,6 +2126,18 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_opt_peephole_select, &(nir_opt_peephole_select_options){.limit = 8});
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
+   const nir_load_store_vectorize_options vector_access = {
+      .callback = vectorize,
+      .modes = nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_shared | nir_var_mem_push_const,
+      .bounds_checked_modes = nir_var_mem_ssbo | nir_var_mem_ubo,
+   };
+   bool vectorized = false;
+   NIR_PASS(vectorized, nir, nir_opt_load_store_vectorize, &vector_access);
+   if (vectorized) {
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
