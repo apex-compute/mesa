@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 use crate::isa::{self, Class, Program, Stage};
 use crate::mir::{self, Opnd};
-use crate::sim;
+use crate::model;
 use std::ffi::{c_char, CStr};
 
 #[repr(C)]
@@ -25,6 +25,7 @@ pub struct Header {
     shared: u32,
     private_bytes: u32,
     output: u32,
+    input_count: u32,
     inputs: [u8; 32],
 }
 #[repr(C)]
@@ -103,7 +104,7 @@ pub unsafe extern "C" fn apex_emit(
         p.shared = header.shared;
         p.private = header.private_bytes;
         p.output = header.output;
-        p.inputs = header.inputs;
+        p.inputs = header.inputs[..(header.input_count as usize).min(32)].to_vec();
         let (p, stats) = mir::compile(ops, values, p)?;
         Ok((p.bytes()?, stats))
     })
@@ -138,15 +139,15 @@ pub struct SimWave {
     exec: u32,
     scalar: [u32; 32],
     vector: [[u32; 16]; 72],
-    primitive: [u8; 16],
-    /// `primitives` blocks of 144 components × {P0, P10, P20}.
-    attributes: *const f32,
+    /// `primitives` attribute blocks of `model::BLOCK` dwords.
+    attributes: *const u32,
     primitives: u32,
     exports: [[[u32; 4]; 16]; 10],
     exported: [u32; 10],
 }
 
-/// Test model: runs a compute grid, or one vertex/fragment wave when `wave` is set.
+/// Runs a compute grid, or one vertex/fragment wave when `wave` is set, on
+/// the ISA reference model.
 #[no_mangle]
 pub unsafe extern "C" fn apex_simulate(
     program: *const u8,
@@ -157,42 +158,34 @@ pub unsafe extern "C" fn apex_simulate(
     wave: *mut SimWave,
     regions: *mut SimRegion,
     count: usize,
-    executed: &mut u64,
     diagnostic: *mut c_char,
 ) -> i32 {
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<u64, String> {
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
         let bytes = unsafe { std::slice::from_raw_parts(program, size) };
-        let p = Program::parse(bytes)?;
         let raw = if count == 0 { &mut [][..] } else { unsafe { std::slice::from_raw_parts_mut(regions, count) } };
-        let mut memory = sim::Memory {
-            regions: raw
-                .iter_mut()
-                .map(|r| sim::Region { gpuva: r.gpuva, data: unsafe { std::slice::from_raw_parts_mut(r.data, r.size as usize) } })
-                .collect(),
-        };
-        let mut m = sim::Machine::new(&p, &mut memory);
+        let mut memory: Vec<model::Region> = raw
+            .iter_mut()
+            .map(|r| model::Region { gpuva: r.gpuva, data: unsafe { std::slice::from_raw_parts_mut(r.data, r.size as usize) } })
+            .collect();
         if let Some(w) = unsafe { wave.as_mut() } {
             let blocks = if w.primitives == 0 {
                 Vec::new()
             } else {
-                let a = unsafe { std::slice::from_raw_parts(w.attributes, w.primitives as usize * 144 * 3) };
-                a.chunks_exact(432).map(|c| std::array::from_fn(|k| [c[3 * k], c[3 * k + 1], c[3 * k + 2]])).collect()
+                let a = unsafe { std::slice::from_raw_parts(w.attributes, w.primitives as usize * model::BLOCK) };
+                a.chunks_exact(model::BLOCK).map(|c| c.try_into().unwrap()).collect()
             };
-            let init = sim::WaveInit { exec: w.exec as u16, scalar: w.scalar, vector: w.vector, primitive: w.primitive, attributes: blocks };
-            m.wave(&init)?;
-            w.exports = m.exports.values;
-            w.exported = m.exports.lanes.map(|x| x as u32);
+            let init = model::Wave { exec: w.exec as u16, scalar: w.scalar, vector: w.vector, attributes: blocks };
+            let e = model::run(bytes, &model::Launch::Wave(&init), &mut memory)?;
+            w.exports = e.values;
+            w.exported = e.lanes.map(|x| x as u32);
         } else {
-            m.compute(user, *groups, private_base)?;
+            model::run(bytes, &model::Launch::Compute { user: *user, groups: *groups, private_base }, &mut memory)?;
         }
-        Ok(m.stats.instructions)
+        Ok(())
     }))
     .unwrap_or_else(|_| Err("simulator panic".into()));
     match run {
-        Ok(n) => {
-            *executed = n;
-            0
-        }
+        Ok(()) => 0,
         Err(e) => {
             if !diagnostic.is_null() {
                 let b = e.as_bytes();

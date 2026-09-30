@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: MIT */
-/* Compiles the benchmark, triangle, compositor and captured GNOME Shell
- * shaders, runs them on the ISA model against host references, and holds the
- * zero-spill gate. Usage: apex-shader-test DIR GNOME_DIR where DIR holds the
- * SPIR-V of bench.{comp,vert,frag}, triangle.{vert,frag} and compositor.frag. */
+/* Compiles the benchmark, triangle and compositor shaders and the captured
+ * GNOME Shell and glmark2 shaders, runs them on the ISA reference model
+ * (Tooling/apex_isa) against host references, and holds the zero-spill gate.
+ * Usage: apex-shader-test DIR GNOME_DIR GLMARK2_DIR where DIR holds the
+ * SPIR-V of bench.{comp,vert,frag}, triangle.{vert,frag} and compositor.frag.
+ * The model's texture unit returns coordinate register a + k plus image
+ * descriptor dword k as component k, which checks coordinate placement. */
 #include "apex.h"
 #include <dirent.h>
 #include <math.h>
@@ -47,20 +50,34 @@ static void buffer_descriptor(uint8_t *p, uint64_t va, uint32_t bytes)
    put(p + 8, bytes);
    put(p + 12, 1); /* out-of-range loads read zero, stores drop */
 }
-/* Linear RGBA8 2D image and a nearest, repeating sampler (isa-notes.md). */
+static void set_bits(uint8_t *p, unsigned lo, unsigned width, uint64_t v)
+{
+   for (unsigned k = 0; k < width; k++)
+      if (v >> k & 1)
+         p[(lo + k) / 8] |= 1u << ((lo + k) % 8);
+}
+/* Linear RGBA8 UNORM 2D image with one level (architecture, Texture unit
+ * descriptor bits), and a nearest, repeating sampler (all fields zero). */
 static void image_descriptor(uint8_t *p, uint64_t va, unsigned w, unsigned h)
 {
-   put(p, (uint32_t)va);
-   put(p + 4, (uint32_t)(va >> 32) | 1u << 8 | 1u << 17);
-   put(p + 8, (w - 1) | (h - 1) << 14);
-   put(p + 12, 0);
-   put(p + 20, (w * 4 + 63) / 64);
+   memset(p, 0, 32);
+   set_bits(p, 0, 40, va);
+   set_bits(p, 40, 4, 3);
+   set_bits(p, 49, 3, 1);
+   set_bits(p, 55, 12, 0 | 1 << 3 | 2 << 6 | 3 << 9);
+   set_bits(p, 67, 14, w - 1);
+   set_bits(p, 81, 14, h - 1);
+   set_bits(p, 106, 5, 1);
+   set_bits(p, 111, 16, (w * 4 + 63) / 64);
 }
 static void sampler_descriptor(uint8_t *p)
 {
-   put(p, 0);
-   put(p + 4, 0);
-   put(p + 8, 0);
+   memset(p, 0, 32);
+}
+/* Component k of the model's texture result for coordinate bits x. */
+static uint32_t texel(const uint8_t *descriptor, unsigned k, uint32_t x)
+{
+   return x + get(descriptor + 4 * k);
 }
 
 static uint32_t *read_file(const char *path, size_t *words)
@@ -104,17 +121,20 @@ static void compile(const char *dir, const char *name, struct apex_compile_resul
    compile_spilling(dir, name, r, false);
 }
 
-static uint64_t run(const struct apex_compile_result *r, struct world *w, const uint32_t user[16],
-                    unsigned groups, struct apex_sim_wave *wave)
+static void run_private(const struct apex_compile_result *r, struct world *w, const uint32_t user[16],
+                        unsigned groups, struct apex_sim_wave *wave, uint64_t private_base)
 {
    uint32_t grid[3] = {groups, 1, 1};
-   uint64_t executed = 0;
    char diagnostic[256] = "";
-   if (apex_simulate(r->data, r->size, user, grid, 0, wave, w->r, w->n, &executed, diagnostic)) {
+   if (apex_simulate(r->data, r->size, user, grid, private_base, wave, w->r, w->n, diagnostic)) {
       fprintf(stderr, "simulation: %s\n", diagnostic);
       abort();
    }
-   return executed;
+}
+static void run(const struct apex_compile_result *r, struct world *w, const uint32_t user[16],
+                unsigned groups, struct apex_sim_wave *wave)
+{
+   run_private(r, w, user, groups, wave, 0);
 }
 
 static void root_user(uint32_t user[16])
@@ -144,7 +164,7 @@ static void test_bench_compute(const char *dir)
       uint32_t user[16];
       root_user(user);
       user[2] = groups, user[3] = user[4] = 1;
-      uint64_t executed = run(&r, &w, user, groups, NULL);
+      run(&r, &w, user, groups, NULL);
       for (unsigned i = 0; i < count; i++) {
          for (unsigned c = 0; c < 4; c++) {
             uint32_t want;
@@ -161,7 +181,6 @@ static void test_bench_compute(const char *dir)
             CHECK(get(dst + 16 * i + 4 * c) == want);
          }
       }
-      printf("  bench.comp mode %u: %llu wave instructions\n", mode, (unsigned long long)executed);
       world_free(&w);
    }
    apex_compile_result_finish(&r);
@@ -175,14 +194,13 @@ static void vertex_inputs(struct apex_sim_wave *wave, unsigned location, unsigne
 }
 
 /* Vertex programs store {position}, {point size, layer, viewport, cull},
- * then varying L at record vec4 2 + L. */
+ * clip distances, then varying L at record vec4 4 + L, 64 bytes a line. */
 static void test_vertex(const char *dir, const char *name, unsigned varying_components)
 {
    struct apex_compile_result r;
    compile(dir, name, &r);
-   uint32_t stride;
-   memcpy(&stride, r.data + 28, 4);
-   CHECK(stride == 48);
+   uint32_t stride = r.data[28] | r.data[29] << 8;
+   CHECK(stride == 128);
    struct world w = {0};
    uint8_t *out = region(&w, 0x800000, 16 * stride);
    region(&w, ROOT, ROOT_BYTES);
@@ -197,39 +215,38 @@ static void test_vertex(const char *dir, const char *name, unsigned varying_comp
       for (unsigned c = 0; c < 4; c++)
          CHECK(get(out + l * stride + 4 * c) == wave->vector[2 + c][l]);
       for (unsigned c = 0; c < varying_components; c++)
-         CHECK(get(out + l * stride + 32 + 4 * c) == wave->vector[6 + c][l]);
+         CHECK(get(out + l * stride + 64 + 4 * c) == wave->vector[6 + c][l]);
    }
    free(wave);
    world_free(&w);
    apex_compile_result_finish(&r);
 }
 
-static float texel(const uint8_t *image, unsigned width, unsigned height, float u, float v,
-                   unsigned c)
-{
-   int x = (int)floorf(u * width), y = (int)floorf(v * height);
-   x = ((x % (int)width) + width) % width;
-   y = ((y % (int)height) + height) % height;
-   return image[(y * width + x) * 4 + c] / 255.0f;
-}
-
-/* Fragment waves: i and j per lane in v0-v1; attribute block of primitive 0. */
-static void fragment_wave(struct apex_sim_wave *wave, float *attributes)
+/* Fragment waves: i and j per lane in v0-v1, covered pixels of quad q at
+ * (2q, 0), attribute block of primitive 0. */
+static void fragment_wave(struct apex_sim_wave *wave, uint32_t *attributes)
 {
    wave->exec = 0xffff;
    wave->scalar[0] = (uint32_t)ROOT;
    for (unsigned l = 0; l < 16; l++) {
       wave->vector[0][l] = bits(0.03125f * (l & 3) + 0.25f * (l >> 2));
       wave->vector[1][l] = bits(0.0625f * (l >> 2));
-      wave->vector[2][l] = (l & 1) | (l >> 1) << 16;
+      wave->vector[2][l] = 2 * (l >> 2);
+      wave->vector[3][l] = 0xff;
    }
    wave->attributes = attributes;
    wave->primitives = 1;
 }
-static float interpolate(const float *attributes, unsigned component, uint32_t i, uint32_t j)
+/* P0, P10 (k = 1) or P20 (k = 2) of attribute code c in a block. */
+static uint32_t *attribute(uint32_t *block, unsigned c, unsigned k)
 {
-   const float *p = attributes + 3 * component;
-   return fmaf(flt(j), p[2], fmaf(flt(i), p[1], p[0]));
+   return block + 8 + 12 * (c / 4) + c % 4 + 4 * k;
+}
+static float interpolate(uint32_t *attributes, unsigned component, uint32_t i, uint32_t j)
+{
+   float p0 = flt(*attribute(attributes, component, 0)), p10 = flt(*attribute(attributes, component, 1));
+   float p20 = flt(*attribute(attributes, component, 2));
+   return fmaf(flt(j), p20, fmaf(flt(i), p10, p0));
 }
 
 static void test_fragment(const char *dir, const char *name, bool textured, bool modulated)
@@ -250,42 +267,45 @@ static void test_fragment(const char *dir, const char *name, bool textured, bool
    const float opacity[4] = {0.5f, 1.0f, 0.25f, 0.75f};
    for (unsigned c = 0; c < 4; c++)
       put(root + PUSH + 4 * c, bits(opacity[c]));
-   float *attributes = calloc(144 * 3, sizeof(float));
+   uint32_t *attributes = calloc(APEX_ATTRIBUTE_BLOCK, sizeof(uint32_t));
    /* Input 0: uv (or a color); input 1: a flat color. */
    for (unsigned c = 0; c < 4; c++) {
-      attributes[3 * c] = 0.1f + 0.2f * c;
-      attributes[3 * c + 1] = 0.5f - 0.125f * c;
-      attributes[3 * c + 2] = 0.25f + 0.0625f * c;
-      attributes[3 * (4 + c)] = 0.2f * (c + 1);
+      *attribute(attributes, c, 0) = bits(0.1f + 0.2f * c);
+      *attribute(attributes, c, 1) = bits(0.5f - 0.125f * c);
+      *attribute(attributes, c, 2) = bits(0.25f + 0.0625f * c);
+      *attribute(attributes, 4 + c, 0) = bits(0.2f * (c + 1));
    }
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
    fragment_wave(wave, attributes);
    run(&r, &w, wave->scalar, 1, wave);
    CHECK(wave->exported[0] == 0xffff);
+   const uint8_t *descriptor = root + slot(0, 0);
    for (unsigned l = 0; l < 16; l++) {
       uint32_t i = wave->vector[0][l], j = wave->vector[1][l];
-      for (unsigned c = 0; c < 4; c++) {
+      /* A sample's coordinates are u and v: components 0 and 1. */
+      for (unsigned c = 0; c < (textured ? 2 : 4); c++) {
          float want;
          if (textured) {
-            float u = interpolate(attributes, 0, i, j), v = interpolate(attributes, 1, i, j);
-            want = texel(packed, tw, th, u, v, c);
+            want = flt(texel(descriptor, c, bits(interpolate(attributes, c, i, j))));
             if (modulated)
-               want = want * attributes[3 * (4 + c)] * opacity[c];
+               want = want * flt(*attribute(attributes, 4 + c, 0)) * opacity[c];
          } else {
             want = interpolate(attributes, c, i, j);
          }
          CHECK(wave->exports[0][l][c] == bits(want));
       }
    }
+   (void)packed;
    free(wave);
    free(attributes);
    world_free(&w);
    apex_compile_result_finish(&r);
 }
 
-/* GNOME Shell (Zink) shaders: compile under the gate and run once on the model
- * against zeroed uniforms and a small texture in every sampler slot. */
-static void test_gnome(const char *dir)
+/* Captured GNOME Shell and glmark2 (Zink) shaders: compile under the gate
+ * and run once on the model against zeroed uniforms and a small texture in
+ * every sampler slot. */
+static void test_captured(const char *dir, unsigned expected)
 {
    DIR *d = opendir(dir);
    CHECK(d);
@@ -296,9 +316,7 @@ static void test_gnome(const char *dir)
          continue;
       struct apex_compile_result r;
       compile(dir, e->d_name, &r);
-      uint32_t stage;
-      memcpy(&stage, r.data + 4, 4);
-      stage &= 0xff;
+      uint32_t stage = r.data[4];
       struct world w = {0};
       uint8_t *root = region(&w, ROOT, ROOT_BYTES);
       region(&w, 0xa00000, 65536);
@@ -316,7 +334,7 @@ static void test_gnome(const char *dir)
          }
       }
       struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
-      float *attributes = calloc(144 * 3, sizeof(float));
+      uint32_t *attributes = calloc(APEX_ATTRIBUTE_BLOCK, sizeof(uint32_t));
       if (stage == APEX_FRAGMENT) {
          fragment_wave(wave, attributes);
       } else {
@@ -325,7 +343,8 @@ static void test_gnome(const char *dir)
          wave->scalar[16] = 0x800000;
       }
       run(&r, &w, wave->scalar, 1, wave);
-      if (stage == APEX_FRAGMENT)
+      /* Every lane exports unless the program discards (header flag bit 1). */
+      if (stage == APEX_FRAGMENT && !(r.data[5] & 2))
          CHECK(wave->exported[0] == 0xffff);
       free(wave);
       free(attributes);
@@ -334,7 +353,7 @@ static void test_gnome(const char *dir)
       count++;
    }
    closedir(d);
-   CHECK(count >= 24);
+   CHECK(count == expected);
 }
 
 /* features.comp: two workgroups of four waves. */
@@ -354,17 +373,7 @@ static void test_features(const char *dir)
    root_user(user);
    user[2] = groups, user[3] = user[4] = 1;
    /* Private arrays need the private base in s20-s21 (header bytes per lane). */
-   uint32_t private_bytes;
-   memcpy(&private_bytes, r.data + 24, 4);
-   uint8_t *private = region(&w, 0x10000000, 4 * 16 * private_bytes + 64);
-   uint32_t grid[3] = {groups, 1, 1};
-   uint64_t executed = 0;
-   char diagnostic[256] = "";
-   if (apex_simulate(r.data, r.size, user, grid, 0x10000000, NULL, w.r, w.n, &executed, diagnostic)) {
-      fprintf(stderr, "simulation: %s\n", diagnostic);
-      abort();
-   }
-   (void)private;
+   run_private(&r, &w, user, groups, NULL, 0x10000000);
    uint32_t hist[16] = {0};
    for (unsigned g = 0; g < groups * 64; g++) {
       uint32_t l = g % 64, wave = l / 16, lane = l % 16, group = g / 64;
@@ -423,7 +432,6 @@ static void test_features(const char *dir)
    CHECK(get(counter) == groups * 64);
    for (unsigned k = 0; k < 16; k++)
       CHECK(get(counter + 4 + 4 * k) == hist[k]);
-   printf("  features.comp: %llu wave instructions\n", (unsigned long long)executed);
    world_free(&w);
    apex_compile_result_finish(&r);
 }
@@ -443,15 +451,9 @@ static void test_spill(const char *dir)
    buffer_descriptor(root + slot(0, 0), 0x200000, words * 4);
    buffer_descriptor(root + slot(0, 1), 0x400000, words * 4);
    put(root + PUSH, 1);
-   uint32_t private_bytes;
-   memcpy(&private_bytes, r.data + 24, 4);
-   region(&w, 0x10000000, 16 * private_bytes);
    uint32_t user[16];
    root_user(user);
-   uint32_t grid[3] = {1, 1, 1};
-   uint64_t executed = 0;
-   char diagnostic[256] = "";
-   CHECK(!apex_simulate(r.data, r.size, user, grid, 0x10000000, NULL, w.r, w.n, &executed, diagnostic));
+   run_private(&r, &w, user, 1, NULL, 0x10000000);
    for (unsigned l = 0; l < 16; l++) {
       for (unsigned k = 0; k < 17; k++) {
          for (unsigned c = 0; c < 4; c++) {
@@ -569,21 +571,21 @@ static void test_texture(const char *dir)
    uint32_t user[16];
    root_user(user);
    run(&r, &w, user, 1, NULL);
+   const uint8_t *d = root + slot(0, 0);
    for (unsigned l = 0; l < 16; l++) {
       unsigned x = l % 8, y = l / 8;
       const uint8_t *o = out + 64 * l;
-      for (unsigned c = 0; c < 4; c++) {
-         CHECK(get(o + 4 * c) == bits(packed[(y * 8 + x) * 4 + c] / 255.0f));
-         CHECK(get(o + 16 + 4 * c) == bits(packed[(y * 8 + (x + 1) % 8) * 4 + c] / 255.0f));
-      }
-      /* Gather: green of (i0, j1), (i1, j1), (i1, j0), (i0, j0) with i0 = x, j0 = y. */
-      const unsigned gx[4] = {0, 1, 1, 0}, gy[4] = {1, 1, 0, 0};
-      for (unsigned c = 0; c < 4; c++) {
-         unsigned tx = (x + gx[c]) % 8, ty = (y + gy[c]) % 4;
-         CHECK(get(o + 32 + 4 * c) == bits(packed[(ty * 8 + tx) * 4 + 1] / 255.0f));
-      }
+      float u = (x + 0.5f) / 8.0f, v = (y + 0.5f) / 4.0f;
+      /* Fetch: integer x, y and level 0 in a+3. */
+      CHECK(get(o) == texel(d, 0, x) && get(o + 4) == texel(d, 1, y) && get(o + 12) == texel(d, 3, 0));
+      /* Level: u, v and the level 0.0 in a+3. */
+      CHECK(get(o + 16) == texel(d, 0, bits(u + 0.125f)) && get(o + 20) == texel(d, 1, bits(v)) &&
+            get(o + 28) == texel(d, 3, 0));
+      /* Gather: u, v. */
+      CHECK(get(o + 32) == texel(d, 0, bits(u)) && get(o + 36) == texel(d, 1, bits(v)));
       CHECK(get(o + 48) == bits(8.0f) && get(o + 52) == bits(4.0f) && get(o + 56) == bits(1.0f));
    }
+   (void)packed;
    world_free(&w);
    apex_compile_result_finish(&r);
 }
@@ -595,10 +597,11 @@ static void test_kill(const char *dir, const char *name, bool demote)
    compile(dir, name, &r);
    struct world w = {0};
    region(&w, ROOT, ROOT_BYTES);
-   float *attributes = calloc(144 * 3, sizeof(float));
-   attributes[3 * 0 + 1] = 1.0f;                  /* x = i */
-   attributes[3 * 1] = 0.5f, attributes[3 * 1 + 1] = 3.0f, attributes[3 * 1 + 2] = -2.0f;
-   attributes[3 * 2] = 0.75f;
+   uint32_t *attributes = calloc(APEX_ATTRIBUTE_BLOCK, sizeof(uint32_t));
+   *attribute(attributes, 0, 1) = bits(1.0f); /* x = i */
+   *attribute(attributes, 1, 0) = bits(0.5f), *attribute(attributes, 1, 1) = bits(3.0f);
+   *attribute(attributes, 1, 2) = bits(-2.0f);
+   *attribute(attributes, 2, 0) = bits(0.75f);
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
    fragment_wave(wave, attributes);
    run(&r, &w, wave->scalar, 1, wave);
@@ -628,9 +631,52 @@ static void test_kill(const char *dir, const char *name, bool demote)
    apex_compile_result_finish(&r);
 }
 
+/* depth.frag: the depth plane at the pixel centre from its origin, and
+ * noperspective weights i Q / q1, j Q / q2 (q1 = q2 = 1, Q = v4). */
+static void test_depth(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "depth.frag.spv", &r);
+   CHECK(r.data[5] & 1u << 6);
+   struct world w = {0};
+   region(&w, ROOT, ROOT_BYTES);
+   uint32_t *attributes = calloc(APEX_ATTRIBUTE_BLOCK, sizeof(uint32_t));
+   attributes[0] = bits(0.25f), attributes[1] = attributes[2] = bits(1.0f);
+   attributes[4] = bits(0.5f), attributes[5] = bits(0.0625f), attributes[6] = bits(-0.03125f);
+   attributes[7] = 3 | 1 << 16; /* origin (3, 1) */
+   for (unsigned c = 0; c < 2; c++) {
+      *attribute(attributes, c, 0) = bits(0.125f + c);
+      *attribute(attributes, c, 1) = bits(2.0f);
+      *attribute(attributes, c, 2) = bits(-1.0f - c);
+   }
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   fragment_wave(wave, attributes);
+   for (unsigned l = 0; l < 16; l++) {
+      wave->vector[2][l] = (8 + 2 * (l >> 2) + (l & 1)) | (4 + ((l >> 1) & 1)) << 16;
+      wave->vector[4][l] = bits(0.5f + 0.125f * (l & 3));
+   }
+   run(&r, &w, wave->scalar, 1, wave);
+   CHECK(wave->exported[0] == 0xffff);
+   for (unsigned l = 0; l < 16; l++) {
+      uint32_t p = wave->vector[2][l];
+      float fx = (float)((int)(p & 0xffff) - 3) + 0.5f, fy = (float)((int)(p >> 16) - 1) + 0.5f;
+      float z = fmaf(fy, -0.03125f, fmaf(fx, 0.0625f, 0.5f));
+      float q = flt(wave->vector[4][l]);
+      uint32_t i = bits(flt(wave->vector[0][l]) * q), j = bits(flt(wave->vector[1][l]) * q);
+      CHECK(wave->exports[0][l][0] == bits(z));
+      CHECK(wave->exports[0][l][1] == bits(interpolate(attributes, 0, i, j)));
+      CHECK(wave->exports[0][l][2] == bits(q));
+      CHECK(wave->exports[0][l][3] == bits(interpolate(attributes, 1, i, j)));
+   }
+   free(wave);
+   free(attributes);
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
 int main(int argc, char **argv)
 {
-   CHECK(argc == 3);
+   CHECK(argc == 4);
    setvbuf(stdout, NULL, _IOLBF, 0);
    test_bench_compute(argv[1]);
    test_vertex(argv[1], "bench.vert.spv", 2);
@@ -645,7 +691,9 @@ int main(int argc, char **argv)
    test_texture(argv[1]);
    test_kill(argv[1], "discard.frag.spv", false);
    test_kill(argv[1], "demote.frag.spv", true);
-   test_gnome(argv[2]);
+   test_depth(argv[1]);
+   test_captured(argv[2], 24);
+   test_captured(argv[3], 54);
    printf("PASS Apex shaders: %u programs, %u instructions, max s%u v%u, spills only in spill.comp\n", shaders,
           total_instructions, max_scalar, max_vector);
    return 0;

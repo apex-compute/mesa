@@ -819,10 +819,9 @@ test_bench(struct vk_physical_device *physical, const char *path)
       {table_va, table, trailer + sizeof(*parameters)}, {src_va, src, count * 16}, {dst_va, dst, count * 16},
    };
    uint32_t user[16] = {table_va}, grid[3] = {groups, 1, 1};
-   uint64_t executed;
    char diagnostic[256] = "";
    if (apex_simulate(program->code.data, program->code.size, user, grid, 0, NULL, regions, 3,
-                     &executed, diagnostic)) {
+                     diagnostic)) {
       fprintf(stderr, "simulation: %s\n", diagnostic);
       abort();
    }
@@ -1059,7 +1058,8 @@ int main(int argc, char **argv)
    /* Header: magic, compute stage, local size 32x1x1. */
    CHECK(wide->program.code.size >= 64 && word(wide->program.code.data) == 0x50585041 &&
          word(wide->program.code.data + 4) == 0 &&
-         word(wide->program.code.data + 16) == (32 | 1 << 9 | 1 << 18));
+         word(wide->program.code.data + 16) == (32 | 1 << 16) &&
+         (word(wide->program.code.data + 20) & 0xffff) == 1);
    if (output) {
       char path[4096];
       CHECK(snprintf(path, sizeof(path), "%s/mesa-wide.apx", output) < sizeof(path));

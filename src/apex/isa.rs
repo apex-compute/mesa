@@ -132,37 +132,34 @@ pub enum Kind {
     OptV(u8),
 }
 
-pub fn fp_source(op: u8) -> bool {
-    matches!(op, op::V_CMP_F | op::V_CMP_CLASS | op::V_ADD_F..=op::V_CVT_PK_F16 | op::V_CUBEID..=op::V_CUBEMA)
-        && !matches!(op, op::V_CVT_F_U | op::V_CVT_F_I)
+/// Sources taking the FP modifiers (bit 0 a, 1 b, 2 c).
+pub fn fp_sources(op: u8) -> u32 {
+    match op {
+        op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => 7,
+        op::V_ADD_F..=op::V_MUL_F | op::V_MIN_F | op::V_MAX_F | op::V_CMP_F | op::V_CVT_PK_F16 => 3,
+        op::V_FLOOR..=op::V_LDEXP | op::V_RCP..=op::V_COS | op::V_CVT_U_F | op::V_CVT_I_F | op::V_CMP_CLASS => 1,
+        _ => 0,
+    }
 }
+/// Operations with an FP32 result, which may clamp.
 pub fn fp_result(op: u8) -> bool {
-    matches!(op, op::V_ADD_F..=op::V_FRACT | op::V_FREXP_MANT | op::V_LDEXP..=op::V_CVT_F_I
-        | op::V_CVT_F16_LO | op::V_CVT_F16_HI | op::V_CUBESC..=op::V_CUBEMA | op::V_INTERP
-        | op::V_INTERP_FLAT)
+    matches!(op, op::V_ADD_F..=op::V_FREXP_MANT | op::V_LDEXP..=op::V_CVT_F_I
+        | op::V_CVT_F16_LO..=op::V_CUBEMA)
 }
 
 pub fn scalar_load_dwords(code: u32) -> u8 {
     [1, 2, 4, 8][code as usize & 3]
 }
-pub fn texture_coordinates(hi: u32, fetch: bool) -> u8 {
-    let dim = (hi >> 19) & 7;
+/// Coordinate registers: four, or eight for gradients, compare with a level or
+/// bias, and offsets.
+pub fn texture_coordinates(hi: u32) -> u8 {
     let variant = (hi >> 14) & 7;
-    let (coords, grads) = match dim {
-        DIM_1D => (1, 1),
-        DIM_2D => (2, 2),
-        DIM_3D => (3, 3),
-        DIM_1D_ARRAY => (2, 1),
-        _ => (3, 2),
-    };
-    if fetch {
-        return coords + 1;
+    let compare = (hi >> 17) & 1 != 0;
+    if variant == TEX_GRADIENT || (compare && matches!(variant, TEX_LEVEL | TEX_BIAS)) || (hi >> 18) & 1 != 0 {
+        8
+    } else {
+        4
     }
-    coords
-        + matches!(variant, TEX_LEVEL | TEX_BIAS) as u8
-        + ((hi >> 17) & 1) as u8
-        + ((hi >> 18) & 1) as u8
-        + if variant == TEX_GRADIENT { 2 * grads } else { 0 }
 }
 
 /// Field kinds of d, a, b and c (c is `hi[7:0]` in the ALU and texture formats).
@@ -182,7 +179,7 @@ pub fn fields(op: u8, hi: u32) -> Result<[Kind; 4], String> {
         op::S_ADD64 | op::S_SUB64 => [S(Def, 2), S(Use, 2), S(Use, 2), None],
         op::S_SHL64 => [S(Def, 2), S(Use, 2), SAny, None],
         op::S_MEMTIME => [S(Def, 2), None, None, None],
-        op::S_LAUNCH => [S(Def, 1), SAny, None, None],
+        op::S_LAUNCH => [S(Def, 1), None, None, None],
         op::S_ADD..=op::S_ORN2 | op::S_SHL..=op::S_CMP_LE_U => [S(Def, 1), SAny, SAny, None],
         op::V_MOV | op::V_NOT | op::V_POPCNT..=op::V_BFREV | op::V_FLOOR..=op::V_FREXP_EXP
         | op::V_RCP..=op::V_CVT_I_F | op::V_CVT_F16_LO | op::V_CVT_F16_HI => [V(Def, 1), Any, None, None],
@@ -217,19 +214,12 @@ pub fn fields(op: u8, hi: u32) -> Result<[Kind; 4], String> {
         op::BUFFER_LOAD => [V(Def, size), OptV(1), S(Use, 4), None],
         op::BUFFER_STORE => [V(Use, size), OptV(1), S(Use, 4), None],
         op::BUFFER_ATOMIC => [atomic_data(hi)?, OptV(1), S(Use, 4), None],
-        op::SCRATCH_LOAD => [V(Def, size), OptV(1), S(Use, 2), None],
-        op::SCRATCH_STORE => [V(Use, size), OptV(1), S(Use, 2), None],
-        op::SHARED_LOAD => [V(Def, size), OptV(1), OptS(1), None],
-        op::SHARED_STORE => [V(Use, size), OptV(1), OptS(1), None],
-        op::SHARED_ATOMIC => [atomic_data(hi)?, OptV(1), OptS(1), None],
-        op::IMAGE_SAMPLE => {
+        op::SCRATCH_LOAD | op::SHARED_LOAD => [V(Def, size), OptV(1), None, None],
+        op::SCRATCH_STORE | op::SHARED_STORE => [V(Use, size), OptV(1), None, None],
+        op::SHARED_ATOMIC => [atomic_data(hi)?, OptV(1), None, None],
+        op::IMAGE_SAMPLE | op::IMAGE_FETCH => {
             let count = ((hi >> 8) & 15).count_ones() as u8;
-            let sampler = if (hi >> 14) & 7 == TEX_FETCH { None } else { S(Use, 8) };
-            [V(Def, count), V(Use, texture_coordinates(hi, false)), S(Use, 8), sampler]
-        }
-        op::IMAGE_FETCH => {
-            let count = ((hi >> 8) & 15).count_ones() as u8;
-            [V(Def, count), V(Use, texture_coordinates(hi, true)), S(Use, 8), None]
+            [V(Def, count), V(Use, texture_coordinates(hi)), S(Use, 8), S(Use, 8)]
         }
         op::EXP => [Raw, V(Use, 4), Raw, None],
         _ => return Err(format!("unknown opcode 0x{op:02x}")),
@@ -275,80 +265,128 @@ impl Inst {
         }
         Ok(k)
     }
+    /// Legality exactly as `Tooling/apex_isa` decodes (Docs/isa.md, Encoding).
     pub fn validate(self) -> Result<(), String> {
-        let kinds = fields(self.op, self.hi)?;
-        let fmt = format(self.op).unwrap();
-        let literal = self.literal();
-        if literal && kinds[3] != Kind::None {
-            return Err("literal in an instruction that needs c".into());
-        }
-        for f in 0..3 {
-            let code = self.field(f);
-            check_operand(kinds[f], code, f)?;
-            let alu_source = matches!(fmt, Format::Salu | Format::Valu) && (f == 1 || f == 2)
-                && matches!(kinds[f], Kind::Any | Kind::SAny);
-            if code == LITERAL && !alu_source && !matches!(kinds[f], Kind::OptS(_) | Kind::OptV(_) | Kind::Raw) {
-                return Err("literal outside an ALU a/b source".into());
-            }
-        }
-        if matches!(self.op, op::GLOBAL_LOAD..=op::GLOBAL_ATOMIC) && self.b == LITERAL && self.a != LITERAL
-            && (self.a % 2 != 0 || self.a >= VECTOR_REGISTERS - 1)
-        {
-            return Err("global address pair".into());
-        }
+        let Some(fmt) = format(self.op) else {
+            return Err(format!("unknown opcode 0x{:02x}", self.op));
+        };
+        let err = |m: &str| Err(m.to_string());
+        let (d, a, b, hi) = (self.d, self.a, self.b, self.hi);
+        let sreg = |x: u8| (SCALAR..EXEC).contains(&x);
+        let vreg = |x: u8| x < VECTOR_REGISTERS;
+        let sbase = |x: u8, n: u8, align: u8| sreg(x) && (x - SCALAR) % align == 0 && x - SCALAR + n <= SCALAR_REGISTERS;
+        let vbase = |x: u8, n: u8, align: u8| vreg(x) && x % align == 0 && x as u32 + n as u32 <= VECTOR_REGISTERS as u32;
+        let constant = |x: u8| (240..=254).contains(&x);
         match fmt {
-            Format::Salu | Format::Valu if !literal => {
-                check_operand(kinds[3], self.hi as u8, 3)?;
-                if self.hi as u8 == LITERAL && kinds[3] != Kind::Raw {
-                    return Err("literal in c".into());
-                }
-                let modifiers = (self.hi >> 8) & 0x3f;
-                let clamp = (self.hi >> 14) & 1;
-                if self.hi >> 15 != 0
-                    || (modifiers != 0 && !fp_source(self.op))
-                    || (clamp != 0 && !fp_result(self.op))
-                    || (fmt == Format::Salu && (modifiers | clamp) != 0)
-                {
-                    return Err("reserved ALU modifier bits".into());
-                }
-            }
-            Format::Valu | Format::Salu => {}
             Format::Control => {
-                if (self.op == op::S_FENCE && self.hi >> 4 != 0)
-                    || (matches!(self.op, op::S_NOP | op::S_ENDPGM | op::S_BARRIER) && self.hi != 0)
-                {
-                    return Err("reserved control bits".into());
+                let cond = matches!(self.op, op::S_CBRANCH_Z | op::S_CBRANCH_NZ);
+                if d != 0 || b != 0 || (!cond && a != 0) {
+                    return err("unused field nonzero");
+                }
+                if cond && !(sreg(a) || a == EXEC || constant(a)) {
+                    return err("branch condition is not a scalar source");
+                }
+                let reserved = match self.op {
+                    op::S_NOP | op::S_ENDPGM | op::S_BARRIER => hi != 0,
+                    op::S_FENCE => hi >> 4 != 0,
+                    op::S_SLEEP => hi >> 16 != 0,
+                    _ => false,
+                };
+                if reserved {
+                    return err("reserved control bits");
                 }
             }
+            Format::Salu | Format::Valu => return self.validate_alu(),
             Format::Memory => {
-                if self.hi >> 29 != 0
-                    || (!matches!(self.op, op::GLOBAL_ATOMIC | op::BUFFER_ATOMIC | op::SHARED_ATOMIC)
-                        && (self.hi >> 24) & 31 != 0)
-                    || (self.hi >> 22) & 3 == 3
-                {
-                    return Err("reserved memory bits".into());
+                let (size, policy, atom, ret) = ((hi >> 20) & 3, (hi >> 22) & 3, (hi >> 24) & 15, (hi >> 28) & 1);
+                let atomic = matches!(self.op, op::GLOBAL_ATOMIC | op::BUFFER_ATOMIC | op::SHARED_ATOMIC);
+                let smem = matches!(self.op, op::S_LOAD | op::S_BUFFER_LOAD);
+                if hi >> 29 != 0 || policy == 3 || (!atomic && (atom | ret) != 0) || (atomic && atom > 9) {
+                    return err("reserved memory bits");
+                }
+                let n = if smem { scalar_load_dwords(size) } else { size as u8 + 1 };
+                if atomic {
+                    if size > 1 || (self.op == op::SHARED_ATOMIC && size != 0) {
+                        return err("atomic size out of range");
+                    }
+                    if !vbase(d, n * if atom == 2 { 2 } else { 1 }, n) {
+                        return err("atomic data registers out of range or odd pair");
+                    }
+                } else if smem {
+                    if !sbase(d, n, 1) {
+                        return err("scalar destination out of range");
+                    }
+                } else if !vbase(d, n, 1) {
+                    return err("vector data registers out of range");
+                }
+                let ok = match self.op {
+                    op::S_LOAD => (a == LITERAL || sreg(a)) && sbase(b, 2, 2),
+                    op::S_BUFFER_LOAD => (a == LITERAL || sreg(a)) && sbase(b, 4, 4),
+                    op::GLOBAL_LOAD..=op::GLOBAL_ATOMIC if b == LITERAL => vbase(a, 2, 2),
+                    op::GLOBAL_LOAD..=op::GLOBAL_ATOMIC => (a == LITERAL || vreg(a)) && sbase(b, 2, 2),
+                    op::BUFFER_LOAD..=op::BUFFER_ATOMIC => (a == LITERAL || vreg(a)) && sbase(b, 4, 4),
+                    _ => (a == LITERAL || vreg(a)) && b == 0,
+                };
+                if !ok {
+                    return err("memory address operands");
                 }
             }
             Format::Texture => {
-                let variant = (self.hi >> 14) & 7;
-                let dim = (self.hi >> 19) & 7;
-                if self.hi >> 22 != 0
-                    || variant > TEX_GATHER
-                    || dim > DIM_CUBE_ARRAY
-                    || (self.hi >> 8) & 15 == 0
-                    || (self.op == op::IMAGE_FETCH && (variant != TEX_FETCH || self.hi & 0x630ff != 0))
-                    || (self.op == op::IMAGE_SAMPLE && variant == TEX_FETCH)
-                    || (variant != TEX_GATHER && (self.hi >> 12) & 3 != 0)
-                    || (variant == TEX_GATHER && ((self.hi >> 8) & 15).count_ones() != 4)
+                let (mask, gather, variant, dim) = ((hi >> 8) & 15, (hi >> 12) & 3, (hi >> 14) & 7, (hi >> 19) & 7);
+                if hi >> 22 != 0 || mask == 0 || variant > TEX_GATHER || dim > DIM_CUBE_ARRAY
+                    || (self.op == op::IMAGE_FETCH && variant != 0)
+                    || (gather != 0 && variant != TEX_GATHER)
                 {
-                    return Err("reserved texture bits".into());
+                    return err("reserved texture bits");
+                }
+                if !vbase(d, mask.count_ones() as u8, 1) || !vbase(a, texture_coordinates(hi), 1)
+                    || !sbase(b, 8, 4) || !sbase(hi as u8, 8, 4)
+                {
+                    return err("texture operands");
                 }
             }
             Format::Export => {
-                if self.d > 9 || self.b > 3 || self.hi != 0 {
-                    return Err("reserved export fields".into());
+                if hi != 0 || d > 9 || !vbase(a, 4, 1) || b > 3 {
+                    return err("reserved export fields");
                 }
             }
+        }
+        Ok(())
+    }
+    fn validate_alu(self) -> Result<(), String> {
+        use Role::*;
+        let (d, a, b, hi) = (self.d, self.a, self.b, self.hi);
+        let roles = alu_roles(self.op);
+        for (f, (role, x)) in roles.iter().zip([d, a, b]).enumerate() {
+            match role {
+                None if x != 0 => return Err(format!("unused field {} nonzero", ["d", "a", "b"][f])),
+                None => {}
+                r if !role_ok(*r, x, f < 3 && f > 0) => {
+                    return Err(format!("reserved operand code {x} in field {}", ["d", "a", "b"][f]))
+                }
+                _ => {}
+            }
+        }
+        if self.op == op::S_LAUNCH {
+            return if hi > 6 { Err("launch selector out of range".into()) } else { Ok(()) };
+        }
+        if self.op == op::V_QUADPERM {
+            return if a == LITERAL || hi >> 8 != 0 { Err("quad pattern".into()) } else { Ok(()) };
+        }
+        let literal = (roles[1] != None && a == LITERAL) || (roles[2] != None && b == LITERAL);
+        if literal {
+            return if roles[3] != None { Err("literal on an operation that uses c".into()) } else { Ok(()) };
+        }
+        let c = hi as u8;
+        match roles[3] {
+            None if c != 0 => return Err("unused field c nonzero".into()),
+            None => {}
+            r if !role_ok(r, c, false) => return Err(format!("reserved operand code {c} in field c")),
+            _ => {}
+        }
+        let (modifiers, clamp) = ((hi >> 8) & 7 | (hi >> 11) & 7, (hi >> 14) & 1);
+        if hi >> 15 != 0 || modifiers & !fp_sources(self.op) != 0 || (clamp != 0 && !fp_result(self.op)) {
+            return Err("reserved ALU modifier bits".into());
         }
         Ok(())
     }
@@ -403,27 +441,74 @@ impl Inst {
     }
 }
 
-fn check_operand(kind: Kind, code: u8, field: usize) -> Result<(), String> {
-    let scalar = |n: u8| code >= SCALAR && code < EXEC && (code - SCALAR) + n <= SCALAR_REGISTERS
-        && (n == 1 || (code - SCALAR) % 2 == 0);
-    let vector = |n: u8| code < VECTOR_REGISTERS && code + n <= VECTOR_REGISTERS
-        && (n != 2 || code % 2 == 0);
-    let constant = code >= 240;
-    let ok = match kind {
-        Kind::None => code == 0,
-        Kind::Raw => true,
-        Kind::S(Access::Def, 1) if field == 0 => scalar(1) || code == EXEC,
-        Kind::S(_, n) => scalar(n),
-        Kind::V(_, n) => vector(n),
-        Kind::Any => code < VECTOR_REGISTERS || scalar(1) || code == EXEC || code == LANE || constant,
-        Kind::SAny => scalar(1) || code == EXEC || constant,
-        Kind::OptS(n) => code == LITERAL || scalar(n),
-        Kind::OptV(_) => code == LITERAL || code < VECTOR_REGISTERS,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("reserved operand code {code} in field {}", ["d", "a", "b", "c"][field]))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    None,
+    /// Vector destination.
+    Vd,
+    /// Scalar destination, or an even scalar pair.
+    Sd,
+    Sd2,
+    /// Scalar register.
+    Sr,
+    /// Vector source; scalar source; 64-bit scalar source.
+    Vs,
+    Ss,
+    Ss2,
+    /// Raw compare condition (6 or 8 values), attribute code, quad pattern.
+    Cond6,
+    Cond8,
+    Attr,
+    Pattern,
+    /// `s_launch` selector in `hi`.
+    Select,
+}
+/// ALU operand roles of d, a, b and c, as the reference decodes them.
+fn alu_roles(o: u8) -> [Role; 4] {
+    use Role::*;
+    match o {
+        op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC => [Sd, Ss, None, None],
+        op::S_CSELECT => [Sd, Ss, Ss, Ss],
+        op::S_ADD64 | op::S_SUB64 => [Sd2, Ss2, Ss2, None],
+        op::S_SHL64 => [Sd2, Ss2, Ss, None],
+        op::S_SETEXEC => [None, Ss, None, None],
+        op::S_MEMTIME => [Sd2, None, None, None],
+        op::S_LAUNCH => [Sd, None, None, Select],
+        0x20..=0x45 => [Sd, Ss, Ss, None],
+        op::V_MOV | op::V_NOT | op::V_POPCNT..=op::V_BFREV | op::V_FLOOR..=op::V_FREXP_EXP
+        | op::V_RCP..=op::V_CVT_I_F | op::V_CVT_F16_LO | op::V_CVT_F16_HI => [Vd, Vs, None, None],
+        op::V_BFI | op::V_PERM | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => [Vd, Vs, Vs, Vs],
+        op::V_ADD_CO | op::V_SUB_CO => [Vd, Vs, Vs, Sr],
+        op::V_ADDC | op::V_SUBB | op::V_CNDMASK => [Vd, Vs, Vs, Ss],
+        op::V_CMP_I | op::V_CMP_U => [Sd, Vs, Vs, Cond6],
+        op::V_CMP_F => [Sd, Vs, Vs, Cond8],
+        op::V_CMP_CLASS => [Sd, Vs, Vs, None],
+        op::V_READLANE => [Sd, Vs, Ss, None],
+        op::V_READFIRSTLANE => [Sd, Vs, None, None],
+        op::V_WRITELANE => [Vd, Ss, Ss, None],
+        op::V_QUADPERM => [Vd, Vs, Pattern, None],
+        op::V_MBCNT => [Vd, Vs, None, None],
+        op::V_INTERP => [Vd, Vs, Vs, Attr],
+        op::V_INTERP_FLAT => [Vd, None, None, Attr],
+        _ => [Vd, Vs, Vs, None],
+    }
+}
+/// Whether `x` fills `role`; `literal` allows the literal (ALU sources a and b).
+fn role_ok(role: Role, x: u8, literal: bool) -> bool {
+    let sreg = (SCALAR..EXEC).contains(&x);
+    let constant = (240..=254).contains(&x) || (x == LITERAL && literal);
+    match role {
+        Role::None | Role::Select => true,
+        Role::Vd => x < VECTOR_REGISTERS,
+        Role::Sd | Role::Sr => sreg,
+        Role::Sd2 => sreg && (x - SCALAR) % 2 == 0,
+        Role::Vs => x <= LANE || constant,
+        Role::Ss => sreg || x == EXEC || constant,
+        Role::Ss2 => (sreg && (x - SCALAR) % 2 == 0) || x == EXEC || constant,
+        Role::Cond6 => x < 6,
+        Role::Cond8 => x < 8,
+        Role::Attr => x < 136,
+        Role::Pattern => x == LITERAL,
     }
 }
 
@@ -484,6 +569,7 @@ pub fn disassemble_one(i: Inst) -> String {
     }
     match fmt {
         Format::Valu if !i.literal() && (i.hi >> 14) & 1 != 0 => text += " clamp",
+        Format::Salu if i.op == op::S_LAUNCH && i.hi != 0 => text += &format!(" imm:{}", i.hi),
         Format::Control if i.hi != 0 => {
             text += &format!(" {}:{}", if i.branch() { "offset" } else { "imm" }, i.hi as i32)
         }
@@ -595,6 +681,7 @@ pub fn assemble_one(line: &str) -> Result<Inst, String> {
         };
         let (shift, mask) = match (fmt, k.as_str()) {
             (Format::Control, _) => (0, u32::MAX),
+            (Format::Salu, "imm") if opcode == op::S_LAUNCH => (0, 7),
             (Format::Memory, "offset") => (0, 0xfffff),
             (Format::Memory, "size") => (20, 3),
             (Format::Memory, "cache") => (22, 3),
@@ -668,7 +755,7 @@ pub enum Stage {
 }
 pub const MAGIC: u32 = 0x5058_5041;
 pub const HEADER: usize = 64;
-// Fragment flags, header word 1 bits 15:8.
+// Fragment flags, header byte 5.
 pub const EARLY_TESTS: u8 = 1;
 pub const DISCARDS: u8 = 2;
 pub const EXPORTS_DEPTH: u8 = 4;
@@ -678,7 +765,7 @@ pub const CENTROID: u8 = 32;
 pub const INVERSE_W: u8 = 64;
 pub const PER_SAMPLE: u8 = 128;
 
-/// Program header (64 bytes) and code.
+/// Program header (64 bytes, Docs/isa.md "Program header") and code.
 #[derive(Clone, Debug)]
 pub struct Program {
     pub stage: Stage,
@@ -691,28 +778,31 @@ pub struct Program {
     /// Vertex output stride in bytes, or the fragment color-target mask with
     /// the dual-source flag in bit 8.
     pub output: u32,
-    /// Fragment inputs: bit 7 valid, bit 6 flat, bits 5:0 vertex output location.
-    pub inputs: [u8; 32],
+    /// Fragment inputs: bit 7 flat; input k is vertex output varying k.
+    pub inputs: Vec<u8>,
 }
 impl Program {
     pub fn new(stage: Stage, code: Vec<Inst>) -> Self {
-        Self { stage, flags: 0, code, entry: 0, local: [16, 1, 1], shared: 0, private: 0, output: 0, inputs: [0; 32] }
+        Self { stage, flags: 0, code, entry: 0, local: [16, 1, 1], shared: 0, private: 0, output: 0, inputs: Vec::new() }
     }
     pub fn invocations(&self) -> u32 {
         self.local.iter().product()
     }
     pub fn validate(&self) -> Result<(), String> {
         let n = self.local;
+        let compute = self.stage == Stage::Compute;
         if self.code.is_empty()
             || self.code.len() > (1 << 20) / 8
             || self.entry as usize >= self.code.len()
-            || n[0] > 256 || n[1] > 256 || n[2] > 64
+            || !(1..=256).contains(&n[0]) || !(1..=256).contains(&n[1]) || !(1..=64).contains(&n[2])
             || !(1..=256).contains(&self.invocations())
             || self.shared > 32768
             || self.private % 4 != 0
-            || (self.stage != Stage::Compute && (self.invocations() != 16 || self.shared != 0))
-            || (self.stage != Stage::Fragment && (self.flags != 0 || self.inputs != [0; 32]))
+            || (!compute && (n != [16, 1, 1] || self.shared != 0 || self.private != 0))
+            || (self.stage != Stage::Fragment && (self.flags != 0 || !self.inputs.is_empty()))
             || (self.stage == Stage::Fragment && self.output >> 9 != 0)
+            || (self.stage == Stage::Vertex && (self.output % 64 != 0 || self.output > 0xffff))
+            || self.inputs.len() > 32 || self.inputs.iter().any(|&e| e & 0x7f != 0)
         {
             return Err("invalid program header".into());
         }
@@ -729,37 +819,40 @@ impl Program {
     }
     pub fn bytes(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
-        let mut h = [0u32; 16];
-        h[0] = MAGIC;
-        h[1] = self.stage as u32 | (self.flags as u32) << 8;
-        h[2] = self.code.len() as u32 * 8;
-        h[3] = self.entry;
-        h[4] = self.local[0] | self.local[1] << 9 | self.local[2] << 18;
-        h[5] = self.shared;
-        h[6] = self.private;
-        h[7] = self.output;
-        for (i, &e) in self.inputs.iter().enumerate() {
-            h[8 + i / 4] |= (e as u32) << (8 * (i % 4));
+        let mut h = Vec::with_capacity(HEADER + 8 * self.code.len());
+        h.extend(MAGIC.to_le_bytes());
+        h.extend([self.stage as u8, self.flags, 0, 0]);
+        h.extend((self.code.len() as u32 * 8).to_le_bytes());
+        h.extend(self.entry.to_le_bytes());
+        for x in [self.local[0], self.local[1], self.local[2], self.shared] {
+            h.extend((x as u16).to_le_bytes());
         }
-        let mut out: Vec<u8> = h.iter().flat_map(|x| x.to_le_bytes()).collect();
+        h.extend(self.private.to_le_bytes());
+        h.extend((self.output as u16).to_le_bytes());
+        h.extend((self.inputs.len() as u16).to_le_bytes());
+        h.extend(&self.inputs);
+        h.resize(HEADER, 0);
         for i in &self.code {
-            out.extend(i.encode()?.to_le_bytes());
+            h.extend(i.encode()?.to_le_bytes());
         }
-        Ok(out)
+        Ok(h)
     }
     pub fn parse(b: &[u8]) -> Result<Self, String> {
         if b.len() < HEADER {
             return Err("short header".into());
         }
-        let h: Vec<u32> = b[..HEADER].chunks_exact(4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect();
-        let stage = match h[1] & 0xff {
+        let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u32;
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let stage = match b[4] {
             0 => Stage::Compute,
             1 => Stage::Vertex,
             2 => Stage::Fragment,
             _ => return Err("invalid stage".into()),
         };
-        if h[0] != MAGIC || h[1] >> 16 != 0 || h[2] % 8 != 0 || h[4] >> 25 != 0
-            || h[2] as u64 + HEADER as u64 != b.len() as u64
+        let count = u16_at(30) as usize;
+        if u32_at(0) != MAGIC || u16_at(6) != 0 || u32_at(8) % 8 != 0 || count > 32
+            || b[32 + count..HEADER].iter().any(|&x| x != 0)
+            || u32_at(8) as u64 + HEADER as u64 != b.len() as u64
         {
             return Err("invalid program header".into());
         }
@@ -767,20 +860,16 @@ impl Program {
             .chunks_exact(8)
             .map(|v| Inst::decode(u64::from_le_bytes(v.try_into().unwrap())))
             .collect::<Result<_, _>>()?;
-        let mut inputs = [0u8; 32];
-        for (i, e) in inputs.iter_mut().enumerate() {
-            *e = (h[8 + i / 4] >> (8 * (i % 4))) as u8;
-        }
         let p = Self {
             stage,
-            flags: (h[1] >> 8) as u8,
+            flags: b[5],
             code,
-            entry: h[3],
-            local: [h[4] & 0x1ff, (h[4] >> 9) & 0x1ff, h[4] >> 18],
-            shared: h[5],
-            private: h[6],
-            output: h[7],
-            inputs,
+            entry: u32_at(12),
+            local: [u16_at(16), u16_at(18), u16_at(20)],
+            shared: u16_at(22),
+            private: u32_at(24),
+            output: u16_at(28),
+            inputs: b[32..32 + count].to_vec(),
         };
         p.validate()?;
         Ok(p)
@@ -791,7 +880,7 @@ impl Program {
             self.stage as u32, self.flags, self.entry, self.local[0], self.local[1], self.local[2],
             self.shared, self.private, self.output
         );
-        for (i, e) in self.inputs.iter().enumerate().filter(|e| *e.1 != 0) {
+        for (i, e) in self.inputs.iter().enumerate() {
             t += &format!(" in{i}:{e}");
         }
         t + "\n" + &disassemble(&self.code)
@@ -820,7 +909,11 @@ impl Program {
                 "private" => p.private = number(v)?,
                 "output" => p.output = number(v)?,
                 k if k.starts_with("in") => {
-                    p.inputs[k[2..].parse::<usize>().map_err(|_| "bad input")?.min(31)] = number(v)? as u8
+                    let i = k[2..].parse::<usize>().map_err(|_| "bad input")?.min(31);
+                    if p.inputs.len() <= i {
+                        p.inputs.resize(i + 1, 0);
+                    }
+                    p.inputs[i] = number(v)? as u8
                 }
                 _ => return Err(format!("unknown header key {k}")),
             }

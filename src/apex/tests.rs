@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: MIT
 use crate::isa::{self, op, Access, Class, Inst, Kind, Program, Stage, LITERAL, SCALAR};
 use crate::mir::{self, Op, Opnd, Value, CONST, COPY, LABEL};
-use crate::sim::{Machine, Memory, Region, WaveInit};
+use crate::model::{self, Launch, Region};
 
 /// A valid instance of every opcode, filling each field by its kind.
 fn sample(opcode: u8) -> Inst {
     let hi = match isa::format(opcode).unwrap() {
         isa::Format::Memory if matches!(opcode, op::GLOBAL_ATOMIC | op::BUFFER_ATOMIC | op::SHARED_ATOMIC) => 2 << 24 | 1 << 28,
         isa::Format::Memory => 1 << 20 | 16,
-        isa::Format::Texture if opcode == op::IMAGE_FETCH => 0xf << 8 | isa::TEX_FETCH << 14 | isa::DIM_2D << 19,
         isa::Format::Texture => 0xf << 8 | isa::DIM_2D << 19,
         _ => 0,
     };
     let kinds = isa::fields(opcode, hi).unwrap();
     let mut i = Inst { op: opcode, d: 0, a: 0, b: 0, hi };
+    if opcode == op::V_QUADPERM {
+        return Inst { d: 1, a: 2, b: LITERAL, hi: 0x1b, ..i };
+    }
     for (f, k) in kinds.iter().enumerate() {
         let code = match *k {
             Kind::None => continue,
@@ -82,17 +84,74 @@ fn encoding() {
     assert!(Inst { op: op::S_NOP, hi: 1, ..Inst::new(0) }.validate().is_err());
 }
 
+/// Legality agrees with the reference decoder on random and mutated words.
+#[test]
+fn reference_decode() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut words = Vec::new();
+    for &(opcode, _) in isa::NAMES {
+        let good = sample(opcode).encode().unwrap();
+        words.push(good);
+        for _ in 0..150 {
+            let r = next();
+            // Flip one or two bits of a legal word, or replace one field.
+            let w = match r % 3 {
+                0 => good ^ 1 << (r >> 8) % 64,
+                1 => good ^ 1 << (r >> 8) % 64 ^ 1 << (r >> 20) % 64,
+                _ => {
+                    let shift = [8, 16, 24, 32, 40, 48, 56][(r >> 8) as usize % 7];
+                    good & !(0xff << shift) | ((r >> 32) & 0xff) << shift
+                }
+            };
+            words.push(w);
+        }
+    }
+    for _ in 0..5000 {
+        let w = next();
+        words.push(w & !0xff | isa::NAMES[(w >> 56) as usize % isa::NAMES.len()].0 as u64);
+    }
+    let dir = std::env::temp_dir().join(format!("apex-decode-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("words.bin");
+    std::fs::write(&path, words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let out = std::process::Command::new("python3")
+        .args(["-m", "apex_isa", "disasm"])
+        .arg(&path)
+        .current_dir(std::env::var_os("APEX_ISA").expect("APEX_ISA names the Tooling directory"))
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut legal = 0;
+    for (w, line) in words.iter().zip(text.lines()) {
+        let reference = !line.starts_with(".word");
+        let ours = Inst::decode(*w);
+        assert_eq!(ours.is_ok(), reference, "0x{w:016x}: reference `{line}`, ours {ours:?}");
+        legal += reference as u32;
+    }
+    assert_eq!(text.lines().count(), words.len());
+    assert!(legal > 1000, "{legal} legal words");
+}
+
 #[test]
 fn header() {
     let mut p = Program::new(Stage::Fragment, isa::assemble("v_interp v0, v0, v1, #4\nexp #0, v[0:3], #1\ns_endpgm").unwrap());
     p.flags = isa::EARLY_TESTS;
     p.output = 1;
-    p.inputs[1] = 0x80 | 5;
+    p.inputs = vec![0, 0x80];
     let bytes = p.bytes().unwrap();
     assert_eq!(bytes.len(), 64 + 24);
     assert_eq!(&bytes[..4], b"APXP");
+    assert_eq!((bytes[4], bytes[5], bytes[30], bytes[33]), (2, 1, 2, 0x80));
     let q = Program::parse(&bytes).unwrap();
-    assert_eq!((q.stage, q.flags, q.output, q.inputs[1]), (Stage::Fragment, 1, 1, 0x85));
+    assert_eq!((q.stage, q.flags, q.output, q.inputs[1]), (Stage::Fragment, 1, 1, 0x80));
     assert_eq!(Program::from_text(&q.text()).unwrap().bytes().unwrap(), bytes);
     let mut bad = bytes.clone();
     bad[0] ^= 1;
@@ -106,9 +165,14 @@ fn header() {
     assert!(wide.bytes().is_err());
     let mut compute = Program::new(Stage::Compute, vec![Inst::new(op::S_ENDPGM)]);
     compute.local = [256, 1, 1];
-    assert!(compute.bytes().is_ok());
+    let bytes = compute.bytes().unwrap();
+    assert_eq!(&bytes[16..24], &[0, 1, 1, 0, 1, 0, 0, 0]);
     compute.local = [256, 2, 1];
     assert!(compute.bytes().is_err());
+    // Private memory belongs to compute launches.
+    let mut vertex = Program::new(Stage::Vertex, vec![Inst::new(op::S_ENDPGM)]);
+    vertex.private = 4;
+    assert!(vertex.bytes().is_err());
 }
 
 /// Runs one compute wave of `text` with 16 lanes; returns the memory image.
@@ -118,13 +182,13 @@ fn run_compute(text: &str, exec: u32, memory: &mut [u8], private: u32) -> Result
     p.private = private;
     p.shared = 256;
     p.validate()?;
-    let mut scratch = vec![0u8; 16 * private as usize + 64];
-    let mut m = Memory {
-        regions: vec![Region { gpuva: 0x1000, data: memory }, Region { gpuva: 0x100000, data: &mut scratch }],
-    };
-    let mut machine = Machine::new(&p, &mut m);
+    compute(&p, [1, 1, 1], 0x100000, memory)
+}
+/// Runs a compute grid with the root (user s0-s1) at 0x1000 over `memory`.
+fn compute(p: &Program, groups: [u32; 3], private_base: u64, memory: &mut [u8]) -> Result<(), String> {
     let user = [0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    machine.compute(&user, [1, 1, 1], 0x100000)
+    let launch = Launch::Compute { user, groups, private_base };
+    model::run(&p.bytes()?, &launch, &mut [Region { gpuva: 0x1000, data: memory }]).map(|_| ())
 }
 fn words(m: &[u8], at: usize, n: usize) -> Vec<u32> {
     (0..n).map(|k| u32::from_le_bytes(m[at + 4 * k..at + 4 * k + 4].try_into().unwrap())).collect()
@@ -204,7 +268,7 @@ fn exec_and_cross_lane() {
          v_readfirstlane s5, v98\n\
          s_andn2_saveexec s6, s4\n\
          v_mov v1, 9\n\
-         s_mov exec, s3\n\
+         s_setexec s3\n\
          v_add v2, lane, 100\n\
          v_readlane s7, v2, 13\n\
          v_mov v3, s7\n\
@@ -270,16 +334,16 @@ fn memory_model() {
     assert_eq!(words(&m, 256, 1), [141], "after this wave's store to the same dword");
     assert_eq!(words(&m, 320, 1), [0], "scalar load past the range reads zero");
     m[512 + 12] = 0;
-    assert!(run_compute(text, 16, &mut m, 0).unwrap_err().contains("out of range"));
+    assert!(run_compute(text, 16, &mut m, 0).unwrap_err().contains("fault"));
 
-    // Private memory interleaves lanes: base + ((wave * words + word) * 16 + lane) * 4.
-    let text = "v_add v2, lane, 5\nv_add v3, lane, 6\nscratch_store v[2:3], off, s[20:21] offset:4 size:1\n\
-                scratch_load v[4:5], off, s[20:21] offset:4 size:1\nv_add v6, v4, v5\n\
+    // Private memory interleaves lanes: wave base + ((word + k) * 16 + lane) * 4.
+    let text = "v_add v2, lane, 5\nv_add v3, lane, 6\nscratch_store v[2:3], off offset:4 size:1\n\
+                scratch_load v[4:5], off offset:4 size:1\nv_add v6, v4, v5\n\
                 v_shl v100, lane, 2\nglobal_store v6, v100, s[0:1] size:0\ns_endpgm";
     let mut m = vec![0u8; 64];
     run_compute(text, 16, &mut m, 12).unwrap();
     assert_eq!(words(&m, 0, 16), (0..16).map(|l| 2 * l + 11).collect::<Vec<_>>());
-    assert!(run_compute(text, 16, &mut m, 8).unwrap_err().contains("private"));
+    assert!(run_compute(text, 16, &mut m, 8).unwrap_err().contains("fault"));
 
     // Atomics at 32 and 64 bits; compare-exchange holds {new, compare}.
     let text = "v_mov v1, 1\nglobal_atomic v1, off, s[0:1] size:0 return:1\n\
@@ -300,17 +364,16 @@ fn memory_model() {
 #[test]
 fn control_and_barriers() {
     // Four waves: each writes shared memory, meets at the barrier, reads a neighbour.
-    let text = "s_launch s2, 3\nv_mov v1, s2\nv_shl v2, v0, 2\nshared_store v1, v2, off size:0\n\
+    let text = "s_launch s2 imm:3\nv_mov v1, s2\nv_shl v2, v0, 2\nshared_store v1, v2 size:0\n\
                 s_fence imm:13\ns_barrier\n\
-                v_add v3, v0, 16\nv_and v3, v3, 63\nv_shl v3, v3, 2\nshared_load v4, v3, off size:0\n\
+                v_add v3, v0, 16\nv_and v3, v3, 63\nv_shl v3, v3, 2\nshared_load v4, v3 size:0\n\
                 s_cmp_eq s3, s2, 3\ns_cbranch_nz s3 offset:1\nv_add v4, v4, 100\n\
                 global_store v4, v2, s[0:1] size:0\ns_endpgm";
     let mut p = Program::new(Stage::Compute, isa::assemble(text).unwrap());
     p.local = [64, 1, 1];
     p.shared = 256;
     let mut m = vec![0u8; 256];
-    let mut mem = Memory { regions: vec![Region { gpuva: 0x1000, data: &mut m }] };
-    Machine::new(&p, &mut mem).compute(&[0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1, 1, 1], 0).unwrap();
+    compute(&p, [1, 1, 1], 0, &mut m).unwrap();
     let got = words(&m, 0, 64);
     for i in 0..64u32 {
         let neighbour = ((i + 16) % 64) / 16;
@@ -318,7 +381,7 @@ fn control_and_barriers() {
     }
     // execz skips a region whose mask is empty.
     let text = format!("v_cmp_u s2, lane, 0, #2\ns_and_saveexec s3, s2\ns_cbranch_execz offset:1\ns_trap imm:1\n\
-                        s_mov exec, s3\nv_mov v1, 3\n{}s_endpgm", store(1, 0));
+                        s_setexec s3\nv_mov v1, 3\n{}s_endpgm", store(1, 0));
     let mut m = vec![0u8; 64];
     run_compute(&text, 16, &mut m, 0).unwrap();
     assert_eq!(words(&m, 0, 16), [3; 16]);
@@ -326,35 +389,36 @@ fn control_and_barriers() {
 
 #[test]
 fn fragment_interpolation_and_export() {
+    // Input 1 component 2 (code 6) and input 1 component 3 (code 7); quads
+    // 2-3 take primitive slot 1.
     let text = "v_interp v10, v0, v1, #6\nv_interp_flat v11, #7\nv_mov v12, 1.0\nv_mov v13, 0\n\
                 exp #0, v[10:13], #1\ns_endpgm";
     let mut p = Program::new(Stage::Fragment, isa::assemble(text).unwrap());
     p.output = 1;
-    p.inputs[1] = 0x80 | 3;
-    let mut init = WaveInit { exec: 0x0ff0, scalar: [0; 32], vector: [[0; 16]; 72], primitive: [0; 16], attributes: vec![[[0.0; 3]; 144]; 2] };
+    p.inputs = vec![0, 0x80];
+    let mut w = model::Wave { exec: 0x0ff0, attributes: vec![[0; model::BLOCK]; 2], ..Default::default() };
     for l in 0..16 {
-        init.vector[0][l] = (0.25 * (l & 3) as f32).to_bits();
-        init.vector[1][l] = (0.5 * (l >> 2) as f32).to_bits();
-        init.primitive[l] = (l >= 8) as u8;
+        w.vector[0][l] = (0.25 * (l & 3) as f32).to_bits();
+        w.vector[1][l] = (0.5 * (l >> 2) as f32).to_bits();
+        w.vector[3][l] = 0xff | ((l >= 8) as u32) << 8;
     }
-    init.attributes[0][6] = [1.0, 2.0, 4.0];
-    init.attributes[1][6] = [-1.0, 8.0, 0.0];
-    init.attributes[0][7] = [3.0, 9.0, 9.0];
-    init.attributes[1][7] = [5.0, 9.0, 9.0];
-    let mut none = Memory { regions: vec![] };
-    let mut m = Machine::new(&p, &mut none);
-    m.wave(&init).unwrap();
-    assert_eq!(m.exports.lanes[0], 0x0ff0);
+    let plane = |p: [f32; 3]| p.map(f32::to_bits);
+    let (a0, a1) = (plane([1.0, 2.0, 4.0]), plane([-1.0, 8.0, 0.0]));
+    // P0, P10, P20 of input 1 component 2 at dwords 8 + 12 + 2 + {0, 4, 8}.
+    for k in 0..3 {
+        w.attributes[0][22 + 4 * k] = a0[k];
+        w.attributes[1][22 + 4 * k] = a1[k];
+    }
+    w.attributes[0][23] = 3.0f32.to_bits();
+    w.attributes[1][23] = 5.0f32.to_bits();
+    let e = model::run(&p.bytes().unwrap(), &Launch::Wave(&w), &mut []).unwrap();
+    assert_eq!(e.lanes[0], 0x0ff0);
     for l in 4..12 {
         let (i, j) = (0.25 * (l & 3) as f32, 0.5 * (l >> 2) as f32);
-        let a = init.attributes[(l >= 8) as usize][6];
-        assert_eq!(f32::from_bits(m.exports.values[0][l][0]), j.mul_add(a[2], i.mul_add(a[1], a[0])));
-        assert_eq!(f32::from_bits(m.exports.values[0][l][1]), if l >= 8 { 5.0 } else { 3.0 });
+        let a = if l >= 8 { a1 } else { a0 }.map(f32::from_bits);
+        assert_eq!(f32::from_bits(e.values[0][l][0]), j.mul_add(a[2], i.mul_add(a[1], a[0])));
+        assert_eq!(f32::from_bits(e.values[0][l][1]), if l >= 8 { 5.0 } else { 3.0 });
     }
-    // A fragment program must end with a done export.
-    let p = Program::new(Stage::Fragment, isa::assemble("s_endpgm").unwrap());
-    let mut none = Memory { regions: vec![] };
-    assert!(Machine::new(&p, &mut none).wave(&init).is_err());
 }
 
 fn v(id: u32) -> Opnd {
@@ -414,9 +478,7 @@ fn allocation_and_spilling() {
     assert!(!p.code.iter().any(|i| i.op == op::S_NOP), "the scoreboard owns hazards");
     let run = |p: &Program| {
         let mut m = vec![0u8; 64];
-        let mut scratch = vec![0u8; 16 * p.private as usize + 64];
-        let mut mem = Memory { regions: vec![Region { gpuva: 0x1000, data: &mut m }, Region { gpuva: 0x100000, data: &mut scratch }] };
-        Machine::new(p, &mut mem).compute(&[0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1, 1, 1], 0x100000).unwrap();
+        compute(p, [1, 1, 1], 0x100000, &mut m).unwrap();
         words(&m, 0, 16)
     };
     let expect = |n: u32| (0..16).map(|l| (0..n).map(|k| l + k * 3 + 1000).sum::<u32>()).collect::<Vec<_>>();
@@ -468,9 +530,7 @@ fn scalar_lane_spills() {
         assert!(p.code.iter().any(|i| i.op == op::V_WRITELANE));
         if stage == Stage::Compute {
             let mut m = vec![0u8; 64];
-            let mut mem = Memory { regions: vec![Region { gpuva: 0x1000, data: &mut m }] };
-            let user = [0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            Machine::new(&p, &mut mem).compute(&user, [3, 1, 1], 0).unwrap();
+            compute(&p, [3, 1, 1], 0, &mut m).unwrap();
             // The last workgroup (x = 2) writes last.
             assert_eq!(words(&m, 0, 1), [(0..count).map(|k| 2 + 1000 + 7 * k).sum::<u32>()]);
         }
@@ -515,8 +575,7 @@ fn divergent_loop_lifetimes() {
     ];
     let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
     let mut m = vec![0u8; 128];
-    let mut mem = Memory { regions: vec![Region { gpuva: 0x1000, data: &mut m }] };
-    Machine::new(&p, &mut mem).compute(&[0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1, 1, 1], 0).unwrap();
+    compute(&p, [1, 1, 1], 0, &mut m).unwrap();
     assert_eq!(words(&m, 0, 16), (0..16).map(|l| 10 * (l + 1)).collect::<Vec<_>>());
     assert_eq!(words(&m, 64, 16), (0..16).map(|l| l + 1 + 77778).collect::<Vec<_>>());
 }

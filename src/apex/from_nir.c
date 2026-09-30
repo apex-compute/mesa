@@ -46,6 +46,7 @@ struct ctx {
    struct util_dynarray ops, values;
    struct def_map *defs;
    bool *vector, *saturated;
+   struct hash_table *range;
    uint32_t labels, restore, end;
    struct loop_state *loop;
    unsigned depth;
@@ -53,7 +54,6 @@ struct ctx {
    uint32_t alive, covered, helper, root;
    uint32_t out[48];
    uint8_t out_written[48];
-   int8_t input_index[VARYING_SLOT_MAX];
    struct apex_header header;
    bool failed;
    char *diagnostic;
@@ -146,7 +146,7 @@ static void branch(struct ctx *c, unsigned op, uint32_t cond, uint32_t l)
 }
 static void set_exec(struct ctx *c, uint32_t x)
 {
-   emit(c, APEX_COPY, apex_phys(APEX_EXEC), x, 0, 0, 0);
+   emit(c, APEX_S_SETEXEC, 0, x, 0, 0, 0);
 }
 static uint32_t exec_copy(struct ctx *c)
 {
@@ -699,7 +699,12 @@ static uint32_t mem_hi(int32_t offset, unsigned size_code)
 }
 static bool fits20(int64_t v) { return v >= -(1 << 19) && v < (1 << 19); }
 /* Splits a byte offset into a register part and a 20-bit immediate. */
-static uint32_t split_offset(struct ctx *c, nir_src s, int64_t *imm)
+/* Splits a constant term off an offset into the immediate. Only buffer
+ * offsets add in 32 bits; elsewhere the register and the sign-extended
+ * immediate add without wrapping, so a positive term folds only when the
+ * rest cannot exceed 2^32 - 1 minus it (a negative one leaves a valid,
+ * non-negative offset unchanged). */
+static uint32_t split_offset(struct ctx *c, nir_src s, int64_t *imm, bool wraps)
 {
    *imm = 0;
    if (nir_src_is_const(s) && fits20(nir_src_as_int(s)))
@@ -707,9 +712,12 @@ static uint32_t split_offset(struct ctx *c, nir_src s, int64_t *imm)
    nir_alu_instr *add = nir_def_as_alu_or_null(s.ssa);
    if (add && add->op == nir_op_iadd) {
       for (unsigned k = 0; k < 2; k++) {
-         if (nir_src_is_const(add->src[k].src) &&
-             fits20(nir_src_comp_as_int(add->src[k].src, add->src[k].swizzle[0]))) {
-            *imm = nir_src_comp_as_int(add->src[k].src, add->src[k].swizzle[0]);
+         if (!nir_src_is_const(add->src[k].src))
+            continue;
+         int64_t v = nir_src_comp_as_int(add->src[k].src, add->src[k].swizzle[0]);
+         nir_scalar rest = nir_get_scalar(add->src[1 - k].src.ssa, add->src[1 - k].swizzle[0]);
+         if (fits20(v) && (wraps || v <= 0 || !nir_addition_might_overflow(c->nir, c->range, rest, v))) {
+            *imm = v;
             return alu_src(c, add, 1 - k);
          }
       }
@@ -717,14 +725,37 @@ static uint32_t split_offset(struct ctx *c, nir_src s, int64_t *imm)
    return src(c, s, 0);
 }
 
-/* A scalar load of `n` dwords into a new scalar group, in 8/4/2/1 pieces. */
+/* Access alignment: the address is align_offset modulo align_mul bytes. */
+struct alignment { unsigned mul, offset; };
+static struct alignment access_alignment(nir_intrinsic_instr *i)
+{
+   if (!nir_intrinsic_has_align_mul(i))
+      return (struct alignment){4, 0};
+   return (struct alignment){nir_intrinsic_align_mul(i), nir_intrinsic_align_offset(i)};
+}
+/* Dwords of the piece at byte `at` of an access with `left` dwords to go.
+ * Every lane address rounds down to 4n bytes (16 for three dwords, 32 for
+ * eight), so a piece is as wide as its alignment allows: scalar loads take
+ * 1, 2, 4 or 8 dwords, vector accesses 1-4. */
+static unsigned piece_dwords(struct alignment a, unsigned at, unsigned left, bool scalar_load)
+{
+   unsigned align = nir_combined_align(a.mul, (a.offset + at) % a.mul);
+   for (unsigned p = MIN2(left, scalar_load ? 8 : 4); p > 1; p--) {
+      if (scalar_load && (p & (p - 1)))
+         continue;
+      if (align >= 4 * util_next_power_of_two(p))
+         return p;
+   }
+   return 1;
+}
+
+/* A scalar load of `n` dwords into a new scalar group, in aligned pieces. */
 static uint32_t s_load(struct ctx *c, unsigned op, uint32_t base, uint32_t offset, int64_t imm,
-                       unsigned n)
+                       unsigned n, struct alignment a)
 {
    uint32_t g = value(c, false, n);
    for (unsigned k = 0; k < n;) {
-      unsigned piece = n - k >= 8 && k % 4 == 0 ? 8 : n - k >= 4 && k % 4 == 0 ? 4 :
-                       n - k >= 2 && k % 2 == 0 ? 2 : 1;
+      unsigned piece = piece_dwords(a, 4 * k, n - k, true);
       unsigned code = piece == 8 ? 3 : piece == 4 ? 2 : piece == 2 ? 1 : 0;
       emit(c, op, sub(g, k, piece), offset ? scalar(c, offset) : 0, base,
            0, mem_hi(imm + 4 * k, code));
@@ -873,7 +904,7 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
    bool fall = false;
    uint32_t result = 0;
    if (space == ROOT || space == BUFFER) {
-      offset = split_offset(c, i->src[address], &imm);
+      offset = split_offset(c, i->src[address], &imm, space == BUFFER);
       if (space == ROOT)
          base = root(c);
       else if (desc_src->ssa->num_components != 4) {
@@ -887,7 +918,8 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
          }
       }
       if (reorder && uniform && !fall) {
-         result = s_load(c, space == ROOT ? APEX_S_LOAD : APEX_S_BUFFER_LOAD, base, offset, imm, n);
+         result = s_load(c, space == ROOT ? APEX_S_LOAD : APEX_S_BUFFER_LOAD, base, offset, imm, n,
+                         access_alignment(i));
          alias(c, &i->def, result);
          return;
       }
@@ -909,7 +941,8 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       }
       uint32_t pair = pair_value(c, src(c, i->src[address], 0));
       if (reorder && uniform) {
-         alias(c, &i->def, s_load(c, APEX_S_LOAD, pair_value(c, scalar(c, pair)), 0, 0, n));
+         alias(c, &i->def, s_load(c, APEX_S_LOAD, pair_value(c, scalar(c, pair)), 0, 0, n,
+                                  access_alignment(i)));
          return;
       }
       op = store ? APEX_GLOBAL_STORE : atomic ? APEX_GLOBAL_ATOMIC : APEX_GLOBAL_LOAD;
@@ -918,29 +951,23 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       else
          b = pair;
    } else if (space == SHARED) {
-      offset = split_offset(c, i->src[address], &imm);
+      offset = split_offset(c, i->src[address], &imm, false);
       imm += nir_intrinsic_has_base(i) ? nir_intrinsic_base(i) : 0;
       if (!fits20(imm)) {
          failf(c, "shared offset out of range", NULL);
          return;
       }
       op = store ? APEX_SHARED_STORE : atomic ? APEX_SHARED_ATOMIC : APEX_SHARED_LOAD;
-      if (offset && is_vec(c, offset))
-         a = offset;
-      else
-         b = offset;
+      a = offset ? vector(c, offset) : 0;
    } else {
       if (c->nir->info.stage != MESA_SHADER_COMPUTE) {
          failf(c, "private memory needs a compute launch", NULL);
          return;
       }
-      offset = split_offset(c, i->src[address], &imm);
+      offset = split_offset(c, i->src[address], &imm, false);
       imm += nir_intrinsic_has_base(i) ? nir_intrinsic_base(i) : 0;
       op = store ? APEX_SCRATCH_STORE : APEX_SCRATCH_LOAD;
       a = offset ? vector(c, offset) : 0;
-      b = value(c, false, 2);
-      emit(c, APEX_COPY, sub(b, 0, 1), apex_phys(APEX_SCALAR + 20), 0, 0, 0);
-      emit(c, APEX_COPY, sub(b, 1, 1), apex_phys(APEX_SCALAR + 21), 0, 0, 0);
    }
    uint32_t guard = store || atomic ? guard_begin(c) : 0;
    uint32_t hi = mem_hi(imm, n - 1);
@@ -965,11 +992,15 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
          emit(c, APEX_COPY, r, sub(operand, 0, 1), 0, 0, 0);
       }
    } else if (store) {
-      emit(c, op, vector_data(c, i->src[0], n), a, b, 0, hi);
+      uint32_t v = vector_data(c, i->src[0], n);
+      for (unsigned k = 0, piece; k < n; k += piece) {
+         piece = space == SCRATCH ? MIN2(n - k, 4) : piece_dwords(access_alignment(i), 4 * k, n - k, false);
+         emit(c, op, piece == n ? v : sub(v, k, piece), a, b, 0, mem_hi(imm + 4 * k, piece - 1));
+      }
    } else {
       uint32_t d = fall ? value(c, true, n) : define(c, &i->def, true);
-      for (unsigned k = 0; k < n; k += 4) {
-         unsigned piece = MIN2(n - k, 4);
+      for (unsigned k = 0, piece; k < n; k += piece) {
+         piece = space == SCRATCH ? MIN2(n - k, 4) : piece_dwords(access_alignment(i), 4 * k, n - k, false);
          emit(c, op, sub(d, k, piece), a, b, 0, mem_hi(imm + 4 * k, piece - 1));
          if (reorder)
             last(c)->flags = APEX_REORDER;
@@ -1044,7 +1075,7 @@ static void emit_if(struct ctx *c, nir_if *nif)
                              then_break ? m : apex_phys(APEX_EXEC), then_break ? apex_phys(APEX_EXEC) : m);
       emit(c, APEX_S_ANDN2, l->iter, l->iter, leaving, 0, 0);
       emit(c, APEX_S_ANDN2, l->live, l->live, leaving, 0, 0);
-      emit(c, APEX_S_ANDN2, apex_phys(APEX_EXEC), apex_phys(APEX_EXEC), leaving, 0, 0);
+      set_exec(c, op2(c, APEX_S_ANDN2, false, apex_phys(APEX_EXEC), leaving));
       branch(c, APEX_S_CBRANCH_EXECZ, 0, c->restore);
       emit_cf(c, then_break ? &nif->else_list : &nif->then_list);
       return;
@@ -1130,20 +1161,19 @@ static uint32_t launch_bits(struct ctx *c, unsigned shift, unsigned bits)
 {
    return op2(c, APEX_V_BFE_U, true, apex_phys(3), constant(c, shift | bits << 8));
 }
+/* Fragment input k is vertex output varying k (Docs/isa.md, Vertex outputs
+ * and fragment inputs); its header byte carries the flat bit. */
 static unsigned fragment_input(struct ctx *c, unsigned location, bool flat)
 {
-   if (c->input_index[location] < 0) {
-      unsigned k = 0;
-      while (k < 32 && c->header.inputs[k])
-         k++;
-      if (k == 32 || location < VARYING_SLOT_VAR0) {
-         failf(c, "unsupported fragment input: ", gl_varying_slot_name_for_stage(location, MESA_SHADER_FRAGMENT));
-         return 0;
-      }
-      c->input_index[location] = k;
-      c->header.inputs[k] = 0x80 | (flat ? 0x40 : 0) | (2 + location - VARYING_SLOT_VAR0);
+   if (location < VARYING_SLOT_VAR0 || location >= VARYING_SLOT_VAR0 + 32) {
+      failf(c, "unsupported fragment input: ", gl_varying_slot_name_for_stage(location, MESA_SHADER_FRAGMENT));
+      return 0;
    }
-   return c->input_index[location];
+   unsigned k = location - VARYING_SLOT_VAR0;
+   c->header.input_count = MAX2(c->header.input_count, k + 1);
+   if (flat)
+      c->header.inputs[k] = 0x80;
+   return k;
 }
 static unsigned record_slot(struct ctx *c, unsigned location, unsigned *component)
 {
@@ -1152,11 +1182,11 @@ static unsigned record_slot(struct ctx *c, unsigned location, unsigned *componen
    case VARYING_SLOT_PSIZ: *component = 0; return 1;
    case VARYING_SLOT_LAYER: *component = 1; return 1;
    case VARYING_SLOT_VIEWPORT: *component = 2; return 1;
-   case VARYING_SLOT_CLIP_DIST0: return 34;
-   case VARYING_SLOT_CLIP_DIST1: return 35;
+   case VARYING_SLOT_CLIP_DIST0: return 2;
+   case VARYING_SLOT_CLIP_DIST1: return 3;
    default:
       if (location >= VARYING_SLOT_VAR0 && location < VARYING_SLOT_VAR0 + 32)
-         return 2 + location - VARYING_SLOT_VAR0;
+         return 4 + location - VARYING_SLOT_VAR0;
       failf(c, "unsupported vertex output: ", gl_varying_slot_name_for_stage(location, MESA_SHADER_VERTEX));
       return 0;
    }
@@ -1195,15 +1225,17 @@ static void store_output(struct ctx *c, nir_intrinsic_instr *i)
 static void finish_outputs(struct ctx *c)
 {
    if (c->nir->info.stage == MESA_SHADER_VERTEX) {
+      /* One 64-byte record line per four vec4s. */
       unsigned records = 0;
       for (unsigned s = 0; s < ARRAY_SIZE(c->out); s++)
          if (c->out[s])
             records = s + 1;
-      c->header.output = records * 16;
+      unsigned stride = 64 * DIV_ROUND_UP(MAX2(records, 1), 4);
+      c->header.output = stride;
       uint32_t base = value(c, false, 2);
       emit(c, APEX_COPY, sub(base, 0, 1), apex_phys(APEX_SCALAR + 16), 0, 0, 0);
       emit(c, APEX_COPY, sub(base, 1, 1), apex_phys(APEX_SCALAR + 17), 0, 0, 0);
-      uint32_t lane = op2(c, APEX_V_MUL_LO, true, apex_phys(APEX_LANE), constant(c, records * 16));
+      uint32_t lane = op2(c, APEX_V_MUL_LO, true, apex_phys(APEX_LANE), constant(c, stride));
       for (unsigned s = 0; s < records; s++)
          if (c->out[s])
             emit(c, APEX_GLOBAL_STORE, c->out[s], lane, base, 0, mem_hi(s * 16, 3));
@@ -1256,6 +1288,47 @@ static uint32_t texture_descriptor(struct ctx *c, nir_tex_instr *t, bool sampler
    }
    return scalar(c, sub(src(c, t->src[k].src, 0), 0, 8));
 }
+/* Bits lo .. lo + width - 1 of an image descriptor (architecture, Texture
+ * unit: width - 1 at 67, height - 1 at 81, depth or layers - 1 at 95,
+ * levels at 106). */
+static uint32_t descriptor_bits(struct ctx *c, uint32_t image, unsigned lo, unsigned width)
+{
+   unsigned dword = lo / 32, shift = lo % 32;
+   uint32_t x = op2(c, APEX_S_BFE_U, false, sub(image, dword, 1), constant(c, shift | MIN2(width, 32 - shift) << 8));
+   if (shift + width > 32) {
+      uint32_t high = op2(c, APEX_S_BFE_U, false, sub(image, dword + 1, 1), constant(c, (shift + width - 32) << 8));
+      x = op2(c, APEX_S_OR, false, x, op2(c, APEX_S_SHL, false, high, constant(c, 32 - shift)));
+   }
+   return x;
+}
+static void texture_size(struct ctx *c, nir_tex_instr *t, uint32_t image)
+{
+   uint32_t g = define(c, &t->def, false);
+   if (t->op == nir_texop_query_levels) {
+      emit(c, APEX_COPY, g, descriptor_bits(c, image, 106, 5), 0, 0, 0);
+      return;
+   }
+   int lod = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   for (unsigned k = 0; k < t->def.num_components; k++) {
+      bool layer = t->is_array && k == t->def.num_components - 1;
+      static const unsigned lo[3] = {67, 81, 95};
+      unsigned field = layer ? 2 : k;
+      uint32_t size = op2(c, APEX_S_ADD, false, descriptor_bits(c, image, lo[field], field == 2 ? 11 : 14),
+                          constant(c, 1));
+      if (layer && t->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+         /* Cube arrays count cubes: layers / 6. */
+         size = op2(c, APEX_S_SHR, false, op2(c, APEX_S_MUL_HI_U, false, size, constant(c, 0xaaaaaaabu)),
+                    constant(c, 2));
+      } else if (lod >= 0 && !layer) {
+         size = op2(c, APEX_S_MAX_U, false, op2(c, APEX_S_SHR, false, size, scalar(c, src(c, t->src[lod].src, 0))),
+                    constant(c, 1));
+      }
+      emit(c, APEX_COPY, sub(g, k, 1), size, 0, 0, 0);
+   }
+}
+/* Coordinate registers in the texture unit's layout (Docs/isa.md, Texture
+ * and export): u, v, w or layer, then the level, bias or reference; the
+ * second four hold gradients, or the level or bias beside a reference. */
 static void emit_tex(struct ctx *c, nir_tex_instr *t)
 {
    unsigned dim = tex_dim(t);
@@ -1265,25 +1338,7 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
    }
    uint32_t image = texture_descriptor(c, t, false);
    if (t->op == nir_texop_txs || t->op == nir_texop_query_levels) {
-      uint32_t g = define(c, &t->def, false);
-      if (t->op == nir_texop_query_levels) {
-         emit(c, APEX_S_ADD, g, op2(c, APEX_S_BFE_U, false, sub(image, 3, 1), constant(c, 11 | 4 << 8)),
-              constant(c, 1), 0, 0);
-         return;
-      }
-      int lod = nir_tex_instr_src_index(t, nir_tex_src_lod);
-      static const unsigned field[3][2] = {{2, 0}, {2, 14}, {3, 0}};
-      for (unsigned k = 0; k < t->def.num_components; k++) {
-         unsigned w = field[k][0] == 3 ? 11 : 14;
-         uint32_t size = op2(c, APEX_S_ADD, false,
-            op2(c, APEX_S_BFE_U, false, sub(image, field[k][0], 1), constant(c, field[k][1] | w << 8)),
-            constant(c, 1));
-         bool layer = t->is_array && k == t->def.num_components - 1;
-         if (lod >= 0 && !layer)
-            size = op2(c, APEX_S_MAX_U, false, op2(c, APEX_S_SHR, false, size, scalar(c, src(c, t->src[lod].src, 0))),
-                       constant(c, 1));
-         emit(c, APEX_COPY, sub(g, k, 1), size, 0, 0, 0);
-      }
+      texture_size(c, t, image);
       return;
    }
    unsigned variant;
@@ -1293,13 +1348,14 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
    case nir_texop_txb: variant = 2; break;
    case nir_texop_txl: variant = 1; break;
    case nir_texop_txd: variant = 3; break;
-   case nir_texop_txf: case nir_texop_txf_ms: variant = 4; break;
+   case nir_texop_txf: case nir_texop_txf_ms: variant = 0; break;
    case nir_texop_tg4: variant = 5; break;
    default:
       failf(c, "unsupported texture op", NULL);
       return;
    }
-   bool fetch = variant == 4;
+   bool fetch = t->op == nir_texop_txf || t->op == nir_texop_txf_ms;
+   bool cube = dim == 3 || dim == 6;
    int coord = nir_tex_instr_src_index(t, nir_tex_src_coord);
    int lod = nir_tex_instr_src_index(t, nir_tex_src_lod);
    int bias = nir_tex_instr_src_index(t, nir_tex_src_bias);
@@ -1308,21 +1364,26 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
    int ddx = nir_tex_instr_src_index(t, nir_tex_src_ddx);
    int ddy = nir_tex_instr_src_index(t, nir_tex_src_ddy);
    int ms = nir_tex_instr_src_index(t, nir_tex_src_ms_index);
-   if (fetch && ms >= 0)
-      failf(c, "multisample fetch outside the model", NULL);
+   if (variant == 3 && (dim == 2 || cube)) {
+      failf(c, "explicit gradients take two axes", NULL);
+      return;
+   }
+   if (variant == 3 && off >= 0) {
+      failf(c, "texel offsets with explicit gradients", NULL);
+      return;
+   }
    unsigned mask = t->is_shadow ? 1 : t->op == nir_texop_tg4 ? 0xf : nir_def_components_read(&t->def);
    if (!mask)
       mask = 1;
+   bool compare = cmp >= 0 && !fetch;
+   bool offset = off >= 0 && !fetch;
    uint32_t hi = mask << 8 | variant << 14 | dim << 19 |
                  (t->op == nir_texop_tg4 ? t->component << 12 : 0) |
-                 (unsigned)(cmp >= 0) << 17 | (unsigned)(off >= 0 && !fetch) << 18;
-   if (fetch && lod < 0)
-      failf(c, "texel fetch without a level", NULL);
-   unsigned count = 0;
-   uint32_t parts[16];
-   unsigned coords = t->coord_components;
-   if (dim == 3 || dim == 6) {
-      /* The compiler selects the cube face: (s, t, face [+ 6 layer]). */
+                 (unsigned)compare << 17 | (unsigned)offset << 18;
+   uint32_t parts[8] = {0};
+   if (cube) {
+      /* The compiler selects the face: face coordinates in [0, 1] and the
+       * integer face | cube index << 3. */
       uint32_t x = src(c, t->src[coord].src, 0), y = src(c, t->src[coord].src, 1);
       uint32_t z = src(c, t->src[coord].src, 2);
       uint32_t ma = value(c, true, 1), sc = value(c, true, 1), tc = value(c, true, 1), face = value(c, true, 1);
@@ -1333,51 +1394,61 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
       uint32_t r = value(c, true, 1), half = constant(c, 0x3f000000u);
       emit(c, APEX_V_RCP, r, ma, 0, 0, 1u << 11);
       for (unsigned k = 0; k < 2; k++) {
-         parts[count] = value(c, true, 1);
-         emit(c, APEX_V_FMA_F, parts[count++], k ? tc : sc, r, half, 0);
+         parts[k] = value(c, true, 1);
+         emit(c, APEX_V_FMA_F, parts[k], k ? tc : sc, r, half, 0);
       }
+      uint32_t index = op1(c, APEX_V_CVT_U_F, true, face);
       if (dim == 6) {
-         uint32_t layer = op1(c, APEX_V_RNDNE, true, src(c, t->src[coord].src, 3));
-         uint32_t both = value(c, true, 1);
-         emit(c, APEX_V_FMA_F, both, layer, constant(c, 0x40c00000u), face, 0);
-         face = both;
+         uint32_t layer = op1(c, APEX_V_CVT_U_F, true, op1(c, APEX_V_RNDNE, true, src(c, t->src[coord].src, 3)));
+         index = op2(c, APEX_V_OR, true, index, op2(c, APEX_V_SHL, true, layer, constant(c, 3)));
       }
-      parts[count++] = face;
+      parts[2] = index;
    } else {
-      for (unsigned k = 0; k < coords; k++)
-         parts[count++] = src(c, t->src[coord].src, k);
+      for (unsigned k = 0; k < t->coord_components; k++)
+         parts[k] = src(c, t->src[coord].src, k);
+      if (fetch && off >= 0)
+         for (unsigned k = 0; k < t->src[off].src.ssa->num_components; k++)
+            parts[k] = op2(c, APEX_V_ADD, true, parts[k], src(c, t->src[off].src, k));
    }
-   if (fetch || variant == 1)
-      parts[count++] = lod >= 0 ? src(c, t->src[lod].src, 0) : constant(c, 0);
-   if (variant == 2)
-      parts[count++] = src(c, t->src[bias].src, 0);
-   if (cmp >= 0)
-      parts[count++] = src(c, t->src[cmp].src, 0);
-   if (off >= 0 && !fetch) {
+   uint32_t level = 0;
+   if (fetch)
+      level = ms >= 0 ? src(c, t->src[ms].src, 0) : lod >= 0 ? src(c, t->src[lod].src, 0) : constant(c, 0);
+   else if (variant == 1)
+      level = lod >= 0 ? src(c, t->src[lod].src, 0) : constant(c, 0);
+   else if (variant == 2)
+      level = src(c, t->src[bias].src, 0);
+   if (compare) {
+      parts[3] = src(c, t->src[cmp].src, 0);
+      if (level)
+         parts[4] = level;
+   } else if (level) {
+      parts[3] = level;
+   }
+   if (variant == 3) {
+      /* d/dx and d/dy of u and v; the unit reads each quad's lowest lane. */
+      for (unsigned k = 0; k < 2 && k < t->src[ddx].src.ssa->num_components; k++) {
+         parts[4 + k] = src(c, t->src[ddx].src, k);
+         parts[6 + k] = src(c, t->src[ddy].src, k);
+      }
+   }
+   if (offset) {
+      /* The packed offset register awaits the texel-offset encoding. */
       uint32_t packed = 0;
       for (unsigned k = 0; k < t->src[off].src.ssa->num_components; k++) {
          if (!nir_src_is_const(t->src[off].src)) {
-            failf(c, "dynamic texel offsets outside the model", NULL);
+            failf(c, "dynamic texel offsets", NULL);
             return;
          }
          packed |= (nir_src_comp_as_uint(t->src[off].src, k) & 0x3f) << (8 * k);
       }
-      parts[count++] = constant(c, packed);
+      parts[5] = constant(c, packed);
    }
-   if (variant == 3) {
-      for (unsigned k = 0; k < t->src[ddx].src.ssa->num_components; k++)
-         parts[count++] = src(c, t->src[ddx].src, k);
-      for (unsigned k = 0; k < t->src[ddy].src.ssa->num_components; k++)
-         parts[count++] = src(c, t->src[ddy].src, k);
-   }
-   if (fetch && off >= 0) {
-      for (unsigned k = 0; k < t->src[off].src.ssa->num_components; k++)
-         parts[k] = op2(c, APEX_V_ADD, true, parts[k], src(c, t->src[off].src, k));
-   }
+   unsigned count = variant == 3 || (compare && level) || offset ? 8 : 4;
    uint32_t coord_group = value(c, true, count);
    for (unsigned k = 0; k < count; k++)
-      emit(c, APEX_COPY, sub(coord_group, k, 1), parts[k], 0, 0, 0);
-   uint32_t sampler = fetch ? 0 : texture_descriptor(c, t, true);
+      if (parts[k])
+         emit(c, APEX_COPY, sub(coord_group, k, 1), parts[k], 0, 0, 0);
+   uint32_t sampler = fetch ? image : texture_descriptor(c, t, true);
    unsigned results = util_bitcount(mask);
    uint32_t out = value(c, true, results);
    emit(c, fetch ? APEX_IMAGE_FETCH : APEX_IMAGE_SAMPLE, out, coord_group, image, sampler, hi);
@@ -1572,14 +1643,18 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       return;
    case nir_intrinsic_load_push_constant: {
       int64_t imm;
-      uint32_t offset = split_offset(c, i->src[0], &imm);
+      uint32_t offset = split_offset(c, i->src[0], &imm, false);
       imm += STANDALONE_PUSH + nir_intrinsic_base(i);
       if (i->src[0].ssa->divergent) {
-         uint32_t g = define(c, d, true);
-         emit(c, APEX_GLOBAL_LOAD, g, vector(c, offset), root(c), 0, mem_hi(imm, d->num_components - 1));
-         last(c)->flags = APEX_REORDER;
+         uint32_t g = define(c, d, true), n = d->num_components;
+         for (unsigned k = 0, piece; k < n; k += piece) {
+            piece = piece_dwords(access_alignment(i), 4 * k, n - k, false);
+            emit(c, APEX_GLOBAL_LOAD, sub(g, k, piece), vector(c, offset), root(c), 0,
+                 mem_hi(imm + 4 * k, piece - 1));
+            last(c)->flags = APEX_REORDER;
+         }
       } else {
-         alias(c, d, s_load(c, APEX_S_LOAD, root(c), offset, imm, d->num_components));
+         alias(c, d, s_load(c, APEX_S_LOAD, root(c), offset, imm, d->num_components, access_alignment(i)));
       }
       return;
    }
@@ -1671,7 +1746,7 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       uint32_t *state = terminate ? &c->alive : &c->covered;
       emit(c, APEX_S_ANDN2, *state, *state, m, 0, 0);
       if (terminate) {
-         emit(c, APEX_S_ANDN2, apex_phys(APEX_EXEC), apex_phys(APEX_EXEC), m, 0, 0);
+         set_exec(c, op2(c, APEX_S_ANDN2, false, apex_phys(APEX_EXEC), m));
          if (c->loop && c->loop->divergent) {
             emit(c, APEX_S_ANDN2, c->loop->iter, c->loop->iter, m, 0, 0);
             emit(c, APEX_S_ANDN2, c->loop->live, c->loop->live, m, 0, 0);
@@ -1689,16 +1764,29 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
    }
    case nir_intrinsic_load_barycentric_pixel: case nir_intrinsic_load_barycentric_centroid:
    case nir_intrinsic_load_barycentric_sample: {
-      if (nir_intrinsic_interp_mode(i) == INTERP_MODE_NOPERSPECTIVE) {
-         failf(c, "noperspective interpolation is outside the model", NULL);
+      bool centroid = i->intrinsic == nir_intrinsic_load_barycentric_centroid;
+      bool linear = nir_intrinsic_interp_mode(i) == INTERP_MODE_NOPERSPECTIVE;
+      if (linear && centroid) {
+         failf(c, "noperspective centroid interpolation is unsupported", NULL);
          return;
       }
-      bool centroid = i->intrinsic == nir_intrinsic_load_barycentric_centroid;
       if (centroid)
          c->header.flags |= 1u << 5;
       if (i->intrinsic == nir_intrinsic_load_barycentric_sample)
          c->header.flags |= 1u << 7;
       uint32_t g = define(c, d, true);
+      if (linear) {
+         /* Screen-space weights from the perspective ones: i Q / q1 and
+          * j Q / q2 with the pixel's 1/w (v4) and the hidden 1/w1, 1/w2. */
+         c->header.flags |= 1u << 6;
+         for (unsigned k = 0; k < 2; k++) {
+            uint32_t q = value(c, true, 1);
+            emit(c, APEX_V_INTERP_FLAT, q, 0, 0, apex_raw(129 + k), 0);
+            uint32_t scale = op2(c, APEX_V_MUL_F, true, apex_phys(4), op1(c, APEX_V_RCP, true, q));
+            emit(c, APEX_V_MUL_F, sub(g, k, 1), apex_phys(k), scale, 0, 0);
+         }
+         return;
+      }
       emit(c, APEX_COPY, sub(g, 0, 1), apex_phys(centroid ? 5 : 0), 0, 0, 0);
       emit(c, APEX_COPY, sub(g, 1, 1), apex_phys(centroid ? 6 : 1), 0, 0, 0);
       return;
@@ -1748,8 +1836,17 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
               op1(c, APEX_V_CVT_F_U, true, op2(c, APEX_V_SHR, true, apex_phys(2), constant(c, 16))),
               constant(c, 0x3f000000u), 0, 0);
       if (read & 4) {
-         failf(c, "gl_FragCoord.z needs the hidden depth attribute (isa-notes.md)", NULL);
-         return;
+         /* The depth plane (attribute code 132) at the pixel centre relative
+          * to its origin x0 | y0 << 16 (code 135). */
+         uint32_t origin = value(c, true, 1);
+         emit(c, APEX_V_INTERP_FLAT, origin, 0, 0, apex_raw(135), 0);
+         uint32_t x = op2(c, APEX_V_SUB, true, op2(c, APEX_V_AND, true, apex_phys(2), constant(c, 0xffff)),
+                          op2(c, APEX_V_AND, true, origin, constant(c, 0xffff)));
+         uint32_t y = op2(c, APEX_V_SUB, true, op2(c, APEX_V_SHR, true, apex_phys(2), constant(c, 16)),
+                          op2(c, APEX_V_SHR, true, origin, constant(c, 16)));
+         uint32_t fx = op2(c, APEX_V_ADD_F, true, op1(c, APEX_V_CVT_F_I, true, x), constant(c, 0x3f000000u));
+         uint32_t fy = op2(c, APEX_V_ADD_F, true, op1(c, APEX_V_CVT_F_I, true, y), constant(c, 0x3f000000u));
+         emit(c, APEX_V_INTERP, sub(g, 2, 1), fx, fy, apex_raw(132), 0);
       }
       if (read & 8) {
          c->header.flags |= 1u << 6;
@@ -2022,8 +2119,11 @@ static bool vectorize(unsigned align_mul, unsigned align_offset, unsigned bit_si
    bool constant = nir_intrinsic_infos[low->intrinsic].has_dest &&
                    (low->intrinsic == nir_intrinsic_load_ubo ||
                     (nir_intrinsic_has_access(low) && (nir_intrinsic_access(low) & ACCESS_CAN_REORDER)));
-   return bit_size == 32 && num_components <= (constant ? 16 : 4) && hole_size <= 0 &&
-          nir_combined_align(align_mul, align_offset) >= 4;
+   /* Vector accesses take 1-4 dwords at their natural alignment (16 bytes
+    * for three); scalar loads split into aligned pieces. */
+   unsigned align = nir_combined_align(align_mul, align_offset);
+   return bit_size == 32 && num_components <= (constant ? 16 : 4) && hole_size <= 0 && align >= 4 &&
+          (constant || align >= 4 * util_next_power_of_two(num_components));
 }
 
 static int fail(struct apex_compile_result *output, const char *message)
@@ -2219,12 +2319,12 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    c.defs = calloc(impl->ssa_alloc + 1, sizeof(*c.defs));
    c.vector = calloc(impl->ssa_alloc + 1, sizeof(bool));
    c.saturated = calloc(impl->ssa_alloc + 1, sizeof(bool));
-   memset(c.input_index, -1, sizeof(c.input_index));
+   c.range = _mesa_pointer_hash_table_create(NULL);
    c.header.stage = stage == MESA_SHADER_COMPUTE ? APEX_COMPUTE :
                     stage == MESA_SHADER_VERTEX ? APEX_VERTEX : APEX_FRAGMENT;
    memcpy(c.header.local, local, sizeof(local));
    c.header.shared = stage == MESA_SHADER_COMPUTE ? nir->info.shared_size : 0;
-   c.header.private_bytes = align(nir->scratch_size, 4);
+   c.header.private_bytes = stage == MESA_SHADER_COMPUTE ? align(nir->scratch_size, 4) : 0;
    classify(&c, impl);
    c.root = value(&c, false, 2);
    emit(&c, APEX_COPY, sub(c.root, 0, 1), apex_phys(APEX_SCALAR + 0), 0, 0, 0);
@@ -2281,6 +2381,7 @@ done:
    free(c.defs);
    free(c.vector);
    free(c.saturated);
+   _mesa_hash_table_destroy(c.range, NULL);
    util_dynarray_fini(&c.ops);
    util_dynarray_fini(&c.values);
    return result;

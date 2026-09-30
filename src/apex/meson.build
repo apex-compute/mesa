@@ -18,7 +18,13 @@ executable('apex-compile', 'main.c',
   link_language : 'cpp',
   install : false,
 )
-apex_rust.test('apex-native', apex_rs, suite : ['apex'])
+# The tests run programs on the ISA reference model, Tooling/apex_isa.
+apex_isa = get_option('apex-isa')
+if apex_isa == ''
+  apex_isa = meson.project_source_root() / '..' / '..' / 'Tooling'
+endif
+apex_test_env = {'APEX_ISA' : apex_isa}
+apex_rust.test('apex-native', apex_rs, suite : ['apex'], env : apex_test_env)
 apex_compiler_test = executable('apex-compiler-test', 'compiler_test.c',
   include_directories : [inc_include, inc_src],
   dependencies : [idep_nir, idep_mesautil],
@@ -26,13 +32,13 @@ apex_compiler_test = executable('apex-compiler-test', 'compiler_test.c',
   link_language : 'cpp',
   install : false,
 )
-test('apex-compiler', apex_compiler_test, suite : ['apex'])
+test('apex-compiler', apex_compiler_test, suite : ['apex'], env : apex_test_env)
 # Benchmark, triangle and compositor shaders plus the captured GNOME Shell
-# shaders run on the ISA model under the zero-spill gate.
+# and glmark2 shaders run on the ISA model under the zero-spill gate.
 apex_test_shaders = []
 foreach s : ['vulkan/bench.comp', 'vulkan/bench.vert', 'vulkan/bench.frag',
              'vulkan/triangle.vert', 'vulkan/triangle.frag', 'tests/compositor.frag',
-             'tests/features.comp', 'tests/spill.comp', 'tests/waterfall.comp', 'tests/control.comp', 'tests/texture.comp', 'tests/discard.frag', 'tests/demote.frag']
+             'tests/features.comp', 'tests/spill.comp', 'tests/waterfall.comp', 'tests/control.comp', 'tests/texture.comp', 'tests/discard.frag', 'tests/demote.frag', 'tests/depth.frag']
   apex_test_shaders += custom_target('apex-test-' + s.underscorify(),
     input : s, output : '@PLAINNAME@.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
@@ -48,6 +54,7 @@ apex_shader_test = executable('apex-shader-test', 'shader_test.c',
   install : false,
 )
 test('apex-shaders', apex_shader_test,
-  args : [meson.current_build_dir(), meson.current_source_dir() / 'tests/gnome'],
-  depends : apex_test_shaders, suite : ['apex'])
+  args : [meson.current_build_dir(), meson.current_source_dir() / 'tests/gnome',
+          meson.current_source_dir() / 'tests/glmark2'],
+  depends : apex_test_shaders, suite : ['apex'], env : apex_test_env, timeout : 600)
 subdir('vulkan')

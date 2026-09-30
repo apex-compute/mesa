@@ -31,11 +31,10 @@ int main(int argc, char **argv)
    if (result) {
       fprintf(stderr, "apex: %s\n", compiled.diagnostic);
    } else {
-      uint32_t h[16];
-      memcpy(h, compiled.data, sizeof(h));
+      const uint8_t *h = compiled.data;
       fprintf(stderr, "apex: %u instructions, s%u v%u, %u spills, shared %u, private %u/lane\n",
               compiled.instructions, compiled.scalar, compiled.vector, compiled.spills,
-              util_le32_to_cpu(h[5]), util_le32_to_cpu(h[6]));
+              h[22] | h[23] << 8, h[24] | h[25] << 8 | h[26] << 16 | (uint32_t)h[27] << 24);
       f = fopen(argv[2], "wb");
       if (!f) {
          perror(argv[2]);

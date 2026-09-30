@@ -3,6 +3,8 @@
 
 option('apex-compiler', type : 'boolean', value : false,
        description : 'Build the standalone Apex native compute compiler')
+option('apex-isa', type : 'string', value : '',
+       description : 'Tooling directory holding the Apex ISA reference model (apex_isa) for the Apex tests; empty is the superproject around dependencies/mesa')
 
 option(
   'split-debug',

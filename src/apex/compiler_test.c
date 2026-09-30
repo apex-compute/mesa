@@ -83,10 +83,8 @@ static void run(const struct apex_compile_result *r, uint8_t *root, size_t bytes
 {
    struct apex_sim_region regions[2] = {{ROOT, root, bytes}, {extra_va, extra, extra_bytes}};
    uint32_t user[16] = {(uint32_t)ROOT}, grid[3] = {1, 1, 1};
-   uint64_t executed;
    char diagnostic[256] = "";
-   if (apex_simulate(r->data, r->size, user, grid, 0, NULL, regions, extra ? 2 : 1, &executed,
-                     diagnostic)) {
+   if (apex_simulate(r->data, r->size, user, grid, 0, NULL, regions, extra ? 2 : 1, diagnostic)) {
       fprintf(stderr, "simulation: %s\n", diagnostic);
       abort();
    }
@@ -219,7 +217,8 @@ int main(int argc, char **argv)
       CHECK(apex_from_nir(nir, &a) == 0);
       ralloc_free(nir);
       unsigned invocations = valid_wide[i][0] * valid_wide[i][1] * valid_wide[i][2];
-      CHECK(word(a.data + 16) == (valid_wide[i][0] | valid_wide[i][1] << 9 | valid_wide[i][2] << 18));
+      CHECK(word(a.data + 16) == (valid_wide[i][0] | valid_wide[i][1] << 16) &&
+            (word(a.data + 20) & 0xffff) == valid_wide[i][2]);
       uint8_t *root = calloc(1, 1024 + 64);
       run(&a, root, 1024 + 64, NULL, 0, 0);
       for (unsigned k = 0; k < 256; k++) {
@@ -259,7 +258,7 @@ int main(int argc, char **argv)
    apex_compile_result_finish(&a);
    CHECK(apex_emit(NULL, 0, values, 1, &header, &a) == 0);
    CHECK(a.data && a.size == 72 && !a.diagnostic[0]);
-   CHECK(word(a.data + 20) == 128 && word(a.data + 24) == 32);
+   CHECK(word(a.data + 20) == (1 | 128 << 16) && word(a.data + 24) == 32);
    CHECK(a.data[64] == APEX_S_ENDPGM);
    apex_compile_result_finish(&a);
    apex_compile_result_finish(&b);
@@ -311,7 +310,7 @@ int main(int argc, char **argv)
    CHECK(apex_from_nir(nir, &a) == 0);
    ralloc_free(nir);
    {
-      const uint64_t data_va = 0x7ff00000000ull;
+      const uint64_t data_va = 0xfeffff0000ull; /* the low word carries */
       uint8_t *data = calloc(1, 0x21000);
       uint8_t root[64] = {0};
       uint32_t words[4] = {(uint32_t)data_va, data_va >> 32, (uint32_t)data_va, data_va >> 32};

@@ -85,25 +85,28 @@ static inline uint32_t apex_raw(unsigned v) { return 1u << 29 | v; }
 #define APEX_LANE 225u
 enum apex_stage { APEX_COMPUTE, APEX_VERTEX, APEX_FRAGMENT };
 struct apex_header {
-   uint32_t stage, flags, local[3], shared, private_bytes, output;
-   uint8_t inputs[32];
+   uint32_t stage, flags, local[3], shared, private_bytes, output, input_count;
+   uint8_t inputs[32]; /* bit 7 flat; input k is vertex output varying k */
 };
 int apex_emit(const struct apex_op *, size_t, const struct apex_value *, size_t,
               const struct apex_header *, struct apex_compile_result *);
 
-/* Test model of the ISA: a compute grid, or one vertex/fragment wave. */
+/* Runs a program on the ISA reference model (Tooling/apex_isa, located by
+ * the APEX_ISA environment variable): a compute grid, or one vertex or
+ * fragment wave. Fragment waves take quad origins from v2 and coverage,
+ * primitive slot and facing from v3; primitive p's attribute block holds
+ * APEX_ATTRIBUTE_BLOCK dwords in the ring layout of Docs/isa.md. */
+#define APEX_ATTRIBUTE_BLOCK (8 + 12 * 32)
 struct apex_sim_region { uint64_t gpuva; void *data; uint64_t size; };
 struct apex_sim_wave {
    uint32_t exec, scalar[32], vector[72][16];
-   uint8_t primitive[16];
-   const float *attributes; /* primitives x 144 components x {P0, P10, P20} */
+   const uint32_t *attributes;
    uint32_t primitives;
    uint32_t exports[10][16][4], exported[10];
 };
 int apex_simulate(const uint8_t *program, size_t size, const uint32_t user[16],
                   const uint32_t groups[3], uint64_t private_base, struct apex_sim_wave *,
-                  struct apex_sim_region *, size_t regions, uint64_t *executed,
-                  char diagnostic[256]);
+                  struct apex_sim_region *, size_t regions, char diagnostic[256]);
 
 int apex_tool(const char *mode, const char *input, const char *output);
 /* Mutates caller-owned NIR; the caller retains its lifetime and GLSL type ref.

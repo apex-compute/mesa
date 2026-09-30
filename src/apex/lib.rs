@@ -2,7 +2,7 @@
 mod api;
 pub mod isa;
 pub mod mir;
+pub mod model;
 pub mod schedule;
-pub mod sim;
 #[cfg(test)]
 mod tests;
