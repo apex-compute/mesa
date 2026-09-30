@@ -205,6 +205,26 @@ fn pressure_and_long_chain() {
 }
 
 #[test]
+fn constants_rematerialize_instead_of_spilling() {
+    // Eighty constants outlive the 52 allocatable registers; none reach private memory.
+    let mut ops = vec![Op::new(0x40, 0, 0, 0, 0, 0)];
+    for id in 1..=80 {
+        ops.push(Op::new(0x20, id, 0, 0, 0, id * 3));
+    }
+    let mut sum = 0;
+    for id in 1..=80 {
+        ops.push(Op::new(0x22, 100 + id, sum, id, 0, 0));
+        sum = 100 + id;
+    }
+    ops.extend([Op::new(0x20, 500, 0, 0, 0, 0), Op::new(0x54, 0, 500, sum, 0, 0)]);
+    let p = mir::compile(&ops, 4, 0, 16).unwrap();
+    assert_eq!(p.private, 0);
+    for lane in 0..16 {
+        assert_eq!(arithmetic_slice(&p, lane), lane + 3 * 80 * 81 / 2);
+    }
+}
+
+#[test]
 fn scalar_control_lifetimes() {
     fn evaluate(ops: &[Op]) -> u32 {
         let program = mir::compile(ops, 0, 0, 16).unwrap();

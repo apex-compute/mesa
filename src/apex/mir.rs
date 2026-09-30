@@ -23,6 +23,8 @@ impl Op {
 enum Home {
     Register(u8),
     Spill(u32),
+    // A single-definition vector immediate is rebuilt at each use.
+    Remat(u32),
 }
 
 fn roles(op: u8, imm: u32) -> Result<[Option<(Class, u8)>; 4], String> {
@@ -133,17 +135,18 @@ pub fn compile(
         *words = (*words).max(slot.checked_add(n as u32).ok_or("spill size overflow")?);
         Ok(slot)
     };
+    let remat = |id: u32| match values[&id] {
+        (Class::V, 1, _, _, Some(pc)) if ops[pc].op == 0x20 => Some(ops[pc].imm),
+        _ => None,
+    };
     for (id, (cl, n, start, end, _)) in order {
         occupied.retain(|v| v.3 >= start);
         let first = if cl == Class::S { 4 } else { 0 };
-        let fits = |r: u8, occupied: &Vec<(Class, u8, u8, usize, u32)>| {
-            r + n <= 52
-                && (n == 1 || r % 2 == 0)
-                && !occupied.iter().any(|v| v.0 == cl && r < v.1 + v.2 && v.1 < r + n)
-        };
+        let aligned = |r: u8| r + n <= 52 && (n == 1 || r % 2 == 0);
+        let overlaps = |r: u8, v: &(Class, u8, u8, usize, u32)| v.0 == cl && r < v.1 + v.2 && v.1 < r + n;
         // Rotate preferred bank with SSA identity; reserve 52..63 for reloads and bank repair.
         let free = (first..52)
-            .filter(|&r| fits(r, &occupied))
+            .filter(|&r| aligned(r) && !occupied.iter().any(|v| overlaps(r, v)))
             .min_by_key(|r| ((r % 4 + 4 - (id % 4) as u8) % 4, *r));
         if let Some(r) = free {
             occupied.push((cl, r, n, end, id));
@@ -153,23 +156,34 @@ pub fn compile(
         if cl == Class::S {
             return Err("scalar register pressure exceeds initial profile".into());
         }
-        // Spill the active vector interval that ends furthest when it outlives
-        // this one and releasing it makes room; otherwise spill this value.
-        let victim = occupied
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.0 == cl && v.3 > end && v.2 == n)
-            .filter(|(_, v)| n == 1 || v.1 % 2 == 0)
-            .max_by_key(|(_, v)| v.3)
-            .map(|(i, _)| i);
-        if let Some(i) = victim {
-            let (_, r, _, victim_end, victim_id) = occupied.remove(i);
-            let (_, _, victim_start, _, _) = values[&victim_id];
-            homes.insert(victim_id, Home::Spill(spill(n, victim_start, victim_end, &mut words)?));
+        // Evict the registers whose occupants all outlive this value, preferring
+        // rematerializable occupants and then the latest nearest end. A pair may
+        // evict two single values; otherwise spill this value.
+        let victim = (first..52)
+            .filter(|&r| aligned(r))
+            .filter_map(|r| {
+                let held: Vec<_> = occupied.iter().filter(|v| overlaps(r, v)).collect();
+                held.iter()
+                    .all(|v| v.3 > end)
+                    .then(|| (held.iter().all(|v| remat(v.4).is_some()), held.iter().map(|v| v.3).min(), r))
+            })
+            .max_by_key(|&(cheap, nearest, r)| (cheap, nearest, std::cmp::Reverse(r)))
+            .map(|(_, _, r)| r);
+        let mut home = |id: u32, n: u8, start: usize, end: usize, words: &mut u32| -> Result<Home, String> {
+            Ok(match remat(id) {
+                Some(imm) => Home::Remat(imm),
+                None => Home::Spill(spill(n, start, end, words)?),
+            })
+        };
+        if let Some(r) = victim {
+            for (_, _, victim_n, victim_end, victim_id) in occupied.extract_if(.., |v| overlaps(r, v)).collect::<Vec<_>>() {
+                let (_, _, victim_start, _, _) = values[&victim_id];
+                homes.insert(victim_id, home(victim_id, victim_n, victim_start, victim_end, &mut words)?);
+            }
             occupied.push((cl, r, n, end, id));
             homes.insert(id, Home::Register(r));
         } else {
-            homes.insert(id, Home::Spill(spill(n, start, end, &mut words)?));
+            homes.insert(id, home(id, n, start, end, &mut words)?);
         }
     }
     let mut native = Vec::new();
@@ -177,12 +191,25 @@ pub fn compile(
     for o in ops {
         instruction_map.push(native.len());
         let roles = roles(o.op, o.imm)?;
+        if roles[0].is_some() && matches!(homes[&o.args[0]], Home::Remat(_)) {
+            continue;
+        }
         let mut fields = [0; 4];
         let mut stores = Vec::new();
         for f in 0..4 {
             if let Some((_, n)) = roles[f] {
                 fields[f] = match homes[&o.args[f]] {
                     Home::Register(r) => r,
+                    // Remat definitions were skipped above, so this is a use.
+                    Home::Remat(imm) => {
+                        let r = 56 + f as u8 * 2;
+                        native.push(Inst {
+                            d: r,
+                            imm,
+                            ..Inst::new(0x20)
+                        });
+                        r
+                    }
                     Home::Spill(slot) => {
                         let r = 56 + f as u8 * 2;
                         for j in 0..n {
