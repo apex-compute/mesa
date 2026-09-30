@@ -57,6 +57,13 @@ pub fn compile(
     if source_private % 4 != 0 {
         return Err("unaligned source private size".into());
     }
+    let coalesced;
+    let ops = if ops.iter().all(|o| !matches!(o.op, 4 | 5) || (o.imm as usize) < ops.len()) {
+        coalesced = coalesce(ops)?;
+        &coalesced[..]
+    } else {
+        ops
+    };
     // Masked vector writes preserve inactive lanes in out-of-SSA phi webs.
     // Include every definition/use and enclose backedges before reusing homes.
     let control = ops.iter().any(|o| matches!(o.op, 4 | 5 | 6));
@@ -394,6 +401,100 @@ pub fn compile(
     }
     p.validate()?;
     Ok(p)
+}
+
+/// Removes out-of-SSA vector copies inside one mask region: a copy's single
+/// use reads the source register directly, and a single-use value is defined
+/// straight into the register it is copied to. Loads then write their final
+/// register and overlap instead of waiting at each copy.
+fn coalesce(ops: &[Op]) -> Result<Vec<Op>, String> {
+    let mut ops = ops.to_vec();
+    let roles: Vec<_> = ops.iter().map(|o| roles(o.op, o.imm)).collect::<Result<_, _>>()?;
+    let mut boundary = vec![false; ops.len() + 1];
+    for (pc, o) in ops.iter().enumerate() {
+        if matches!(o.op, 1 | 2 | 4 | 5 | 6 | 7 | 8) {
+            boundary[pc] = true;
+        }
+        if matches!(o.op, 4 | 5) {
+            boundary[o.imm as usize] = true;
+        }
+    }
+    let mut defs: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut uses: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
+    for (pc, (o, r)) in ops.iter().zip(&roles).enumerate() {
+        if r[0].is_some() {
+            defs.entry(o.args[0]).or_default().push(pc);
+        }
+        for f in 1..4 {
+            if r[f].is_some() {
+                uses.entry(o.args[f]).or_default().push((pc, f));
+            }
+        }
+    }
+    let single = |defs: &BTreeMap<u32, Vec<usize>>, id: u32| defs.get(&id).map(Vec::len) == Some(1);
+    // Whether register id is untouched strictly between pcs a and b in one region.
+    let quiet = |ops: &[Op], a: usize, b: usize, id: u32| {
+        (a + 1..=b).all(|pc| !boundary[pc])
+            && (a + 1..b).all(|pc| (0..4).all(|f| roles[pc][f].is_none() || ops[pc].args[f] != id))
+    };
+    let vector = |r: Option<(Class, u8)>| r == Some((Class::V, 1));
+    let mut removed = vec![false; ops.len()];
+    for pc in 0..ops.len() {
+        if ops[pc].op != 0x21 {
+            continue;
+        }
+        let (copy, source) = (ops[pc].args[0], ops[pc].args[1]);
+        if copy == source {
+            continue;
+        }
+        let copy_uses = uses.get(&copy).cloned().unwrap_or_default();
+        // A load_reg copy: forward the register to every use in its region.
+        if single(&defs, copy)
+            && !copy_uses.is_empty()
+            && copy_uses.iter().all(|&(u, _)| u > pc && quiet(&ops, pc, u, source) && !removed[u])
+            && copy_uses.iter().all(|&(u, f)| (1..4).all(|g| g == f || ops[u].args[g] != copy))
+        {
+            for &(u, f) in &copy_uses {
+                ops[u].args[f] = source;
+            }
+            let reads = uses.entry(source).or_default();
+            reads.retain(|&(u, _)| u != pc);
+            reads.extend(copy_uses);
+            removed[pc] = true;
+            continue;
+        }
+        // A store_reg copy: define the single-use source directly into the copy.
+        let source_uses = uses.get(&source).map(Vec::as_slice).unwrap_or_default();
+        if let (true, [(u, _)], Some(&[d])) = (single(&defs, source), source_uses, defs.get(&source).map(Vec::as_slice)) {
+            if *u == pc && d < pc && !removed[d] && vector(roles[d][0]) && quiet(&ops, d, pc, copy)
+                && (1..4).all(|f| roles[d][f].is_none() || ops[d].args[f] != source)
+            {
+                ops[d].args[0] = copy;
+                let writes = defs.get_mut(&copy).unwrap();
+                writes.retain(|&w| w != pc);
+                writes.push(d);
+                removed[pc] = true;
+            }
+        }
+    }
+    let mut map = vec![0; ops.len() + 1];
+    let mut kept = 0;
+    for pc in 0..ops.len() {
+        map[pc] = kept;
+        kept += !removed[pc] as usize;
+    }
+    map[ops.len()] = kept;
+    Ok(ops
+        .into_iter()
+        .zip(removed)
+        .filter(|(_, r)| !r)
+        .map(|(mut o, _)| {
+            if matches!(o.op, 4 | 5) {
+                o.imm = map[o.imm as usize] as u32;
+            }
+            o
+        })
+        .collect())
 }
 
 /// Hull intervals from liveness on the linear control-flow graph. Every

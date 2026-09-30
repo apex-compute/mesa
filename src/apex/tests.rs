@@ -205,6 +205,25 @@ fn pressure_and_long_chain() {
 }
 
 #[test]
+fn copies_coalesce_so_loads_overlap() {
+    // Out-of-SSA shape: each load is copied into a register, then read back.
+    let ops = [
+        Op::new(0x20, 1, 0, 0, 0, 0),
+        Op::new(0x20, 2, 0, 0, 0, 4),
+        Op::new(0x53, 3, 1, 0, 0, 0),
+        Op::new(0x21, 10, 3, 0, 0, 0),
+        Op::new(0x53, 4, 2, 0, 0, 0),
+        Op::new(0x21, 11, 4, 0, 0, 0),
+        Op::new(0x21, 5, 10, 0, 0, 0),
+        Op::new(0x22, 6, 5, 11, 0, 0),
+        Op::new(0x54, 0, 1, 6, 0, 0),
+    ];
+    let p = mir::compile(&ops, 64, 0, 16).unwrap();
+    let code: Vec<u8> = p.code.iter().map(|i| i.op).filter(|&op| op != 0).collect();
+    assert_eq!(code, [0x20, 0x20, 0x53, 0x53, 3, 0x22, 0x54, 3, 1]);
+}
+
+#[test]
 fn constants_rematerialize_instead_of_spilling() {
     // Eighty constants outlive the 52 allocatable registers; none reach private memory.
     let mut ops = vec![Op::new(0x40, 0, 0, 0, 0, 0)];
