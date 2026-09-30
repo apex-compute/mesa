@@ -254,6 +254,8 @@ gbm_case(struct gbm_device *device, EGLDisplay display, uint32_t usage, const ch
             same &= words[y * map_stride / 4 + x] == 0x01000000u * y + x;
       if (words)
          p_gbm_bo_unmap(bo, data);
+      /* gbm_bo_map requires *map_data to be NULL. */
+      data = NULL;
       snprintf(what, sizeof(what), "%s: CPU writes read back", name);
       check(same, what);
    }
@@ -288,6 +290,8 @@ gbm_case(struct gbm_device *device, EGLDisplay display, uint32_t usage, const ch
          words = p_gbm_bo_map(bo, 0, 0, SIZE, SIZE, GBM_BO_TRANSFER_READ, &map_stride, &data);
          bool seen = words && words[15 * map_stride / 4 + 15] == 0xff400000u &&
                      (words[0] & 0xffff00ffu) == 0xffff00ffu;
+         if (words && !seen)
+            printf("     read (15, 15) 0x%08x, (0, 0) 0x%08x\n", words[15 * map_stride / 4 + 15], words[0]);
          if (words)
             p_gbm_bo_unmap(bo, data);
          snprintf(what, sizeof(what), "%s: rendering reaches the GBM buffer", name);
