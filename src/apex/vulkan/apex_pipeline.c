@@ -101,13 +101,13 @@ buffer_component(nir_builder *b, nir_intrinsic_instr *i, nir_def *start, unsigne
    }
 }
 
-/* Whether bytes offset..offset + width fit in range. Subtract from the range
- * before comparing: offset + width may wrap. */
+/* Whether width bytes at the offset where left = range - offset bytes remain
+ * fit in the range. Checking offset < range first keeps left from wrapping, and
+ * leaves only constants loop-invariant. */
 static nir_def *
-buffer_inside(nir_builder *b, nir_def *range, nir_def *offset, unsigned width)
+buffer_inside(nir_builder *b, nir_def *started, nir_def *left, unsigned width)
 {
-   return nir_iand(b, nir_uge_imm(b, range, width),
-                   nir_uge(b, nir_iadd_imm(b, range, -(int)width), offset));
+   return nir_iand(b, started, nir_uge_imm(b, left, width));
 }
 
 static bool
@@ -148,19 +148,20 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def *offset = i->src[store ? 2 : 1].ssa;
    nir_def *start = nir_build_addr_iadd(b, nir_vec2(b, words[0], words[1]),
       nir_address_format_2x32bit_global, nir_var_mem_global, offset);
+   nir_def *started = nir_ult(b, offset, words[2]), *left = nir_isub(b, words[2], offset);
    unsigned mask = store ? nir_intrinsic_write_mask(i) : BITFIELD_MASK(i->num_components);
    unsigned count = util_last_bit(mask);
    nir_def *whole[4], *values[4];
    /* A vector wholly inside the range takes one branch-free path. Others,
     * including the zero-range null sentinel, bound each component. */
    if (count > 1) {
-      nir_push_if(b, buffer_inside(b, words[2], offset, count * 4));
+      nir_push_if(b, buffer_inside(b, started, left, count * 4));
       u_foreach_bit(c, mask)
          whole[c] = buffer_component(b, i, start, c);
       nir_push_else(b, NULL);
    }
    u_foreach_bit(c, mask) {
-      nir_push_if(b, buffer_inside(b, words[2], offset, c * 4 + 4));
+      nir_push_if(b, buffer_inside(b, started, left, c * 4 + 4));
       nir_def *loaded = buffer_component(b, i, start, c);
       nir_push_else(b, NULL);
       nir_def *zero = nir_imm_int(b, 0);
