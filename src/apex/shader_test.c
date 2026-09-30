@@ -345,9 +345,9 @@ static void test_features(const char *dir)
    const unsigned groups = 2, limit = 40;
    struct world w = {0};
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
-   uint8_t *out = region(&w, 0x200000, groups * 64 * 64);
+   uint8_t *out = region(&w, 0x200000, groups * 64 * 80);
    uint8_t *counter = region(&w, 0x300000, 17 * 4);
-   buffer_descriptor(root + slot(0, 0), 0x200000, groups * 64 * 64);
+   buffer_descriptor(root + slot(0, 0), 0x200000, groups * 64 * 80);
    buffer_descriptor(root + slot(0, 1), 0x300000, 17 * 4);
    put(root + PUSH, limit);
    uint32_t user[16];
@@ -368,7 +368,7 @@ static void test_features(const char *dir)
    uint32_t hist[16] = {0};
    for (unsigned g = 0; g < groups * 64; g++) {
       uint32_t l = g % 64, wave = l / 16, lane = l % 16, group = g / 64;
-      const uint8_t *o = out + g * 64;
+      const uint8_t *o = out + g * 80;
       uint32_t acc = 0;
       for (uint32_t k = 0; k < limit; k++) {
          if ((k + l) % 3 == 0)
@@ -412,6 +412,13 @@ static void test_features(const char *dir)
          rev |= ((l >> k) & 1) << (31 - k);
       CHECK(get(o + 60) == (msb | __builtin_popcount(l * 77) << 8 |
                             (uint32_t)__builtin_ctz(l + 64) << 16 | (rev >> 24) << 24));
+      CHECK(get(o + 64) == ((l ^ 1) | (l ^ 3) << 8));
+      CHECK(get(o + 68) == ((l & ~3u) + 2) * 7);
+      unsigned below = 0;
+      for (unsigned k = 16 * wave; k < l; k++)
+         below += k % 3 == 0;
+      CHECK(get(o + 72) == below);
+      CHECK(get(o + 76) == 4 * (l & ~3u) + 6);
    }
    CHECK(get(counter) == groups * 64);
    for (unsigned k = 0; k < 16; k++)
@@ -502,6 +509,7 @@ static void test_kill(const char *dir, const char *name, bool demote)
 int main(int argc, char **argv)
 {
    CHECK(argc == 3);
+   setvbuf(stdout, NULL, _IOLBF, 0);
    test_bench_compute(argv[1]);
    test_vertex(argv[1], "bench.vert.spv", 2);
    test_vertex(argv[1], "triangle.vert.spv", 4);

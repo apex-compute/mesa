@@ -357,22 +357,22 @@ fn coalesce(ops: &mut Vec<Op>, values: &[Value], fixed: &mut BTreeMap<u32, u8>) 
                 }
                 let home = fs as u32 - at;
                 let class = values[big as usize].class;
-                // Other launch values inside the new home must be copied to the matching place.
-                let copies: Vec<(u32, u32, u32)> = ops
-                    .iter()
-                    .filter(|o| o.op == COPY)
-                    .filter_map(|o| match (o.f[0], o.f[1]) {
-                        (Opnd::Val { id: a, off: ao, .. }, Opnd::Val { id: b, off: bo, .. }) => Some((a, ao as u32, b + 0 * bo as u32)),
-                        _ => None,
+                // Other launch values inside the new home must be copied
+                // whole into the matching place of the group.
+                let copied = |id: u32, h: u32, parent: &mut Vec<(u32, u32)>| {
+                    ops.iter().any(|o| match (o.op, o.f[0], o.f[1]) {
+                        (COPY, Opnd::Val { id: a, off: ao, .. }, Opnd::Val { id: s, off: 0, .. }) if s == id => {
+                            let (ra, oa) = find(parent, a);
+                            ra == big && home + oa + ao as u32 == h
+                        }
+                        _ => false,
                     })
-                    .collect();
-                let clash = fixed.clone().iter().any(|(&id, &h)| {
+                };
+                let others: Vec<(u32, u8)> = fixed.iter().map(|(&id, &h)| (id, h)).collect();
+                let clash = others.into_iter().any(|(id, h)| {
                     id != small && values[id as usize].class == class
                         && (h as u32) < home + width(big) && home < h as u32 + values[id as usize].width as u32
-                        && !copies.iter().any(|&(a, ao, b)| {
-                            let (ra, oa) = find(&mut parent, a);
-                            b == id && ra == big && home + oa + ao == h as u32
-                        })
+                        && !copied(id, h as u32, &mut parent)
                 });
                 if clash {
                     continue;

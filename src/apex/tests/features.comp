@@ -8,6 +8,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_quad : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) buffer Out { uint o[]; };
@@ -17,7 +19,7 @@ shared uint tile[64];
 void main()
 {
    uint l = gl_LocalInvocationIndex, g = gl_GlobalInvocationID.x;
-   uint base = g * 16u;
+   uint base = g * 20u;
    uint acc = 0u;
    for (uint k = 0u; k < p.limit; k++) {
       if ((k + l) % 3u == 0u)
@@ -53,4 +55,8 @@ void main()
    o[base + 14u] = uint(clamp(x, -1.0, 1.0) * 1000.0 + 5000.0);
    o[base + 15u] = uint(findMSB(l * 1234u + 1u)) | uint(bitCount(l * 77u)) << 8 |
                    uint(findLSB(l + 64u)) << 16 | (bitfieldReverse(l) >> 24) << 24;
+   o[base + 16u] = subgroupQuadSwapHorizontal(l) | subgroupQuadSwapDiagonal(l) << 8;
+   o[base + 17u] = subgroupQuadBroadcast(l * 7u, 2u);
+   o[base + 18u] = subgroupBallotExclusiveBitCount(subgroupBallot(l % 3u == 0u));
+   o[base + 19u] = subgroupClusteredAdd(l, 4u);
 }

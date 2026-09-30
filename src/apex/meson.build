@@ -37,6 +37,7 @@ foreach s : ['vulkan/bench.comp', 'vulkan/bench.vert', 'vulkan/bench.frag',
     input : s, output : '@PLAINNAME@.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
                '@INPUT@', '-o', '@OUTPUT@'],
+    build_by_default : true,
   )
 endforeach
 apex_shader_test = executable('apex-shader-test', 'shader_test.c',

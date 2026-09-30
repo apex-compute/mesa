@@ -1643,6 +1643,25 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       }
       return;
    }
+   case nir_intrinsic_quad_broadcast: case nir_intrinsic_quad_swap_horizontal:
+   case nir_intrinsic_quad_swap_vertical: case nir_intrinsic_quad_swap_diagonal: {
+      /* Two bits per quad lane select its source lane. */
+      unsigned pattern = i->intrinsic == nir_intrinsic_quad_swap_horizontal ? 0xb1 :
+                         i->intrinsic == nir_intrinsic_quad_swap_vertical ? 0x4e :
+                         i->intrinsic == nir_intrinsic_quad_swap_diagonal ? 0x1b :
+                         (nir_src_as_uint(i->src[1]) & 3) * 0x55;
+      uint32_t g = define(c, d, true);
+      for (unsigned k = 0; k < words(d); k++)
+         emit(c, APEX_V_QUADPERM, sub(g, k, 1), vector(c, sub(src(c, i->src[0], 0), k, 1)),
+              constant(c, pattern), 0, 0);
+      return;
+   }
+   case nir_intrinsic_mbcnt_amd: {
+      uint32_t m = scalar(c, src(c, i->src[0], 0));
+      uint32_t count = op1(c, APEX_V_MBCNT, true, m);
+      emit(c, APEX_V_ADD, define(c, d, true), count, src(c, i->src[1], 0), 0, 0);
+      return;
+   }
    case nir_intrinsic_shuffle: {
       uint32_t g = define(c, d, true);
       for (unsigned k = 0; k < words(d); k++)
@@ -1725,18 +1744,25 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       return;
    }
    case nir_intrinsic_load_frag_coord: {
+      /* Pixel centers from v2 (x | y << 16); w is the interpolated 1/w in v4. */
+      unsigned read = nir_def_components_read(d);
       uint32_t g = define(c, d, true);
-      uint32_t xy = apex_phys(2);
-      uint32_t x = op2(c, APEX_V_AND, true, xy, constant(c, 0xffff));
-      uint32_t y = op2(c, APEX_V_SHR, true, xy, constant(c, 16));
-      emit(c, APEX_V_ADD_F, sub(g, 0, 1), op1(c, APEX_V_CVT_F_U, true, x), constant(c, 0x3f000000u), 0, 0);
-      emit(c, APEX_V_ADD_F, sub(g, 1, 1), op1(c, APEX_V_CVT_F_U, true, y), constant(c, 0x3f000000u), 0, 0);
-      if (nir_def_components_read(d) & 4) {
-         failf(c, "gl_FragCoord.z is outside the model", NULL);
+      if (read & 1)
+         emit(c, APEX_V_ADD_F, sub(g, 0, 1),
+              op1(c, APEX_V_CVT_F_U, true, op2(c, APEX_V_AND, true, apex_phys(2), constant(c, 0xffff))),
+              constant(c, 0x3f000000u), 0, 0);
+      if (read & 2)
+         emit(c, APEX_V_ADD_F, sub(g, 1, 1),
+              op1(c, APEX_V_CVT_F_U, true, op2(c, APEX_V_SHR, true, apex_phys(2), constant(c, 16))),
+              constant(c, 0x3f000000u), 0, 0);
+      if (read & 4) {
+         failf(c, "gl_FragCoord.z needs the hidden depth attribute (isa-notes.md)", NULL);
          return;
       }
-      c->header.flags |= 1u << 6;
-      emit(c, APEX_COPY, sub(g, 3, 1), apex_phys(4), 0, 0, 0);
+      if (read & 8) {
+         c->header.flags |= 1u << 6;
+         emit(c, APEX_COPY, sub(g, 3, 1), apex_phys(4), 0, 0, 0);
+      }
       return;
    }
    case nir_intrinsic_load_front_face:
@@ -2103,7 +2129,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       .subgroup_size = 16, .ballot_bit_size = 32, .ballot_components = 1,
       .lower_to_scalar = true, .lower_vote_ieq = true, .lower_vote_feq = true,
       .lower_vote_bool_eq = true, .lower_subgroup_masks = true, .lower_relative_shuffle = true,
-      .lower_quad = true, .lower_reduce = true, .lower_rotate_to_shuffle = true,
+      .lower_quad_broadcast_dynamic = true, .lower_quad_vote = true,
+      .lower_ballot_bit_count_to_mbcnt_amd = true,
+      .lower_reduce = true, .lower_rotate_to_shuffle = true,
       .lower_shuffle_to_32bit = true,
    };
    bool progress;
