@@ -303,15 +303,17 @@ lower_push_constant(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def *values[8];
    for (unsigned c = 0; c < i->num_components * words; c++) {
       unsigned end = base + c * 4 + 4;
-      nir_def *inside = end <= size ? nir_ule_imm(b, i->src[0].ssa, size - end) : nir_imm_false(b);
-      nir_push_if(b, inside);
+      if (end > size) {
+         values[c] = nir_imm_int(b, 0);
+         continue;
+      }
+      /* Clamping keeps the immutable load inside the push range, so it
+       * speculates and hoists; words beyond the range read as zero. */
+      nir_def *offset = i->src[0].ssa;
       nir_def *value = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-         nir_iadd_imm(b, i->src[0].ssa, table_bytes + base + c * 4), .align_mul = 4,
-         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
-      nir_push_else(b, NULL);
-      nir_def *zero = nir_imm_int(b, 0);
-      nir_pop_if(b, NULL);
-      values[c] = nir_if_phi(b, value, zero);
+         nir_iadd_imm(b, nir_umin(b, offset, nir_imm_int(b, size - end)), table_bytes + base + c * 4),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
+      values[c] = nir_bcsel(b, nir_ule_imm(b, offset, size - end), value, nir_imm_int(b, 0));
    }
    if (words == 2)
       for (unsigned c = 0; c < i->num_components; c++)
