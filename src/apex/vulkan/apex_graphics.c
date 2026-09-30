@@ -763,7 +763,8 @@ pack_color(nir_builder *b, enum pipe_format format, nir_def *color)
       nir_def *v = nir_channel(b, color, s);
       const unsigned bits[1] = {ch->size};
       if (ch->type == UTIL_FORMAT_TYPE_FLOAT)
-         v = ch->size == 32 ? v : apex_float_to_small(b, v, ch->size - 5, ch->size == 16);
+         v = ch->size == 32 ? v : ch->size == 16 ? apex_float_to_small(b, v, 10, true) :
+                                  apex_float_to_small(b, v, ch->size - 5, false);
       else if (ch->normalized)
          v = ch->type == UTIL_FORMAT_TYPE_UNSIGNED ? nir_format_float_to_unorm(b, v, bits) :
                                                      nir_format_float_to_snorm(b, v, bits);
