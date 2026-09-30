@@ -749,11 +749,101 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
    apex_device_finish(&device);
 }
 
+/* bench.comp through the Vulkan lowering, run on the ISA model with a table
+ * laid out as drm_prepare writes it: descriptor rows, the robust sentinel,
+ * the push image and the dispatch trailer. */
+static void
+test_bench(struct vk_physical_device *physical, const char *path)
+{
+   struct apex_device device;
+   const float priority = 1;
+   const VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueCount = 1, .pQueuePriorities = &priority};
+   const VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
+   device.transport = APEX_TRANSPORT_DRM;
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   FILE *f = fopen(path, "rb");
+   CHECK(f && !fseek(f, 0, SEEK_END));
+   long bytes = ftell(f);
+   rewind(f);
+   uint32_t *spirv = malloc(bytes);
+   CHECK(spirv && fread(spirv, 1, bytes, f) == bytes && !fclose(f));
+   VkShaderModule module;
+   const VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = bytes, .pCode = spirv};
+   CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
+   free(spirv);
+   const VkDescriptorSetLayoutBinding bindings[] = {
+      {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+   };
+   const VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 2, .pBindings = bindings};
+   VkDescriptorSetLayout set;
+   CHECK(v->CreateDescriptorSetLayout(dev, &si, NULL, &set) == VK_SUCCESS);
+   const VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+   const VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1, .pSetLayouts = &set, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   const VkComputePipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .layout = layout, .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
+   VkPipeline pipeline;
+   CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
+   struct apex_program *program = &apex_pipeline_from_handle(pipeline)->program;
+   CHECK(program->descriptor_count == 2 && program->push_size == 8 && !program->code.spills);
+   const unsigned groups = 3, count = 2000, stride = groups * 256;
+   const uint64_t table_va = 0x10000, src_va = 0x200000, dst_va = 0x400000;
+   unsigned trailer = apex_program_trailer(program);
+   uint8_t *table = calloc(1, trailer + sizeof(struct apex_dispatch_parameters));
+   uint32_t *src = malloc(count * 16), *dst = calloc(1, count * 16);
+   for (unsigned i = 0; i < count * 4; i++)
+      src[i] = util_cpu_to_le32(0x9e3779b9u * (i + 1));
+   union apex_descriptor *rows = (void *)table;
+   for (unsigned r = 0; r <= program->descriptor_count; r++)
+      rows[r].buffer.flags = util_cpu_to_le32(APEX_BUFFER_ROBUST);
+   rows[0].buffer = (struct apex_buffer_descriptor){src_va, 0, count * 16, APEX_BUFFER_ROBUST};
+   rows[1].buffer = (struct apex_buffer_descriptor){dst_va, 0, count * 16, APEX_BUFFER_ROBUST};
+   uint32_t *push_image = (void *)(table + (program->descriptor_count + 1) * sizeof(union apex_descriptor));
+   push_image[0] = 2; /* copy */
+   push_image[1] = count;
+   struct apex_dispatch_parameters *parameters = (void *)(table + trailer);
+   *parameters = (struct apex_dispatch_parameters){.base = {0, groups, groups}, .groups = {groups, 1, 1}};
+   struct apex_sim_region regions[] = {
+      {table_va, table, trailer + sizeof(*parameters)}, {src_va, src, count * 16}, {dst_va, dst, count * 16},
+   };
+   uint32_t user[16] = {table_va}, grid[3] = {groups, 1, 1};
+   uint64_t executed;
+   char diagnostic[256] = "";
+   if (apex_simulate(program->code.data, program->code.size, user, grid, 0, NULL, regions, 3,
+                     &executed, diagnostic)) {
+      fprintf(stderr, "simulation: %s\n", diagnostic);
+      abort();
+   }
+   for (unsigned i = 0; i < count * 4; i++)
+      CHECK(dst[i] == src[i]);
+   (void)stride;
+   free(table);
+   free(src);
+   free(dst);
+   v->DestroyPipeline(dev, pipeline, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   v->DestroyDescriptorSetLayout(dev, set, NULL);
+   v->DestroyShaderModule(dev, module, NULL);
+   apex_device_finish(&device);
+}
+
 int main(int argc, char **argv)
 {
-   bool graphics = argc == 8 && !strcmp(argv[1], "--graphics");
-   CHECK(graphics || argc == 10 || argc == 11);
-   const char *output = argc == 11 ? argv[10] : NULL;
+   bool graphics = argc == 6 && !strcmp(argv[1], "--graphics");
+   CHECK(graphics || argc == 11 || argc == 12);
+   const char *output = argc == 12 ? argv[11] : NULL;
    FILE *f = fopen(graphics ? argv[2] : argv[1], "rb");
    CHECK(f && fseek(f, 0, SEEK_END) == 0);
    long size = ftell(f);
@@ -925,6 +1015,7 @@ int main(int argc, char **argv)
    test_dispatch(&physical, argv[5], output, true, false);
    test_dispatch(&physical, argv[6], output, false, true);
    test_fill(&physical, output);
+   test_bench(&physical, argv[10]);
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex Mesa compute pipelines: specialization, entrypoints, lifetime, failures");
