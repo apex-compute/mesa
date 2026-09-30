@@ -139,6 +139,29 @@ pub fn compile(
         (Class::V, 1, _, _, Some(pc)) if ops[pc].op == 0x20 => Some(ops[pc].imm),
         _ => None,
     };
+    // Spill cost: each definition and use weighted by loop depth. A reload
+    // costs a load and its wait; a rematerialization one immediate.
+    let loops: Vec<(usize, usize)> = ops
+        .iter()
+        .enumerate()
+        .filter(|(pc, o)| matches!(o.op, 4 | 5) && (o.imm as usize) <= *pc)
+        .map(|(pc, o)| (o.imm as usize, pc))
+        .collect();
+    let mut cost: BTreeMap<u32, u64> = BTreeMap::new();
+    for (pc, o) in ops.iter().enumerate() {
+        let depth = loops.iter().filter(|&&(h, l)| h <= pc && pc <= l).count().min(6);
+        for (f, role) in roles(o.op, o.imm)?.iter().enumerate() {
+            if role.is_some() {
+                *cost.entry(o.args[f]).or_default() += 8u64.pow(depth as u32);
+            }
+        }
+    }
+    // Divide by the interval length: spilling a long, rarely used value
+    // relieves more pressure than spilling a short, busy one.
+    let cost = |id: u32| {
+        let (_, _, start, end, _) = values[&id];
+        (cost[&id] << 20) * if remat(id).is_some() { 1 } else { 2 } / (end - start + 1) as u64
+    };
     for (id, (cl, n, start, end, _)) in order {
         occupied.retain(|v| v.3 >= start);
         let first = if cl == Class::S { 4 } else { 0 };
@@ -156,18 +179,18 @@ pub fn compile(
         if cl == Class::S {
             return Err("scalar register pressure exceeds initial profile".into());
         }
-        // Evict the registers whose occupants all outlive this value, preferring
-        // rematerializable occupants and then the latest nearest end. A pair may
-        // evict two single values; otherwise spill this value.
+        // Evict the aligned window whose occupants cost least to spill, then
+        // whose nearest end is latest, unless spilling this value costs less.
+        // A pair may evict two single values.
         let victim = (first..52)
             .filter(|&r| aligned(r))
-            .filter_map(|r| {
-                let held: Vec<_> = occupied.iter().filter(|v| overlaps(r, v)).collect();
-                held.iter()
-                    .all(|v| v.3 > end)
-                    .then(|| (held.iter().all(|v| remat(v.4).is_some()), held.iter().map(|v| v.3).min(), r))
+            .map(|r| {
+                let held = occupied.iter().filter(|v| overlaps(r, v));
+                let price: u64 = held.clone().map(|v| cost(v.4)).sum();
+                (price, std::cmp::Reverse(held.map(|v| v.3).min().unwrap_or(usize::MAX)), r)
             })
-            .max_by_key(|&(cheap, nearest, r)| (cheap, nearest, std::cmp::Reverse(r)))
+            .min()
+            .filter(|&(price, nearest, _)| (price, nearest) < (cost(id), std::cmp::Reverse(end)))
             .map(|(_, _, r)| r);
         let mut home = |id: u32, n: u8, start: usize, end: usize, words: &mut u32| -> Result<Home, String> {
             Ok(match remat(id) {
