@@ -599,6 +599,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_opt_peephole_select, &(nir_opt_peephole_select_options){0});
    } while (progress);
    NIR_PASS(_, nir, nir_shader_lower_instructions, fp32_sign_conversion, lower_fp32_sign_conversion, NULL);
+   /* Undefined values (unwritten output components, uninitialized phis)
+    * read zero: the ISA has no undefined register state. */
+   NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
    NIR_PASS(_, nir, nir_lower_continue_constructs);
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
