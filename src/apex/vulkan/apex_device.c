@@ -2021,10 +2021,14 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: prims = vertex_count / 3; break;
    default: prims = vertex_count >= 3 ? vertex_count - 2 : 0; break;
    }
-   if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-       !cmd->vertex || !cmd->fragment ||
-       !dyn->vp.viewport_count || dyn->vp.viewport_count > APEX_DRAW_MAX_VIEWPORTS ||
-       dyn->vp.scissor_count < dyn->vp.viewport_count || dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
+   /* With rasterizer discard only vertex shading runs: the fragment stage,
+    * viewports and polygon mode are unused. */
+   bool discard = dyn->rs.rasterizer_discard_enable;
+   if (topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || !cmd->vertex ||
+       (!discard && (!cmd->fragment || !dyn->vp.viewport_count ||
+                     dyn->vp.viewport_count > APEX_DRAW_MAX_VIEWPORTS ||
+                     dyn->vp.scissor_count < dyn->vp.viewport_count ||
+                     dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL)) ||
        (indexed && !cmd->index.bytes)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -2211,7 +2215,7 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    uint32_t tile = dyn->ms.rasterization_samples > 1 ? 2 : 4;
    uint32_t tiles = (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 2], tile) - draw[APEX_DRAW_SCISSOR] / tile) *
                     (DIV_ROUND_UP(draw[APEX_DRAW_SCISSOR + 3], tile) - draw[APEX_DRAW_SCISSOR + 1] / tile);
-   bool raster = !dyn->rs.rasterizer_discard_enable && tiles;
+   bool raster = !discard && tiles;
    if (indirect) {
       uint64_t lists = prim_va + APEX_ARENA_PRIM_BYTES, counts = lists + APEX_ARENA_LIST_BYTES;
       draw[APEX_DRAW_BIN_LISTS] = lists;
