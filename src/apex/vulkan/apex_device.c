@@ -1587,9 +1587,11 @@ static void
 emit_dispatch(struct apex_command_buffer *cmd, struct apex_dispatch *dispatch)
 {
    begin_work(cmd, APEX_CP_CLASS_COMPUTE);
+   const uint64_t private_base = ((struct apex_device *)cmd->vk.base.device)->private_arena.va;
    const uint32_t compute[10] = {
       [2] = program_invocations(dispatch->program), [3] = 1, [4] = 1,
       [5] = dispatch->parameters.base[0],
+      [8] = (uint32_t)private_base, [9] = private_base >> 32,
    };
    dispatch->patch = cmd->ib.count + 2;
    apex_cp_set_state(&cmd->ib, APEX_STATE_COMPUTE_PROGRAM, ARRAY_SIZE(compute), compute);
@@ -3962,7 +3964,7 @@ apex_GetSemaphoreCounterValue(VkDevice dev, VkSemaphore semaphore, uint64_t *val
 
 #define APEX_RING_BYTES (64 * 1024)
 
-/* The ring lives in LOCAL (written through BAR2), the retirement word in
+/* The ring and the private arena live in LOCAL, the retirement word in
  * SYSTEM; the kernel supplies the status page and doorbell mappings. */
 static VkResult
 create_queue(struct apex_device *device)
@@ -3970,6 +3972,13 @@ create_queue(struct apex_device *device)
    VkResult result = bo_create(device, APEX_RING_BYTES, APEX_VM_READ, 0, 0, &device->ring_bo);
    if (result == VK_SUCCESS)
       result = host_words_create(device, 4096, &device->retire);
+   if (result == VK_SUCCESS) {
+      mtx_lock(&device->va_mutex);
+      uint64_t va = util_vma_heap_alloc(&device->va_heap, APEX_PRIVATE_BYTES, APEX_PRIVATE_BYTES);
+      mtx_unlock(&device->va_mutex);
+      result = va ? bo_create(device, APEX_PRIVATE_BYTES, APEX_VM_READ | APEX_VM_WRITE, 0, va,
+                              &device->private_arena) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
    if (result != VK_SUCCESS)
       return result;
    memset(device->retire.map, 0, 8);
@@ -4008,6 +4017,7 @@ destroy_queue(struct apex_device *device)
    device->status_map = device->doorbell_map = NULL;
    device->status_va = 0;
    device->ring = (struct apex_ring){0};
+   apex_bo_finish(device, &device->private_arena);
    apex_bo_finish(device, &device->retire);
    apex_bo_finish(device, &device->ring_bo);
 }
@@ -4121,7 +4131,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->queue_id = 0;
    device->status_va = 0;
    device->status_map = device->doorbell_map = NULL;
-   device->ring_bo = device->retire = (struct apex_bo){0};
+   device->ring_bo = device->retire = device->private_arena = (struct apex_bo){0};
    device->ring = (struct apex_ring){0};
    device->sequence = device->kwait = 0;
    device->programs_uploaded = false;

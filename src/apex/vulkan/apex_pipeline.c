@@ -448,9 +448,9 @@ apex_program_compile(struct vk_device *device, struct apex_program *program, nir
       }
    }
    uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
-   /* GPUVM reserves the low 2 MiB for this dispatch's padded private data. */
+   /* The device's private arena holds this dispatch's padded private data. */
    program->max_workgroups = program->table && extent ?
-      MIN2(1024, (2 * 1024 * 1024) / extent) : 1024;
+      MIN2(1024, APEX_PRIVATE_BYTES / extent) : 1024;
    return program->max_workgroups ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
 }
 

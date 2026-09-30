@@ -215,6 +215,10 @@ test_device(const char *spirv_path)
          device.status_va == MOCK_STATUS_VA);
    CHECK(k.gems[1].va == k.ring_va && k.gems[1].vm_flags == APEX_VM_READ && !k.gems[1].flags);
    CHECK(k.gems[2].flags == APEX_GEM_SYSTEM && k.gems[2].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
+   /* The private arena: 2 MiB of LOCAL, read-write at a 2 MiB-aligned GPUVA. */
+   CHECK(device.private_arena.handle == 3 && k.gems[3].va == device.private_arena.va &&
+         k.gems[3].va && !(k.gems[3].va % APEX_PRIVATE_BYTES) && k.gems[3].size == APEX_PRIVATE_BYTES &&
+         !k.gems[3].flags && k.gems[3].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkQueue queue;
@@ -230,7 +234,7 @@ test_device(const char *spirv_path)
       CHECK(v->MapMemory(dev, memory[t], 0, VK_WHOLE_SIZE, 0, (void **)&map[t]) == VK_SUCCESS);
       memset(map[t], 0, 65536);
    }
-   CHECK(k.gems[3].flags == 0 && k.gems[4].flags == APEX_GEM_SYSTEM);
+   CHECK(k.gems[4].flags == 0 && k.gems[5].flags == APEX_GEM_SYSTEM);
    VkBuffer local, system;
    const VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16384,
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -244,7 +248,7 @@ test_device(const char *spirv_path)
    CHECK(v->BindBufferMemory(dev, system, memory[1], 0) == VK_SUCCESS);
    const uint64_t local_va = vk_buffer_from_handle(local)->device_address;
    const uint64_t system_va = vk_buffer_from_handle(system)->device_address;
-   CHECK(local_va == k.gems[3].va && system_va == k.gems[4].va);
+   CHECK(local_va == k.gems[4].va && system_va == k.gems[5].va);
 
    VkEvent event;
    const VkEventCreateInfo ei = {.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
@@ -361,11 +365,12 @@ test_device(const char *spirv_path)
                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
          VK_NOT_READY);
    CHECK(!stamps[1] && stamps[2] == 1000 && stamps[3] == 1);
-   /* The dispatch: compute state, patched program and table GPUVAs. */
+   /* The dispatch: compute state, private arena, patched program and table GPUVAs. */
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
    CHECK(seen.count == 1 && seen.last.grid[0] == 3 && seen.last.grid[1] == 1 && seen.last.grid[2] == 1);
    CHECK(MOCK_U64(seen.last.state, APEX_STATE_COMPUTE_PROGRAM) == p->program.bo.va);
    CHECK(k.gems[p->program.bo.handle].vm_flags == (APEX_VM_READ | APEX_VM_EXEC));
+   CHECK(MOCK_U64(seen.last.state, APEX_STATE_COMPUTE_PRIVATE) == k.gems[3].va);
    CHECK(seen.last.state[APEX_STATE_COMPUTE_LOCAL] == 16 &&
          seen.last.state[APEX_STATE_COMPUTE_LOCAL + 1] == 1);
    CHECK(seen.last.state[APEX_STATE_COMPUTE_USER + 2] == 3);

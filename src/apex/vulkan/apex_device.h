@@ -92,6 +92,8 @@ struct apex_bo {
 
 /* Internal single-queue device on one user-mode ring. A negative fd builds an
  * offline device for compiler tests: no memory, queue or submission. */
+#define APEX_PRIVATE_BYTES (2u * 1024 * 1024)
+
 struct apex_device {
    struct vk_device vk;
    struct vk_device_dispatch_table cmd_dispatch;
@@ -112,6 +114,9 @@ struct apex_device {
    struct apex_ring ring;
    /* SIGNAL target retiring batch arenas without an interrupt. */
    struct apex_bo retire;
+   /* Private data of the one dispatch in flight: APEX_PRIVATE_BYTES of
+    * LOCAL at a 2 MiB-aligned GPUVA, the compute private base. */
+   struct apex_bo private_arena;
    uint64_t sequence, kwait;
    struct list_head busy_arenas, free_arenas;
    /* A program upload since the last batch invalidates instruction caches. */
