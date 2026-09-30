@@ -582,6 +582,14 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
                                     VK_COMPONENT_SWIZZLE_ONE};
    CHECK(apex_border_swizzle(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, &rrr1) == SW(0, 0, 0, O));
    CHECK(apex_border_swizzle(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, &identity) == SW(0, Z, Z, O));
+   /* Depth and stencil texels read (D or S, 0, 0, 1): word 0 bits 8..19. */
+   uint32_t words[3];
+   CHECK(apex_format_encode(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, &identity, words));
+   CHECK(((words[0] >> 8) & 0xfff) == SW(0, Z, Z, O));
+   CHECK(apex_format_encode(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, &identity, words));
+   CHECK(((words[0] >> 8) & 0xfff) == SW(1, Z, Z, O) && (words[0] & (1u << 20)));
+   CHECK(apex_format_encode(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, &rrr1, words));
+   CHECK(((words[0] >> 8) & 0xfff) == SW(0, 0, 0, O));
 #undef SW
    /* Custom border colors reach the sampler row without a format. */
    VkDevice handle = apex_device_to_handle(&device);

@@ -70,7 +70,15 @@ apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponent
       uint32_t field = ch->shift | ch->size << 7 | type << 13;
       out[1 + c / 2] |= field << (16 * (c % 2));
    }
-   /* Output component c reads format component view[c], stored as swizzle[f]. */
+   /* Format component f is stored channel rgba[f]. Depth and stencil
+    * convert to RGBA as (D or S, 0, 0, 1). */
+   unsigned rgba[4] = {desc->swizzle[0], desc->swizzle[1], desc->swizzle[2], desc->swizzle[3]};
+   if (desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS) {
+      rgba[0] = desc->swizzle[aspect == VK_IMAGE_ASPECT_STENCIL_BIT];
+      rgba[1] = rgba[2] = PIPE_SWIZZLE_0;
+      rgba[3] = PIPE_SWIZZLE_1;
+   }
+   /* Output component c reads format component view[c], stored as rgba[f]. */
    const VkComponentSwizzle view[4] = {
       mapping ? mapping->r : VK_COMPONENT_SWIZZLE_IDENTITY,
       mapping ? mapping->g : VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -86,7 +94,7 @@ apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponent
       } else if (s == VK_COMPONENT_SWIZZLE_ONE) {
          stored = APEX_SWIZZLE_1;
       } else {
-         unsigned f = desc->swizzle[s - VK_COMPONENT_SWIZZLE_R];
+         unsigned f = rgba[s - VK_COMPONENT_SWIZZLE_R];
          stored = f <= PIPE_SWIZZLE_W ? f : f == PIPE_SWIZZLE_1 ? APEX_SWIZZLE_1 : APEX_SWIZZLE_0;
       }
       out[0] |= stored << (8 + 3 * c);
