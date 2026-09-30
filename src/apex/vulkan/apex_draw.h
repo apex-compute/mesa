@@ -33,7 +33,7 @@
 #define APEX_DRAW_CULL 23             /* VkCullModeFlags */
 #define APEX_DRAW_FRONT_FACE 24       /* VkFrontFace */
 /* Bit 0 depth test, bit 1 depth write, bit 2 stencil test, bit 3 depth bias,
- * bits 4..6 depth VkCompareOp, bit 8 depth clamp. */
+ * bits 4..6 depth VkCompareOp, bit 8 depth clamp, bit 9 depth clip off. */
 #define APEX_DRAW_DEPTH 25
 #define APEX_DRAW_COLOR 26            /* per attachment: VA lo, VA hi, row stride */
 #define APEX_DRAW_COLOR_WORDS 3
@@ -125,8 +125,9 @@
 #define APEX_PRIM_INV_W 20            /* 1/w per vertex (FP32) */
 #define APEX_PRIM_WEIGHTS 23          /* 3 x 3 FP32: sub-vertex i weight of source vertex j */
 #define APEX_PRIM_SOURCE 32           /* 3 source vertex record indices */
-/* Bit 0 front-facing, bit 1 stippled line, bit 2 smooth line; bits 16..19
- * viewport index; bits 20..31 layer. */
+/* Bit 0 front-facing, bit 1 stippled line, bit 2 smooth line, bit 3 every
+ * sample takes the pixel center's coverage (parallelogram lines); bits
+ * 16..19 viewport index; bits 20..31 layer. */
 #define APEX_PRIM_FLAGS 35
 #define APEX_PRIM_ID 36
 #define APEX_PRIM_COUNT 37            /* first record only: records written for the input primitive */

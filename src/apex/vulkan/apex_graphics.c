@@ -465,12 +465,22 @@ struct fragment_lowering {
    bool invalid;
 };
 
+/* Vertex-record word of a generic input or of the clip/cull distances. */
+static nir_def *
+input_slot(nir_builder *b, const struct apex_program *program, unsigned location)
+{
+   if (location >= VARYING_SLOT_CLIP_DIST0 && location <= VARYING_SLOT_CLIP_DIST1)
+      return nir_iadd_imm(b, nir_iand_imm(b, draw_word(b, program, APEX_DRAW_CLIP), 0xffff),
+                          (location - VARYING_SLOT_CLIP_DIST0) * 4);
+   return draw_word(b, program, APEX_DRAW_SLOTS + location - VARYING_SLOT_VAR0);
+}
+
 static nir_def *
 attribute(nir_builder *b, struct fragment_lowering *ctx, nir_def *source, unsigned location,
           unsigned component)
 {
    const struct apex_program *program = &ctx->shader->program;
-   nir_def *slot = draw_word(b, program, APEX_DRAW_SLOTS + location - VARYING_SLOT_VAR0);
+   nir_def *slot = input_slot(b, program, location);
    nir_def *word = nir_iadd(b, nir_imul(b, source, draw_word(b, program, APEX_DRAW_VERTEX_STRIDE)),
                             nir_iadd_imm(b, slot, component));
    return load_word(b, address_add(b, draw_address(b, program, APEX_DRAW_VERTEX_LO),
@@ -498,7 +508,14 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
       break;
    case nir_intrinsic_load_interpolated_input:
    case nir_intrinsic_load_input: {
-      unsigned location = nir_intrinsic_io_semantics(i).location;
+      /* Compact clip/cull distance inputs address their second vec4 slot
+       * through the offset source. */
+      nir_src *offset = nir_get_io_offset_src(i);
+      if (!nir_src_is_const(*offset)) {
+         ctx->invalid = true;
+         return false;
+      }
+      unsigned location = nir_intrinsic_io_semantics(i).location + nir_src_as_uint(*offset);
       unsigned component = nir_intrinsic_component(i);
       if (i->def.bit_size != 32) {
          ctx->invalid = true;
@@ -525,7 +542,8 @@ lower_fragment_intrinsic(nir_builder *b, nir_intrinsic_instr *i, void *data)
          replacement = nir_channels(b, coord, BITFIELD_RANGE(component, i->def.num_components));
          break;
       }
-      if (location < VARYING_SLOT_VAR0 || location >= VARYING_SLOT_VAR0 + 32) {
+      bool clip = location == VARYING_SLOT_CLIP_DIST0 || location == VARYING_SLOT_CLIP_DIST1;
+      if (!clip && (location < VARYING_SLOT_VAR0 || location >= VARYING_SLOT_VAR0 + 32)) {
          replacement = nir_imm_zero(b, i->def.num_components, 32);
          break;
       }
@@ -1140,6 +1158,12 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *qy = nir_i2i64(b, nir_iadd(b, nir_ishl_imm(b, py, 8), sy));
    nir_def *cx = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, px, 8), 128));
    nir_def *cy = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, py, 8), 128));
+   if (samples > 1) {
+      /* Parallelogram lines cover all samples of pixels whose center they cover. */
+      nir_def *at_center = nir_ine_imm(b, nir_iand_imm(b, FIELD(APEX_PRIM_FLAGS), 8), 0);
+      qx = nir_bcsel(b, at_center, cx, qx);
+      qy = nir_bcsel(b, at_center, cy, qy);
+   }
    nir_def *edge[3], *center[3];
    nir_def *multisample = draw_word(b, program, APEX_DRAW_MULTISAMPLE);
    /* The box is clipped to the primitive's viewport scissor. */

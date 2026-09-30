@@ -2286,7 +2286,8 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
                            (stencil && dyn->ds.stencil.test_enable) << 2 |
                            (depth && dyn->rs.depth_bias.enable) << 3 |
                            dyn->ds.depth.compare_op << 4 |
-                           (uint32_t)dyn->rs.depth_clamp_enable << 8;
+                           (uint32_t)dyn->rs.depth_clamp_enable << 8 |
+                           (uint32_t)!vk_rasterization_state_depth_clip_enable(&dyn->rs) << 9;
    for (unsigned f = 0; f < 2; f++) {
       const struct vk_stencil_test_face_state *face = f ? &dyn->ds.stencil.back : &dyn->ds.stencil.front;
       draw[APEX_DRAW_STENCIL + f * 2] = face->op.fail | face->op.pass << 3 | face->op.depth_fail << 6 |

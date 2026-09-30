@@ -50,11 +50,11 @@ vec3 D[8];
 
 // Guard-band scale keeps snapped coordinates within +/-30000 pixels.
 // Planes 7 and up are the clip distances, interpolated by source weights;
-// depth clamp disables the z planes 5 and 6.
-bool g_depth_clamp;
+// disabled depth clipping removes the z planes 5 and 6.
+bool g_depth_clip_off;
 float plane_distance(uint plane, vec4 v, vec3 b, vec2 guard)
 {
-   if (g_depth_clamp && (plane == 5u || plane == 6u)) return 1.0;
+   if (g_depth_clip_off && (plane == 5u || plane == 6u)) return 1.0;
    if (plane == 0u) return v.w - 1.17549435e-38;
    if (plane == 1u) return v.x + guard.x * v.w;
    if (plane == 2u) return guard.x * v.w - v.x;
@@ -218,6 +218,10 @@ void emit(uint n, bool polygon, bool front, float bias, bool fill_bias, uint lin
       }
       if (line == 3u)
          flags |= 4u;
+      // Parallelogram lines cover every sample of a pixel whose center
+      // they cover.
+      if (line < 2u)
+         flags |= 8u;
       ivec2 a = q[0] - extend, e = q[1] + extend;
       q[2] = e + offset; z[2] = z[1]; inv_w[2] = inv_w[1]; B[2] = B[1];
       q[3] = a + offset; z[3] = z[0]; inv_w[3] = inv_w[0]; B[3] = B[0];
@@ -364,11 +368,11 @@ void setup(uint g, uint prims)
    uint layer_slot = draw(APEX_DRAW_LAYER_SLOT), view = draw(APEX_DRAW_VIEW);
    uint layer = view != ~0u ? view :
                 layer_slot == ~0u ? 0u : min(vertices.w[provoking * stride + layer_slot], 4095u);
-   // Depth clamp disables the z >= 0 and z <= w planes; clip distances
-   // follow the fixed planes.
+   // Disabled depth clipping (the default under depth clamp) removes the
+   // z >= 0 and z <= w planes; clip distances follow the fixed planes.
    uint clip = draw(APEX_DRAW_CLIP);
    uint clip_slot = clip & 0xffffu, clips = (clip >> 16) & 15u, culls = (clip >> 20) & 15u;
-   g_depth_clamp = (draw(APEX_DRAW_DEPTH) & 256u) != 0u;
+   g_depth_clip_off = (draw(APEX_DRAW_DEPTH) & 512u) != 0u;
    g_planes = 7u + clips;
    g_scale = viewport.zw * 0.5;
    g_offset = viewport.xy + g_scale;
