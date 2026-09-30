@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /* Draw block shared by the driver, the setup kernel (GLSL) and generated
  * vertex/fragment kernels. All values are little-endian 32-bit words. The
- * block follows the dispatch parameters in a job's immutable trailer. */
+ * block follows the APEX_DISPATCH_WORDS dispatch parameters (struct
+ * apex_dispatch_parameters) in a job's immutable trailer. */
+#define APEX_DISPATCH_WORDS 14
+#define APEX_DISPATCH_PREDICATE 11
 #ifndef APEX_DRAW_H
 #define APEX_DRAW_H
 

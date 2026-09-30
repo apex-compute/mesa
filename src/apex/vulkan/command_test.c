@@ -85,7 +85,7 @@ image_exec(struct drm_apex_vm_exec *r)
       for (unsigned i = 0; i < 4; i++) CHECK(words[48 + i] == 0xc0010000 + i);
    } else if (d == 1 || d == 5) {
       /* Internal clear job: texels only, row padding untouched. */
-      const uint32_t *clear = words + 8 + 12;
+      const uint32_t *clear = words + 8 + APEX_DISPATCH_WORDS;
       unsigned offset = d == 1 ? 9280 : 14592;
       uint32_t color = d == 1 ? 0x5a17c0de : 0xff80ff00;
       CHECK(((uint64_t)clear[1] << 32 | clear[0]) == base + offset);
@@ -103,7 +103,7 @@ image_exec(struct drm_apex_vm_exec *r)
       const unsigned from[] = {12316, 2308, 8648}, to[] = {2308, 8648, 12800};
       const unsigned src_row[] = {20, 64, 64}, dst_row[] = {64, 64, 28};
       const unsigned src_slice[] = {60, 192, 320}, dst_slice[] = {192, 320, 112};
-      const uint32_t *copy = words + 8 + 12;
+      const uint32_t *copy = words + 8 + APEX_DISPATCH_WORDS;
       CHECK(((uint64_t)copy[1] << 32 | copy[0]) == base + from[phase]);
       CHECK(((uint64_t)copy[3] << 32 | copy[2]) == base + to[phase]);
       CHECK(copy[4] == src_row[phase] && copy[5] == dst_row[phase]);

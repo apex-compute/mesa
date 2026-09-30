@@ -12,7 +12,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
 const uint TRAILER = 8u;
-const uint DRAW = TRAILER + 12u;
+const uint DRAW = TRAILER + APEX_DISPATCH_WORDS;
 uint64_t address(uint i) { return uint64_t(root[DRAW + i]) | (uint64_t(root[DRAW + i + 1u]) << 32); }
 // Dynamic words of indirect draws live in the resolved parameter block.
 uint draw(uint i)
@@ -21,8 +21,19 @@ uint draw(uint i)
    return APEX_DRAW_DYNAMIC(i) && params != 0ul ? Words(params).w[i] : root[DRAW + i];
 }
 
+// Conditional rendering: the job does nothing when its predicate value is
+// zero, or nonzero if inverted (struct apex_dispatch_parameters).
+bool discarded()
+{
+   uint64_t va = uint64_t(root[TRAILER + APEX_DISPATCH_PREDICATE]) |
+                 (uint64_t(root[TRAILER + APEX_DISPATCH_PREDICATE + 1u]) << 32);
+   return va != 0ul && ((Words(va).w[0] == 0u) != (root[TRAILER + APEX_DISPATCH_PREDICATE + 2u] != 0u));
+}
+
 void main()
 {
+   if (discarded())
+      return;
    uint topology = draw(APEX_DRAW_TOPOLOGY);
    uint verts = topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
    Words state = Words(address(APEX_DRAW_XFB));

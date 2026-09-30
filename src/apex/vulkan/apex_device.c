@@ -140,6 +140,11 @@ struct apex_command_buffer {
       struct { uint64_t va, size; } buffers[APEX_DRAW_MAX_XFB_BUFFERS];
       uint64_t state, query;
    } xfb;
+   /* Conditional rendering predicate for draws, dispatches and attachment
+    * clears; internal vk_meta work (meta > 0) is never conditional. */
+   struct { uint64_t va; bool inverted; } predicate;
+   bool predicate_jobs;
+   unsigned meta;
    struct {
       VkRect2D area;
       uint32_t color_count;
@@ -564,7 +569,8 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
                                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                        VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
-                                       VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT)))
+                                       VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+                                       VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
@@ -1504,6 +1510,9 @@ clear_commands(struct apex_command_buffer *cmd)
    memset(&cmd->index, 0, sizeof(cmd->index));
    cmd->occlusion = 0;
    memset(&cmd->xfb, 0, sizeof(cmd->xfb));
+   cmd->predicate.va = 0;
+   cmd->predicate_jobs = false;
+   cmd->meta = 0;
    memset(&cmd->rendering, 0, sizeof(cmd->rendering));
    memset(cmd->push, 0, sizeof(cmd->push));
    memset(cmd->graphics_push, 0, sizeof(cmd->graphics_push));
@@ -1730,6 +1739,11 @@ push_compute(struct apex_command_buffer *cmd, struct apex_dispatch_parameters pa
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
+   if (!cmd->meta && cmd->predicate.va) {
+      parameters.predicate[0] = cmd->predicate.va;
+      parameters.predicate[1] = cmd->predicate.va >> 32;
+      parameters.inverted = cmd->predicate.inverted;
+   }
    *dispatch = (struct apex_dispatch) {
       .program = &cmd->pipeline->program, .groups = groups, .parameters = parameters,
    };
@@ -1914,7 +1928,9 @@ apex_CmdBlitImage2(VkCommandBuffer handle, const VkBlitImageInfo2 *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    struct apex_device *device = (void *)cmd->vk.base.device;
+   cmd->meta++;
    vk_meta_blit_image2(&cmd->vk, &device->meta, info);
+   cmd->meta--;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -2018,9 +2034,27 @@ apex_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAt
          pack_color(target->image->vk.format, &a->clearValue.color, texel);
       else
          pack_depth_stencil(target->image->vk.format, a->aspectMask, &a->clearValue.depthStencil, texel);
+      cmd->predicate_jobs = true;
       for (unsigned r = 0; r < rect_count; r++)
          clear_layers(cmd, target, rects[r].baseArrayLayer, rects[r].layerCount, rects[r].rect, texel);
+      cmd->predicate_jobs = false;
    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBeginConditionalRenderingEXT(VkCommandBuffer handle, const VkConditionalRenderingBeginInfoEXT *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, buffer, info->buffer);
+   cmd->predicate.va = buffer->vk.device_address + info->offset;
+   cmd->predicate.inverted = info->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdEndConditionalRenderingEXT(VkCommandBuffer handle)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   cmd->predicate.va = 0;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -2140,6 +2174,11 @@ push_job(struct apex_command_buffer *cmd, struct apex_program *program,
    job->program = program;
    job->groups = groups;
    job->parameters = (struct apex_dispatch_parameters){.base = {base}, .groups = {groups, end, 1}};
+   if (cmd->predicate_jobs && !cmd->meta && cmd->predicate.va) {
+      job->parameters.predicate[0] = cmd->predicate.va;
+      job->parameters.predicate[1] = cmd->predicate.va >> 32;
+      job->parameters.inverted = cmd->predicate.inverted;
+   }
    memcpy(job->push, cmd->graphics_push, sizeof(job->push));
    job->graphics = true;
    memcpy(job->draw, draw, sizeof(job->draw));
@@ -2538,14 +2577,16 @@ record_draw(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
             uint32_t first_vertex, uint32_t first_instance, bool indexed, int32_t vertex_offset,
             const struct apex_indirect *indirect)
 {
+   cmd->predicate_jobs = true;
    if (!cmd->rendering.view_mask) {
       record_view(cmd, vertex_count, instance_count, first_vertex, first_instance, indexed,
                   vertex_offset, indirect, ~0u);
-      return;
+   } else {
+      u_foreach_bit(view, cmd->rendering.view_mask)
+         record_view(cmd, vertex_count, instance_count, first_vertex, first_instance, indexed,
+                     vertex_offset, indirect, view);
    }
-   u_foreach_bit(view, cmd->rendering.view_mask)
-      record_view(cmd, vertex_count, instance_count, first_vertex, first_instance, indexed,
-                  vertex_offset, indirect, view);
+   cmd->predicate_jobs = false;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -2706,7 +2747,9 @@ record_word(struct apex_command_buffer *cmd, uint64_t va, uint64_t size, uint32_
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    memcpy(push, cmd->push, sizeof(push));
    VkDeviceAddressRangeKHR range = {.address = va, .size = size};
+   cmd->meta++;
    vk_meta_fill_memory(&cmd->vk, &device->meta, &range, 0, value);
+   cmd->meta--;
    cmd->pipeline = pipeline;
    memcpy(cmd->push, push, sizeof(push));
 }
@@ -2968,7 +3011,9 @@ apex_CmdFillBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
    struct apex_pipeline *pipeline = cmd->pipeline;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    memcpy(push, cmd->push, sizeof(push));
+   cmd->meta++;
    vk_meta_fill_memory(&cmd->vk, &device->meta, &range, dst->vk.address_flags, data);
+   cmd->meta--;
    cmd->pipeline = pipeline;
    memcpy(cmd->push, push, sizeof(push));
 }
@@ -2985,7 +3030,9 @@ apex_CmdCopyBuffer2(VkCommandBuffer handle, const VkCopyBufferInfo2 *info)
    struct apex_pipeline *pipeline = cmd->pipeline;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    memcpy(push, cmd->push, sizeof(push));
+   cmd->meta++;
    vk_meta_copy_buffer(&cmd->vk, &device->meta, info);
+   cmd->meta--;
    cmd->pipeline = pipeline;
    memcpy(cmd->push, push, sizeof(push));
 }
@@ -3003,7 +3050,9 @@ apex_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offse
    struct apex_pipeline *pipeline = cmd->pipeline;
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    memcpy(push, cmd->push, sizeof(push));
+   cmd->meta++;
    vk_meta_update_buffer(&cmd->vk, &device->meta, buffer, offset, size, data);
+   cmd->meta--;
    cmd->pipeline = pipeline;
    memcpy(cmd->push, push, sizeof(push));
 }
@@ -3152,7 +3201,9 @@ copy_image_rows(struct apex_command_buffer *cmd, uint64_t src, uint32_t src_row,
          VkCopyDeviceMemoryInfoKHR info = {
             .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR, .regionCount = 1, .pRegions = &region,
          };
+         cmd->meta++;
          vk_meta_copy_memory(&cmd->vk, &device->meta, &info);
+         cmd->meta--;
       }
    }
    cmd->pipeline = pipeline;
@@ -3537,6 +3588,9 @@ drm_prepare(struct apex_device *device, const struct apex_dispatch *dispatch,
       parameters->indirect[w] = util_cpu_to_le32(dispatch->parameters.indirect[w]);
    for (unsigned axis = 0; axis < 3; axis++)
       parameters->origin[axis] = util_cpu_to_le32(dispatch->parameters.origin[axis]);
+   for (unsigned w = 0; w < 2; w++)
+      parameters->predicate[w] = util_cpu_to_le32(dispatch->parameters.predicate[w]);
+   parameters->inverted = util_cpu_to_le32(dispatch->parameters.inverted);
    if (dispatch->graphics) {
       uint32_t *draw = (void *)(parameters + 1);
       for (unsigned i = 0; i < APEX_DRAW_WORDS; i++)
@@ -3993,6 +4047,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       .CmdResolveImage2 = apex_CmdResolveImage2, .CmdBlitImage2 = apex_CmdBlitImage2,
       .CmdDispatchBase = apex_CmdDispatchBase,
       .CmdClearAttachments = apex_CmdClearAttachments,
+      .CmdBeginConditionalRenderingEXT = apex_CmdBeginConditionalRenderingEXT,
+      .CmdEndConditionalRenderingEXT = apex_CmdEndConditionalRenderingEXT,
       .CmdClearDepthStencilImage = apex_CmdClearDepthStencilImage,
       .CmdBindVertexBuffers2 = apex_CmdBindVertexBuffers2,
       .CmdBindIndexBuffer2 = apex_CmdBindIndexBuffer2,

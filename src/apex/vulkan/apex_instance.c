@@ -329,6 +329,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_line_rasterization = true,
       .EXT_depth_clip_enable = true,
       .EXT_transform_feedback = true,
+      .EXT_conditional_rendering = true,
       .KHR_vertex_attribute_divisor = true,
       .EXT_vertex_attribute_divisor = true,
       .EXT_scalar_block_layout = true,
@@ -403,6 +404,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .depthClipEnable = true,
       /* One stream captured by the setup kernel in primitive order. */
       .transformFeedback = true,
+      /* Draw, dispatch and clear kernels test the predicate (struct
+       * apex_dispatch_parameters); secondaries do not inherit it. */
+      .conditionalRendering = true,
       /* Vertex fetch divides the instance index by any divisor, zero repeating
        * the first instance. */
       .vertexAttributeInstanceRateDivisor = true,

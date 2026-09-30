@@ -54,6 +54,9 @@ bool apex_program_lower_resources(struct apex_program *program, struct nir_shade
 VkResult apex_program_compile(struct vk_device *device, struct apex_program *program,
                               struct nir_shader *nir);
 void apex_program_finish(struct apex_device *device, struct apex_program *program);
+/* Whether conditional rendering discards the job (struct
+ * apex_dispatch_parameters predicate at byte offset `trailer`). */
+nir_def *apex_predicate_discarded(nir_builder *b, unsigned trailer);
 /* Lowers texture instructions to the software sampler (apex_texture.c). */
 bool apex_lower_textures(struct apex_program *program, struct nir_shader *nir);
 /* FP16 bits in the low half of a 32-bit value to FP32 bits, and back. */

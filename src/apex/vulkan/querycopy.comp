@@ -10,7 +10,7 @@ layout(local_size_x = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
-const uint QUERY = 8u + 12u;
+const uint QUERY = 8u + APEX_DISPATCH_WORDS;
 uint word(uint i) { return root[QUERY + i]; }
 uint64_t address(uint i) { return uint64_t(word(i)) | (uint64_t(word(i + 1u)) << 32); }
 

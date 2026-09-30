@@ -13,11 +13,22 @@ layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
 const uint TRAILER = 8u;
-const uint CLEAR = TRAILER + 12u;
+const uint CLEAR = TRAILER + APEX_DISPATCH_WORDS;
 uint word(uint i) { return root[CLEAR + i]; }
+
+// Conditional rendering: the job does nothing when its predicate value is
+// zero, or nonzero if inverted (struct apex_dispatch_parameters).
+bool discarded()
+{
+   uint64_t va = uint64_t(root[TRAILER + APEX_DISPATCH_PREDICATE]) |
+                 (uint64_t(root[TRAILER + APEX_DISPATCH_PREDICATE + 1u]) << 32);
+   return va != 0ul && ((Words(va).w[0] == 0u) != (root[TRAILER + APEX_DISPATCH_PREDICATE + 2u] != 0u));
+}
 
 void main()
 {
+   if (discarded())
+      return;
    uint width = word(APEX_CLEAR_WIDTH), chunks = (width + 63u) / 64u;
    uint rows = word(APEX_CLEAR_ROWS);
    uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;

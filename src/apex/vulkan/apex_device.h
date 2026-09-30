@@ -7,6 +7,7 @@
 #include "vk_meta.h"
 #include "vk_sampler.h"
 #include "apex_format.h"
+#include "apex_draw.h"
 #include "util/vma.h"
 
 enum apex_transport { APEX_TRANSPORT_NATIVE, APEX_TRANSPORT_DRM };
@@ -70,14 +71,19 @@ union apex_descriptor {
 /* Compute jobs: base = first and end linear workgroup and the launch stride,
  * groups = API grid, indirect = VkDispatchIndirectCommand address supplying
  * the grid (zero for direct jobs), origin = vkCmdDispatchBase offset. Graphics
- * jobs use base[0] and groups[0..1] as their launch range. */
+ * jobs use base[0] and groups[0..1] as their launch range. predicate =
+ * conditional rendering's 32-bit value address (zero when unconditional):
+ * the job does nothing when the value is zero, or nonzero if inverted. */
 struct apex_dispatch_parameters {
    uint32_t base[3];
    uint32_t groups[3];
    uint32_t indirect[2];
    uint32_t origin[3];
-   uint32_t reserved;
+   uint32_t predicate[2];
+   uint32_t inverted;
 };
+_Static_assert(sizeof(struct apex_dispatch_parameters) == APEX_DISPATCH_WORDS * 4,
+              "trailer words shared with the internal kernels");
 
 struct apex_bo {
    void *map;

@@ -287,6 +287,8 @@ wrap_workgroups(const struct apex_program *program, nir_shader *nir)
    nir_pop_if(b, NULL);
    nir_def *grid = nir_if_phi(b, indirect_grid, direct_grid);
    nir_def *end = nir_if_phi(b, indirect_end, words[1]);
+   /* Conditional rendering discards the whole dispatch. */
+   end = nir_bcsel(b, apex_predicate_discarded(b, trailer), nir_imm_int(b, 0), end);
    nir_store_var(b, ctx.grid, grid, 0x7);
    nir_variable *linear = nir_local_variable_create(impl, glsl_uint_type(), "linear");
    nir_def *native = nir_load_base_workgroup_id(b, 32);
@@ -312,6 +314,23 @@ wrap_workgroups(const struct apex_program *program, nir_shader *nir)
    nir_pop_loop(b, loop);
    nir_progress(true, impl, nir_metadata_none);
    nir_shader_intrinsics_pass(nir, lower_workgroup, nir_metadata_control_flow, &ctx);
+}
+
+nir_def *
+apex_predicate_discarded(nir_builder *b, unsigned trailer)
+{
+   nir_def *words[3];
+   for (unsigned w = 0; w < 3; w++)
+      words[w] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
+                               nir_imm_int(b, trailer + (APEX_DISPATCH_PREDICATE + w) * 4),
+                               .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+   nir_def *va = nir_vec2(b, words[0], words[1]);
+   nir_def *present = nir_ine_imm(b, nir_ior(b, words[0], words[1]), 0), *kept = nir_imm_false(b);
+   nir_push_if(b, present);
+   nir_def *zero = nir_ieq_imm(b, nir_load_global_2x32(b, 1, 32, va, .align_mul = 4), 0);
+   nir_def *discarded = nir_ine(b, zero, nir_ine_imm(b, words[2], 0));
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, discarded, kept);
 }
 
 static bool

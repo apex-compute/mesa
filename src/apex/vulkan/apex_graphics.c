@@ -430,6 +430,8 @@ build_vertex_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *first_instance = draw_word(b, program, APEX_DRAW_FIRST_INSTANCE);
    nir_def *end = nir_umin(b, root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups) + 4),
                            nir_ushr_imm(b, nir_iadd_imm(b, total, 63), 6));
+   /* Conditional rendering discards the draw. */
+   end = nir_bcsel(b, apex_predicate_discarded(b, trailer), nir_imm_int(b, 0), end);
    nir_variable *w_var = nir_local_variable_create(impl, glsl_uint_type(), "vertex_group");
    nir_store_var(b, w_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
    nir_loop *loop = nir_push_loop(b);
@@ -1045,6 +1047,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    unsigned trailer = apex_program_trailer(program);
    nir_variable *t_var = nir_local_variable_create(impl, glsl_uint_type(), "tile");
    nir_store_var(b, t_var, nir_iadd(b, root_word(b, trailer), native_workgroup(b)), 1);
+   nir_def *discarded = apex_predicate_discarded(b, trailer);
    nir_loop *tile_loop = nir_push_loop(b);
    nir_def *x0 = draw_word(b, program, APEX_DRAW_SCISSOR);
    nir_def *y0 = draw_word(b, program, APEX_DRAW_SCISSOR + 1);
@@ -1060,7 +1063,8 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
                                     draw_word(b, program, APEX_DRAW_BIN_CHUNKS)));
    /* A job covers tiles [base, end) with a stride of its workgroup count. */
    nir_def *end = root_word(b, trailer + offsetof(struct apex_dispatch_parameters, groups) + 4);
-   nir_def *tiles = nir_bcsel(b, empty, nir_imm_int(b, 0), nir_umin(b, nir_imul(b, tw, th), end));
+   nir_def *tiles = nir_bcsel(b, nir_ior(b, empty, discarded), nir_imm_int(b, 0),
+                              nir_umin(b, nir_imul(b, tw, th), end));
    nir_def *t = loop_counter(b, t_var, tiles);
    nir_def *ty = nir_udiv(b, t, tw);
    nir_def *tx = nir_isub(b, t, nir_imul(b, ty, tw));
