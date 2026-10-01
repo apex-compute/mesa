@@ -1192,7 +1192,7 @@ build_fragment_kernel(struct apex_shader *shader, nir_shader *nir,
    nir_def *cx = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, px, 8), 128));
    nir_def *cy = nir_i2i64(b, nir_iadd_imm(b, nir_ishl_imm(b, py, 8), 128));
    if (samples > 1) {
-      /* Parallelogram lines cover all samples of pixels whose center they cover. */
+      /* Bresenham lines cover all samples of pixels whose center they cover. */
       nir_def *at_center = nir_ine_imm(b, nir_iand_imm(b, FIELD(APEX_PRIM_FLAGS), 8), 0);
       qx = nir_bcsel(b, at_center, cx, qx);
       qy = nir_bcsel(b, at_center, cy, qy);

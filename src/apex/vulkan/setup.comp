@@ -218,9 +218,9 @@ void emit(uint n, bool polygon, bool front, float bias, bool fill_bias, uint lin
       }
       if (line == 3u)
          flags |= 4u;
-      // Parallelogram lines cover every sample of a pixel whose center
-      // they cover.
-      if (line < 2u)
+      // Bresenham lines cover every sample of a pixel whose center they
+      // cover; default lines keep per-sample coverage.
+      if (line < 2u && (draw(APEX_DRAW_RASTER) & 512u) != 0u)
          flags |= 8u;
       ivec2 a = q[0] - extend, e = q[1] + extend;
       q[2] = e + offset; z[2] = z[1]; inv_w[2] = inv_w[1]; B[2] = B[1];

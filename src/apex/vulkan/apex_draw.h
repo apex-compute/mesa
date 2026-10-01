@@ -28,7 +28,7 @@
 #define APEX_DRAW_INDEX_SIZE 14       /* bound index bytes: indices beyond read zero */
 #define APEX_DRAW_LOGIC_OP 15         /* VkLogicOp | enable << 4 */
 /* VkPolygonMode | line quad << 4 (1 parallelogram, 2 rectangle, 3 smooth
- * rectangle) | stipple enable << 8. */
+ * rectangle) | stipple enable << 8 | Bresenham << 9. */
 #define APEX_DRAW_RASTER 16
 #define APEX_DRAW_LINE_STIPPLE 17     /* factor | pattern << 16 */
 #define APEX_DRAW_LINE_WIDTH 18       /* FP32 */
@@ -143,7 +143,7 @@
 #define APEX_PRIM_WEIGHTS 23          /* 3 x 3 FP32: sub-vertex i weight of source vertex j */
 #define APEX_PRIM_SOURCE 32           /* 3 source vertex record indices */
 /* Bit 0 front-facing, bit 1 stippled line, bit 2 smooth line, bit 3 every
- * sample takes the pixel center's coverage (parallelogram lines); bits
+ * sample takes the pixel center's coverage (Bresenham lines); bits
  * 16..19 viewport index; bits 20..31 layer. */
 #define APEX_PRIM_FLAGS 35
 #define APEX_PRIM_ID 36

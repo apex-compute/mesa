@@ -2313,7 +2313,8 @@ record_view(struct apex_command_buffer *cmd, uint32_t vertex_count, uint32_t ins
    /* Default and Bresenham lines are minor-axis parallelograms. */
    uint32_t line = dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR ? 2 :
                    dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR ? 3 : 1;
-   draw[APEX_DRAW_RASTER] = dyn->rs.polygon_mode | line << 4 | (uint32_t)dyn->rs.line.stipple.enable << 8;
+   draw[APEX_DRAW_RASTER] = dyn->rs.polygon_mode | line << 4 | (uint32_t)dyn->rs.line.stipple.enable << 8 |
+                            (uint32_t)(dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR) << 9;
    draw[APEX_DRAW_LINE_STIPPLE] = dyn->rs.line.stipple.factor | (uint32_t)dyn->rs.line.stipple.pattern << 16;
    draw[APEX_DRAW_LINE_WIDTH] = float_bits(dyn->rs.line.width);
    draw[APEX_DRAW_LOGIC_OP] = dyn->cb.logic_op | (uint32_t)dyn->cb.logic_op_enable << 4;
