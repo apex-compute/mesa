@@ -2126,6 +2126,44 @@ static bool vectorize(unsigned align_mul, unsigned align_offset, unsigned bit_si
           (constant || align >= 4 * util_next_power_of_two(num_components));
 }
 
+/* A value an if's branch computes and the code after the if computes again
+ * moves before the if, where CSE shares it; the work never runs more often
+ * than before. */
+static bool available_before(nir_src *src, void *before)
+{
+   return nir_block_dominates(nir_def_block(src->ssa), before);
+}
+static bool hoist_repeated(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_dominance);
+      bool moved = false;
+      nir_foreach_block(before, impl) {
+         nir_cf_node *next = nir_cf_node_next(&before->cf_node);
+         if (!next || next->type != nir_cf_node_if)
+            continue;
+         nir_block *after = nir_cf_node_as_block(nir_cf_node_next(next));
+         nir_foreach_block_in_cf_node(block, next) {
+            nir_foreach_instr_safe(instr, block) {
+               if ((instr->type != nir_instr_type_alu && instr->type != nir_instr_type_intrinsic) ||
+                   !nir_instr_can_speculate(instr) || !nir_foreach_src(instr, available_before, before))
+                  continue;
+               nir_foreach_instr(later, after) {
+                  if (nir_instrs_equal(instr, later)) {
+                     nir_instr_move(nir_after_block(before), instr);
+                     moved = true;
+                     break;
+                  }
+               }
+            }
+         }
+      }
+      progress |= nir_progress(moved, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 /* Position keeps its association, so pipelines computing the same position
  * expression rasterize the same depth (equal-depth multipass). */
 static void keep_position_order(nir_shader *nir)
@@ -2311,6 +2349,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, hoist_repeated);
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_licm, licm_filter);
       NIR_PASS(progress, nir, nir_opt_dead_cf);

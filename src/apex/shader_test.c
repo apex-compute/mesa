@@ -375,6 +375,46 @@ static void test_mix(const char *dir)
    apex_compile_result_finish(&r);
 }
 
+/* hoist.frag with the branch taken (limit 3) and not (limit 0). */
+static void test_hoist(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "hoist.frag.spv", &r);
+   uint32_t *attributes = calloc(APEX_ATTRIBUTE_BLOCK, sizeof(uint32_t));
+   for (unsigned c = 0; c < 3; c++) {
+      *attribute(attributes, c, 0) = bits(0.4f * c - 0.3f);
+      *attribute(attributes, c, 1) = bits(1.5f - 0.6f * c);
+      *attribute(attributes, c, 2) = bits(0.7f + 0.2f * c);
+   }
+   for (unsigned taken = 0; taken < 2; taken++) {
+      struct world w = {0};
+      uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+      float limit = taken ? 3.0f : 0.0f;
+      put(root + PUSH, bits(limit));
+      struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+      fragment_wave(wave, attributes);
+      run(&r, &w, wave->scalar, 1, wave);
+      for (unsigned l = 0; l < 16; l++) {
+         uint32_t i = wave->vector[0][l], j = wave->vector[1][l];
+         double v[3], length = 0;
+         for (unsigned c = 0; c < 3; c++) {
+            v[c] = interpolate(attributes, c, i, j);
+            length += v[c] * v[c];
+         }
+         length = sqrt(length);
+         double attenuation = taken ? 1 - fmin(length / limit, 1) : 1;
+         for (unsigned c = 0; c < 4; c++) {
+            double want = c < 3 ? v[c] / length * attenuation : attenuation;
+            CHECK(fabs(flt(wave->exports[0][l][c]) - want) <= 1e-5);
+         }
+      }
+      free(wave);
+      world_free(&w);
+   }
+   free(attributes);
+   apex_compile_result_finish(&r);
+}
+
 /* Captured GNOME Shell and glmark2 (Zink) shaders: compile under the gate
  * and run once on the model against zeroed uniforms and a small texture in
  * every sampler slot. */
@@ -759,6 +799,7 @@ int main(int argc, char **argv)
    test_fragment(argv[1], "compositor.frag.spv", true, true);
    test_transform(argv[1]);
    test_mix(argv[1]);
+   test_hoist(argv[1]);
    test_features(argv[1]);
    test_spill(argv[1]);
    test_waterfall(argv[1]);
