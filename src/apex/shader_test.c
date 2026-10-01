@@ -222,6 +222,48 @@ static void test_vertex(const char *dir, const char *name, unsigned varying_comp
    apex_compile_result_finish(&r);
 }
 
+/* transform.vert: the varying's translation joins its first product
+ * (within rounding of the exact sum); the position keeps the association
+ * its expression gives, bit for bit. */
+static void test_transform(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "transform.vert.spv", &r);
+   uint32_t stride = r.data[28] | r.data[29] << 8;
+   struct world w = {0};
+   uint8_t *out = region(&w, 0x800000, 16 * stride);
+   uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+   float m[2][4][4];
+   for (unsigned k = 0; k < 2; k++)
+      for (unsigned c = 0; c < 4; c++)
+         for (unsigned e = 0; e < 4; e++) {
+            m[k][c][e] = c == 3 ? 1000.3f + 7.1f * e + k : 0.37f * (c + 1) - 0.11f * e + 0.013f * k;
+            put(root + PUSH + 64 * k + 16 * c + 4 * e, bits(m[k][c][e]));
+         }
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   wave->exec = 0xffff;
+   wave->scalar[0] = (uint32_t)ROOT;
+   wave->scalar[16] = 0x800000;
+   vertex_inputs(wave, 0, 4, 1.0f);
+   run(&r, &w, wave->scalar, 1, wave);
+   bool differs = false;
+   for (unsigned l = 0; l < 16; l++) {
+      float x = flt(wave->vector[2][l]), y = flt(wave->vector[3][l]), z = flt(wave->vector[4][l]);
+      for (unsigned e = 0; e < 4; e++) {
+         const float (*a)[4] = m[0], (*b)[4] = m[1];
+         float position = fmaf(a[2][e], z, fmaf(a[0][e], x, a[1][e] * y)) + a[3][e];
+         differs |= position != fmaf(a[2][e], z, fmaf(a[0][e], x, fmaf(a[1][e], y, a[3][e])));
+         CHECK(get(out + l * stride + 4 * e) == bits(position));
+         double exact = (double)b[0][e] * x + (double)b[1][e] * y + (double)b[2][e] * z + b[3][e];
+         CHECK(fabs(flt(get(out + l * stride + 64 + 4 * e)) - exact) <= 2e-7 * fabs(exact));
+      }
+   }
+   CHECK(differs);
+   free(wave);
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
 /* Fragment waves: i and j per lane in v0-v1, covered pixels of quad q at
  * (2q, 0), attribute block of primitive 0. */
 static void fragment_wave(struct apex_sim_wave *wave, uint32_t *attributes)
@@ -296,6 +338,37 @@ static void test_fragment(const char *dir, const char *name, bool textured, bool
       }
    }
    (void)packed;
+   free(wave);
+   free(attributes);
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
+/* mix.frag: mix(a, b, 1 - t) within rounding of a + (1 - t)(b - a). */
+static void test_mix(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "mix.frag.spv", &r);
+   struct world w = {0};
+   region(&w, ROOT, ROOT_BYTES);
+   uint32_t *attributes = calloc(APEX_ATTRIBUTE_BLOCK, sizeof(uint32_t));
+   for (unsigned c = 0; c < 12; c++) {
+      *attribute(attributes, c, 0) = bits(0.3f * c - 1.7f);
+      *attribute(attributes, c, 1) = bits(0.45f - 0.07f * c);
+      *attribute(attributes, c, 2) = bits(0.2f + 0.05f * c);
+   }
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   fragment_wave(wave, attributes);
+   run(&r, &w, wave->scalar, 1, wave);
+   CHECK(wave->exported[0] == 0xffff);
+   for (unsigned l = 0; l < 16; l++) {
+      uint32_t i = wave->vector[0][l], j = wave->vector[1][l];
+      for (unsigned c = 0; c < 4; c++) {
+         double a = interpolate(attributes, c, i, j), b = interpolate(attributes, 4 + c, i, j);
+         double t = interpolate(attributes, 8 + c, i, j), want = a + (1 - t) * (b - a);
+         CHECK(fabs(flt(wave->exports[0][l][c]) - want) <= 4e-7 * fmax(fabs(a), fabs(b)));
+      }
+   }
    free(wave);
    free(attributes);
    world_free(&w);
@@ -684,6 +757,8 @@ int main(int argc, char **argv)
    test_fragment(argv[1], "bench.frag.spv", true, false);
    test_fragment(argv[1], "triangle.frag.spv", false, false);
    test_fragment(argv[1], "compositor.frag.spv", true, true);
+   test_transform(argv[1]);
+   test_mix(argv[1]);
    test_features(argv[1]);
    test_spill(argv[1]);
    test_waterfall(argv[1]);

@@ -2126,6 +2126,42 @@ static bool vectorize(unsigned align_mul, unsigned align_offset, unsigned bit_si
           (constant || align >= 4 * util_next_power_of_two(num_components));
 }
 
+/* Position keeps its association, so pipelines computing the same position
+ * expression rasterize the same depth (equal-depth multipass). */
+static void keep_position_order(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct util_dynarray stack;
+   util_dynarray_init(&stack, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         instr->pass_flags = 0;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+         if (i->intrinsic == nir_intrinsic_store_output &&
+             nir_intrinsic_io_semantics(i).location == VARYING_SLOT_POS)
+            util_dynarray_append(&stack, nir_def_instr(i->src[0].ssa));
+      }
+   }
+   while (util_dynarray_num_elements(&stack, nir_instr *)) {
+      nir_instr *instr = util_dynarray_pop(&stack, nir_instr *);
+      if (instr->pass_flags || (instr->type != nir_instr_type_alu && instr->type != nir_instr_type_phi))
+         continue;
+      instr->pass_flags = 1;
+      if (instr->type == nir_instr_type_phi) {
+         nir_foreach_phi_src(p, nir_instr_as_phi(instr))
+            util_dynarray_append(&stack, nir_def_instr(p->src.ssa));
+         continue;
+      }
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      alu->fp_math_ctrl |= nir_op_valid_fp_math_ctrl(alu->op, nir_fp_no_reassoc | nir_fp_no_transform);
+      for (unsigned k = 0; k < nir_op_infos[alu->op].num_inputs; k++)
+         util_dynarray_append(&stack, nir_def_instr(alu->src[k].src.ssa));
+   }
+   util_dynarray_fini(&stack);
+}
+
 static int fail(struct apex_compile_result *output, const char *message)
 {
    snprintf(output->diagnostic, sizeof(output->diagnostic), "%s", message);
@@ -2294,6 +2330,12 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
       NIR_PASS(_, nir, nir_opt_dce);
    }
    NIR_PASS(_, nir, nir_opt_algebraic_late);
+   /* Fusion leaves the fused products behind until DCE; is_used_once
+    * patterns need them gone. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   if (stage == MESA_SHADER_VERTEX)
+      keep_position_order(nir);
+   NIR_PASS(_, nir, apex_nir_opt_late);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_lower_continue_constructs);

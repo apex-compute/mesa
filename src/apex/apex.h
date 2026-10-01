@@ -112,6 +112,8 @@ int apex_tool(const char *mode, const char *input, const char *output);
 /* Mutates caller-owned NIR; the caller retains its lifetime and GLSL type ref.
  * Compute, vertex and fragment stages. */
 int apex_from_nir(struct nir_shader *, struct apex_compile_result *);
+/* Late algebraic rules (apex_nir_algebraic.py). */
+bool apex_nir_opt_late(struct nir_shader *);
 /* Validates Vulkan 1.3 SPIR-V and compiles its first entry point (standalone). */
 int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_result *);
 #endif
