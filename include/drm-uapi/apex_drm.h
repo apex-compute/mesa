@@ -14,10 +14,11 @@
 
 /* Output only. PRIME_COHERENT distinguishes GPUVM implementations that
  * refresh shared dma-buf backing before execution and copy writable results
- * back before completion. MULTIWAVE admits APX2 groups of up to 256 invocations
- * on the bound image. HOST_COHERENT requires the image's SYSTEM atomic feature
- * and a coherent DMA mapping; every allocation is checked again. Capabilities
- * describe this interface, not raw PCI. */
+ * back before completion; it also admits LOCAL objects. MULTIWAVE admits APX2
+ * groups of up to 256 invocations on the bound image. HOST_COHERENT requires
+ * the image's SYSTEM atomic feature and a coherent DMA mapping; every
+ * allocation is checked again. Capabilities describe this interface, not raw
+ * PCI. */
 struct drm_apex_info {
 	__u32 version;
 	__u32 capabilities;
@@ -25,11 +26,16 @@ struct drm_apex_info {
 };
 
 #define APEX_DRM_GEM_HOST_COHERENT (1U << 0)
+#define APEX_DRM_GEM_LOCAL (1U << 1)
 
 /* Opt-in HOST_COHERENT uses pinned, bidirectionally DMA-mapped shmem as the
  * GPU's SYSTEM backing; CPU and GPU share its bytes without GEM_TRANSFER.
- * size returns the page-rounded extent; handle must be zero on input.
- * Handles belong to the calling DRM file. Other flags are invalid. */
+ * LOCAL (with PRIME_COHERENT) allocates contiguous LOCAL backing at creation
+ * and no host copy: the mmap is a write-combined BAR2 view, PRIME export shares
+ * the backing with this device's importers, KMS scans it out in place, and
+ * GEM_TRANSFER rejects it. Dumb buffers are LOCAL objects. The two flags are
+ * exclusive. size returns the page-rounded extent; handle must be zero on
+ * input. Handles belong to the calling DRM file. Other flags are invalid. */
 struct drm_apex_gem_create {
 	__u64 size;
 	__u32 flags;

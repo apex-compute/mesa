@@ -11,19 +11,31 @@
  *                                    buffer imported as an EGLImage.
  *   apex-gles-application caps NODE  Desktop GL and GLES 3 contexts on the
  *                                    device: versions and the extensions
- *                                    Mesa requires for GLES 3.0 and 3.1. */
+ *                                    Mesa requires for GLES 3.0 and 3.1.
+ *   apex-gles-application scanout CARD
+ *                                    GBM scanout buffers rendered through
+ *                                    Zink become KMS framebuffers; as DRM
+ *                                    master with a connected sink, page-flip
+ *                                    between two of them, rendering each
+ *                                    frame with a different clear color. */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
+#include "drm-uapi/drm.h"
+#include "drm-uapi/drm_mode.h"
 #include "gbm.h"
 
 #define SIZE 16
@@ -218,7 +230,7 @@ run_egl(const char *node)
 
 #define GBM_FUNCTIONS(X) X(gbm_create_device) X(gbm_device_destroy) X(gbm_device_get_backend_name) \
    X(gbm_bo_create) X(gbm_bo_destroy) X(gbm_bo_get_fd) X(gbm_bo_get_stride) X(gbm_bo_get_modifier) \
-   X(gbm_bo_map) X(gbm_bo_unmap) X(gbm_bo_create_with_modifiers2)
+   X(gbm_bo_map) X(gbm_bo_unmap) X(gbm_bo_create_with_modifiers2) X(gbm_bo_get_handle)
 #define DECLARE(f) static __typeof__(f) *p_##f;
 
 GBM_FUNCTIONS(DECLARE)
@@ -361,6 +373,173 @@ run_gbm(const char *node)
    return failures != 0;
 }
 
+struct scanout_buffer {
+   struct gbm_bo *bo;
+   GLuint framebuffer;
+   uint32_t fb;
+};
+
+/* A GBM scanout buffer as a GL render target and a KMS framebuffer. The
+ * kernel admits only LOCAL-resident objects, so ADDFB2 succeeding shows the
+ * Zink allocation scans out in place. */
+static bool
+scanout_buffer(int fd, struct gbm_device *device, EGLDisplay display, uint32_t width,
+               uint32_t height, struct scanout_buffer *buffer)
+{
+   buffer->bo = p_gbm_bo_create(device, width, height, GBM_FORMAT_XRGB8888,
+                                GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+   check(buffer->bo, "scanout gbm_bo_create");
+   if (!buffer->bo)
+      return false;
+   int dmabuf = p_gbm_bo_get_fd(buffer->bo);
+   uint32_t stride = p_gbm_bo_get_stride(buffer->bo);
+   PFNEGLCREATEIMAGEKHRPROC create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+   PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC image_storage =
+      (PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES");
+   const EGLint attributes[] = {
+      EGL_WIDTH, (EGLint)width, EGL_HEIGHT, (EGLint)height,
+      EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_XRGB8888, EGL_DMA_BUF_PLANE0_FD_EXT, dmabuf,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0, EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)stride, EGL_NONE,
+   };
+   EGLImageKHR image = dmabuf >= 0 && create_image ?
+      create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes) : EGL_NO_IMAGE_KHR;
+   if (dmabuf >= 0)
+      close(dmabuf);
+   check(image != EGL_NO_IMAGE_KHR && image_storage, "scanout EGLImage");
+   if (image == EGL_NO_IMAGE_KHR || !image_storage)
+      return false;
+   GLuint renderbuffer;
+   glGenFramebuffers(1, &buffer->framebuffer);
+   glGenRenderbuffers(1, &renderbuffer);
+   glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+   image_storage(GL_RENDERBUFFER, image);
+   glBindFramebuffer(GL_FRAMEBUFFER, buffer->framebuffer);
+   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+   check(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE, "scanout framebuffer complete");
+   struct drm_mode_fb_cmd2 command = {
+      .width = width, .height = height, .pixel_format = GBM_FORMAT_XRGB8888,
+      .handles[0] = p_gbm_bo_get_handle(buffer->bo).u32, .pitches[0] = stride,
+   };
+   bool added = !ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &command);
+   printf("     %ux%u stride %u: ADDFB2 %s\n", width, height, stride, added ? "accepted" : strerror(errno));
+   check(added, "KMS accepts the Zink scanout buffer");
+   buffer->fb = command.fb_id;
+   return added;
+}
+
+/* Clears flush without waiting: each flip relies on the kernel waiting for
+ * the buffer's implicit fences before scanning it out. */
+static void
+scanout_frame(const struct scanout_buffer *buffer, unsigned frame, uint32_t width, uint32_t height)
+{
+   glBindFramebuffer(GL_FRAMEBUFFER, buffer->framebuffer);
+   glViewport(0, 0, width, height);
+   glClearColor((frame % 3 == 0) * 0.75f, (frame % 3 == 1) * 0.75f, (frame % 3 == 2) * 0.75f, 1.0f);
+   glClear(GL_COLOR_BUFFER_BIT);
+   glFlush();
+}
+
+static bool
+flip(int fd, uint32_t crtc, uint32_t fb)
+{
+   struct drm_mode_crtc_page_flip request = {
+      .crtc_id = crtc, .fb_id = fb, .flags = DRM_MODE_PAGE_FLIP_EVENT,
+   };
+   if (ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &request))
+      return false;
+   struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
+   struct drm_event_vblank event;
+   return poll(&poll_fd, 1, 2000) == 1 && read(fd, &event, sizeof(event)) >= (ssize_t)sizeof(event.base) &&
+          event.base.type == DRM_EVENT_FLIP_COMPLETE;
+}
+
+static int
+run_scanout(const char *node)
+{
+   void *library = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+   check(library, "libgbm.so.1");
+   if (!library)
+      return 1;
+   GBM_FUNCTIONS(RESOLVE)
+   int fd = open(node, O_RDWR | O_CLOEXEC);
+   check(fd >= 0, "open card node");
+   if (fd < 0)
+      return 1;
+   struct gbm_device *device = p_gbm_create_device(fd);
+   check(device, "gbm_create_device");
+   if (!device)
+      return 1;
+   EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, device, NULL);
+   check(display != EGL_NO_DISPLAY, "GBM platform display");
+   if (display == EGL_NO_DISPLAY || !gles2_context(display, NULL))
+      return 1;
+   /* The first connected connector's first (preferred) mode on the CRTC. */
+   uint32_t crtcs[4], connectors[4];
+   struct drm_mode_card_res resources = {
+      .crtc_id_ptr = (uintptr_t)crtcs, .connector_id_ptr = (uintptr_t)connectors,
+      .count_crtcs = 4, .count_connectors = 4,
+   };
+   struct drm_mode_modeinfo modes[64], mode = {0};
+   uint32_t connector = 0;
+   if (!ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &resources) && resources.count_crtcs) {
+      for (unsigned i = 0; i < resources.count_connectors && i < 4 && !connector; i++) {
+         struct drm_mode_get_connector query = {.connector_id = connectors[i]};
+         if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &query) || query.connection != 1 || !query.count_modes)
+            continue;
+         query = (struct drm_mode_get_connector) {.connector_id = connectors[i],
+            .modes_ptr = (uintptr_t)modes, .count_modes = 64};
+         if (!ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &query) && query.count_modes) {
+            connector = connectors[i];
+            mode = modes[0];
+         }
+      }
+   }
+   uint32_t width = connector ? mode.hdisplay : 256, height = connector ? mode.vdisplay : 64;
+   struct scanout_buffer buffers[2] = {0};
+   bool ready = scanout_buffer(fd, device, display, width, height, &buffers[0]) &&
+                scanout_buffer(fd, device, display, width, height, &buffers[1]);
+   if (ready && !connector)
+      puts("     no connected sink: flips skipped");
+   else if (ready && ioctl(fd, DRM_IOCTL_SET_MASTER, NULL))
+      puts("     not DRM master: flips skipped");
+   else if (ready) {
+      scanout_frame(&buffers[0], 0, width, height);
+      struct drm_mode_crtc crtc = {
+         .crtc_id = crtcs[0], .fb_id = buffers[0].fb, .set_connectors_ptr = (uintptr_t)&connector,
+         .count_connectors = 1, .mode = mode, .mode_valid = 1,
+      };
+      bool set = !ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+      printf("     %s %ux%u@%u\n", set ? "modeset" : "modeset failed", width, height, mode.vrefresh);
+      check(set, "modeset onto the Zink scanout buffer");
+      const unsigned frames = 180;
+      unsigned flipped = 0;
+      struct timespec begin, end;
+      clock_gettime(CLOCK_MONOTONIC, &begin);
+      for (unsigned frame = 1; set && frame <= frames; frame++, flipped++) {
+         scanout_frame(&buffers[frame & 1], frame, width, height);
+         if (!flip(fd, crtcs[0], buffers[frame & 1].fb))
+            break;
+      }
+      clock_gettime(CLOCK_MONOTONIC, &end);
+      double seconds = (end.tv_sec - begin.tv_sec) + (end.tv_nsec - begin.tv_nsec) * 1e-9;
+      printf("     %u flips in %.2f s (%.1f per second)\n", flipped, seconds, flipped / seconds);
+      check(flipped == frames, "page flips between Zink scanout buffers");
+      crtc = (struct drm_mode_crtc) {.crtc_id = crtcs[0]};
+      ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+      ioctl(fd, DRM_IOCTL_DROP_MASTER, NULL);
+   }
+   for (unsigned i = 0; i < 2; i++) {
+      if (buffers[i].fb)
+         ioctl(fd, DRM_IOCTL_MODE_RMFB, &buffers[i].fb);
+      if (buffers[i].bo)
+         p_gbm_bo_destroy(buffers[i].bo);
+   }
+   eglTerminate(display);
+   p_gbm_device_destroy(device);
+   close(fd);
+   return failures != 0;
+}
+
 /* Extensions of Mesa's GLES 3.0 and 3.1 version checks (compute_version_es2)
  * that have extension strings; the rest are implied by these or limits. */
 static const char *const es30_extensions[] = {
@@ -467,12 +646,14 @@ run_caps(const char *node)
 int
 main(int argc, char **argv)
 {
-   if (argc != 3 || (strcmp(argv[1], "egl") && strcmp(argv[1], "gbm") && strcmp(argv[1], "caps"))) {
-      fprintf(stderr, "usage: %s egl|gbm|caps DRM-NODE\n", argv[0]);
+   if (argc != 3 || (strcmp(argv[1], "egl") && strcmp(argv[1], "gbm") && strcmp(argv[1], "caps") &&
+                     strcmp(argv[1], "scanout"))) {
+      fprintf(stderr, "usage: %s egl|gbm|caps|scanout DRM-NODE\n", argv[0]);
       return 2;
    }
    int result = !strcmp(argv[1], "egl") ? run_egl(argv[2]) :
-                !strcmp(argv[1], "gbm") ? run_gbm(argv[2]) : run_caps(argv[2]);
+                !strcmp(argv[1], "gbm") ? run_gbm(argv[2]) :
+                !strcmp(argv[1], "scanout") ? run_scanout(argv[2]) : run_caps(argv[2]);
    puts(result ? "FAIL" : "PASS");
    return result;
 }

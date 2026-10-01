@@ -66,8 +66,11 @@ __wrap_ioctl(int fd, unsigned long request, ...)
       CHECK(!ftruncate(fd, (r->handle + 1) * 65536));
    } else if (request == DRM_IOCTL_APEX_GEM_MMAP) {
       struct drm_apex_gem_mmap *r = arg;
-      CHECK(handles[r->handle].live && handles[r->handle].object != 0);
+      struct stat st;
+      CHECK(handles[r->handle].live && !fstat(fd, &st));
       r->offset = r->handle * 65536;
+      if (st.st_size < (off_t)(r->offset + 65536))
+         CHECK(!ftruncate(fd, r->offset + 65536));
       maps++;
    } else if (request == DRM_IOCTL_PRIME_FD_TO_HANDLE) {
       struct drm_prime_handle *r = arg;
@@ -148,7 +151,8 @@ int main(void)
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkMemoryFdPropertiesKHR props = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, objects[0], &props) == VK_SUCCESS);
-   CHECK(props.memoryTypeBits == 2 && !live && closes == 1 && fcntl(objects[0], F_GETFD) >= 0);
+   /* Imports take either device-local type: device-only PRIME or LOCAL-resident. */
+   CHECK(props.memoryTypeBits == 6 && !live && closes == 1 && fcntl(objects[0], F_GETFD) >= 0);
    CHECK(!ftruncate(fd, 4096)); /* Valid extent, but not a PRIME-exported object. */
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &props) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
    VkExportMemoryAllocateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
@@ -254,7 +258,7 @@ int main(void)
       v->FreeMemory(dev, memory[1 - order], NULL);
       CHECK(!live && closes == before + 1);
    }
-   /* External images: PRIME-only memory, dma-buf import, LINEAR modifier. */
+   /* External images: LOCAL-resident memory, dma-buf import, LINEAR modifier. */
    VkExternalMemoryImageCreateInfo external_image = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
       .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
@@ -267,7 +271,7 @@ int main(void)
    CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
    VkMemoryRequirements image_req;
    v->GetImageMemoryRequirements(dev, image, &image_req);
-   CHECK(image_req.size == 192 && image_req.memoryTypeBits == 2);
+   CHECK(image_req.size == 192 && image_req.memoryTypeBits == 4);
    VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
       .image = image};
    import = (VkImportMemoryFdInfoKHR) {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
@@ -276,7 +280,21 @@ int main(void)
    ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &import,
       .allocationSize = 192, .memoryTypeIndex = 1};
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   v->FreeMemory(dev, memory[0], NULL);
+   /* The LOCAL-resident import maps on first use, once per GEM storage. */
+   import.fd = dup(objects[0]);
+   ai.memoryTypeIndex = 2;
+   unsigned maps_before = maps;
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS && maps == maps_before);
    CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
+   CHECK(v->MapMemory(dev, memory[0], 64, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS && map);
+   CHECK(maps == maps_before + 1);
+   ((uint8_t *)map)[0] = 0x5a;
+   v->UnmapMemory(dev, memory[0]);
+   CHECK(v->MapMemory(dev, memory[0], 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS);
+   CHECK(maps == maps_before + 1 && ((uint8_t *)map)[64] == 0x5a);
+   v->UnmapMemory(dev, memory[0]);
    ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = 4096, .memoryTypeIndex = 0};
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_SUCCESS);
@@ -319,12 +337,12 @@ int main(void)
    plane_layout.offset = 128;
    CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
    v->GetImageMemoryRequirements(dev, image, &image_req);
-   CHECK(image_req.size == 320 && image_req.memoryTypeBits == 2);
+   CHECK(image_req.size == 320 && image_req.memoryTypeBits == 4);
    VkDeviceImageMemoryRequirements device_req = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, .pCreateInfo = &image_info};
    VkMemoryRequirements2 req2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
    v->GetDeviceImageMemoryRequirements(dev, &device_req, &req2);
-   CHECK(req2.memoryRequirements.size == 320 && req2.memoryRequirements.memoryTypeBits == 2);
+   CHECK(req2.memoryRequirements.size == 320 && req2.memoryRequirements.memoryTypeBits == 4);
    v->GetImageSubresourceLayout(dev, image, &plane, &layout);
    CHECK(layout.offset == 128 && layout.rowPitch == 64);
    CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -332,6 +350,31 @@ int main(void)
    v->FreeMemory(dev, memory[1], NULL);
    v->FreeMemory(dev, memory[0], NULL);
    CHECK(!live);
+   /* Owned LOCAL-resident storage: GEM_LOCAL, a coherent mapping (the mock
+    * rejects every GEM_TRANSFER), dma-buf export and external images. */
+   expected_create_flags = APEX_DRM_GEM_LOCAL;
+   ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &export, .allocationSize = 8192, .memoryTypeIndex = 2};
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
+   CHECK(v->MapMemory(dev, memory[0], 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS && map);
+   memset(map, 0x3c, 8192);
+   VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = memory[0], .size = VK_WHOLE_SIZE};
+   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+   CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
+   CHECK(((uint8_t *)map)[8191] == 0x3c);
+   get = (VkMemoryGetFdInfoKHR) {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+      .memory = memory[0], .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+   CHECK(v->GetMemoryFdKHR(dev, &get, &exported) == VK_SUCCESS && !close(exported));
+   external_image.pNext = NULL;
+   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, image, memory[0], 4096) == VK_SUCCESS);
+   v->DestroyImage(dev, image, NULL);
+   v->UnmapMemory(dev, memory[0]);
+   v->FreeMemory(dev, memory[0], NULL);
+   CHECK(!live);
+   expected_create_flags = 0;
    ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = 8192, .memoryTypeIndex = 1};
    import.pNext = &export;
@@ -357,6 +400,7 @@ int main(void)
          .allocationSize = 8192, .memoryTypeIndex = coherent ? 2 : 1};
       before = creates;
       if (!host_coherent) {
+         ai.memoryTypeIndex = 1 + 2 * coherent; /* One past the last type. */
          CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_FEATURE_NOT_PRESENT);
          CHECK(!memory[0] && creates == before);
          apex_device_finish(&device);
@@ -391,7 +435,7 @@ int main(void)
       CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[0]) == VK_SUCCESS);
       VkMemoryRequirements req;
       v->GetBufferMemoryRequirements(dev, buffers[0], &req);
-      CHECK(req.memoryTypeBits == (coherent ? 7 : 3));
+      CHECK(req.memoryTypeBits == (coherent ? 15 : 3));
       CHECK(v->BindBufferMemory(dev, buffers[0], memory[0], 4096) == VK_SUCCESS);
       image_info = (VkImageCreateInfo) {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
          .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R32_UINT,
@@ -400,7 +444,7 @@ int main(void)
          .usage = VK_IMAGE_USAGE_STORAGE_BIT};
       CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
       v->GetImageMemoryRequirements(dev, image, &req);
-      CHECK(req.memoryTypeBits == (coherent ? 7 : 3));
+      CHECK(req.memoryTypeBits == (coherent ? 15 : 3));
       CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
       ai.pNext = &export;
       CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -416,6 +460,16 @@ int main(void)
       v->UnmapMemory(dev, memory[0]);
       v->FreeMemory(dev, memory[0], NULL);
       CHECK(!live);
+      /* LOCAL-resident storage follows the host-coherent type. */
+      ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = 8192, .memoryTypeIndex = 3};
+      expected_create_flags = APEX_DRM_GEM_LOCAL;
+      CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) ==
+            (coherent ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT));
+      if (coherent)
+         v->FreeMemory(dev, memory[0], NULL);
+      expected_create_flags = 0;
+      CHECK(!live);
       apex_device_finish(&device);
    }
    puts("PASS Apex host-coherent memory: independent capability, GEM flag/no fallback, range no-ops, buffer/image types, external rejection, cleanup (mock DRM)");
@@ -423,6 +477,6 @@ int main(void)
    for (unsigned i = 0; i < object_count; i++) CHECK(!close(objects[i]));
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
-   puts("PASS Apex external memory: device-only queries, external images and LINEAR modifiers, fd ownership, same-file handle dedup, alias offsets, both free orders, failure cleanup (mock PRIME, no GPU execution)");
+   puts("PASS Apex external memory: device-local import types, LOCAL-resident external images, lazy import maps and LINEAR modifiers, fd ownership, same-file handle dedup, alias offsets, both free orders, failure cleanup (mock PRIME, no GPU execution)");
    return 0;
 }

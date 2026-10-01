@@ -254,7 +254,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
    get_memory(physical, &mem);
-   CHECK(mem.memoryTypeCount == 1u + coherent + host_coherent &&
+   CHECK(mem.memoryTypeCount == 1u + 2 * coherent + host_coherent &&
          mem.memoryHeapCount == 1u + host_coherent);
    CHECK(mem.memoryTypes[0].propertyFlags ==
          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
@@ -266,6 +266,13 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       CHECK(mem.memoryTypes[1 + coherent].heapIndex == 1 &&
             !mem.memoryHeaps[1].flags && mem.memoryHeaps[1].size == 1024ull * 1024 * 1024);
    }
+   /* LOCAL-resident storage shares the device heap and follows the others. */
+   if (coherent)
+      CHECK(mem.memoryTypes[2 + host_coherent].propertyFlags ==
+            (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            mem.memoryTypes[2 + host_coherent].heapIndex == 0 &&
+            (mem.memoryHeaps[0].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT));
    PROC(GetPhysicalDeviceExternalBufferPropertiesKHR, get_external);
    VkPhysicalDeviceExternalBufferInfo external = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
@@ -521,7 +528,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(requirements.memoryRequirements.size == 128 &&
          requirements.memoryRequirements.alignment == 64 &&
          requirements.memoryRequirements.memoryTypeBits ==
-            (host_coherent ? (coherent ? 7 : 3) : (coherent ? 3 : 1)));
+            (host_coherent ? (coherent ? 15 : 3) : (coherent ? 7 : 1)));
    CHECK(!dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation);
    destroy_buffer(device, buffer, NULL);
    int fd1 = last_fd;

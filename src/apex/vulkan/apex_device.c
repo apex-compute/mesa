@@ -350,6 +350,14 @@ unlock:
    return result;
 }
 
+/* Memory types: 0 explicit-transfer host, 1 device-only PRIME, the optional
+ * host-coherent SYSTEM type, then LOCAL-resident storage with PRIME. */
+static uint32_t
+local_memory_types(const struct apex_device *device)
+{
+   return device->prime_coherent ? 1u << (2 + device->host_coherent) : 0;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_GetMemoryFdKHR(VkDevice dev, const VkMemoryGetFdInfoKHR *info, int *fd)
 {
@@ -385,14 +393,37 @@ apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits t
    mtx_unlock(&device->memory_mutex);
    if (ret)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   properties->memoryTypeBits = 2; /* Foreign backing has no Vulkan CPU access. */
+   properties->memoryTypeBits = 2 | local_memory_types(device);
    return VK_SUCCESS;
 }
 
 static uint32_t
 host_memory_types(const struct apex_device *device)
 {
-   return 1 | (device->host_coherent ? 1u << (1 + device->prime_coherent) : 0);
+   return 1 | (device->host_coherent ? 1u << (1 + device->prime_coherent) : 0) |
+          local_memory_types(device);
+}
+
+/* Imported memory has no CPU mapping until the first vkMapMemory. */
+static VkResult
+map_storage(struct apex_device *device, struct apex_memory *memory)
+{
+   struct apex_bo *bo = &memory->storage->bo;
+   VkResult result = VK_SUCCESS;
+   mtx_lock(&device->memory_mutex);
+   if (!bo->map) {
+      struct drm_apex_gem_mmap map = {.handle = bo->handle};
+      void *ptr = MAP_FAILED;
+      if (!ioctl(device->fd, DRM_IOCTL_APEX_GEM_MMAP, &map))
+         ptr = mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd, map.offset);
+      if (ptr == MAP_FAILED)
+         result = VK_ERROR_MEMORY_MAP_FAILED;
+      else
+         bo->map = ptr;
+   }
+   memory->data = bo->map;
+   mtx_unlock(&device->memory_mutex);
+   return result;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -401,8 +432,9 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->memoryTypeIndex > (unsigned)(device->prime_coherent + device->host_coherent))
+   if (info->memoryTypeIndex > (unsigned)(2 * device->prime_coherent + device->host_coherent))
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   bool local = local_memory_types(device) & (1u << info->memoryTypeIndex);
    const VkImportMemoryFdInfoKHR *import = vk_find_struct_const(info->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    if (import && !import->handleType)
       import = NULL;
@@ -411,10 +443,11 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    if ((import && (import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
                    import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ||
        (types & ~APEX_EXTERNAL_MEMORY_TYPES) ||
-       /* Imports use the device-only type. Export also admits explicit-transfer
+       /* Imports use a device-local type. Export also admits explicit-transfer
         * type 0: after first export shmem is canonical and transfers only wait. */
        ((import || types) && (!device->prime_coherent ||
-                              (info->memoryTypeIndex != 1 && (import || info->memoryTypeIndex != 0)))))
+                              (info->memoryTypeIndex != 1 && !local &&
+                               (import || info->memoryTypeIndex != 0)))))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    /* Every allocation has a device address; capture/replay is unsupported. */
    const VkMemoryAllocateFlagsInfo *flags = vk_find_struct_const(info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
@@ -447,6 +480,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
       }
       result = bo_create(device, info->allocationSize,
                          APEX_DRM_VM_READ | APEX_DRM_VM_WRITE,
+                         local ? APEX_DRM_GEM_LOCAL :
                          device->host_coherent && info->memoryTypeIndex == 1u + device->prime_coherent ?
                             APEX_DRM_GEM_HOST_COHERENT : 0, 0, &mem->storage->bo);
       if (result == VK_SUCCESS) {
@@ -504,6 +538,11 @@ apex_MapMemory2(VkDevice dev, const VkMemoryMapInfo *info, void **out)
        info->flags || info->offset >= memory->vk.size ||
        (info->size != VK_WHOLE_SIZE && info->size > memory->vk.size - info->offset))
       return VK_ERROR_MEMORY_MAP_FAILED;
+   if (!memory->data) {
+      VkResult result = map_storage(device, memory);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    *out = (uint8_t *)memory->data + info->offset;
    return VK_SUCCESS;
 }
@@ -969,11 +1008,12 @@ static void
 image_memory_requirements(struct apex_device *device, VkDeviceSize size, bool external,
                           VkMemoryRequirements2 *out)
 {
-   /* Images may also live in device-only PRIME-capable storage, which
-    * external images require. */
+   /* Images may also live in device-only PRIME-capable storage; external
+    * images require LOCAL-resident storage so that they scan out in place. */
    out->memoryRequirements = (VkMemoryRequirements) {
       .size = size, .alignment = 64,
-      .memoryTypeBits = (external ? 0 : host_memory_types(device)) | (device->prime_coherent ? 2 : 0),
+      .memoryTypeBits = external ? local_memory_types(device) :
+                        host_memory_types(device) | (device->prime_coherent ? 2 : 0),
    };
    VkMemoryDedicatedRequirements *dedicated = vk_find_struct(out->pNext, MEMORY_DEDICATED_REQUIREMENTS);
    if (dedicated) {
@@ -1010,10 +1050,12 @@ apex_GetImageMemoryRequirements2(VkDevice dev,
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo *infos)
 {
+   VK_FROM_HANDLE(apex_device, device, dev);
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
       VK_FROM_HANDLE(apex_image, image, infos[i].image);
-      if (image->vk.external_handle_types && mem->vk.memory_type_index != 1)
+      if (image->vk.external_handle_types &&
+          !(local_memory_types(device) & (1u << mem->vk.memory_type_index)))
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       /* The image starts at its explicit DRM plane offset. */
       VkDeviceSize offset = infos[i].memoryOffset + image->plane_offset;

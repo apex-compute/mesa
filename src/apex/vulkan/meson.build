@@ -220,7 +220,7 @@ custom_target('apex-ms-texture-spv',
   command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default : true,
 )
-# Explicit hardware GLES 2 bring-up through Zink: EGL device and GBM modes.
+# Explicit hardware GLES 2 bring-up through Zink: EGL device, GBM and KMS scanout modes.
 dep_apex_egl = dependency('egl', required : false)
 dep_apex_glesv2 = dependency('glesv2', required : false)
 if with_gallium_zink and with_egl and with_gbm and dep_apex_egl.found() and dep_apex_glesv2.found()

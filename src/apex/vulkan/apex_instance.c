@@ -102,8 +102,8 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
       .memoryHeaps[0] = {.size = APEX_MAX_ALLOCATION,
                         .flags = device->prime_coherent ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0},
    };
+   VkPhysicalDeviceMemoryProperties *mem = &properties->memoryProperties;
    if (device->host_coherent) {
-      VkPhysicalDeviceMemoryProperties *mem = &properties->memoryProperties;
       mem->memoryTypes[mem->memoryTypeCount++] = (VkMemoryType) {
          .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
@@ -112,6 +112,14 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
       };
       mem->memoryHeaps[1] = (VkMemoryHeap) {.size = APEX_MAX_ALLOCATION};
    }
+   /* LOCAL-resident storage: a write-combined BAR2 view, and the only
+    * storage of external images, which therefore scan out in place. */
+   if (device->prime_coherent)
+      mem->memoryTypes[mem->memoryTypeCount++] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      };
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -639,8 +647,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    physical->host_coherent = caps.capabilities & APEX_DRM_CAP_HOST_COHERENT;
    physical->sync_types[0] = &physical->sync_type;
    physical->vk.supported_sync_types = physical->sync_types;
-   /* Swapchain images blit into exported PRIME buffers that KMS scans out;
-    * the primary node needs the video group or seat access. */
+   /* KMS scans swapchain images out of their LOCAL-resident memory; the
+    * primary node needs the video group or seat access. */
    physical->display_fd = -1;
    if (instance->enabled_extensions.KHR_display && (drm->available_nodes & (1 << DRM_NODE_PRIMARY)))
       physical->display_fd = open(drm->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
@@ -651,7 +659,6 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       destroy_physical(&physical->vk);
       return result;
    }
-   physical->wsi_device.supports_scanout = false;
    physical->wsi_device.supports_modifiers = false;
    physical->vk.wsi_device = &physical->wsi_device;
    *out = &physical->vk;
