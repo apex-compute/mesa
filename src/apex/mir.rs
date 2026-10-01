@@ -933,15 +933,8 @@ fn lower(ops: &[Op], values: &[Value], homes: &BTreeMap<u32, u8>) -> Result<Vec<
                             literal = Some(v);
                         }
                     }
-                    match f {
-                        0 => i.d = c,
-                        1 => i.a = c,
-                        2 => i.b = c,
-                        _ => {
-                            if matches!(fmt, Format::Salu | Format::Valu | Format::Texture) {
-                                i.hi = (i.hi & !0xff) | c as u32;
-                            }
-                        }
+                    if f < 3 || matches!(fmt, Format::Salu | Format::Valu | Format::Texture) {
+                        i.set_field(f, c);
                     }
                 }
                 if x == op::V_QUADPERM {

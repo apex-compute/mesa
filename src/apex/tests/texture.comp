@@ -1,5 +1,5 @@
 #version 450
-// Texture instructions from compute: fetch, explicit level, gather, size.
+// Texture instructions from compute: fetch, explicit level, gather, size, texel offsets.
 layout(local_size_x = 16) in;
 layout(set = 0, binding = 0) uniform sampler2D image;
 layout(std430, set = 0, binding = 1) buffer Output { vec4 o[]; };
@@ -8,8 +8,9 @@ void main()
    uint l = gl_LocalInvocationIndex;
    ivec2 at = ivec2(l % 8u, l / 8u);
    vec2 uv = (vec2(at) + 0.5) / vec2(8.0, 4.0);
-   o[l * 4u] = texelFetch(image, at, 0);
-   o[l * 4u + 1u] = textureLod(image, uv + vec2(0.125, 0.0), 0.0);
-   o[l * 4u + 2u] = textureGather(image, uv, 1);
-   o[l * 4u + 3u] = vec4(textureSize(image, 0), textureQueryLevels(image), 0.0);
+   o[l * 5u] = texelFetch(image, at, 0);
+   o[l * 5u + 1u] = textureLod(image, uv + vec2(0.125, 0.0), 0.0);
+   o[l * 5u + 2u] = textureGather(image, uv, 1);
+   o[l * 5u + 3u] = vec4(textureSize(image, 0), textureQueryLevels(image), 0.0);
+   o[l * 5u + 4u] = textureLodOffset(image, uv, 0.0, ivec2(-3, 7));
 }

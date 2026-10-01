@@ -24,7 +24,7 @@ opcodes! {
     S_CMP_LT_U = 0x37, S_CMP_LE_I = 0x38, S_CMP_LE_U = 0x39, S_CSELECT = 0x3a, S_ADD64 = 0x3b,
     S_SUB64 = 0x3c, S_SHL64 = 0x3d, S_FF1 = 0x3e, S_POPCNT = 0x3f, S_AND_SAVEEXEC = 0x40,
     S_OR_SAVEEXEC = 0x41, S_ANDN2_SAVEEXEC = 0x42, S_SETEXEC = 0x43, S_MEMTIME = 0x44,
-    S_LAUNCH = 0x45,
+    S_LAUNCH = 0x45, S_ADD_F = 0x46, S_MUL_F = 0x47, S_FMA_F = 0x48, S_RCP = 0x49, S_RSQ = 0x4a,
 
     V_MOV = 0x60, V_ADD = 0x61, V_SUB = 0x62, V_MUL_LO = 0x63, V_MUL_HI_U = 0x64,
     V_MUL_HI_I = 0x65, V_AND = 0x66, V_OR = 0x67, V_XOR = 0x68, V_NOT = 0x69, V_SHL = 0x6a,
@@ -93,7 +93,7 @@ pub enum Format {
 pub fn format(op: u8) -> Option<Format> {
     Some(match op {
         0x00..=0x0a => Format::Control,
-        0x20..=0x45 => Format::Salu,
+        0x20..=0x4a => Format::Salu,
         0x60..=0xab => Format::Valu,
         0xc0..=0xcc => Format::Memory,
         0xe0 | 0xe1 => Format::Texture,
@@ -135,27 +135,34 @@ pub enum Kind {
 /// Sources taking the FP modifiers (bit 0 a, 1 b, 2 c).
 pub fn fp_sources(op: u8) -> u32 {
     match op {
-        op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => 7,
-        op::V_ADD_F..=op::V_MUL_F | op::V_MIN_F | op::V_MAX_F | op::V_CMP_F | op::V_CVT_PK_F16 => 3,
-        op::V_FLOOR..=op::V_LDEXP | op::V_RCP..=op::V_COS | op::V_CVT_U_F | op::V_CVT_I_F | op::V_CMP_CLASS => 1,
+        op::S_FMA_F | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => 7,
+        op::S_ADD_F | op::S_MUL_F | op::V_ADD_F..=op::V_MUL_F | op::V_MIN_F | op::V_MAX_F | op::V_CMP_F | op::V_CVT_PK_F16 => 3,
+        op::S_RCP | op::S_RSQ | op::V_FLOOR..=op::V_LDEXP | op::V_RCP..=op::V_COS | op::V_CVT_U_F | op::V_CVT_I_F | op::V_CMP_CLASS => 1,
         _ => 0,
     }
 }
 /// Operations with an FP32 result, which may clamp.
 pub fn fp_result(op: u8) -> bool {
-    matches!(op, op::V_ADD_F..=op::V_FREXP_MANT | op::V_LDEXP..=op::V_CVT_F_I
+    matches!(op, op::S_ADD_F..=op::S_RSQ | op::V_ADD_F..=op::V_FREXP_MANT | op::V_LDEXP..=op::V_CVT_F_I
         | op::V_CVT_F16_LO..=op::V_CUBEMA)
 }
 
 pub fn scalar_load_dwords(code: u32) -> u8 {
     [1, 2, 4, 8][code as usize & 3]
 }
-/// Coordinate registers: four, or eight for gradients, compare with a level or
-/// bias, and offsets.
+/// Texture hi: `[4:0]` sampler descriptor base n (registers s[4n] ...), `[8:5]`
+/// mask, `[10:9]` gather component, `[13:11]` variant, `[14]` compare,
+/// `[17:15]` dimensionality, `[29:18]` signed 4-bit texel offsets x, y, z.
+pub fn texture_hi(mask: u32, gather: u32, variant: u32, compare: bool, dim: u32, offsets: [i32; 3]) -> u32 {
+    mask << 5 | gather << 9 | variant << 11 | (compare as u32) << 14 | dim << 15
+        | offsets.iter().enumerate().fold(0, |x, (k, &o)| x | ((o as u32) & 15) << (18 + 4 * k))
+}
+/// Coordinate registers: four, or eight for gradients and compare with a level
+/// or bias.
 pub fn texture_coordinates(hi: u32) -> u8 {
-    let variant = (hi >> 14) & 7;
-    let compare = (hi >> 17) & 1 != 0;
-    if variant == TEX_GRADIENT || (compare && matches!(variant, TEX_LEVEL | TEX_BIAS)) || (hi >> 18) & 1 != 0 {
+    let variant = (hi >> 11) & 7;
+    let compare = (hi >> 14) & 1 != 0;
+    if variant == TEX_GRADIENT || (compare && matches!(variant, TEX_LEVEL | TEX_BIAS)) {
         8
     } else {
         4
@@ -171,16 +178,17 @@ pub fn fields(op: u8, hi: u32) -> Result<[Kind; 4], String> {
     Ok(match op {
         op::S_NOP..=op::S_BRANCH | op::S_CBRANCH_EXECZ..=op::S_SLEEP => none,
         op::S_CBRANCH_Z | op::S_CBRANCH_NZ => [None, SAny, None, None],
-        op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC => {
-            [S(Def, 1), SAny, None, None]
-        }
+        op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC
+        | op::S_RCP | op::S_RSQ => [S(Def, 1), SAny, None, None],
         op::S_SETEXEC => [None, SAny, None, None],
-        op::S_CSELECT => [S(Def, 1), SAny, SAny, SAny],
+        op::S_CSELECT | op::S_FMA_F => [S(Def, 1), SAny, SAny, SAny],
         op::S_ADD64 | op::S_SUB64 => [S(Def, 2), S(Use, 2), S(Use, 2), None],
         op::S_SHL64 => [S(Def, 2), S(Use, 2), SAny, None],
         op::S_MEMTIME => [S(Def, 2), None, None, None],
         op::S_LAUNCH => [S(Def, 1), None, None, None],
-        op::S_ADD..=op::S_ORN2 | op::S_SHL..=op::S_CMP_LE_U => [S(Def, 1), SAny, SAny, None],
+        op::S_ADD..=op::S_ORN2 | op::S_SHL..=op::S_CMP_LE_U | op::S_ADD_F | op::S_MUL_F => {
+            [S(Def, 1), SAny, SAny, None]
+        }
         op::V_MOV | op::V_NOT | op::V_POPCNT..=op::V_BFREV | op::V_FLOOR..=op::V_FREXP_EXP
         | op::V_RCP..=op::V_CVT_I_F | op::V_CVT_F16_LO | op::V_CVT_F16_HI => [V(Def, 1), Any, None, None],
         op::V_BFI | op::V_PERM | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => [V(Def, 1), Any, Any, Any],
@@ -218,7 +226,7 @@ pub fn fields(op: u8, hi: u32) -> Result<[Kind; 4], String> {
         op::SCRATCH_STORE | op::SHARED_STORE => [V(Use, size), OptV(1), None, None],
         op::SHARED_ATOMIC => [atomic_data(hi)?, OptV(1), None, None],
         op::IMAGE_SAMPLE | op::IMAGE_FETCH => {
-            let count = ((hi >> 8) & 15).count_ones() as u8;
+            let count = ((hi >> 5) & 15).count_ones() as u8;
             [V(Def, count), V(Use, texture_coordinates(hi)), S(Use, 8), S(Use, 8)]
         }
         op::EXP => [Raw, V(Use, 4), Raw, None],
@@ -247,8 +255,23 @@ impl Inst {
     pub fn new(op: u8) -> Self {
         Self { op, d: 0, a: 0, b: 0, hi: 0 }
     }
+    /// Field f as an operand code; the texture sampler base n is register s[4n].
     pub fn field(self, f: usize) -> u8 {
-        [self.d, self.a, self.b, self.hi as u8][f]
+        match f {
+            3 if format(self.op) == Some(Format::Texture) => SCALAR + 4 * (self.hi as u8 & 31),
+            _ => [self.d, self.a, self.b, self.hi as u8][f],
+        }
+    }
+    pub fn set_field(&mut self, f: usize, code: u8) {
+        match f {
+            0 => self.d = code,
+            1 => self.a = code,
+            2 => self.b = code,
+            _ if format(self.op) == Some(Format::Texture) => {
+                self.hi = (self.hi & !31) | (code.wrapping_sub(SCALAR) / 4) as u32 & 31
+            }
+            _ => self.hi = (self.hi & !0xff) | code as u32,
+        }
     }
     /// The literal occupies `hi` when a or b is 255 in the ALU formats.
     pub fn literal(self) -> bool {
@@ -332,15 +355,15 @@ impl Inst {
                 }
             }
             Format::Texture => {
-                let (mask, gather, variant, dim) = ((hi >> 8) & 15, (hi >> 12) & 3, (hi >> 14) & 7, (hi >> 19) & 7);
-                if hi >> 22 != 0 || mask == 0 || variant > TEX_GATHER || dim > DIM_CUBE_ARRAY
+                let (mask, gather, variant, dim) = ((hi >> 5) & 15, (hi >> 9) & 3, (hi >> 11) & 7, (hi >> 15) & 7);
+                if hi >> 30 != 0 || hi & 31 > 22 || mask == 0 || variant > TEX_GATHER || dim > DIM_CUBE_ARRAY
                     || (self.op == op::IMAGE_FETCH && variant != 0)
                     || (gather != 0 && variant != TEX_GATHER)
                 {
                     return err("reserved texture bits");
                 }
                 if !vbase(d, mask.count_ones() as u8, 1) || !vbase(a, texture_coordinates(hi), 1)
-                    || !sbase(b, 8, 4) || !sbase(hi as u8, 8, 4)
+                    || !sbase(b, 8, 4)
                 {
                     return err("texture operands");
                 }
@@ -467,14 +490,15 @@ enum Role {
 fn alu_roles(o: u8) -> [Role; 4] {
     use Role::*;
     match o {
-        op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC => [Sd, Ss, None, None],
-        op::S_CSELECT => [Sd, Ss, Ss, Ss],
+        op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC
+        | op::S_RCP | op::S_RSQ => [Sd, Ss, None, None],
+        op::S_CSELECT | op::S_FMA_F => [Sd, Ss, Ss, Ss],
         op::S_ADD64 | op::S_SUB64 => [Sd2, Ss2, Ss2, None],
         op::S_SHL64 => [Sd2, Ss2, Ss, None],
         op::S_SETEXEC => [None, Ss, None, None],
         op::S_MEMTIME => [Sd2, None, None, None],
         op::S_LAUNCH => [Sd, None, None, Select],
-        0x20..=0x45 => [Sd, Ss, Ss, None],
+        0x20..=0x4a => [Sd, Ss, Ss, None],
         op::V_MOV | op::V_NOT | op::V_POPCNT..=op::V_BFREV | op::V_FLOOR..=op::V_FREXP_EXP
         | op::V_RCP..=op::V_CVT_I_F | op::V_CVT_F16_LO | op::V_CVT_F16_HI => [Vd, Vs, None, None],
         op::V_BFI | op::V_PERM | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => [Vd, Vs, Vs, Vs],
@@ -549,7 +573,7 @@ pub fn disassemble_one(i: Inst) -> String {
             Kind::OptS(_) | Kind::OptV(_) if code == LITERAL => "off".into(),
             _ => {
                 let mut t = operand_text(code, n, i.hi);
-                if fmt == Format::Valu && !i.literal() && f > 0 && f < 4 {
+                if fp_sources(i.op) != 0 && !i.literal() && f > 0 && f < 4 {
                     if (i.hi >> (10 + f)) & 1 != 0 {
                         t = format!("|{t}|");
                     }
@@ -568,7 +592,9 @@ pub fn disassemble_one(i: Inst) -> String {
         text += &ops.join(", ");
     }
     match fmt {
-        Format::Valu if !i.literal() && (i.hi >> 14) & 1 != 0 => text += " clamp",
+        Format::Salu | Format::Valu if fp_result(i.op) && !i.literal() && (i.hi >> 14) & 1 != 0 => {
+            text += " clamp"
+        }
         Format::Salu if i.op == op::S_LAUNCH && i.hi != 0 => text += &format!(" imm:{}", i.hi),
         Format::Control if i.hi != 0 => {
             text += &format!(" {}:{}", if i.branch() { "offset" } else { "imm" }, i.hi as i32)
@@ -586,11 +612,15 @@ pub fn disassemble_one(i: Inst) -> String {
             }
         }
         Format::Texture => {
-            for (k, shift, bits) in [("mask", 8, 15), ("gather", 12, 3), ("variant", 14, 7),
-                ("compare", 17, 1), ("offsets", 18, 1), ("dim", 19, 7)] {
+            for (k, shift, bits) in [("mask", 5, 15), ("gather", 9, 3), ("variant", 11, 7),
+                ("compare", 14, 1), ("dim", 15, 7)] {
                 if (i.hi >> shift) & bits != 0 {
                     text += &format!(" {k}:{}", (i.hi >> shift) & bits);
                 }
+            }
+            if (i.hi >> 18) & 0xfff != 0 {
+                let o = |k: u32| (((i.hi >> (18 + 4 * k)) & 15) as i32 ^ 8) - 8;
+                text += &format!(" offset:{}:{}:{}", o(0), o(1), o(2));
             }
         }
         _ => {}
@@ -676,6 +706,12 @@ pub fn assemble_one(line: &str) -> Result<Inst, String> {
     for (k, v) in &keys {
         let v = if k == "offset" && fmt == Format::Memory {
             (number(v)? & 0xfffff) as u32
+        } else if k == "offset" && fmt == Format::Texture {
+            let o: Vec<i32> = v.split(':').map(|x| x.parse().map_err(|_| format!("bad offset {v}"))).collect::<Result<_, _>>()?;
+            if o.len() != 3 || o.iter().any(|x| !(-8..=7).contains(x)) {
+                return Err(format!("texel offsets {v}"));
+            }
+            texture_hi(0, 0, 0, false, 0, [o[0], o[1], o[2]])
         } else {
             number(v)?
         };
@@ -687,12 +723,12 @@ pub fn assemble_one(line: &str) -> Result<Inst, String> {
             (Format::Memory, "cache") => (22, 3),
             (Format::Memory, "atomic") => (24, 15),
             (Format::Memory, "return") => (28, 1),
-            (Format::Texture, "mask") => (8, 15),
-            (Format::Texture, "gather") => (12, 3),
-            (Format::Texture, "variant") => (14, 7),
-            (Format::Texture, "compare") => (17, 1),
-            (Format::Texture, "offsets") => (18, 1),
-            (Format::Texture, "dim") => (19, 7),
+            (Format::Texture, "mask") => (5, 15),
+            (Format::Texture, "gather") => (9, 3),
+            (Format::Texture, "variant") => (11, 7),
+            (Format::Texture, "compare") => (14, 1),
+            (Format::Texture, "offset") => (0, u32::MAX),
+            (Format::Texture, "dim") => (15, 7),
             _ => return Err(format!("unknown key {k}")),
         };
         i.hi |= (v & mask) << shift;
@@ -720,12 +756,7 @@ pub fn assemble_one(line: &str) -> Result<Inst, String> {
         if modifiers != 0 {
             i.hi |= (modifiers & 1) << (7 + f) | (modifiers >> 1) << (10 + f);
         }
-        match f {
-            0 => i.d = code,
-            1 => i.a = code,
-            2 => i.b = code,
-            _ => i.hi = (i.hi & !0xff) | code as u32,
-        }
+        i.set_field(f, code);
     }
     if next.next().is_some() {
         return Err("extra operand".into());

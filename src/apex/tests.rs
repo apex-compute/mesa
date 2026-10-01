@@ -8,7 +8,7 @@ fn sample(opcode: u8) -> Inst {
     let hi = match isa::format(opcode).unwrap() {
         isa::Format::Memory if matches!(opcode, op::GLOBAL_ATOMIC | op::BUFFER_ATOMIC | op::SHARED_ATOMIC) => 2 << 24 | 1 << 28,
         isa::Format::Memory => 1 << 20 | 16,
-        isa::Format::Texture => 0xf << 8 | isa::DIM_2D << 19,
+        isa::Format::Texture => isa::texture_hi(0xf, 0, 0, false, isa::DIM_2D, [1, -2, 0]),
         _ => 0,
     };
     let kinds = isa::fields(opcode, hi).unwrap();
@@ -27,12 +27,7 @@ fn sample(opcode: u8) -> Inst {
             Kind::OptS(_) => SCALAR + 10,
             Kind::OptV(_) => 20,
         };
-        match f {
-            0 => i.d = code,
-            1 => i.a = code,
-            2 => i.b = code,
-            _ => i.hi = (i.hi & !0xff) | code as u32,
-        }
+        i.set_field(f, code);
     }
     i
 }
@@ -47,11 +42,11 @@ fn encoding() {
         assert_eq!(isa::assemble_one(&text).unwrap_or_else(|e| panic!("{text}: {e}")), i, "{text}");
     }
     // Class bases and consecutive numbering.
-    assert_eq!(op::S_LAUNCH, 0x45);
+    assert_eq!(op::S_RSQ, 0x4a);
     assert_eq!(op::V_INTERP_FLAT, 0xab);
     assert_eq!(op::SHARED_ATOMIC, 0xcc);
     assert_eq!(op::EXP, 0xe2);
-    for bad in [0x0b, 0x1f, 0x46, 0x5f, 0xac, 0xbf, 0xcd, 0xe3, 0xff] {
+    for bad in [0x0b, 0x1f, 0x4b, 0x5f, 0xac, 0xbf, 0xcd, 0xe3, 0xff] {
         assert!(Inst::decode(bad).is_err());
     }
     let add = Inst { op: op::V_ADD, d: 1, a: 2, b: 3, hi: 0 };
@@ -254,6 +249,57 @@ fn arithmetic() {
         assert_eq!(w(16), 0x5600, "(mask & insert) | (~mask & base)");
         assert_eq!(w(17), 0x7fc0_0000, "canonical NaN");
     }
+}
+
+/// The scalar FP forms return the vector forms' bits, modifiers and clamp included.
+#[test]
+fn scalar_fp() {
+    let cases: [[f32; 3]; 12] = [
+        [1.5, -2.25, 0.75], [0.1, 3.0, -0.3], [-0.0, 0.0, -0.0], [f32::NAN, 1.0, 2.0],
+        [f32::INFINITY, 0.0, 1.0], [f32::from_bits(1), 0.5, f32::from_bits(0x8000_0003)],
+        [3e38, 2.0, -3e38], [1e-20, 1e-20, 1e-40], [0.6, 0.7, -0.2], [-4.0, 0.25, 1.0],
+        [16.0, -16.0, 256.0], [f32::NEG_INFINITY, -1.0, f32::INFINITY],
+    ];
+    let forms = [
+        ("add_f", "{d}, s4, s5"), ("add_f", "{d}, -s4, |s5| clamp"), ("mul_f", "{d}, s4, s5"),
+        ("mul_f", "{d}, |s4|, -s5 clamp"), ("fma_f", "{d}, s4, s5, s6"), ("fma_f", "{d}, -s4, s5, -|s6|"),
+        ("fma_f", "{d}, s4, s4, s6 clamp"), ("rcp", "{d}, s4"), ("rcp", "{d}, -|s5|"), ("rsq", "{d}, s6"),
+        ("rsq", "{d}, |s4| clamp"),
+    ];
+    let mut text = String::new();
+    for k in 0..cases.len() {
+        text += &format!("s_load s[4:7], off, s[0:1] offset:{} size:2\n", 16 * k);
+        for (f, (name, args)) in forms.iter().enumerate() {
+            let at = 1024 + 128 * (k * forms.len() + f);
+            text += &format!("s_{name} {}\nv_mov v1, s8\n", args.replace("{d}", "s8"));
+            text += &format!("v_{name} {}\n", args.replace("{d}", "v2"));
+            text += &store(1, at as u32);
+            text += &store(2, at as u32 + 64);
+        }
+    }
+    text += "s_endpgm";
+    let mut m = vec![0u8; 1024 + 128 * cases.len() * forms.len()];
+    for (k, c) in cases.iter().enumerate() {
+        for (j, x) in c.iter().enumerate() {
+            m[16 * k + 4 * j..16 * k + 4 * j + 4].copy_from_slice(&x.to_bits().to_le_bytes());
+        }
+    }
+    run_compute(&text, 16, &mut m, 0).unwrap();
+    let mut distinct = std::collections::BTreeSet::new();
+    for k in 0..cases.len() {
+        for f in 0..forms.len() {
+            let at = 1024 + 128 * (k * forms.len() + f);
+            let (s, v) = (words(&m, at, 16), words(&m, at + 64, 16));
+            assert!(s.iter().chain(&v).all(|&x| x == v[0]), "case {k} form {f}: s {:08x} v {:08x}", s[0], v[0]);
+            distinct.insert(v[0]);
+        }
+        let [a, b, c] = cases[k];
+        let fma = a.mul_add(b, c);
+        if !fma.is_nan() {
+            assert_eq!(words(&m, 1024 + 128 * (k * forms.len() + 4), 1)[0], fma.to_bits(), "fma case {k}");
+        }
+    }
+    assert!(distinct.len() > 40, "{} distinct results", distinct.len());
 }
 
 #[test]

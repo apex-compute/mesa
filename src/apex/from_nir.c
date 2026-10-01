@@ -1368,18 +1368,27 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
       failf(c, "explicit gradients take two axes", NULL);
       return;
    }
-   if (variant == 3 && off >= 0) {
-      failf(c, "texel offsets with explicit gradients", NULL);
-      return;
-   }
    unsigned mask = t->is_shadow ? 1 : t->op == nir_texop_tg4 ? 0xf : nir_def_components_read(&t->def);
    if (!mask)
       mask = 1;
    bool compare = cmp >= 0 && !fetch;
-   bool offset = off >= 0 && !fetch;
-   uint32_t hi = mask << 8 | variant << 14 | dim << 19 |
-                 (t->op == nir_texop_tg4 ? t->component << 12 : 0) |
-                 (unsigned)compare << 17 | (unsigned)offset << 18;
+   /* Texture hi (isa.rs texture_hi): the sampler base joins at encoding. */
+   uint32_t hi = mask << 5 | (t->op == nir_texop_tg4 ? t->component << 9 : 0) | variant << 11 |
+                 (unsigned)compare << 14 | dim << 15;
+   if (off >= 0 && !fetch) {
+      for (unsigned k = 0; k < t->src[off].src.ssa->num_components; k++) {
+         if (!nir_src_is_const(t->src[off].src)) {
+            failf(c, "dynamic texel offsets", NULL);
+            return;
+         }
+         int32_t o = nir_src_comp_as_int(t->src[off].src, k);
+         if (o < -8 || o > 7) {
+            failf(c, "texel offset out of range", NULL);
+            return;
+         }
+         hi |= ((uint32_t)o & 15) << (18 + 4 * k);
+      }
+   }
    uint32_t parts[8] = {0};
    if (cube) {
       /* The compiler selects the face: face coordinates in [0, 1] and the
@@ -1431,19 +1440,7 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
          parts[6 + k] = src(c, t->src[ddy].src, k);
       }
    }
-   if (offset) {
-      /* The packed offset register awaits the texel-offset encoding. */
-      uint32_t packed = 0;
-      for (unsigned k = 0; k < t->src[off].src.ssa->num_components; k++) {
-         if (!nir_src_is_const(t->src[off].src)) {
-            failf(c, "dynamic texel offsets", NULL);
-            return;
-         }
-         packed |= (nir_src_comp_as_uint(t->src[off].src, k) & 0x3f) << (8 * k);
-      }
-      parts[5] = constant(c, packed);
-   }
-   unsigned count = variant == 3 || (compare && level) || offset ? 8 : 4;
+   unsigned count = variant == 3 || (compare && level) ? 8 : 4;
    uint32_t coord_group = value(c, true, count);
    for (unsigned k = 0; k < count; k++)
       if (parts[k])

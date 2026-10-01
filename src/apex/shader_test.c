@@ -4,8 +4,9 @@
  * (Tooling/apex_isa) against host references, and holds the zero-spill gate.
  * Usage: apex-shader-test DIR GNOME_DIR GLMARK2_DIR where DIR holds the
  * SPIR-V of bench.{comp,vert,frag}, triangle.{vert,frag} and compositor.frag.
- * The model's texture unit returns coordinate register a + k plus image
- * descriptor dword k as component k, which checks coordinate placement. */
+ * The model's texture unit returns coordinate register a + k plus image and
+ * sampler descriptor dwords k and the request flags as component k, which
+ * checks coordinate placement and the instruction's texture fields. */
 #include "apex.h"
 #include <dirent.h>
 #include <math.h>
@@ -74,11 +75,15 @@ static void sampler_descriptor(uint8_t *p)
 {
    memset(p, 0, 32);
 }
-/* Component k of the model's texture result for coordinate bits x. */
-static uint32_t texel(const uint8_t *descriptor, unsigned k, uint32_t x)
+/* Component k of the model's texture result for coordinate bits x
+ * (apex_isa default_texture): the request flags hold the texel offsets in
+ * 4-bit fields, the variant at 13 (fetch 4), the dimensionality at 16 and the
+ * gather component at 19. */
+static uint32_t texel(const uint8_t *image, const uint8_t *sampler, unsigned k, uint32_t x, uint32_t flags)
 {
-   return x + get(descriptor + 4 * k);
+   return x + get(image + 4 * k) + get(sampler + 4 * k) + flags;
 }
+#define FLAGS_2D (1u << 16)
 
 static uint32_t *read_file(const char *path, size_t *words)
 {
@@ -328,7 +333,7 @@ static void test_fragment(const char *dir, const char *name, bool textured, bool
       for (unsigned c = 0; c < (textured ? 2 : 4); c++) {
          float want;
          if (textured) {
-            want = flt(texel(descriptor, c, bits(interpolate(attributes, c, i, j))));
+            want = flt(texel(descriptor, descriptor + 32, c, bits(interpolate(attributes, c, i, j)), FLAGS_2D));
             if (modulated)
                want = want * flt(*attribute(attributes, 4 + c, 0)) * opacity[c];
          } else {
@@ -672,7 +677,7 @@ static void test_texture(const char *dir)
    struct world w = {0};
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
    uint8_t *image = region(&w, 0x900000, 64 * 4);
-   uint8_t *out = region(&w, 0x200000, 16 * 64);
+   uint8_t *out = region(&w, 0x200000, 16 * 80);
    uint8_t packed[8 * 4 * 4];
    for (unsigned k = 0; k < sizeof(packed); k++) {
       packed[k] = (uint8_t)(k * 29 + 5);
@@ -680,23 +685,28 @@ static void test_texture(const char *dir)
    }
    image_descriptor(root + slot(0, 0), 0x900000, 8, 4);
    sampler_descriptor(root + slot(0, 0) + 32);
-   buffer_descriptor(root + slot(0, 1), 0x200000, 16 * 64);
+   buffer_descriptor(root + slot(0, 1), 0x200000, 16 * 80);
    uint32_t user[16];
    root_user(user);
    run(&r, &w, user, 1, NULL);
-   const uint8_t *d = root + slot(0, 0);
+   const uint8_t *d = root + slot(0, 0), *s = d + 32;
+   const uint32_t fetch = 4u << 13 | FLAGS_2D, level = 1u << 13 | FLAGS_2D, gather = 5u << 13 | FLAGS_2D | 1u << 19;
+   const uint32_t offset = level | (-3 & 15) | 7 << 4;
    for (unsigned l = 0; l < 16; l++) {
       unsigned x = l % 8, y = l / 8;
-      const uint8_t *o = out + 64 * l;
+      const uint8_t *o = out + 80 * l;
       float u = (x + 0.5f) / 8.0f, v = (y + 0.5f) / 4.0f;
-      /* Fetch: integer x, y and level 0 in a+3. */
-      CHECK(get(o) == texel(d, 0, x) && get(o + 4) == texel(d, 1, y) && get(o + 12) == texel(d, 3, 0));
+      /* Fetch: integer x, y and level 0 in a+3; the image descriptor is the sampler. */
+      CHECK(get(o) == texel(d, d, 0, x, fetch) && get(o + 4) == texel(d, d, 1, y, fetch) &&
+            get(o + 12) == texel(d, d, 3, 0, fetch));
       /* Level: u, v and the level 0.0 in a+3. */
-      CHECK(get(o + 16) == texel(d, 0, bits(u + 0.125f)) && get(o + 20) == texel(d, 1, bits(v)) &&
-            get(o + 28) == texel(d, 3, 0));
+      CHECK(get(o + 16) == texel(d, s, 0, bits(u + 0.125f), level) && get(o + 20) == texel(d, s, 1, bits(v), level) &&
+            get(o + 28) == texel(d, s, 3, 0, level));
       /* Gather: u, v. */
-      CHECK(get(o + 32) == texel(d, 0, bits(u)) && get(o + 36) == texel(d, 1, bits(v)));
+      CHECK(get(o + 32) == texel(d, s, 0, bits(u), gather) && get(o + 36) == texel(d, s, 1, bits(v), gather));
       CHECK(get(o + 48) == bits(8.0f) && get(o + 52) == bits(4.0f) && get(o + 56) == bits(1.0f));
+      /* Offsets travel in the instruction, not in coordinate registers. */
+      CHECK(get(o + 64) == texel(d, s, 0, bits(u), offset) && get(o + 76) == texel(d, s, 3, 0, offset));
    }
    (void)packed;
    world_free(&w);
