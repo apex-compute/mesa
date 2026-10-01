@@ -1907,7 +1907,7 @@ record_resolve(struct apex_command_buffer *cmd, const struct apex_image *src, ui
       return;
    }
    uint64_t from = image_address(src, src_level, src_layer, src_offset);
-   uint64_t to = image_address(dst, dst_level, dst_layer, dst_offset);
+   uint64_t to = image_address(dst, dst_level, dst_layer, (VkOffset3D){0, dst_offset.y, dst_offset.z});
    uint32_t words[APEX_DRAW_WORDS] = {
       [APEX_RESOLVE_SRC] = from, [APEX_RESOLVE_SRC + 1] = from >> 32,
       [APEX_RESOLVE_SRC_ROW] = src->levels[src_level].row_stride,
@@ -1916,7 +1916,7 @@ record_resolve(struct apex_command_buffer *cmd, const struct apex_image *src, ui
       [APEX_RESOLVE_DST_ROW] = dst->levels[dst_level].row_stride,
       [APEX_RESOLVE_DST_SLICE] = dst->levels[dst_level].slice_stride,
       [APEX_RESOLVE_WIDTH] = extent.width, [APEX_RESOLVE_ROWS] = extent.height,
-      [APEX_RESOLVE_LAYERS] = layers,
+      [APEX_RESOLVE_LAYERS] = layers, [APEX_RESOLVE_DST_X] = dst_offset.x,
    };
    uint64_t items = (uint64_t)extent.width * extent.height * layers;
    uint32_t groups = DIV_ROUND_UP(items, 16), limit = MIN2(program->max_workgroups, 1024);

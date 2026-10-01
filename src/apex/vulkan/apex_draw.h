@@ -181,12 +181,13 @@
 #define APEX_RESOLVE_SRC 0            /* first source pixel VA lo, hi */
 #define APEX_RESOLVE_SRC_ROW 2
 #define APEX_RESOLVE_SRC_SLICE 3
-#define APEX_RESOLVE_DST 4            /* first destination pixel VA lo, hi */
+#define APEX_RESOLVE_DST 4            /* destination row start (pixel x = 0) VA lo, hi */
 #define APEX_RESOLVE_DST_ROW 6
 #define APEX_RESOLVE_DST_SLICE 7
 #define APEX_RESOLVE_WIDTH 8
 #define APEX_RESOLVE_ROWS 9
 #define APEX_RESOLVE_LAYERS 10
+#define APEX_RESOLVE_DST_X 11         /* first destination pixel column: sub-word texels stay word aligned */
 
 /* Internal ETC2/EAC decode job words (in place of the draw block): one
  * invocation per texel of a width x height x layers region, from its first

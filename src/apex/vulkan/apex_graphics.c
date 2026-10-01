@@ -1807,7 +1807,9 @@ build_resolve(const struct apex_program *program, enum pipe_format format)
    }
    if (average)
       texel = pack_color(b, format, nir_fmul_imm(b, sum, 0.25f));
-   struct texel_target t = texel_target(b, dst_row, nir_imm_int(b, 0), x, nir_imm_int(b, 0), format);
+   struct texel_target t = texel_target(b, dst_row, nir_imm_int(b, 0),
+                                        nir_iadd(b, x, draw_word(b, program, APEX_RESOLVE_DST_X)),
+                                        nir_imm_int(b, 0), format);
    if (bits >= 32) {
       for (unsigned w = 0; w < bits / 32; w++)
          store_word(b, nir_channel(b, texel, w), address_add(b, t.address, nir_imm_int(b, w * 4)));
