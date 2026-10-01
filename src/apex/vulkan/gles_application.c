@@ -16,8 +16,9 @@
  *                                    GBM scanout buffers rendered through
  *                                    Zink become KMS framebuffers; as DRM
  *                                    master with a connected sink, page-flip
- *                                    between two of them, rendering each
- *                                    frame with a different clear color. */
+ *                                    between two of them through each of
+ *                                    three clear colors and check that the
+ *                                    shown buffer holds the frame's color. */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -427,6 +428,12 @@ scanout_buffer(int fd, struct gbm_device *device, EGLDisplay display, uint32_t w
    return added;
 }
 
+static uint32_t
+scanout_color(unsigned frame)
+{
+   return 0xbfu << (16 - 8 * (frame % 3)); /* XRGB8888 0.75 red, green, blue */
+}
+
 /* Clears flush without waiting: each flip relies on the kernel waiting for
  * the buffer's implicit fences before scanning it out. */
 static void
@@ -439,8 +446,34 @@ scanout_frame(const struct scanout_buffer *buffer, unsigned frame, uint32_t widt
    glFlush();
 }
 
+/* The display reads the buffer in place, so once its flip completes the
+ * buffer's memory is what reaches the sink: sample corners and center. */
 static bool
-flip(int fd, uint32_t crtc, uint32_t fb)
+scanout_shows(const struct scanout_buffer *buffer, unsigned frame, uint32_t width, uint32_t height)
+{
+   const uint32_t points[5][2] = {
+      {0, 0}, {width - 1, 0}, {width / 2, height / 2}, {0, height - 1}, {width - 1, height - 1},
+   };
+   bool ok = true;
+   for (unsigned i = 0; i < 5; i++) {
+      uint32_t stride;
+      void *data = NULL;
+      uint32_t *texel = p_gbm_bo_map(buffer->bo, points[i][0], points[i][1], 1, 1,
+                                     GBM_BO_TRANSFER_READ, &stride, &data);
+      uint32_t value = texel ? *texel & 0xffffff : ~0u;
+      if (texel)
+         p_gbm_bo_unmap(buffer->bo, data);
+      if (value != scanout_color(frame)) {
+         printf("     frame %u (%u,%u): %#08x, expected %#08x\n", frame, points[i][0], points[i][1],
+                value, scanout_color(frame));
+         ok = false;
+      }
+   }
+   return ok;
+}
+
+static bool
+flip(int fd, uint32_t crtc, uint32_t fb, int timeout_ms)
 {
    struct drm_mode_crtc_page_flip request = {
       .crtc_id = crtc, .fb_id = fb, .flags = DRM_MODE_PAGE_FLIP_EVENT,
@@ -449,8 +482,16 @@ flip(int fd, uint32_t crtc, uint32_t fb)
       return false;
    struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
    struct drm_event_vblank event;
-   return poll(&poll_fd, 1, 2000) == 1 && read(fd, &event, sizeof(event)) >= (ssize_t)sizeof(event.base) &&
+   return poll(&poll_fd, 1, timeout_ms) == 1 && read(fd, &event, sizeof(event)) >= (ssize_t)sizeof(event.base) &&
           event.base.type == DRM_EVENT_FLIP_COMPLETE;
+}
+
+static double
+seconds_since(const struct timespec *begin)
+{
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   return (now.tv_sec - begin->tv_sec) + (now.tv_nsec - begin->tv_nsec) * 1e-9;
 }
 
 static int
@@ -503,27 +544,38 @@ run_scanout(const char *node)
    else if (ready && ioctl(fd, DRM_IOCTL_SET_MASTER, NULL))
       puts("     not DRM master: flips skipped");
    else if (ready) {
+      /* Software rasterization takes seconds per frame: the flip deadline
+       * scales with the measured time of a finished first frame. */
+      struct timespec begin;
+      clock_gettime(CLOCK_MONOTONIC, &begin);
       scanout_frame(&buffers[0], 0, width, height);
+      glFinish();
+      double frame_seconds = seconds_since(&begin);
+      int timeout_ms = 2000 + (int)(4000 * frame_seconds);
       struct drm_mode_crtc crtc = {
          .crtc_id = crtcs[0], .fb_id = buffers[0].fb, .set_connectors_ptr = (uintptr_t)&connector,
          .count_connectors = 1, .mode = mode, .mode_valid = 1,
       };
       bool set = !ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
-      printf("     %s %ux%u@%u\n", set ? "modeset" : "modeset failed", width, height, mode.vrefresh);
+      printf("     %s %ux%u@%u, first frame %.2f s\n", set ? "modeset" : "modeset failed", width, height,
+             mode.vrefresh, frame_seconds);
       check(set, "modeset onto the Zink scanout buffer");
-      const unsigned frames = 180;
-      unsigned flipped = 0;
-      struct timespec begin, end;
+      check(!set || scanout_shows(&buffers[0], 0, width, height), "modeset buffer holds its color");
+      /* Six flips show each color from each buffer. */
+      const unsigned frames = 6;
+      unsigned flipped = 0, shown = 0;
       clock_gettime(CLOCK_MONOTONIC, &begin);
       for (unsigned frame = 1; set && frame <= frames; frame++, flipped++) {
          scanout_frame(&buffers[frame & 1], frame, width, height);
-         if (!flip(fd, crtcs[0], buffers[frame & 1].fb))
+         if (!flip(fd, crtcs[0], buffers[frame & 1].fb, timeout_ms))
             break;
+         shown += scanout_shows(&buffers[frame & 1], frame, width, height);
       }
-      clock_gettime(CLOCK_MONOTONIC, &end);
-      double seconds = (end.tv_sec - begin.tv_sec) + (end.tv_nsec - begin.tv_nsec) * 1e-9;
-      printf("     %u flips in %.2f s (%.1f per second)\n", flipped, seconds, flipped / seconds);
+      double seconds = seconds_since(&begin);
+      printf("     %u flips in %.2f s (%.2f s per flip), %u showing their color\n", flipped, seconds,
+             flipped ? seconds / flipped : 0.0, shown);
       check(flipped == frames, "page flips between Zink scanout buffers");
+      check(shown == frames, "flipped buffers hold their frame's color");
       crtc = (struct drm_mode_crtc) {.crtc_id = crtcs[0]};
       ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
       ioctl(fd, DRM_IOCTL_DROP_MASTER, NULL);
