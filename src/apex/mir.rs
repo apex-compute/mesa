@@ -184,7 +184,7 @@ fn check(ops: &[Op], values: &[Value]) -> Result<(), String> {
 
 /// Replaces single-dword constants by inline codes or the instruction's literal
 /// where the encoding allows, then materializes the rest.
-fn fold_constants(ops: &mut [Op], _values: &[Value]) {
+fn fold_constants(ops: &mut [Op], values: &[Value]) {
     // Dwords written once, by a constant: (value, dword) -> (constant, writes).
     let mut constant: BTreeMap<(u32, u8), (u32, usize)> = BTreeMap::new();
     for o in ops.iter() {
@@ -231,7 +231,47 @@ fn fold_constants(ops: &mut [Op], _values: &[Value]) {
             }
         }
     }
+    // A constant left in a register shares an equal earlier one of its
+    // straight-line region when every read is in that region.
+    let mut region = vec![0u32; ops.len()];
+    let mut r = 0;
+    for (i, o) in ops.iter().enumerate() {
+        r += o.boundary() as u32;
+        region[i] = r;
+    }
+    let mut reads: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    for (i, o) in ops.iter().enumerate() {
+        for u in o.uses() {
+            reads.entry(u).and_modify(|e| *e = e.filter(|&x| x == region[i])).or_insert(Some(region[i]));
+        }
+    }
+    let mut first: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    let mut rename: BTreeMap<u32, u32> = BTreeMap::new();
+    for (i, o) in ops.iter().enumerate() {
+        let Opnd::Val { id, off: 0, n: 1 } = o.f[0] else { continue };
+        if o.op != CONST || values[id as usize].width != 1 || !constant.contains_key(&(id, 0))
+            || reads.get(&id).is_some_and(|&x| x != Some(region[i]))
+        {
+            continue;
+        }
+        match first.entry((region[i], o.imm)) {
+            std::collections::btree_map::Entry::Occupied(e) => {
+                rename.insert(id, *e.get());
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(id);
+            }
+        }
+    }
     for o in ops.iter_mut() {
+        let access = o.access();
+        for f in 1..4 {
+            if let (Some(Access::Use), Opnd::Val { id, off, n }) = (access[f], o.f[f]) {
+                if let Some(&to) = rename.get(&id) {
+                    o.f[f] = Opnd::Val { id: to, off, n };
+                }
+            }
+        }
         if o.op == CONST {
             o.op = COPY;
             o.f[1] = Opnd::Lit(o.imm);
