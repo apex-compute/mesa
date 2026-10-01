@@ -14,6 +14,7 @@ pub fn latency(o: &Op) -> u32 {
         op::V_MUL_LO..=op::V_MUL_HI_I => 6,
         op::V_ADD_F..=op::V_LDEXP | op::V_CVT_F_U..=op::V_CUBEMA | op::V_INTERP | op::V_INTERP_FLAT => 12,
         op::V_RCP..=op::V_COS => 16,
+        op::S_ADD_F..=op::S_RSQ => 23,
         op::V_CMP_F | op::V_CMP_CLASS => 12,
         op::V_READLANE..=op::V_MBCNT => 4,
         0x60..=0xab => 4,

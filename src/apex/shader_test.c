@@ -380,6 +380,46 @@ static void test_mix(const char *dir)
    apex_compile_result_finish(&r);
 }
 
+/* uniform.comp: the scalar FP forms return the vector forms' bits on normal,
+ * signed-zero, subnormal, infinite and NaN operands. */
+static void test_uniform(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "uniform.comp.spv", &r);
+   unsigned seen = 0;
+   for (size_t i = 64; i < r.size; i += 8)
+      if (r.data[i] >= APEX_S_ADD_F && r.data[i] <= APEX_S_RSQ)
+         seen |= 1u << (r.data[i] - APEX_S_ADD_F);
+   CHECK(seen == 0x1f);
+   static const float sets[][4] = {
+      {1.5f, -2.25f, 0.75f, 0.4f}, {0.1f, 3.0f, 0.3f, 1.7f}, {-0.0f, 0.0f, -0.0f, -0.5f},
+      {1e-39f, 0.5f, 3e-39f, 2.0f}, {INFINITY, 0.0f, 4.0f, NAN}, {3e38f, 2.0f, -3e38f, -INFINITY},
+      {-4.0f, 0.25f, 16.0f, 0.999f},
+   };
+   const unsigned n = 9;
+   for (unsigned k = 0; k < sizeof(sets) / sizeof(sets[0]); k++) {
+      struct world w = {0};
+      uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+      uint8_t *in = region(&w, 0x200000, 16 * 16);
+      uint8_t *out = region(&w, 0x300000, 16 * 2 * n * 4);
+      for (unsigned c = 0; c < 4; c++) {
+         put(root + PUSH + 4 * c, bits(sets[k][c]));
+         for (unsigned l = 0; l < 16; l++)
+            put(in + 16 * l + 4 * c, bits(sets[k][c]));
+      }
+      buffer_descriptor(root + slot(0, 0), 0x200000, 16 * 16);
+      buffer_descriptor(root + slot(0, 1), 0x300000, 16 * 2 * n * 4);
+      uint32_t user[16];
+      root_user(user);
+      run(&r, &w, user, 1, NULL);
+      for (unsigned l = 0; l < 16; l++)
+         for (unsigned f = 0; f < n; f++)
+            CHECK(get(out + 4 * (2 * n * l + f)) == get(out + 4 * (2 * n * l + n + f)));
+      world_free(&w);
+   }
+   apex_compile_result_finish(&r);
+}
+
 /* hoist.frag with the branch taken (limit 3) and not (limit 0). */
 static void test_hoist(const char *dir)
 {
@@ -810,6 +850,7 @@ int main(int argc, char **argv)
    test_transform(argv[1]);
    test_mix(argv[1]);
    test_hoist(argv[1]);
+   test_uniform(argv[1]);
    test_features(argv[1]);
    test_spill(argv[1]);
    test_waterfall(argv[1]);

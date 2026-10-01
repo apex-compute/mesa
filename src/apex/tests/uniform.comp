@@ -1,0 +1,27 @@
+#version 450
+// Uniform FP arithmetic on the scalar unit: each expression runs on push
+// constants (uniform) and on the same values loaded per lane (divergent);
+// apex-shader-test compares the bits.
+layout(local_size_x = 16) in;
+layout(push_constant) uniform P { vec4 x; } p;
+layout(std430, set = 0, binding = 0) readonly buffer In { vec4 x[]; } lanes;
+layout(std430, set = 0, binding = 1) buffer Out { float o[]; };
+const uint N = 9u;
+void forms(vec4 x, uint at)
+{
+   o[at] = x.x + x.y;
+   o[at + 1u] = x.x - abs(x.y);
+   o[at + 2u] = x.x * x.y;
+   o[at + 3u] = fma(x.x, x.y, x.z);
+   o[at + 4u] = fma(-x.x, x.w, -x.z);
+   o[at + 5u] = 1.0 / x.x;
+   o[at + 6u] = inversesqrt(x.z);
+   o[at + 7u] = clamp(x.y * x.w, 0.0, 1.0);
+   o[at + 8u] = clamp(x.w, 0.0, 1.0);
+}
+void main()
+{
+   uint l = gl_LocalInvocationIndex;
+   forms(p.x, 2u * N * l);
+   forms(lanes.x[l], 2u * N * l + N);
+}

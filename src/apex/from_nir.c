@@ -230,7 +230,8 @@ static uint32_t mask_to_flag(struct ctx *c, uint32_t m)
 }
 
 /* Class selection. A uniform value lives in scalar registers when a scalar
- * form computes it from scalar sources. */
+ * form computes it from scalar sources; FP add, multiply, FMA, reciprocal and
+ * its root have scalar forms with the vector forms' bits. */
 static bool scalar_alu(nir_op op)
 {
    switch (op) {
@@ -244,7 +245,8 @@ static bool scalar_alu(nir_op op)
    case nir_op_vec8: case nir_op_vec16: case nir_op_bcsel: case nir_op_b2i32: case nir_op_b2f32:
    case nir_op_fneg: case nir_op_fabs: case nir_op_pack_64_2x32_split:
    case nir_op_unpack_64_2x32_split_x: case nir_op_unpack_64_2x32_split_y:
-   case nir_op_u2u32: case nir_op_i2i32:
+   case nir_op_u2u32: case nir_op_i2i32: case nir_op_fadd: case nir_op_fsub: case nir_op_fmul:
+   case nir_op_ffma: case nir_op_ffma_weak: case nir_op_frcp: case nir_op_frsq: case nir_op_fsat:
       return true;
    default:
       return false;
@@ -378,12 +380,31 @@ static bool single_fsat_use(nir_def *d)
    return user->type == nir_instr_type_alu && nir_instr_as_alu(user)->op == nir_op_fsat;
 }
 
+/* The scalar form of a vector FP operation; subtraction negates b. */
+static unsigned scalar_fp(unsigned op)
+{
+   switch (op) {
+   case APEX_V_ADD_F: case APEX_V_SUB_F: return APEX_S_ADD_F;
+   case APEX_V_MUL_F: return APEX_S_MUL_F;
+   case APEX_V_FMA_F: return APEX_S_FMA_F;
+   case APEX_V_RCP: return APEX_S_RCP;
+   case APEX_V_RSQ: return APEX_S_RSQ;
+   default: return 0;
+   }
+}
+
 static void fp_op(struct ctx *c, nir_alu_instr *a, unsigned op)
 {
    unsigned n = nir_op_infos[a->op].num_inputs;
    uint32_t hi = 0, s[3] = {0};
    for (unsigned i = 0; i < n; i++)
       s[i] = fp_src(c, a, i, i + 1, &hi);
+   bool vec = vec_def(c, &a->def);
+   if (!vec) {
+      if (op == APEX_V_SUB_F)
+         hi ^= 1u << 9;
+      op = scalar_fp(op);
+   }
    if (op == APEX_V_LDEXP) {
       hi &= ~((1u << 9) | (1u << 12));
       s[1] = alu_src(c, a, 1);
@@ -392,7 +413,7 @@ static void fp_op(struct ctx *c, nir_alu_instr *a, unsigned op)
       hi |= 1u << 14;
       c->saturated[a->def.index] = true;
    }
-   emit(c, op, define(c, &a->def, true), s[0], s[1], n > 2 ? s[2] : 0, hi);
+   emit(c, op, define(c, &a->def, vec), s[0], s[1], n > 2 ? s[2] : 0, hi);
 }
 
 static void int_op(struct ctx *c, nir_alu_instr *a, unsigned vop, unsigned sop)
@@ -539,9 +560,11 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
          alias(c, d, alu_src(c, a, 0));
          return;
       } else {
+         /* max(x, 0) clamped, or x × 1 clamped: NaN and -0 give +0 in both. */
          uint32_t hi = 1u << 14;
          uint32_t x = fp_src(c, a, 0, 1, &hi);
-         emit(c, APEX_V_MAX_F, define(c, d, true), x, constant(c, 0), 0, hi);
+         emit(c, vec ? APEX_V_MAX_F : APEX_S_MUL_F, define(c, d, vec), x,
+              constant(c, vec ? 0 : 0x3f800000u), 0, hi);
          return;
       }
    default:
