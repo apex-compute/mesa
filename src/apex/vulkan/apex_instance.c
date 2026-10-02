@@ -469,7 +469,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    };
    struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,
-      .vendorID = 0x10ee, .deviceID = 0xa15e,
+      .vendorID = VK_VENDOR_ID_APEX, .deviceID = 0xa15e,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
       .deviceName = "Apex development (non-conformant)",
       .maxMemoryAllocationCount = 4096,
@@ -555,7 +555,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxPerSetDescriptors = APEX_MAX_DESCRIPTORS,
       .maxMemoryAllocationSize = APEX_MAX_ALLOCATION,
       /* Vulkan 1.2: depth/stencil resolves take sample 0. */
-      .driverID = VK_DRIVER_ID_MESA_LLVMPIPE,
+      .driverID = VK_DRIVER_ID_APEX,
       .driverName = "Apex", .driverInfo = "Mesa development driver (non-conformant)",
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,

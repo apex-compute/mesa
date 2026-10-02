@@ -2978,6 +2978,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_PANVK:
    case VK_DRIVER_ID_MESA_NVK:
    case VK_DRIVER_ID_MESA_KOSMICKRISP:
+   case VK_DRIVER_ID_APEX:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.implicit_sync = false;
       break;
@@ -3146,6 +3147,7 @@ init_driver_workarounds(struct zink_screen *screen)
    /* these drivers benefit from renderpass optimization */
    switch (zink_driverid(screen)) {
    case VK_DRIVER_ID_MESA_LLVMPIPE:
+   case VK_DRIVER_ID_APEX:
    case VK_DRIVER_ID_MESA_TURNIP:
    case VK_DRIVER_ID_MESA_PANVK:
    case VK_DRIVER_ID_MESA_V3DV:
@@ -3173,6 +3175,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_NVK:
    case VK_DRIVER_ID_MESA_LLVMPIPE:
    case VK_DRIVER_ID_MESA_PANVK:
+   case VK_DRIVER_ID_APEX:
    case VK_DRIVER_ID_ARM_PROPRIETARY:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.can_do_invalid_linear_modifier = true;
@@ -3186,6 +3189,7 @@ init_driver_workarounds(struct zink_screen *screen)
    /* these drivers have no difference between unoptimized and optimized shader compilation */
    switch (zink_driverid(screen)) {
    case VK_DRIVER_ID_MESA_LLVMPIPE:
+   case VK_DRIVER_ID_APEX:
       screen->driver_workarounds.disable_optimized_compile = true;
       break;
    default:
@@ -3237,6 +3241,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_NVK:
    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
    case VK_DRIVER_ID_MESA_TURNIP:
+   case VK_DRIVER_ID_APEX:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.general_layout = true;
       break;
