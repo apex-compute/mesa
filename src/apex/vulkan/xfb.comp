@@ -1,0 +1,109 @@
+#version 450
+// Transform feedback bookkeeping, one invocation (apex_job.h). After a
+// draw's capture program, advances each buffer's byte offset by the
+// primitives that fit (the capture program writes the same ones) and adds
+// the primitives written and needed to an active stream query. Loads and
+// stores the offsets from and to counter buffers at begin and end.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_job.h"
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+uint64_t address(uint i) { return uint64_t(job(i)) | (uint64_t(job(i + 1u)) << 32); }
+
+uint draw(uint i)
+{
+   uint64_t params = address(APEX_XFB_PARAMS);
+   return params != 0ul ? Words(params).w[i] : job(APEX_XFB_DRAW + i);
+}
+
+// Robust index fetch: indices beyond the bound bytes read zero.
+bool restart_at(uint position)
+{
+   uint flags = job(APEX_XFB_FLAGS);
+   uint shift = flags & 3u, bytes = 1u << shift;
+   uint byte = (draw(2u) + position) << shift;
+   uint value = 0u;
+   if (byte + bytes <= job(APEX_XFB_INDEX_BYTES)) {
+      uint64_t va = address(APEX_XFB_INDEX) + uint64_t(byte & ~3u);
+      value = Words(va).w[0] >> ((byte & 3u) * 8u);
+   }
+   uint mask = shift == 2u ? 0xffffffffu : (1u << (8u * bytes)) - 1u;
+   return (value & mask) == mask;
+}
+
+uint primitives(uint count, uint topology, uint verts)
+{
+   uint flags = job(APEX_XFB_FLAGS);
+   bool restart = (flags & (APEX_XFB_FLAG_INDEXED | APEX_XFB_FLAG_RESTART)) ==
+                  (APEX_XFB_FLAG_INDEXED | APEX_XFB_FLAG_RESTART);
+   if (restart && (topology == 2u || topology >= 4u)) {
+      uint n = 0u, run = 0u;
+      for (uint i = 0u; i < count; i++) {
+         run = restart_at(i) ? 0u : run + 1u;
+         if (run >= verts)
+            n++;
+      }
+      return n;
+   }
+   switch (topology) {
+   case 0u: return count;
+   case 1u: return count / 2u;
+   case 2u: return count > 1u ? count - 1u : 0u;
+   case 3u: return count / 3u;
+   default: return count > 2u ? count - 2u : 0u;
+   }
+}
+
+void main()
+{
+   uint mode = job(APEX_XFB_MODE);
+   uint64_t state_va = address(APEX_XFB_STATE);
+   Words state = Words(state_va);
+   if (mode != APEX_XFB_ADVANCE) {
+      for (uint b = 0u; b < APEX_XFB_BUFFERS; b++) {
+         uint64_t counter = address(APEX_XFB_COUNTERS + 2u * b);
+         if (counter == 0ul)
+            continue;
+         if (mode == APEX_XFB_LOAD)
+            state.w[APEX_XFB_STATE_OFFSETS + b] = Words(counter).w[0];
+         else
+            Words(counter).w[0] = state.w[APEX_XFB_STATE_OFFSETS + b];
+      }
+      return;
+   }
+   uint64_t count_va = address(APEX_XFB_COUNT);
+   if (count_va != 0ul && job(APEX_XFB_DRAW_INDEX) >= Words(count_va).w[0])
+      return;
+   uint topology = (job(APEX_XFB_FLAGS) >> 8u) & 7u;
+   uint verts = topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
+   uint needed = primitives(draw(0u), topology, verts) * draw(1u);
+   // Without active transform feedback the query counts needed only.
+   uint fit = state_va != 0ul ? needed : 0u;
+   for (uint b = 0u; state_va != 0ul && b < APEX_XFB_BUFFERS; b++) {
+      uint stride = (job(APEX_XFB_STRIDES + b / 2u) >> (16u * (b & 1u))) & 0xffffu;
+      uint offset = state.w[APEX_XFB_STATE_OFFSETS + b];
+      uint size = state.w[APEX_XFB_STATE_BUFFERS + 3u * b + 2u];
+      if (stride != 0u)
+         fit = min(fit, size > offset ? (size - offset) / (verts * stride) : 0u);
+   }
+   for (uint b = 0u; state_va != 0ul && b < APEX_XFB_BUFFERS; b++) {
+      uint stride = (job(APEX_XFB_STRIDES + b / 2u) >> (16u * (b & 1u))) & 0xffffu;
+      if (stride != 0u)
+         state.w[APEX_XFB_STATE_OFFSETS + b] += fit * verts * stride;
+   }
+   uint64_t query = address(APEX_XFB_QUERY);
+   if (query != 0ul) {
+      Words slot = Words(query);
+      uint64_t written = (uint64_t(slot.w[0]) | (uint64_t(slot.w[1]) << 32)) + uint64_t(fit);
+      uint64_t total = (uint64_t(slot.w[2]) | (uint64_t(slot.w[3]) << 32)) + uint64_t(needed);
+      slot.w[0] = uint(written);
+      slot.w[1] = uint(written >> 32);
+      slot.w[2] = uint(total);
+      slot.w[3] = uint(total >> 32);
+   }
+}

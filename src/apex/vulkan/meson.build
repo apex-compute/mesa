@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Internal kernels are SPIR-V embedded as C arrays.
 apex_internal_spv = []
-foreach kernel : ['copy', 'clear', 'querycopy', 'etc2']
+foreach kernel : ['copy', 'clear', 'querycopy', 'etc2', 'xfb']
   apex_internal_spv += custom_target('apex_' + kernel + '_spv',
     input : kernel + '.comp', output : 'apex_' + kernel + '_spv.h',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
@@ -201,7 +201,11 @@ foreach fixture : ['clip.vert', 'clip.frag']
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
   )
 endforeach
-test('apex-cp', apex_cp_test, args : [apex_pipeline_spv, apex_triangle_spv], suite : ['apex'],
+apex_xfb_vert_spv = custom_target('apex-xfb-vert',
+  input : 'xfb.vert', output : 'xfb.vert.spv',
+  command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
+)
+test('apex-cp', apex_cp_test, args : [apex_pipeline_spv, apex_triangle_spv, apex_xfb_vert_spv], suite : ['apex'],
   env : apex_test_env)
 test('apex-graphics-programs', apex_pipeline_test,
   args : ['--graphics', apex_texture_spv, apex_triangle_spv, apex_clip_spv],

@@ -1,6 +1,6 @@
 #version 450
-// vkCmdCopyQueryPoolResults: one invocation per query. Pool slots hold a
-// 64-bit value then a 32-bit availability word (apex_job.h).
+// vkCmdCopyQueryPoolResults: one invocation per query. Pool slots hold one
+// or two 64-bit values and a 32-bit availability word (apex_job.h).
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -17,22 +17,25 @@ void main()
    uint q = gl_GlobalInvocationID.x;
    if (q >= job(APEX_QUERY_COUNT))
       return;
-   uint flags = job(APEX_QUERY_FLAGS);
+   uint flags = job(APEX_QUERY_FLAGS), values = job(APEX_QUERY_VALUES);
    Words slot = Words(address(APEX_QUERY_SLOT) + uint64_t(q) * APEX_QUERY_STRIDE);
    Words dst = Words(address(APEX_QUERY_DST) + uint64_t(q) * job(APEX_QUERY_DST_STRIDE));
    bool wide = (flags & 1u) != 0u;        // VK_QUERY_RESULT_64_BIT
    bool with_available = (flags & 4u) != 0u;
    bool partial = (flags & 8u) != 0u;
-   uint available = slot.w[2];
-   uint lo = slot.w[0], hi = slot.w[1];
-   if (available != 0u || partial) {
-      dst.w[0] = wide || hi == 0u ? lo : 0xffffffffu;
-      if (wide)
-         dst.w[1] = hi;
+   uint available = slot.w[APEX_QUERY_AVAILABLE / 4];
+   uint words = wide ? 2u : 1u;
+   for (uint v = 0u; v < values; v++) {
+      uint lo = slot.w[2u * v], hi = slot.w[2u * v + 1u];
+      if (available != 0u || partial) {
+         dst.w[v * words] = wide || hi == 0u ? lo : 0xffffffffu;
+         if (wide)
+            dst.w[v * words + 1u] = hi;
+      }
    }
    if (with_available) {
-      dst.w[wide ? 2u : 1u] = available;
+      dst.w[values * words] = available;
       if (wide)
-         dst.w[3] = 0u;
+         dst.w[values * words + 1u] = 0u;
    }
 }

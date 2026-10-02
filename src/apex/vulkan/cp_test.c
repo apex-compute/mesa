@@ -3,8 +3,9 @@
  * growth, ring wrap and space accounting, the vkQueueSubmit batch sequence,
  * a device recorded through Vulkan whose ring the command-processor model in
  * mock_kernel.h executes, and a render pass whose pass record, draw
- * registers and state blocks the model reads back. Steady-state submission
- * must issue no ioctl. */
+ * registers and state blocks the model reads back, and transform feedback
+ * with its dispatches run on the ISA model. Steady-state submission must
+ * issue no ioctl. */
 #include "apex_private.h"
 #include "apex_job.h"
 #include "apex_pipeline.h"
@@ -13,6 +14,7 @@
 #include "vk_buffer.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
+#include <math.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
 
@@ -472,12 +474,238 @@ shader_module(const struct vk_device_dispatch_table *v, VkDevice dev, const char
    return module;
 }
 
+/* Runs a dispatch on the ISA model over the mock's GEMs of at most 2 MiB:
+ * submission arenas, programs, buffers and query pools. */
+static void
+simulate_dispatch(struct mock_kernel *kernel, const struct mock_dispatch *d)
+{
+   uint64_t program_va = MOCK_U64(d->state, APEX_STATE_COMPUTE_PROGRAM);
+   uint32_t header[16];
+   mock_read(kernel, program_va, header, sizeof(header));
+   size_t size = 64 + header[2];
+   uint8_t *program = malloc(size);
+   CHECK(program);
+   mock_read(kernel, program_va, program, size);
+   struct apex_sim_region regions[64];
+   unsigned count = 0;
+   for (unsigned h = 1; h <= kernel->gem_count; h++) {
+      const struct mock_gem *g = &kernel->gems[h];
+      if (!g->live || !g->va || g->size > (2u << 20))
+         continue;
+      CHECK(count < ARRAY_SIZE(regions));
+      regions[count] = (struct apex_sim_region){g->va, malloc(g->size), g->size};
+      mock_read(kernel, g->va, regions[count].data, g->size);
+      count++;
+   }
+   char diagnostic[256] = "";
+   if (apex_simulate(program, size, &d->state[APEX_STATE_COMPUTE_USER], d->grid,
+                     MOCK_U64(d->state, APEX_STATE_COMPUTE_PRIVATE), NULL, regions, count, diagnostic)) {
+      fprintf(stderr, "simulation: %s\n", diagnostic);
+      abort();
+   }
+   for (unsigned r = 0; r < count; r++) {
+      mock_write(kernel, regions[r].gpuva, regions[r].data, regions[r].size);
+      free(regions[r].data);
+   }
+   free(program);
+   seen.count++;
+}
+
+/* Transform feedback through the CP model with dispatches on the ISA
+ * model: a two-instance triangle strip captured into two buffers, the
+ * first of which holds five of its six triangles; the stream query and
+ * counter buffers receive the primitives written and needed and the byte
+ * offsets. Resumed from the counters into rebound buffers, an indexed
+ * strip with a restart index appends its three triangles. */
+static void
+test_transform_feedback(const struct vk_device_dispatch_table *v, VkDevice dev, VkQueue queue,
+                        VkDeviceMemory memory, VkImageView view, const char *vertex_path,
+                        const char *fragment_path)
+{
+   const uint64_t memory_va = ((struct apex_memory *)apex_memory_from_handle(memory))->storage->bo.va;
+   /* Vertex buffer at 192 KiB, capture buffers at 256 and 264 KiB, counters at 272 KiB. */
+   const VkDeviceSize places[4] = {196608, 262144, 270336, 278528};
+   VkBuffer buffers[4];
+   for (unsigned i = 0; i < 4; i++) {
+      const VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096,
+         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                  VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                  VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT};
+      CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[i]) == VK_SUCCESS);
+      CHECK(v->BindBufferMemory(dev, buffers[i], memory, places[i]) == VK_SUCCESS);
+   }
+   const uint8_t zero[4096] = {0};
+   for (unsigned i = 1; i < 4; i++)
+      mock_write(&k, memory_va + places[i], zero, sizeof(zero));
+   /* Vertex i: position (i, 2i, -i, 1) and BGRA8 color (10i, 20 + i, 30 + i, 255). */
+   for (unsigned i = 0; i < 6; i++) {
+      float position[4] = {i, 2.0f * i, -(float)i, 1.0f};
+      uint8_t color[4] = {10 * i, 20 + i, 30 + i, 255};
+      mock_write(&k, memory_va + places[0] + 32 * i, position, 16);
+      mock_write(&k, memory_va + places[0] + 32 * i + 16, color, 4);
+   }
+   const uint16_t indices[8] = {0, 1, 2, 0xffff, 3, 4, 5, 2};
+   mock_write(&k, memory_va + places[0] + 1024, indices, sizeof(indices));
+
+   VkShaderModule modules[2] = {shader_module(v, dev, vertex_path), shader_module(v, dev, fragment_path)};
+   const VkPipelineShaderStageCreateInfo stages[2] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = modules[0], .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = modules[1], .pName = "main"},
+   };
+   const VkVertexInputBindingDescription binding = {0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
+   const VkVertexInputAttributeDescription attributes[2] = {
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_B8G8R8A8_UNORM, 16},
+   };
+   const VkPipelineVertexInputStateCreateInfo vis = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+      .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
+      .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = attributes,
+   };
+   const VkPipelineInputAssemblyStateCreateInfo ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, .primitiveRestartEnable = VK_TRUE,
+   };
+   const VkViewport viewport = {0, 0, 100, 70, 0, 1};
+   const VkRect2D scissor = {{0, 0}, {100, 70}};
+   const VkPipelineViewportStateCreateInfo vp = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor,
+   };
+   const VkPipelineRasterizationStateCreateInfo rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+      .rasterizerDiscardEnable = VK_TRUE, .lineWidth = 1.0f,
+   };
+   const VkPipelineMultisampleStateCreateInfo ms = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+   };
+   const VkPipelineColorBlendAttachmentState blend = {.colorWriteMask = 0xf};
+   const VkPipelineColorBlendStateCreateInfo cb = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+      .attachmentCount = 1, .pAttachments = &blend,
+   };
+   const VkFormat color = VK_FORMAT_R8G8B8A8_UNORM;
+   const VkPipelineRenderingCreateInfo rendering = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .colorAttachmentCount = 1, .pColorAttachmentFormats = &color,
+   };
+   const VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   const VkGraphicsPipelineCreateInfo pi = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering,
+      .stageCount = 2, .pStages = stages, .pVertexInputState = &vis, .pInputAssemblyState = &ia,
+      .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
+      .pColorBlendState = &cb, .layout = layout,
+   };
+   VkPipeline pipeline;
+   CHECK(v->CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
+   const VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+      .queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, .queryCount = 1};
+   VkQueryPool pool;
+   CHECK(v->CreateQueryPool(dev, &qpi, NULL, &pool) == VK_SUCCESS);
+
+   VkCommandPool command_pool;
+   const VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   CHECK(v->CreateCommandPool(dev, &cpi, NULL, &command_pool) == VK_SUCCESS);
+   const VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = command_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+   VkCommandBuffer cmd;
+   CHECK(v->AllocateCommandBuffers(dev, &cai, &cmd) == VK_SUCCESS);
+   const VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   v->CmdResetQueryPool(cmd, pool, 0, 1);
+   const VkRenderingAttachmentInfo color_attachment = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view,
+      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+   const VkRenderingInfo render = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {{0, 0}, {100, 70}}, .layerCount = 1, .colorAttachmentCount = 1,
+      .pColorAttachments = &color_attachment};
+   v->CmdBeginRendering(cmd, &render);
+   v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   const VkDeviceSize vertex_offset = 0;
+   v->CmdBindVertexBuffers(cmd, 0, 1, &buffers[0], &vertex_offset);
+   const VkDeviceSize offsets[2] = {0, 0}, sizes[2] = {500, VK_WHOLE_SIZE}, counter_offsets[2] = {0, 4};
+   v->CmdBindTransformFeedbackBuffersEXT(cmd, 0, 2, &buffers[1], offsets, sizes);
+   v->CmdBeginQueryIndexedEXT(cmd, pool, 0, 0, 0);
+   v->CmdBeginTransformFeedbackEXT(cmd, 0, 0, NULL, NULL);
+   v->CmdDraw(cmd, 5, 2, 1, 0);
+   const VkBuffer counters[2] = {buffers[3], buffers[3]};
+   v->CmdEndTransformFeedbackEXT(cmd, 0, 2, counters, counter_offsets);
+   v->CmdEndQueryIndexedEXT(cmd, pool, 0, 0);
+   const VkDeviceSize whole[2] = {VK_WHOLE_SIZE, VK_WHOLE_SIZE};
+   v->CmdBindTransformFeedbackBuffersEXT(cmd, 0, 2, &buffers[1], offsets, whole);
+   v->CmdBindIndexBuffer(cmd, buffers[0], 1024, VK_INDEX_TYPE_UINT16);
+   v->CmdBeginTransformFeedbackEXT(cmd, 0, 2, counters, counter_offsets);
+   v->CmdDrawIndexed(cmd, 8, 1, 0, 0, 0);
+   v->CmdEndTransformFeedbackEXT(cmd, 0, 2, counters, counter_offsets);
+   v->CmdEndRendering(cmd);
+   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+   const VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+      .commandBuffer = cmd};
+   const VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+      .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+   seen.count = 0;
+   k.on_dispatch = simulate_dispatch;
+   CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
+   mock_cp_run(&k);
+   k.on_dispatch = NULL;
+   /* Capture, bookkeeping and the counter store; then the counter load too. */
+   CHECK(!k.blocked && seen.count == 7);
+
+   /* Output vertex o is vertex o mod 3 of strip triangle t = o / 3 mod 3,
+    * in Vulkan's order {t, t + 1 + t % 2, t + 2 - t % 2} from firstVertex 1.
+   * The sixth triangle does not fit the first buffer, so neither buffer
+    * stores it. The indexed strip's runs are {0, 1, 2} and {3, 4, 5, 2}. */
+   const unsigned restarted[9] = {0, 1, 2, 3, 4, 5, 4, 2, 5};
+   float captured[8], pair[2];
+   for (unsigned o = 0; o < 25; o++) {
+      unsigned t = o / 3 % 3, j = o % 3, instance = o < 15 ? o / 9 : 0;
+      unsigned vertex = o >= 15 && o < 24 ? restarted[o - 15] :
+                        1 + (j == 0 ? t : j == 1 ? t + 1 + t % 2 : t + 2 - t % 2);
+      mock_read(&k, memory_va + places[1] + 32 * o, captured, sizeof(captured));
+      mock_read(&k, memory_va + places[2] + 16 * o + 4, pair, sizeof(pair));
+      if (o == 24) {
+         for (unsigned c = 0; c < 8; c++)
+            CHECK(captured[c] == 0.0f);
+         CHECK(pair[0] == 0.0f && pair[1] == 0.0f);
+         continue;
+      }
+      const float shade[4] = {(30 + vertex) / 255.0f, (20 + vertex) / 255.0f, 10 * vertex / 255.0f, 1.0f};
+      const float position[4] = {vertex, 2.0f * vertex, -(float)vertex, 1.0f};
+      for (unsigned c = 0; c < 4; c++)
+         CHECK(fabsf(captured[c] - shade[c]) < 1e-6f && captured[4 + c] == position[c]);
+      CHECK(pair[0] == position[0] + vertex && pair[1] == position[1] + 100.0f * instance);
+   }
+   uint32_t counted[2];
+   mock_read(&k, memory_va + places[3], counted, sizeof(counted));
+   CHECK(counted[0] == 24 * 32 && counted[1] == 24 * 16);
+   uint64_t results[3];
+   CHECK(v->GetQueryPoolResults(dev, pool, 0, 1, sizeof(results), results, sizeof(results),
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS);
+   CHECK(results[0] == 5 && results[1] == 6 && results[2] == 1);
+   CHECK(v->QueueWaitIdle(queue) == VK_SUCCESS);
+
+   v->FreeCommandBuffers(dev, command_pool, 1, &cmd);
+   v->DestroyCommandPool(dev, command_pool, NULL);
+   v->DestroyQueryPool(dev, pool, NULL);
+   v->DestroyPipeline(dev, pipeline, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   for (unsigned i = 0; i < 2; i++)
+      v->DestroyShaderModule(dev, modules[i], NULL);
+   for (unsigned i = 0; i < 4; i++)
+      v->DestroyBuffer(dev, buffers[i], NULL);
+}
+
 /* A render pass and its draws through Vulkan, executed by the CP model:
  * the pass record in the bin pool, the draw registers, the state blocks
  * they name and the draw packets (Docs/architecture.md, Command processor
  * and user-mode rings; Fixed-function graphics). */
 static void
-test_graphics(const char *vertex_path, const char *fragment_path)
+test_graphics(const char *vertex_path, const char *fragment_path, const char *xfb_path)
 {
    struct vk_instance instance;
    const struct vk_instance_extension_table extensions = {0};
@@ -489,7 +717,7 @@ test_graphics(const char *vertex_path, const char *fragment_path)
    struct vk_physical_device physical;
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
    const struct vk_properties properties = {.subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16};
-   const struct vk_features features = {.dynamicRendering = true};
+   const struct vk_features features = {.dynamicRendering = true, .transformFeedback = true};
    CHECK(vk_physical_device_init(&physical, &instance, NULL, &features, &properties,
                                  &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
@@ -722,8 +950,9 @@ test_graphics(const char *vertex_path, const char *fragment_path)
    CHECK(d->op == APEX_CP_DRAW_INDIRECT && MOCK_U64(d->payload, 0) == buffer_va + 2048 &&
          d->payload[2] == 3 && d->payload[3] == 16 && !MOCK_U64(d->payload, 4));
    /* The query's availability follows END_PASS. */
-   CHECK(mock_read32(&k, ((struct apex_query_pool *)apex_query_pool_from_handle(pool))->bo.va + 16 + 8) == 1);
+   CHECK(mock_read32(&k, ((struct apex_query_pool *)apex_query_pool_from_handle(pool))->bo.va + APEX_QUERY_STRIDE + APEX_QUERY_AVAILABLE) == 1);
    CHECK(v->QueueWaitIdle(queue) == VK_SUCCESS);
+   test_transform_feedback(v, dev, queue, memory, views[0], xfb_path, fragment_path);
 
    v->FreeCommandBuffers(dev, command_pool, 1, &cmd);
    v->DestroyCommandPool(dev, command_pool, NULL);
@@ -743,16 +972,17 @@ test_graphics(const char *vertex_path, const char *fragment_path)
    vk_physical_device_finish(&physical);
    vk_instance_finish(&instance);
    puts("PASS Apex CP graphics: pass record and attachments in the bin pool, draw registers, vertex-input, "
-        "raster, depth-stencil, blend and viewport blocks, DRAW, DRAW_INDEXED, DRAW_INDIRECT, queries");
+        "raster, depth-stencil, blend and viewport blocks, DRAW, DRAW_INDEXED, DRAW_INDIRECT, queries, "
+        "transform feedback capture on the ISA model");
 }
 
 int
 main(int argc, char **argv)
 {
-   CHECK(argc == 4);
+   CHECK(argc == 5);
    test_encoder();
    test_ring();
    test_device(argv[1]);
-   test_graphics(argv[2], argv[3]);
+   test_graphics(argv[2], argv[3], argv[4]);
    return 0;
 }

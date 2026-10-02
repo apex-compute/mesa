@@ -178,8 +178,11 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .pNext = &robustness,
    };
+   VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, .pNext = &maintenance5,
+   };
    VkPhysicalDeviceProvokingVertexFeaturesEXT provoking = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .pNext = &maintenance5,
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .pNext = &xfb,
       .transformFeedbackPreservesProvokingVertex = VK_TRUE,
    };
    VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {
@@ -203,7 +206,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(features.features.robustBufferAccess && robustness.robustBufferAccess2);
    CHECK(!robustness.robustImageAccess2 && robustness.nullDescriptor);
    CHECK(maintenance5.maintenance5 && provoking.provokingVertexLast &&
-         !provoking.transformFeedbackPreservesProvokingVertex);
+         provoking.transformFeedbackPreservesProvokingVertex && xfb.transformFeedback && !xfb.geometryStreams);
    CHECK(border.customBorderColors && border.customBorderColorWithoutFormat);
    CHECK(swizzle.borderColorSwizzle && swizzle.borderColorSwizzleFromImage);
    CHECK(depth_clip.depthClipEnable);
@@ -218,9 +221,13 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT,
       .pNext = &maintenance5_props,
    };
+   VkPhysicalDeviceTransformFeedbackPropertiesEXT xfb_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
+      .pNext = &provoking_props,
+   };
    VkPhysicalDeviceRobustness2PropertiesEXT robust_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT,
-      .pNext = &provoking_props,
+      .pNext = &xfb_props,
    };
    VkPhysicalDeviceProperties2 properties2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &robust_props,
@@ -232,7 +239,9 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(drm_props.hasRender && drm_props.renderMajor == 1 && drm_props.renderMinor == 3);
    CHECK(drm_props.hasPrimary && drm_props.primaryMajor == 1 && drm_props.primaryMinor == 5);
    CHECK(provoking_props.provokingVertexModePerPipeline &&
-         !provoking_props.transformFeedbackPreservesTriangleFanProvokingVertex);
+         provoking_props.transformFeedbackPreservesTriangleFanProvokingVertex);
+   CHECK(xfb_props.maxTransformFeedbackStreams == 1 && xfb_props.maxTransformFeedbackBuffers == 4 &&
+         xfb_props.transformFeedbackQueries && !xfb_props.transformFeedbackDraw);
    CHECK(maintenance5_props.earlyFragmentSampleMaskTestBeforeSampleCounting &&
          !maintenance5_props.earlyFragmentMultisampleCoverageAfterSampleCounting &&
          maintenance5_props.depthStencilSwizzleOneSupport && !maintenance5_props.polygonModePointSize &&
@@ -246,6 +255,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
       VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME,
       VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+      VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
       VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME};
    for (unsigned i = 0; i < ARRAY_SIZE(zink_extensions); i++) {
       bool found = false;

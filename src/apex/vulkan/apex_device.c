@@ -1410,7 +1410,8 @@ apex_CreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->queryType != VK_QUERY_TYPE_OCCLUSION && info->queryType != VK_QUERY_TYPE_TIMESTAMP)
+   if (info->queryType != VK_QUERY_TYPE_OCCLUSION && info->queryType != VK_QUERY_TYPE_TIMESTAMP &&
+       info->queryType != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct apex_query_pool *pool = vk_query_pool_create(&device->vk, info, alloc, sizeof(*pool));
    if (!pool)
@@ -1452,6 +1453,8 @@ apex_GetQueryPoolResults(VkDevice dev, VkQueryPool handle, uint32_t first, uint3
    VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_query_pool, pool, handle);
    const uint8_t *slots = (const uint8_t *)pool->bo.map + (uint64_t)first * APEX_QUERY_STRIDE;
+   unsigned values = pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2 : 1;
+   unsigned width = flags & VK_QUERY_RESULT_64_BIT ? 8 : 4;
    VkResult status = VK_SUCCESS;
    for (uint32_t q = 0; q < count; q++) {
       const volatile uint32_t *slot = (const void *)(slots + (uint64_t)q * APEX_QUERY_STRIDE);
@@ -1459,28 +1462,27 @@ apex_GetQueryPoolResults(VkDevice dev, VkQueryPool handle, uint32_t first, uint3
          VkResult result = vk_device_check_status(&device->vk);
          if (result != VK_SUCCESS)
             return result;
-         if (slot[2] || !(flags & VK_QUERY_RESULT_WAIT_BIT))
+         if (slot[APEX_QUERY_AVAILABLE / 4] || !(flags & VK_QUERY_RESULT_WAIT_BIT))
             break;
          /* Results arrive from the queue; poll without holding locks. */
          nanosleep(&(struct timespec){.tv_nsec = 100000}, NULL);
       }
-      bool available = slot[2];
-      uint64_t value = slot[0] | (uint64_t)slot[1] << 32;
-      unsigned size = flags & VK_QUERY_RESULT_64_BIT ? 8 : 4;
+      bool available = slot[APEX_QUERY_AVAILABLE / 4];
       uint8_t *out = (uint8_t *)data + q * stride;
-      if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-         if (size == 8)
-            memcpy(out, &value, 8);
+      for (unsigned v = 0; v < values && (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)); v++) {
+         uint64_t value = slot[2 * v] | (uint64_t)slot[2 * v + 1] << 32;
+         if (width == 8)
+            memcpy(out + 8 * v, &value, 8);
          else
-            *(uint32_t *)out = value > UINT32_MAX ? UINT32_MAX : value;
+            *(uint32_t *)(out + 4 * v) = value > UINT32_MAX ? UINT32_MAX : value;
       }
       if (!available)
          status = VK_NOT_READY;
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
-         if (size == 8)
-            *(uint64_t *)(out + 8) = available;
+         if (width == 8)
+            *(uint64_t *)(out + 8 * values) = available;
          else
-            *(uint32_t *)(out + 4) = available;
+            *(uint32_t *)(out + 4 * values) = available;
       }
    }
    return status;

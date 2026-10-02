@@ -61,13 +61,52 @@
 #define APEX_EAC_RG11 5
 #define APEX_EAC_RG11_SNORM 6
 
-/* Query slots: 64-bit value, 32-bit availability, padding. */
-#define APEX_QUERY_STRIDE 16
+/* Query slots: one 64-bit value (two for transform feedback streams:
+ * primitives written, then needed), the 32-bit availability word at byte
+ * 16, padding. */
+#define APEX_QUERY_STRIDE 32
+#define APEX_QUERY_AVAILABLE 16
 /* Query copy: one invocation per query. */
 #define APEX_QUERY_SLOT 0             /* first slot VA lo, hi */
 #define APEX_QUERY_DST 2              /* copy destination VA lo, hi */
 #define APEX_QUERY_DST_STRIDE 4
 #define APEX_QUERY_COUNT 5
 #define APEX_QUERY_FLAGS 6            /* VkQueryResultFlags */
+#define APEX_QUERY_VALUES 7           /* values per query: 1 or 2 */
+
+/* Transform feedback. A draw's capture program (the vertex program built as
+ * a compute kernel, apex_graphics.c) and the bookkeeping kernel share these
+ * job words. The draw's parameters are its VkDraw(Indexed)IndirectCommand
+ * words, read from APEX_XFB_PARAMS when nonzero; a nonzero count address
+ * skips draw APEX_XFB_DRAW_INDEX at or beyond the u32 it holds. */
+#define APEX_XFB_DRAW 0               /* 4 or 5 command words */
+#define APEX_XFB_PARAMS 5             /* indirect command VA lo, hi */
+#define APEX_XFB_COUNT 7              /* draw count VA lo, hi */
+#define APEX_XFB_DRAW_INDEX 9
+#define APEX_XFB_INDEX 10             /* index buffer VA lo, hi */
+#define APEX_XFB_INDEX_BYTES 12
+#define APEX_XFB_FLAGS 13             /* index type 1:0, indexed 2, restart 3, last provoking 4, topology 10:8 */
+#define APEX_XFB_VERTEX_INPUT 14      /* vertex-input block VA lo, hi */
+#define APEX_XFB_STATE 16             /* state VA lo, hi */
+#define APEX_XFB_QUERY 18             /* stream query slot VA lo, hi; 0 without one */
+#define APEX_XFB_STRIDES 20           /* buffer strides, two per word, 16 bits each */
+#define APEX_XFB_MODE 22
+/* Bookkeeping modes: advance the offsets and query by a draw, load the
+ * offsets from counter buffers, store them to counter buffers. */
+#define APEX_XFB_ADVANCE 0
+#define APEX_XFB_LOAD 1
+#define APEX_XFB_STORE 2
+#define APEX_XFB_COUNTERS 0           /* load and store: 4 counter VAs lo, hi; 0 skips */
+#define APEX_XFB_FLAG_INDEXED (1u << 2)
+#define APEX_XFB_FLAG_RESTART (1u << 3)
+#define APEX_XFB_FLAG_LAST (1u << 4)
+/* State, 16 words from vkCmdBeginTransformFeedbackEXT: each buffer's byte
+ * offset, then each buffer's {VA lo, VA hi, bytes}. */
+#define APEX_XFB_BUFFERS 4
+#define APEX_XFB_STATE_OFFSETS 0
+#define APEX_XFB_STATE_BUFFERS 4
+#define APEX_XFB_STATE_WORDS 16
+/* Capture workgroup width. */
+#define APEX_XFB_LOCAL 64
 
 #endif

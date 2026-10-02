@@ -103,6 +103,9 @@ struct apex_table {
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    uint32_t trailer[APEX_TRAILER_WORDS + APEX_JOB_WORDS];
+   /* Trailer words w (bit w) whose pair {w, w + 1} holds a data offset,
+    * written as its GPUVA. */
+   uint64_t relocs;
    uint64_t offset;      /* in the submission arena */
 };
 /* IB dwords (low, high) patched with a GPUVA at submission. */
@@ -170,6 +173,14 @@ struct apex_command_buffer {
                depth_stencil[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS],
                viewport[APEX_HW_VIEWPORT_DWORDS];
    } state;
+   /* Transform feedback: the bound buffers and, while active, the state
+    * block (APEX_XFB_STATE_*) at data offset `state`; the active stream
+    * query's slot VA. */
+   struct {
+      struct { uint64_t va, size; } buffers[APEX_XFB_BUFFERS];
+      bool active;
+      uint64_t state, query;
+   } xfb;
    /* Occlusion query slots 0-7 in use, and availability writes waiting
     * for the end of the render pass. */
    uint8_t query_slots;

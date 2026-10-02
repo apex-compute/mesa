@@ -14,6 +14,10 @@ struct apex_shader {
       /* Output record bytes per vertex and clip distances written. */
       uint32_t stride;
       uint8_t clip_distances;
+      /* With transform feedback outputs: the capture program (code.size
+       * nonzero) and each buffer's stride. */
+      struct apex_program capture;
+      uint16_t xfb_strides[4];
    } vertex;
 };
 

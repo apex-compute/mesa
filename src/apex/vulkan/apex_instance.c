@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
 #include "apex_hw.h"
+#include "apex_job.h"
 #include "apex_entrypoints.h"
 #include "drm-uapi/apex_drm.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -313,6 +314,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_queue_family_foreign = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
       .KHR_maintenance5 = true,
       .EXT_provoking_vertex = true,
+      .EXT_transform_feedback = true,
       .EXT_custom_border_color = true,
       .EXT_border_color_swizzle = true,
       .KHR_line_rasterization = true,
@@ -376,6 +378,12 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .nullDescriptor = true,
       .maintenance5 = true,
       .provokingVertexLast = true,
+      /* Capture programs write each primitive's vertices in the order of
+       * its provoking-vertex mode, fans included (apex_graphics.c). */
+      .transformFeedbackPreservesProvokingVertex = true,
+      /* One vertex stream; capture runs the vertex program as a compute
+       * pass before the draw. */
+      .transformFeedback = true,
       /* Border colors need no format; the texture unit replaces the
        * format's channels before the view's component mapping. */
       .customBorderColors = true,
@@ -578,6 +586,12 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .provokingVertexModePerPipeline = true,
       .maxCustomBorderColorSamplers = 4000,
       .maxVertexAttribDivisor = UINT32_MAX, .supportsNonZeroFirstInstance = true,
+      .transformFeedbackPreservesTriangleFanProvokingVertex = true,
+      /* Buffer sizes and offsets are 32-bit in the capture state. */
+      .maxTransformFeedbackStreams = 1, .maxTransformFeedbackBuffers = APEX_XFB_BUFFERS,
+      .maxTransformFeedbackBufferSize = UINT32_MAX,
+      .maxTransformFeedbackStreamDataSize = 512, .maxTransformFeedbackBufferDataSize = 512,
+      .maxTransformFeedbackBufferDataStride = 2048, .transformFeedbackQueries = true,
       .drmHasRender = has_render,
       .drmRenderMajor = has_render ? major(render_stat.st_rdev) : 0,
       .drmRenderMinor = has_render ? minor(render_stat.st_rdev) : 0,
