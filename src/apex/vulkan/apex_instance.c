@@ -13,7 +13,9 @@
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "wsi_common.h"
+#include "util/disk_cache.h"
 #include "util/log.h"
+#include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -609,6 +611,14 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .drmPrimaryMajor = has_primary ? major(primary_stat.st_rdev) : 0,
       .drmPrimaryMinor = has_primary ? minor(primary_stat.st_rdev) : 0,
    };
+   /* Pipeline caches are valid only for the driver build that wrote them. */
+   blake3_hasher cache_hash;
+   blake3_hash cache_id;
+   _mesa_blake3_init(&cache_hash);
+   if (disk_cache_get_function_identifier((void *)try_create_physical, &cache_hash)) {
+      _mesa_blake3_final(&cache_hash, cache_id);
+      memcpy(properties.pipelineCacheUUID, cache_id, VK_UUID_SIZE);
+   }
    /* Opaque-fd compatibility is the flat GEM byte layout, revision 1. */
    memcpy(properties.driverUUID, "Apex GEM bytes 1", VK_UUID_SIZE);
    properties.deviceUUID[0] = 0xee; properties.deviceUUID[1] = 0x10;
