@@ -639,7 +639,7 @@ test_small_floats(void)
       }
    }
    CHECK(n == 3 * ARRAY_SIZE(values));
-   /* The fragment kernel packs R11G11B10 through its channel fields. */
+   /* Format words pack R11G11B10 through its channel fields. */
    const struct util_format_description *desc = util_format_description(PIPE_FORMAT_R11G11B10_FLOAT);
    CHECK(desc->nr_channels == 3 && desc->channel[0].shift == 0 && desc->channel[0].size == 11 &&
          desc->channel[1].shift == 11 && desc->channel[2].shift == 22 && desc->channel[2].size == 10 &&
