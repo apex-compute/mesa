@@ -2248,4 +2248,6 @@ void
 apex_cmd_meta_init(struct vk_meta_device *meta)
 {
    meta->cmd_bind_map_buffer = bind_map_upload;
+   /* vk_meta splits rectangle draws into vertex uploads of this size. */
+   meta->max_bind_map_buffer_size_B = 64 * 1024;
 }
