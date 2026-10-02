@@ -162,7 +162,7 @@ apex_cp_test = executable('apex-cp-test', 'cp_test.c',
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
 )
-test('apex-cp', apex_cp_test, args : [apex_pipeline_spv], suite : ['apex'])
+
 apex_external_memory_test = executable('apex-external-memory-test', 'external_memory_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
@@ -201,6 +201,8 @@ foreach fixture : ['clip.vert', 'clip.frag']
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],
   )
 endforeach
+test('apex-cp', apex_cp_test, args : [apex_pipeline_spv, apex_triangle_spv], suite : ['apex'],
+  env : apex_test_env)
 test('apex-graphics-programs', apex_pipeline_test,
   args : ['--graphics', apex_texture_spv, apex_triangle_spv, apex_clip_spv],
   env : ['NIR_DEBUG=validate'], suite : ['apex'])

@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: MIT */
 /* Offline command-processor gate: packet encodings for every opcode, IB
  * growth, ring wrap and space accounting, the vkQueueSubmit batch sequence,
- * and a device recorded through Vulkan whose ring the command-processor model
- * in mock_kernel.h executes. Steady-state submission must issue no ioctl. */
-#include "apex_device.h"
+ * a device recorded through Vulkan whose ring the command-processor model in
+ * mock_kernel.h executes, and a render pass whose pass record, draw
+ * registers and state blocks the model reads back. Steady-state submission
+ * must issue no ioctl. */
+#include "apex_private.h"
 #include "apex_job.h"
 #include "apex_pipeline.h"
 #include "mock_kernel.h"
@@ -444,12 +446,313 @@ test_device(const char *spirv_path)
         "doorbell-only steady-state submission over ring wraps, multi-IB batch, fault to device loss");
 }
 
+static struct {
+   unsigned count;
+   struct mock_draw draws[8];
+} drawn;
+
+static void
+on_draw(struct mock_kernel *kernel, const struct mock_draw *d)
+{
+   if (drawn.count < ARRAY_SIZE(drawn.draws))
+      drawn.draws[drawn.count] = *d;
+   drawn.count++;
+}
+
+static VkShaderModule
+shader_module(const struct vk_device_dispatch_table *v, VkDevice dev, const char *path)
+{
+   size_t size;
+   uint32_t *code = load_spirv(path, &size);
+   VkShaderModule module;
+   const VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = size, .pCode = code};
+   CHECK(v->CreateShaderModule(dev, &mi, NULL, &module) == VK_SUCCESS);
+   free(code);
+   return module;
+}
+
+/* A render pass and its draws through Vulkan, executed by the CP model:
+ * the pass record in the bin pool, the draw registers, the state blocks
+ * they name and the draw packets (Docs/architecture.md, Command processor
+ * and user-mode rings; Fixed-function graphics). */
+static void
+test_graphics(const char *vertex_path, const char *fragment_path)
+{
+   struct vk_instance instance;
+   const struct vk_instance_extension_table extensions = {0};
+   const struct vk_instance_dispatch_table instance_dispatch = {0};
+   const VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+   CHECK(vk_instance_init(&instance, &extensions, &instance_dispatch, &ii,
+                          vk_default_allocator()) == VK_SUCCESS);
+   (void)vk_instance_to_handle(&instance);
+   struct vk_physical_device physical;
+   const struct vk_physical_device_dispatch_table physical_dispatch = {0};
+   const struct vk_properties properties = {.subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16};
+   const struct vk_features features = {.dynamicRendering = true};
+   CHECK(vk_physical_device_init(&physical, &instance, NULL, &features, &properties,
+                                 &physical_dispatch) == VK_SUCCESS);
+   (void)vk_physical_device_to_handle(&physical);
+   mock_kernel_init(&k);
+   k.on_draw = on_draw;
+   struct apex_device device;
+   const float priority = 1;
+   const VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueCount = 1, .pQueuePriorities = &priority};
+   const VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+   CHECK(apex_device_init(&device, &physical, &di, NULL, k.fd) == VK_SUCCESS);
+   VkDevice dev = apex_device_to_handle(&device);
+   const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
+   VkQueue queue;
+   v->GetDeviceQueue(dev, 0, 0, &queue);
+
+   /* A 100 x 70 RGBA8 target and a D24S8 depth-stencil image, tiled. */
+   const VkImageCreateInfo color_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {100, 70, 1},
+      .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+   VkImageCreateInfo depth_info = color_info;
+   depth_info.format = VK_FORMAT_D24_UNORM_S8_UINT;
+   depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   VkImage images[2];
+   CHECK(v->CreateImage(dev, &color_info, NULL, &images[0]) == VK_SUCCESS);
+   CHECK(v->CreateImage(dev, &depth_info, NULL, &images[1]) == VK_SUCCESS);
+   VkMemoryRequirements req;
+   v->GetImageMemoryRequirements(dev, images[0], &req);
+   /* 100 x 70 texels of 4 bytes: 4 x 3 tiles of 32 x 32. */
+   CHECK(req.size == 12 * 4096 && req.alignment == 4096);
+   const VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = 1 << 20, .memoryTypeIndex = 0};
+   VkDeviceMemory memory;
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, images[0], memory, 0) == VK_SUCCESS);
+   CHECK(v->BindImageMemory(dev, images[1], memory, 65536) == VK_SUCCESS);
+   const uint64_t memory_va = ((struct apex_memory *)apex_memory_from_handle(memory))->storage->bo.va;
+   VkImageView views[2];
+   for (unsigned i = 0; i < 2; i++) {
+      const VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = images[i], .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = i ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_R8G8B8A8_UNORM,
+         .subresourceRange = {i ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT :
+                              VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+      CHECK(v->CreateImageView(dev, &vi, NULL, &views[i]) == VK_SUCCESS);
+   }
+   VkBuffer vertices;
+   const VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096,
+      .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+   CHECK(v->CreateBuffer(dev, &bi, NULL, &vertices) == VK_SUCCESS);
+   CHECK(v->BindBufferMemory(dev, vertices, memory, 131072) == VK_SUCCESS);
+   const uint64_t buffer_va = memory_va + 131072;
+
+   VkShaderModule modules[2] = {shader_module(v, dev, vertex_path), shader_module(v, dev, fragment_path)};
+   const VkPipelineShaderStageCreateInfo stages[2] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = modules[0], .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = modules[1], .pName = "main"},
+   };
+   const VkVertexInputBindingDescription binding = {0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
+   const VkVertexInputAttributeDescription attributes[2] = {
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R8G8B8A8_UNORM, 16},
+   };
+   const VkPipelineVertexInputStateCreateInfo vis = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+      .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
+      .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = attributes,
+   };
+   const VkPipelineInputAssemblyStateCreateInfo ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, .primitiveRestartEnable = VK_TRUE,
+   };
+   const VkViewport viewport = {4, 6, 80, 60, 0.25f, 0.75f};
+   const VkRect2D scissor = {{2, 3}, {90, 50}};
+   const VkPipelineViewportStateCreateInfo vp = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor,
+   };
+   const VkPipelineRasterizationStateCreateInfo rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+      .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_BACK_BIT,
+      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f,
+   };
+   const VkPipelineMultisampleStateCreateInfo ms = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+   };
+   const VkPipelineDepthStencilStateCreateInfo dss = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+      .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS,
+   };
+   const VkPipelineColorBlendAttachmentState blend = {
+      .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+      .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
+      .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+      .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf,
+   };
+   const VkPipelineColorBlendStateCreateInfo cb = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+      .attachmentCount = 1, .pAttachments = &blend,
+   };
+   const VkFormat color = VK_FORMAT_R8G8B8A8_UNORM;
+   const VkPipelineRenderingCreateInfo rendering = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .colorAttachmentCount = 1, .pColorAttachmentFormats = &color,
+      .depthAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT, .stencilAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT,
+   };
+   const VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+   VkPipelineLayout layout;
+   CHECK(v->CreatePipelineLayout(dev, &li, NULL, &layout) == VK_SUCCESS);
+   const VkGraphicsPipelineCreateInfo pi = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering,
+      .stageCount = 2, .pStages = stages, .pVertexInputState = &vis, .pInputAssemblyState = &ia,
+      .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
+      .pDepthStencilState = &dss, .pColorBlendState = &cb, .layout = layout,
+   };
+   VkPipeline pipeline;
+   CHECK(v->CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
+   const VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+      .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = 2};
+   VkQueryPool pool;
+   CHECK(v->CreateQueryPool(dev, &qpi, NULL, &pool) == VK_SUCCESS);
+
+   VkCommandPool command_pool;
+   const VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   CHECK(v->CreateCommandPool(dev, &cpi, NULL, &command_pool) == VK_SUCCESS);
+   const VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = command_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+   VkCommandBuffer cmd;
+   CHECK(v->AllocateCommandBuffers(dev, &cai, &cmd) == VK_SUCCESS);
+   const VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   v->CmdResetQueryPool(cmd, pool, 0, 2);
+   const VkRenderingAttachmentInfo color_attachment = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = views[0],
+      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue.color.float32 = {1.0f, 0.0f, 0.5f, 1.0f}};
+   const VkRenderingAttachmentInfo depth_attachment = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = views[1],
+      .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .clearValue.depthStencil = {1.0f, 0x5a}};
+   const VkRenderingInfo render = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {{0, 0}, {100, 70}}, .layerCount = 1, .colorAttachmentCount = 1,
+      .pColorAttachments = &color_attachment, .pDepthAttachment = &depth_attachment,
+      .pStencilAttachment = &depth_attachment};
+   v->CmdBeginRendering(cmd, &render);
+   v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   const VkDeviceSize offset = 64;
+   v->CmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
+   v->CmdBeginQuery(cmd, pool, 1, 0);
+   v->CmdDraw(cmd, 4, 2, 1, 3);
+   v->CmdEndQuery(cmd, pool, 1);
+   v->CmdBindIndexBuffer(cmd, vertices, 1024, VK_INDEX_TYPE_UINT16);
+   v->CmdDrawIndexed(cmd, 6, 1, 2, -1, 0);
+   v->CmdDrawIndirect(cmd, vertices, 2048, 3, 16);
+   v->CmdEndRendering(cmd);
+   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+   const VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+      .commandBuffer = cmd};
+   const VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+      .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+   CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
+   mock_cp_run(&k);
+   CHECK(!k.blocked && !k.in_pass && k.packets[APEX_CP_BEGIN_PASS] == 1 && k.packets[APEX_CP_END_PASS] == 1);
+   CHECK(k.packets[APEX_CP_QUERY_BEGIN] == 1 && k.packets[APEX_CP_QUERY_END] == 1 && drawn.count == 3);
+
+   /* The pass record in the bin pool: pool, 32 MiB, area, one layer, 64 x
+    * 64 tiles of one sample, the regions; color attachment 0 cleared and
+    * stored, tiled at 4 tiles per row; the depth-stencil attachment
+    * cleared, not stored. */
+   const uint64_t pool_va = device.bin_pool.va;
+   uint32_t record[128];
+   mock_read(&k, pool_va, record, sizeof(record));
+   CHECK(MOCK_U64(record, 0) == pool_va && record[2] == APEX_BIN_POOL_BYTES && record[3] == 0 &&
+         record[4] == (100 | 70u << 16) && record[5] == 1 && record[7] == 0);
+   CHECK(record[8] == APEX_POOL_DRAW_BYTES && record[9] == APEX_POOL_VERTEX_BYTES &&
+         record[10] == APEX_POOL_PRIMITIVE_BYTES);
+   const uint32_t *a = &record[16];
+   CHECK(a[0] == (1 | 1u << 1 | 1u << 5 | 3u << 16) && a[1] == (uint32_t)memory_va &&
+         a[2] == ((uint32_t)(memory_va >> 32) | 4u << 16) && a[3] == 12 * 4096 / 64 && a[8] == 12 * 4096 / 64);
+   CHECK(a[4] == (0xff | 0x80u << 16 | 0xffu << 24));
+   a = &record[16 + 12 * 8];
+   CHECK(a[0] == (1 | 1u << 1 | 1u << 3 | 1u << 5 | 1u << 8 | 3u << 16) && a[1] == (uint32_t)(memory_va + 65536));
+   CHECK(a[4] == 0x3f800000 && a[6] == (0xffffff | 0x5au << 24));
+
+   /* Draw 0: the vertex registers, the vertex-input block and the program. */
+   const struct mock_draw *d = &drawn.draws[0];
+   CHECK(d->op == APEX_CP_DRAW && d->payload[0] == 4 && d->payload[1] == 2 && d->payload[2] == 1 &&
+         d->payload[3] == 3);
+   uint64_t vs = MOCK_U64(d->state, APEX_STATE_VERTEX), fs = MOCK_U64(d->state, APEX_STATE_FRAGMENT);
+   CHECK(!(vs & 63) && !(fs & 63) && mock_read32(&k, vs) == 0x50585041 && mock_read32(&k, fs) == 0x50585041);
+   CHECK((mock_read32(&k, vs + 4) & 0xff) == 1 && (mock_read32(&k, fs + 4) & 0xff) == 2);
+   uint32_t vi[128];
+   mock_read(&k, MOCK_U64(d->state, APEX_STATE_VERTEX + 2), vi, sizeof(vi));
+   CHECK(vi[0] == (uint32_t)(buffer_va + 64) && vi[1] == (((buffer_va + 64) >> 32) | 32u << 16) &&
+         vi[2] == 4096 - 64);
+   CHECK(vi[64] == ((1u << 2 | 3) << 8) && vi[65] == 2 && vi[66] == ((4u << 2 | 3) << 8 | 16u << 16) &&
+         vi[67] == 6 && vi[96] == 0);
+   /* Topology TRIANGLE_STRIP; restart applies to indexed draws. */
+   CHECK(d->state[APEX_STATE_VERTEX + 8] == 4 && !d->state[APEX_STATE_VERTEX + 9]);
+   /* Fragment registers: raster, depth-stencil, blend and viewport blocks. */
+   uint32_t raster[16], ds[16], blend_block[64], viewport_block[256];
+   mock_read(&k, MOCK_U64(d->state, APEX_STATE_FRAGMENT + 2), raster, sizeof(raster));
+   mock_read(&k, MOCK_U64(d->state, APEX_STATE_FRAGMENT + 4), ds, sizeof(ds));
+   mock_read(&k, MOCK_U64(d->state, APEX_STATE_FRAGMENT + 6), blend_block, sizeof(blend_block));
+   mock_read(&k, MOCK_U64(d->state, APEX_STATE_FRAGMENT + 8), viewport_block, sizeof(viewport_block));
+   CHECK(raster[0] == (2 | 1u << 2 | 1u << 9) && raster[1] == 1);
+   CHECK(ds[0] == (1 | 2 | 1u << 2 | 1u << 8) && ds[2] == 0x33800000);
+   CHECK(blend_block[0] == 0 && blend_block[1] == (0xf | 0u << 4 | 1u << 9 | 7u << 17 | 6u << 22 | 1u << 30));
+   CHECK(viewport_block[0] == 0x40800000 && viewport_block[3] == 0x42700000 && viewport_block[4] == 0x3e800000 &&
+         viewport_block[128] == (2 | 3u << 16) && viewport_block[129] == (92 | 53u << 16));
+   CHECK(d->state[APEX_STATE_DYNAMIC + 12] == 1 && d->state[APEX_STATE_DYNAMIC + 11] == 0x3f800000);
+   /* Both stages read one table; the vertex stage's view index is 0. */
+   uint64_t table = MOCK_U64(d->state, APEX_STATE_VERTEX_USER);
+   CHECK(table && table == MOCK_U64(d->state, APEX_STATE_FRAGMENT_USER) && !d->state[APEX_STATE_VERTEX_USER + 2]);
+
+   /* Draw 1: indexed, 16-bit indices from byte 1024 with restart. */
+   d = &drawn.draws[1];
+   CHECK(d->op == APEX_CP_DRAW_INDEXED && d->payload[0] == 6 && d->payload[2] == 2 &&
+         d->payload[3] == 0xffffffff && d->payload[4] == 0);
+   CHECK(MOCK_U64(d->state, APEX_STATE_VERTEX + 4) == buffer_va + 1024 &&
+         d->state[APEX_STATE_VERTEX + 6] == 4096 - 1024 && d->state[APEX_STATE_VERTEX + 7] == 1 &&
+         d->state[APEX_STATE_VERTEX + 9] == 1 && d->state[APEX_STATE_VERTEX + 10] == 0xffffffff);
+   /* Draw 2: three commands from the buffer at its 16-byte stride. */
+   d = &drawn.draws[2];
+   CHECK(d->op == APEX_CP_DRAW_INDIRECT && MOCK_U64(d->payload, 0) == buffer_va + 2048 &&
+         d->payload[2] == 3 && d->payload[3] == 16 && !MOCK_U64(d->payload, 4));
+   /* The query's availability follows END_PASS. */
+   CHECK(mock_read32(&k, ((struct apex_query_pool *)apex_query_pool_from_handle(pool))->bo.va + 16 + 8) == 1);
+   CHECK(v->QueueWaitIdle(queue) == VK_SUCCESS);
+
+   v->FreeCommandBuffers(dev, command_pool, 1, &cmd);
+   v->DestroyCommandPool(dev, command_pool, NULL);
+   v->DestroyQueryPool(dev, pool, NULL);
+   v->DestroyPipeline(dev, pipeline, NULL);
+   v->DestroyPipelineLayout(dev, layout, NULL);
+   for (unsigned i = 0; i < 2; i++) {
+      v->DestroyShaderModule(dev, modules[i], NULL);
+      v->DestroyImageView(dev, views[i], NULL);
+      v->DestroyImage(dev, images[i], NULL);
+   }
+   v->DestroyBuffer(dev, vertices, NULL);
+   v->FreeMemory(dev, memory, NULL);
+   apex_device_finish(&device);
+   CHECK(!k.queue && !k.live);
+   mock_kernel_finish(&k);
+   vk_physical_device_finish(&physical);
+   vk_instance_finish(&instance);
+   puts("PASS Apex CP graphics: pass record and attachments in the bin pool, draw registers, vertex-input, "
+        "raster, depth-stencil, blend and viewport blocks, DRAW, DRAW_INDEXED, DRAW_INDIRECT, queries");
+}
+
 int
 main(int argc, char **argv)
 {
-   CHECK(argc == 2);
+   CHECK(argc == 4);
    test_encoder();
    test_ring();
    test_device(argv[1]);
+   test_graphics(argv[2], argv[3]);
    return 0;
 }

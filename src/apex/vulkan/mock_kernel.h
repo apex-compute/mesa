@@ -36,6 +36,12 @@ struct mock_dispatch {
    uint32_t grid[3];
 };
 
+/* A draw packet with the registers it snapshots. */
+struct mock_draw {
+   uint32_t state[0x100];
+   uint32_t op, payload[6];
+};
+
 struct mock_kernel {
    int fd;
    uint64_t next_offset;
@@ -54,8 +60,9 @@ struct mock_kernel {
    uint32_t state[0x100];
    uint64_t time;
    unsigned packets[256];
-   bool blocked;
+   bool blocked, in_pass;
    void (*on_dispatch)(struct mock_kernel *, const struct mock_dispatch *);
+   void (*on_draw)(struct mock_kernel *, const struct mock_draw *);
    void *data;
 };
 
@@ -157,7 +164,7 @@ mock_kernel_ioctl(struct mock_kernel *k, unsigned long request, void *arg)
       *(struct drm_apex_info *)arg = (struct drm_apex_info) {
          .local_bytes = 8ull << 30, .visible_bytes = 8ull << 30, .timestamp_hz = 250000000,
          .queue_slots = 64, .vm_slots = 64, .queues_per_file = 8,
-         .cores = 1, .texture_units = 0, .tile_planes = 0,
+         .cores = 2, .texture_units = 1, .tile_planes = 16,
       };
       return 0;
    case DRM_IOCTL_APEX_GEM_CREATE: {
@@ -320,8 +327,39 @@ mock_cp_stream(struct mock_kernel *k, uint64_t base, uint32_t mask, uint32_t *po
          break;
       }
       case APEX_CP_SET_STATE:
-         MOCK_CHECK(p[0] + count - 1 <= 0x100);
+         /* The register file's accepted indices. */
+         for (uint32_t r = p[0]; r < p[0] + count - 1; r++)
+            MOCK_CHECK(r <= 0x009 || (r >= 0x010 && r <= 0x02a) || (r >= 0x030 && r <= 0x04b) ||
+                       (r >= 0x050 && r <= 0x06f) || (r >= 0x080 && r <= 0x0ff));
          memcpy(&k->state[p[0]], &p[1], (count - 1) * 4);
+         break;
+      case APEX_CP_BEGIN_PASS: {
+         /* The pass registers become the pass record at the pool's start. */
+         uint64_t pool = MOCK_U64(k->state, APEX_STATE_PASS);
+         MOCK_CHECK(!k->in_pass && !(pool & 63) && k->state[APEX_STATE_PASS + 2] >= 1u << 20);
+         mock_write(k, pool, &k->state[APEX_STATE_PASS], 512);
+         k->in_pass = true;
+         break;
+      }
+      case APEX_CP_END_PASS:
+         MOCK_CHECK(k->in_pass);
+         k->in_pass = false;
+         break;
+      case APEX_CP_DRAW: case APEX_CP_DRAW_INDEXED:
+      case APEX_CP_DRAW_INDIRECT: case APEX_CP_DRAW_INDEXED_INDIRECT: {
+         MOCK_CHECK(k->in_pass && MOCK_U64(k->state, APEX_STATE_VERTEX));
+         struct mock_draw d = {.op = op};
+         memcpy(d.state, k->state, sizeof(d.state));
+         memcpy(d.payload, p, count * 4);
+         if (k->on_draw)
+            k->on_draw(k, &d);
+         break;
+      }
+      case APEX_CP_QUERY_BEGIN:
+         MOCK_CHECK(p[0] < 8);
+         break;
+      case APEX_CP_QUERY_END:
+         MOCK_CHECK(p[0] < 8 && !(p[1] & 7));
          break;
       case APEX_CP_DISPATCH: {
          struct mock_dispatch d;
