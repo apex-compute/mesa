@@ -370,6 +370,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
       .EXT_4444_formats = true,
+      .EXT_conditional_rendering = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
@@ -466,6 +467,10 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* The texture unit's 4444 class samples both alpha-first orders. */
       .formatA4R4G4B4 = true,
       .formatA4B4G4R4 = true,
+      /* PREDICATE skips draws and dispatches; secondaries replay into the
+       * primary under its predicate. */
+      .conditionalRendering = true,
+      .inheritedConditionalRendering = true,
    };
    struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,

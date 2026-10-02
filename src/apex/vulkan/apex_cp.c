@@ -212,6 +212,13 @@ apex_cp_query_end(struct apex_ib *ib, uint32_t slot, uint64_t va)
 }
 
 void
+apex_cp_predicate(struct apex_ib *ib, uint64_t va, uint32_t flags)
+{
+   assert(!(va & 3) && !(flags & ~(APEX_CP_PREDICATE_ENABLE | APEX_CP_PREDICATE_INVERTED)));
+   apex_cp_packet(ib, APEX_CP_PREDICATE, 3, (uint32_t[]){LO(va), HI(va), flags});
+}
+
+void
 apex_cp_batch(struct apex_ib *ib, const struct apex_cp_batch *batch)
 {
    if (batch->acquire_cache)

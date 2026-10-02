@@ -90,6 +90,7 @@ clear_commands(struct apex_command_buffer *cmd)
    memset(&cmd->xfb, 0, sizeof(cmd->xfb));
    cmd->query_slots = 0;
    cmd->meta = 0;
+   memset(&cmd->predicate, 0, sizeof(cmd->predicate));
    memset(&cmd->rendering, 0, sizeof(cmd->rendering));
    memset(cmd->push, 0, sizeof(cmd->push));
    memset(cmd->graphics_push, 0, sizeof(cmd->graphics_push));
@@ -152,6 +153,28 @@ const struct vk_command_buffer_ops apex_command_buffer_ops = {
    .create = create_command_buffer, .reset = reset_command_buffer, .destroy = destroy_command_buffer,
 };
 
+/* Conditional rendering: the application's draws and dispatches and the
+ * clears of vkCmdClearAttachments run under PREDICATE; driver work (vk_meta
+ * transfers, internal kernels, render-pass clears) runs with it off. The CP
+ * reads the predicate again each time PREDICATE turns it on. */
+static bool
+user_work(const struct apex_command_buffer *cmd)
+{
+   return !cmd->meta || cmd->predicate.meta;
+}
+
+static void
+predicate(struct apex_command_buffer *cmd, bool user)
+{
+   bool on = user && cmd->predicate.active;
+   if (on == cmd->predicate.on)
+      return;
+   apex_cp_predicate(&cmd->ib, on ? cmd->predicate.va : 0,
+                     on ? APEX_CP_PREDICATE_ENABLE |
+                          (cmd->predicate.inverted ? APEX_CP_PREDICATE_INVERTED : 0) : 0);
+   cmd->predicate.on = on;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_BeginCommandBuffer(VkCommandBuffer handle, const VkCommandBufferBeginInfo *info)
 {
@@ -166,6 +189,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL
 apex_EndCommandBuffer(VkCommandBuffer handle)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   /* The queue's predicate does not outlive the command buffer. */
+   predicate(cmd, false);
    if (cmd->ib.failed || cmd->data.size == UINT32_MAX)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
    else if (cmd->ib.count > 1u << 24)
@@ -475,6 +500,7 @@ apex_CmdDispatchBase(VkCommandBuffer handle, uint32_t ox, uint32_t oy, uint32_t 
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   predicate(cmd, user_work(cmd));
    struct apex_table *table = table_create(cmd, &cmd->pipeline->program, NULL, cmd->sets, cmd->push);
    if (table)
       dispatch_grid(cmd, &cmd->pipeline->program, table, (uint32_t[3]){ox, oy, oz}, (uint32_t[3]){x, y, z});
@@ -497,6 +523,7 @@ apex_CmdDispatchIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize o
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   predicate(cmd, user_work(cmd));
    struct apex_table *table = table_create(cmd, &cmd->pipeline->program, NULL, cmd->sets, cmd->push);
    if (table)
       emit_dispatch(cmd, &cmd->pipeline->program, table, (uint32_t[3]){0}, NULL,
@@ -504,14 +531,16 @@ apex_CmdDispatchIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize o
 }
 
 /* An internal kernel over a grid of workgroups with its job words; job
- * word w holds a data offset for bit w of `relocs`. */
+ * word w holds a data offset for bit w of `relocs`. `user` kernels belong
+ * to an application draw and share its predicate. */
 static void
 internal_dispatch(struct apex_command_buffer *cmd, enum apex_internal which, const uint32_t *words,
-                  const uint32_t grid[3], uint32_t relocs)
+                  const uint32_t grid[3], uint32_t relocs, bool user)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    if (!grid[0] || !grid[1] || !grid[2])
       return;
+   predicate(cmd, user && user_work(cmd));
    struct apex_program *program;
    VkResult result = apex_internal_program(device, which, &program);
    if (result != VK_SUCCESS) {
@@ -731,18 +760,28 @@ meta_rendering_info(const struct apex_command_buffer *cmd, struct vk_meta_render
       info->stencil_attachment_format = cmd->rendering.depth.format;
 }
 
-static VKAPI_ATTR void VKAPI_CALL
-apex_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAttachment *attachments,
-                         uint32_t rect_count, const VkClearRect *rects)
+/* The application's clears are rendering commands under conditional
+ * rendering; a render pass's own clears are not. */
+static void
+clear_attachments(struct apex_command_buffer *cmd, uint32_t count, const VkClearAttachment *attachments,
+                  uint32_t rect_count, const VkClearRect *rects, bool user)
 {
-   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    struct apex_device *device = (void *)cmd->vk.base.device;
    struct vk_meta_rendering_info render;
    meta_rendering_info(cmd, &render);
    struct saved_state saved;
    meta_begin(cmd, &saved);
+   cmd->predicate.meta = user;
    vk_meta_clear_attachments(&cmd->vk, &device->meta, &render, count, attachments, rect_count, rects);
+   cmd->predicate.meta = false;
    meta_end(cmd, &saved);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAttachment *attachments,
+                         uint32_t rect_count, const VkClearRect *rects)
+{
+   clear_attachments(apex_command_buffer_from_handle(handle), count, attachments, rect_count, rects, true);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -861,7 +900,7 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    if (clear) {
       const VkClearAttachment c = {.aspectMask = clear, .clearValue.depthStencil = clear_value};
       const VkClearRect rect = {.rect = info->renderArea, .layerCount = info->viewMask ? 1 : cmd->rendering.layers};
-      apex_CmdClearAttachments(handle, 1, &c, 1, &rect);
+      clear_attachments(cmd, 1, &c, 1, &rect, false);
    }
 }
 
@@ -1118,7 +1157,7 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
       emit_dispatch(cmd, capture, table, (uint32_t[3]){0}, (uint32_t[3]){groups, 1, 1}, 0);
    }
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
-   internal_dispatch(cmd, APEX_INTERNAL_XFB, words, (uint32_t[3]){1, 1, 1}, relocs);
+   internal_dispatch(cmd, APEX_INTERNAL_XFB, words, (uint32_t[3]){1, 1, 1}, relocs, true);
 }
 
 /* Multiview repeats the draw per view with the view index in user data;
@@ -1133,6 +1172,7 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   predicate(cmd, user_work(cmd));
    uint32_t views = cmd->rendering.view_mask ? cmd->rendering.view_mask : 1;
    u_foreach_bit(view, views) {
       if (!emit_draw_state(cmd, indexed, cmd->rendering.view_mask ? view : 0))
@@ -1185,7 +1225,7 @@ xfb_counters(struct apex_command_buffer *cmd, uint32_t mode, uint32_t first, uin
    if (!any)
       return;
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
-   internal_dispatch(cmd, APEX_INTERNAL_XFB, words, (uint32_t[3]){1, 1, 1}, BITFIELD_BIT(APEX_XFB_STATE));
+   internal_dispatch(cmd, APEX_INTERNAL_XFB, words, (uint32_t[3]){1, 1, 1}, BITFIELD_BIT(APEX_XFB_STATE), false);
 }
 
 /* A new state block: zero offsets, or the counter buffers' when resuming. */
@@ -1283,6 +1323,26 @@ apex_CmdDrawIndexedIndirectCount(VkCommandBuffer handle, VkBuffer buffer, VkDevi
 {
    record_indirect(apex_command_buffer_from_handle(handle), true, buffer, offset, count_buffer,
                    count_offset, draws, stride);
+}
+
+/* ---- Conditional rendering ---------------------------------------------- */
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdBeginConditionalRenderingEXT(VkCommandBuffer handle, const VkConditionalRenderingBeginInfoEXT *info)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   VK_FROM_HANDLE(apex_buffer, buffer, info->buffer);
+   cmd->predicate.va = buffer->vk.device_address + info->offset;
+   cmd->predicate.inverted = info->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+   cmd->predicate.active = true;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+apex_CmdEndConditionalRenderingEXT(VkCommandBuffer handle)
+{
+   VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
+   cmd->predicate.active = false;
+   predicate(cmd, false);
 }
 
 /* ---- Events, queries and timestamps ------------------------------------- */
@@ -1429,7 +1489,7 @@ apex_CmdCopyQueryPoolResults(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
       [APEX_QUERY_DST_STRIDE] = stride, [APEX_QUERY_COUNT] = count, [APEX_QUERY_FLAGS] = flags,
       [APEX_QUERY_VALUES] = qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2 : 1,
    };
-   internal_dispatch(cmd, APEX_INTERNAL_QUERY_COPY, words, (uint32_t[3]){DIV_ROUND_UP(count, 16), 1, 1}, 0);
+   internal_dispatch(cmd, APEX_INTERNAL_QUERY_COPY, words, (uint32_t[3]){DIV_ROUND_UP(count, 16), 1, 1}, 0, false);
 }
 
 /* ---- Transfers ---------------------------------------------------------- */
@@ -1545,7 +1605,7 @@ copy_surfaces(struct apex_command_buffer *cmd, const uint32_t src[APEX_SURFACE_W
    words[APEX_COPY_SRC_OFFSET] = src_offset;
    words[APEX_COPY_DST_OFFSET] = dst_offset;
    words[APEX_COPY_MASK] = mask;
-   internal_dispatch(cmd, APEX_INTERNAL_COPY, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, planes}, 0);
+   internal_dispatch(cmd, APEX_INTERNAL_COPY, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, planes}, 0, false);
 }
 
 /* Element of one aspect within a texel: byte offset, bytes and the bits of
@@ -1697,7 +1757,7 @@ record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, u
    words[APEX_DECODE_EXTENT + 1] = height;
    words[APEX_DECODE_EXTENT + 2] = layers;
    words[APEX_DECODE_KIND] = kind;
-   internal_dispatch(cmd, APEX_INTERNAL_ETC2, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, layers}, 0);
+   internal_dispatch(cmd, APEX_INTERNAL_ETC2, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, layers}, 0, false);
 }
 
 /* The clear kernel over layers x rect of one level: pattern and mask
@@ -1722,7 +1782,7 @@ record_clear(struct apex_command_buffer *cmd, const struct apex_image *image, un
    words[APEX_CLEAR_BYTES] = vk_format_get_blocksize(image->vk.format);
    memcpy(&words[APEX_CLEAR_PATTERN], pattern, 16);
    memcpy(&words[APEX_CLEAR_MASK], mask, 16);
-   internal_dispatch(cmd, APEX_INTERNAL_CLEAR, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, planes}, 0);
+   internal_dispatch(cmd, APEX_INTERNAL_CLEAR, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, planes}, 0, false);
 }
 
 static void
@@ -2242,6 +2302,8 @@ apex_cmd_entrypoints(struct vk_device_entrypoint_table *t)
    t->CmdBlitImage2 = apex_CmdBlitImage2;
    t->CmdResolveImage2 = apex_CmdResolveImage2;
    t->CmdPipelineBarrier2 = apex_CmdPipelineBarrier2;
+   t->CmdBeginConditionalRenderingEXT = apex_CmdBeginConditionalRenderingEXT;
+   t->CmdEndConditionalRenderingEXT = apex_CmdEndConditionalRenderingEXT;
 }
 
 void

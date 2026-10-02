@@ -187,6 +187,13 @@ struct apex_command_buffer {
    struct { uint64_t va; uint8_t slot; } queries[8];
    struct util_dynarray pass_availability;
    unsigned meta;
+   /* Conditional rendering: the predicate while active, whether PREDICATE
+    * is on in the queue, and whether vk_meta work counts as the
+    * application's (vkCmdClearAttachments). */
+   struct {
+      uint64_t va;
+      bool active, inverted, on, meta;
+   } predicate;
    struct {
       bool active, suspending;
       VkRect2D area;

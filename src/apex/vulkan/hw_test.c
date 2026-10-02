@@ -538,7 +538,8 @@ test_descriptors(void)
          field(d, 16, 2) == 2 && field(d, 18, 1) == 0 && field(d, 19, 4) == 0);
    CHECK(field(d, 23, 14) == ((uint32_t)-640 & 0x3fff) && field(d, 37, 12) == 320 && field(d, 49, 12) == 4095 &&
          field(d, 61, 3) == 3 && field(d, 64, 64) == 0 && d[4] == f2u(0.5f) && d[7] == f2u(1.0f));
-   puts("PASS texture-unit descriptors: image and sampler bits, format classes with 4444, 1555 and packed floats, depth and stencil views");
+   puts("PASS texture-unit descriptors: image and sampler bits, format classes with 4444, 1555 and "
+        "packed floats, depth and stencil views");
 }
 
 /* The internal copy kernel, compiled by p7-isa and run on the ISA model,

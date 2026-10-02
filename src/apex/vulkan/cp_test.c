@@ -103,6 +103,9 @@ test_encoder(void)
    apex_cp_query_begin(&ib, 3);
    apex_cp_query_end(&ib, 3, 0x900);
    EXPECT(&ib, 0x00000161, 3, 0x00000362, 3, 0x900, 0);
+   apex_cp_predicate(&ib, 0x3000000a04ull, APEX_CP_PREDICATE_ENABLE | APEX_CP_PREDICATE_INVERTED);
+   apex_cp_predicate(&ib, 0, 0);
+   EXPECT(&ib, 0x00000363, 0xa04, 0x30, 3, 0x00000363, 0, 0, 0);
    apex_cp_packet(&ib, APEX_CP_TLB_INVALIDATE, 1, (uint32_t[]){9});
    apex_cp_packet(&ib, APEX_CP_VM_DRAIN, 1, (uint32_t[]){9});
    EXPECT(&ib, 0x00000180, 9, 0x00000181, 9);
@@ -952,6 +955,56 @@ test_graphics(const char *vertex_path, const char *fragment_path, const char *xf
    /* The query's availability follows END_PASS. */
    CHECK(mock_read32(&k, ((struct apex_query_pool *)apex_query_pool_from_handle(pool))->bo.va + APEX_QUERY_STRIDE + APEX_QUERY_AVAILABLE) == 1);
    CHECK(v->QueueWaitIdle(queue) == VK_SUCCESS);
+
+   /* Conditional rendering: under a zero predicate the draw and the
+    * application's attachment clear skip while the query copy, driver work,
+    * runs with PREDICATE off; an inverted nonzero predicate skips, a plain
+    * one draws. Each PREDICATE that turns skipping on reads the value. */
+   const uint32_t predicates[2] = {0, 1};
+   mock_write(&k, buffer_va + 3072, predicates, sizeof(predicates));
+   CHECK(v->ResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+   CHECK(v->BeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+   const VkConditionalRenderingBeginInfoEXT conditions[3] = {
+      {.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT, .buffer = vertices, .offset = 3072},
+      {.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT, .buffer = vertices, .offset = 3076,
+       .flags = VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT},
+      {.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT, .buffer = vertices, .offset = 3076},
+   };
+   for (unsigned c = 0; c < 3; c++) {
+      v->CmdBeginConditionalRenderingEXT(cmd, &conditions[c]);
+      v->CmdBeginRendering(cmd, &render);
+      v->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      v->CmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
+      v->CmdDraw(cmd, 4, 1, 0, 0);
+      if (c == 0) {
+         const VkClearAttachment clear = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .clearValue.color.float32 = {0, 1, 0, 1}};
+         const VkClearRect rect = {.rect = {{0, 0}, {16, 16}}, .layerCount = 1};
+         v->CmdClearAttachments(cmd, 1, &clear, 1, &rect);
+      }
+      v->CmdEndRendering(cmd);
+      if (c == 0)
+         v->CmdCopyQueryPoolResults(cmd, pool, 0, 2, vertices, 3584, 8, 0);
+      v->CmdEndConditionalRenderingEXT(cmd);
+   }
+   CHECK(v->EndCommandBuffer(cmd) == VK_SUCCESS);
+   unsigned draws_before = 0, dispatches = k.packets[APEX_CP_DISPATCH], drawn_before = drawn.count;
+   unsigned predicates_before = k.packets[APEX_CP_PREDICATE], skipped = k.skipped;
+   for (unsigned op = APEX_CP_DRAW; op <= APEX_CP_DRAW_INDEXED_INDIRECT; op++)
+      draws_before += k.packets[op];
+   CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
+   mock_cp_run(&k);
+   unsigned draws = 0;
+   for (unsigned op = APEX_CP_DRAW; op <= APEX_CP_DRAW_INDEXED_INDIRECT; op++)
+      draws += k.packets[op];
+   draws -= draws_before;
+   /* The skipped draws: the first, the clear's (at least one) and the
+    * second; the third draws. On, off for the query copy, on and off,
+    * on and off. */
+   CHECK(!k.blocked && !k.predicate && draws >= 4 && k.skipped - skipped == draws - 1 &&
+         drawn.count == drawn_before + 1 && k.packets[APEX_CP_DISPATCH] > dispatches &&
+         k.packets[APEX_CP_PREDICATE] - predicates_before == 6);
+   CHECK(v->QueueWaitIdle(queue) == VK_SUCCESS);
    test_transform_feedback(v, dev, queue, memory, views[0], xfb_path, fragment_path);
 
    v->FreeCommandBuffers(dev, command_pool, 1, &cmd);
@@ -973,7 +1026,7 @@ test_graphics(const char *vertex_path, const char *fragment_path, const char *xf
    vk_instance_finish(&instance);
    puts("PASS Apex CP graphics: pass record and attachments in the bin pool, draw registers, vertex-input, "
         "raster, depth-stencil, blend and viewport blocks, DRAW, DRAW_INDEXED, DRAW_INDIRECT, queries, "
-        "transform feedback capture on the ISA model");
+        "conditional rendering, transform feedback capture on the ISA model");
 }
 
 int

@@ -61,6 +61,9 @@ struct mock_kernel {
    uint64_t time;
    unsigned packets[256];
    bool blocked, in_pass;
+   /* PREDICATE: draws and dispatches skip while set; `skipped` counts them. */
+   bool predicate;
+   unsigned skipped;
    void (*on_dispatch)(struct mock_kernel *, const struct mock_dispatch *);
    void (*on_draw)(struct mock_kernel *, const struct mock_draw *);
    void *data;
@@ -296,6 +299,7 @@ mock_count_ok(uint32_t op, uint32_t count)
    case APEX_CP_TIMESTAMP: return count == 3;
    case APEX_CP_QUERY_BEGIN: return count == 1;
    case APEX_CP_QUERY_END: return count == 3;
+   case APEX_CP_PREDICATE: return count == 3;
    default: return false;
    }
 }
@@ -319,6 +323,12 @@ mock_cp_stream(struct mock_kernel *k, uint64_t base, uint32_t mask, uint32_t *po
       for (uint32_t i = 0; i < count; i++)
          mock_read(k, base + (uint64_t)((start + 1 + i) & mask) * 4, &p[i], 4);
       k->packets[op]++;
+      bool skippable = op == APEX_CP_DISPATCH || op == APEX_CP_DISPATCH_INDIRECT ||
+                       (op >= APEX_CP_DRAW && op <= APEX_CP_DRAW_INDEXED_INDIRECT);
+      if (skippable && k->predicate) {
+         k->skipped++;
+         op = APEX_CP_NOP;
+      }
       switch (op) {
       case APEX_CP_INDIRECT: {
          MOCK_CHECK(depth < 2 && p[2] && !(p[0] & 3));
@@ -362,6 +372,16 @@ mock_cp_stream(struct mock_kernel *k, uint64_t base, uint32_t mask, uint32_t *po
          break;
       case APEX_CP_QUERY_END:
          MOCK_CHECK(p[0] < 8 && !(p[1] & 7));
+         break;
+      case APEX_CP_PREDICATE:
+         /* Bit 0 reads the u32 as the packet executes; bit 1 inverts. */
+         MOCK_CHECK(!(p[2] & ~3u));
+         if (p[2] & 1) {
+            MOCK_CHECK(!(p[0] & 3));
+            k->predicate = (mock_read32(k, MOCK_U64(p, 0)) == 0) != ((p[2] >> 1) & 1);
+         } else {
+            k->predicate = false;
+         }
          break;
       case APEX_CP_DISPATCH: {
          struct mock_dispatch d;

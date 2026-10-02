@@ -30,6 +30,7 @@ enum apex_cp_op {
    APEX_CP_TIMESTAMP = 0x60,
    APEX_CP_QUERY_BEGIN = 0x61,
    APEX_CP_QUERY_END = 0x62,
+   APEX_CP_PREDICATE = 0x63,
    APEX_CP_TLB_INVALIDATE = 0x80,
    APEX_CP_VM_DRAIN = 0x81,
 };
@@ -65,6 +66,10 @@ enum apex_cp_op {
 
 /* WRITE and TIMESTAMP flag bit 0: after prior work of the queue. */
 #define APEX_CP_AFTER_PRIOR_WORK 1u
+/* PREDICATE flags: skip draws and dispatches while the u32 at the address
+ * is zero, or nonzero when inverted; no flags stop skipping. */
+#define APEX_CP_PREDICATE_ENABLE (1u << 0)
+#define APEX_CP_PREDICATE_INVERTED (1u << 1)
 
 /* Status page, written by the CP in host memory. */
 #define APEX_STATUS_RPTR 0
@@ -122,6 +127,8 @@ void apex_cp_write(struct apex_ib *ib, uint64_t va, uint32_t flags, uint32_t dwo
 void apex_cp_timestamp(struct apex_ib *ib, uint64_t va, uint32_t flags);
 void apex_cp_query_begin(struct apex_ib *ib, uint32_t slot);
 void apex_cp_query_end(struct apex_ib *ib, uint32_t slot, uint64_t va);
+/* `va` is 4-byte aligned; ignored without APEX_CP_PREDICATE_ENABLE. */
+void apex_cp_predicate(struct apex_ib *ib, uint64_t va, uint32_t flags);
 
 /* The per-queue user-mode ring. `status` is the read-only status page and
  * `doorbell` the queue's doorbell page (offset 0: wptr on write, live rptr
