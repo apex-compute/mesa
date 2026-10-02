@@ -535,7 +535,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .minStorageBufferOffsetAlignment = 4,
       .nonCoherentAtomSize = 1,
       .optimalBufferCopyOffsetAlignment = 64,
-      /* Device timebase: 250 MHz on both profiles. */
+      /* The device timebase the kernel reads from BAR0 TIMEBASE. */
       .timestampPeriod = 1e9f / caps.timestamp_hz, .timestampComputeAndGraphics = true,
       .optimalBufferCopyRowPitchAlignment = 64,
       /* Descriptor bounds are checked without rounding, per 32-bit component. */

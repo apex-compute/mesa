@@ -18,6 +18,8 @@
 #define PROC(type, name) PFN_vk##type name = (PFN_vk##type)gipa(instance, "vk" #type); CHECK(name)
 
 static int fault, open_count, last_fd;
+/* DRM_APEX_INFO timestamp_hz the mock kernel reports, when nonzero. */
+static uint64_t timestamp_hz;
 static bool mock;
 /* Each render-node open is a fresh DRM file: a mock kernel on its memfd. */
 static struct mock_kernel kernels[32];
@@ -105,6 +107,8 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
          return -1;
       }
       mock_kernel_ioctl(kernel, request, arg);
+      if (timestamp_hz)
+         ((struct drm_apex_info *)arg)->timestamp_hz = timestamp_hz;
       if (fault == 3)
          ((struct drm_apex_info *)arg)->timestamp_hz = 0;
       return 0;
@@ -162,6 +166,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    PROC(GetPhysicalDeviceProperties, get_properties);
    VkPhysicalDeviceProperties props;
    get_properties(physical, &props);
+   /* The timestamp period follows the clock the kernel reports. */
+   CHECK(props.limits.timestampPeriod == 1e9f / (timestamp_hz ? timestamp_hz : 250000000));
    CHECK(props.limits.maxComputeWorkGroupCount[0] == 65535 &&
          props.limits.maxComputeWorkGroupCount[1] == 65535 &&
          props.limits.maxComputeWorkGroupCount[2] == 65535 &&
@@ -554,7 +560,13 @@ int main(int argc, char **argv)
          version.name = fault == 1 ? "foreign-driver" : "apex-display";
          exercise(apex_GetInstanceProcAddr);
       }
-      puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, queue creation, cleanup (mock DRM)");
+      /* The M4.1 fabric's 125 MHz timebase and the M4.2 target's 250 MHz. */
+      fault = 0;
+      for (unsigned i = 0; i < 2; i++) {
+         timestamp_hz = i ? 250000000 : 125000000;
+         exercise(apex_GetInstanceProcAddr);
+      }
+      puts("PASS Apex instance: device/ABI/sync filtering, compute-only queries, fresh VM opens, queue creation, cleanup, timestamp period at 125 and 250 MHz (mock DRM)");
    } else {
       CHECK(!setenv("VK_DRIVER_FILES", argv[1], 1));
       /* The real system loader consumes the generated manifest and shared ICD. */

@@ -22,7 +22,7 @@
 struct drm_apex_info {
 	__u64 local_bytes;   /* allocatable LOCAL */
 	__u64 visible_bytes; /* BAR2 extent; equals local_bytes on U50 */
-	__u64 timestamp_hz;  /* 250000000 */
+	__u64 timestamp_hz;  /* device timestamp clock, BAR0 TIMEBASE */
 	__u32 queue_slots, vm_slots; /* per device; zero without a command processor */
 	__u32 queues_per_file;       /* 8 */
 	__u32 cores, texture_units, tile_planes;
