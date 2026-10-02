@@ -6,6 +6,7 @@
  * Docs/architecture.md (Fixed-function graphics) written out here, and the
  * internal copy kernel run on the ISA model (Tooling/apex_isa) through the
  * tiled layout. */
+#include "apex_device.h"
 #include "apex_graphics.h"
 #include "apex_hw.h"
 #include "apex_job.h"
@@ -279,11 +280,113 @@ test_pass(void)
          apex_hw_tile_selector(4, 5) == 1);
    CHECK(apex_hw_selector_width(3) == 32 && apex_hw_selector_height(3) == 16);
    /* At most 4096 bins: 4096 x 4096 at 64 x 64 tiles is the limit. */
-   struct apex_hw_pass big = {.x1 = 4096, .y1 = 4096, .layers = 1, .samples = 1};
+   struct apex_hw_pass big = {.pool = 0x4200000000ull, .pool_bytes = 32 << 20, .x1 = 4096, .y1 = 4096,
+      .layers = 1, .samples = 1, .draw_bytes = 2 << 20, .vertex_bytes = 8 << 20, .primitive_bytes = 6 << 20};
    CHECK(apex_hw_pass_record(&big, w));
    big.layers = 2;
    CHECK(!apex_hw_pass_record(&big, w));
    puts("PASS pass record: header line, attachment descriptors, planes, tile selector, bin bound");
+}
+
+/* The raster back end's pass validation (raster_bins.veryl), written out
+ * here against records that each break one rule. */
+static void
+test_pass_validation(void)
+{
+   uint32_t r[APEX_HW_PASS_DWORDS], w[APEX_HW_PASS_DWORDS];
+   /* One 64 x 64 bin of a single-sampled RGBA8 pass in a 64 KiB pool:
+    * header 512, draws 1 KiB, heads 64, vertex outputs 2 KiB, primitives
+    * 128 and one chunk end at 3,840 bytes. */
+   const uint32_t base[17] = {0, 0x42, 3840, 0, 64 | 64u << 16, 1, 0, 0, 1024, 2048, 128,
+                              0, 0, 0, 0, 0, 1 | 3u << 16};
+   memset(r, 0, sizeof(r));
+   memcpy(r, base, sizeof(base));
+   CHECK(apex_hw_pass_valid(r));
+#define REJECTS(dword, value) do { \
+   memcpy(w, r, sizeof(r)); w[dword] = (value); CHECK(!apex_hw_pass_valid(w)); } while (0)
+#define ACCEPTS(dword, value) do { \
+   memcpy(w, r, sizeof(r)); w[dword] = (value); CHECK(apex_hw_pass_valid(w)); } while (0)
+   /* Header: selector, render area, layers, bins. */
+   REJECTS(7, 5);
+   ACCEPTS(7, 4);
+   REJECTS(4, 0 | 64u << 16);
+   REJECTS(3, 64 | 0u << 16);
+   REJECTS(5, 0);
+   REJECTS(5, 2049);
+   memcpy(w, r, sizeof(r));
+   w[2] = 32 << 20, w[4] = 128 | 64u << 16, w[5] = 2048;
+   CHECK(apex_hw_pass_valid(w));
+   w[4] = 129 | 64u << 16;
+   CHECK(!apex_hw_pass_valid(w));
+   /* Regions: draws at least 1 KiB, primitives at least 128 bytes, the
+    * last chunk inside the pool. */
+   REJECTS(8, 1023);
+   REJECTS(10, 127);
+   REJECTS(2, 3839);
+   ACCEPTS(2, 3840);
+   memcpy(w, r, sizeof(r));
+   w[4] = 128 | 64u << 16; /* two bins still take one 64-byte head line */
+   CHECK(apex_hw_pass_valid(w));
+   w[4] = 64 | 1088u << 16; /* 17 bins take two */
+   CHECK(!apex_hw_pass_valid(w));
+   /* Color formats: classes 1-11 and 13 with the types they take, 1555
+    * with either alpha order; no 4444, D24 or packed float. */
+   const struct { uint8_t format; bool ok; } formats[] = {
+      {0x00, false}, {0x01, true}, {0x13, true}, {0x53, true}, {0xd3, true}, {0x5d, true},
+      {0x54, false}, {0x44, true}, {0x49, true}, {0x4a, false}, {0x4b, false}, {0x0a, true},
+      {0x8a, true}, {0x2b, true}, {0x14, true}, {0x16, true}, {0x17, false}, {0x1b, false},
+      {0x1d, true}, {0x0c, false}, {0x0e, false}, {0x6e, false}, {0x0f, true}, {0x8f, true},
+      {0x6f, true}, {0xef, true}, {0x1f, false}, {0x4f, false}, {0x63, false}, {0x7b, false},
+      {0x07, true}, {0x37, true},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(formats); i++) {
+      CHECK(apex_hw_color_renderable(formats[i].format) == formats[i].ok);
+      memcpy(w, r, sizeof(r));
+      w[16] = 1 | (uint32_t)formats[i].format << 16;
+      CHECK(apex_hw_pass_valid(w) == formats[i].ok);
+   }
+   /* Depth formats 1-6; an absent attachment's byte is not checked. */
+   const unsigned depth = APEX_HW_PASS_ATTACHMENT(APEX_HW_DEPTH_ATTACHMENT);
+   for (unsigned f = 0; f < 8; f++) {
+      memcpy(w, r, sizeof(r));
+      w[depth] = 1 | 1u << 8 | f << 16;
+      CHECK(apex_hw_pass_valid(w) == (f >= 1 && f <= 6));
+   }
+   ACCEPTS(28, 0x7fu << 16);
+   /* Planes: an RGBA32 target on an even pair, ending within 16 planes at
+    * 64 x 64 single-sampled; 4 samples fit four planes at 64 x 64. */
+   ACCEPTS(28, 1 | 2u << 8 | 0x49u << 16);
+   REJECTS(28, 1 | 3u << 8 | 0x49u << 16);
+   ACCEPTS(28, 1 | 14u << 8 | 0x49u << 16);
+   REJECTS(28, 1 | 15u << 8 | 0x49u << 16);
+   ACCEPTS(28, 1 | 15u << 8 | 0x03u << 16);
+   memcpy(w, r, sizeof(r));
+   w[7] = 2 << 4;
+   w[depth] = 1 | 3u << 8 | 3u << 16;
+   CHECK(apex_hw_pass_valid(w));
+   w[depth] = 1 | 4u << 8 | 3u << 16;
+   CHECK(!apex_hw_pass_valid(w));
+   w[7] = 1 | 2u << 4; /* 64 x 32 tiles hold eight planes at 4 samples */
+   CHECK(apex_hw_pass_valid(w));
+#undef REJECTS
+#undef ACCEPTS
+   /* The driver's pool regions and every color attachment format it
+    * renders pass. */
+   CHECK(APEX_POOL_DRAW_BYTES >= 1024 && APEX_POOL_PRIMITIVE_BYTES >= 128);
+   for (VkFormat f = VK_FORMAT_UNDEFINED; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; f++) {
+      uint8_t code = apex_hw_color_format(f);
+      CHECK(!code || apex_hw_color_renderable(code));
+   }
+   struct apex_hw_pass pass = {.pool = 0x4200000000ull, .pool_bytes = APEX_BIN_POOL_BYTES, .x1 = 4096,
+      .y1 = 4096, .layers = 1, .samples = 1, .draw_bytes = APEX_POOL_DRAW_BYTES,
+      .vertex_bytes = APEX_POOL_VERTEX_BYTES, .primitive_bytes = APEX_POOL_PRIMITIVE_BYTES};
+   CHECK(apex_hw_pass_record(&pass, w));
+   pass.primitive_bytes = 64;
+   CHECK(!apex_hw_pass_record(&pass, w));
+   pass.primitive_bytes = APEX_POOL_PRIMITIVE_BYTES;
+   pass.pool_bytes = APEX_POOL_DRAW_BYTES + APEX_POOL_VERTEX_BYTES + APEX_POOL_PRIMITIVE_BYTES;
+   CHECK(!apex_hw_pass_record(&pass, w));
+   puts("PASS pass validation: selector, area, layers, bins, regions, color and depth formats, planes");
 }
 
 /* Texel (x, y) of a tiled level, written independently from the
@@ -462,6 +565,7 @@ main(void)
    test_raster_depth_blend();
    test_viewport_dynamic();
    test_pass();
+   test_pass_validation();
    test_layout();
    test_descriptors();
    struct vk_instance instance;

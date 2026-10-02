@@ -19,10 +19,13 @@ enum apex_hw_class {
    APEX_HW_CLASS_NONE, APEX_HW_CLASS_R8, APEX_HW_CLASS_RG8, APEX_HW_CLASS_RGBA8,
    APEX_HW_CLASS_R16, APEX_HW_CLASS_RG16, APEX_HW_CLASS_RGBA16, APEX_HW_CLASS_R32,
    APEX_HW_CLASS_RG32, APEX_HW_CLASS_RGBA32, APEX_HW_CLASS_565, APEX_HW_CLASS_RGB10A2,
-   APEX_HW_CLASS_D24, APEX_HW_CLASS_RGBX8,
+   APEX_HW_CLASS_D24, APEX_HW_CLASS_RGBX8, APEX_HW_CLASS_4444, APEX_HW_CLASS_1555,
 };
+/* The packed 16-bit classes are UNORM with alpha in the low field (type 0)
+ * or the high field (APEX_HW_ALPHA_FIRST). */
 enum apex_hw_type {
    APEX_HW_UNORM, APEX_HW_SNORM, APEX_HW_UINT, APEX_HW_SINT, APEX_HW_FLOAT, APEX_HW_SRGB,
+   APEX_HW_ALPHA_FIRST, APEX_HW_SHARED_EXPONENT,
 };
 #define APEX_HW_FORMAT(class, type, bgr) ((class) | (type) << 4 | (bgr) << 7)
 #define APEX_HW_SWIZZLE_0 4
@@ -35,6 +38,9 @@ bool apex_hw_texture_format(VkFormat format, VkImageAspectFlags aspect, uint8_t 
                             uint8_t channel[4]);
 /* Color-attachment format byte, 0 when the ROP cannot render the format. */
 uint8_t apex_hw_color_format(VkFormat format);
+/* Whether the ROP renders a color format byte: classes 1-11 and 13 with a
+ * number type the class takes, and 1555 (15) UNORM in either alpha order. */
+bool apex_hw_color_renderable(uint8_t format);
 /* DepthFormat of a depth/stencil attachment, 0 when unsupported. */
 enum apex_hw_depth {
    APEX_HW_DEPTH_NONE, APEX_HW_D16, APEX_HW_X8_D24, APEX_HW_D24S8, APEX_HW_D32F, APEX_HW_S8,
@@ -195,7 +201,14 @@ struct apex_hw_pass {
 int apex_hw_tile_selector(unsigned samples, unsigned planes);
 unsigned apex_hw_selector_width(unsigned selector);
 unsigned apex_hw_selector_height(unsigned selector);
-/* Writes the pass record; false when the attachments exceed the tile buffer
- * or the bins exceed APEX_HW_MAX_BINS. */
+/* Writes the pass record; false when the raster back end would reject it
+ * (apex_hw_pass_valid). */
 bool apex_hw_pass_record(struct apex_hw_pass *pass, uint32_t out[APEX_HW_PASS_DWORDS]);
+/* The raster back end's pass validation, which reports INVALID_PASS: a
+ * tile-size selector of at most 4, a non-empty render area, 1 to 2,048
+ * layers and at most APEX_HW_MAX_BINS bins, colour formats the ROP renders,
+ * depth formats 1-6, planes that fit the tile buffer at the tile size and
+ * samples, a draw region of at least 1 KiB, a primitive region of at least
+ * 128 bytes and every region with one bin chunk inside the pool. */
+bool apex_hw_pass_valid(const uint32_t record[APEX_HW_PASS_DWORDS]);
 #endif

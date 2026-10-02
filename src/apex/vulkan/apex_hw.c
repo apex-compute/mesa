@@ -554,14 +554,7 @@ apex_hw_pass_record(struct apex_hw_pass *pass, uint32_t out[APEX_HW_PASS_DWORDS]
       plane += a->planes;
    }
    int selector = apex_hw_tile_selector(pass->samples, plane);
-   if (selector < 0 || pass->x1 <= pass->x0 || pass->y1 <= pass->y0 || !pass->layers)
-      return false;
-   /* Tiles sit on multiples of the tile size; bins count from the render
-    * area's first tile. */
-   unsigned tw = selector_w[selector], th = selector_h[selector];
-   uint64_t bins = (uint64_t)((pass->x1 - 1) / tw - pass->x0 / tw + 1) *
-                   ((pass->y1 - 1) / th - pass->y0 / th + 1) * pass->layers;
-   if (bins > APEX_HW_MAX_BINS)
+   if (selector < 0)
       return false;
    out[0] = (uint32_t)pass->pool;
    out[1] = (uint32_t)(pass->pool >> 32);
@@ -573,5 +566,66 @@ apex_hw_pass_record(struct apex_hw_pass *pass, uint32_t out[APEX_HW_PASS_DWORDS]
    out[8] = pass->draw_bytes;
    out[9] = pass->vertex_bytes;
    out[10] = pass->primitive_bytes;
+   return apex_hw_pass_valid(out);
+}
+
+bool
+apex_hw_color_renderable(uint8_t format)
+{
+   unsigned cls = format & 15, type = format >> 4 & 7;
+   if (cls == APEX_HW_CLASS_1555)
+      return type == APEX_HW_UNORM || type == APEX_HW_ALPHA_FIRST;
+   if (cls == APEX_HW_CLASS_NONE || cls == APEX_HW_CLASS_D24 || cls == APEX_HW_CLASS_4444 ||
+       type >= APEX_HW_ALPHA_FIRST)
+      return false;
+   if (type == APEX_HW_SRGB)
+      return cls <= APEX_HW_CLASS_RGBA8 || cls == APEX_HW_CLASS_RGBX8;
+   if (type == APEX_HW_FLOAT)
+      return cls >= APEX_HW_CLASS_R16 && cls <= APEX_HW_CLASS_RGBA32;
+   if (type == APEX_HW_SNORM)
+      return cls < APEX_HW_CLASS_R32 || cls > APEX_HW_CLASS_RGB10A2;
    return true;
+}
+
+bool
+apex_hw_pass_valid(const uint32_t r[APEX_HW_PASS_DWORDS])
+{
+   unsigned selector = r[7] & 7, samples_log2 = r[7] >> 4 & 3;
+   uint32_t x0 = r[3] & 0xffff, y0 = r[3] >> 16, x1 = r[4] & 0xffff, y1 = r[4] >> 16;
+   if (selector > 4 || x1 <= x0 || y1 <= y0 || !r[5] || r[5] > 2048)
+      return false;
+   unsigned tw = selector_w[selector], th = selector_h[selector];
+   uint64_t bins = (uint64_t)((x1 - 1) / tw - x0 / tw + 1) * ((y1 - 1) / th - y0 / th + 1) * r[5];
+   if (bins > APEX_HW_MAX_BINS)
+      return false;
+   /* Attachment formats and planes: a 16-byte target takes an even plane
+    * pair; the planes end within the tile buffer at the tile size and
+    * samples. */
+   unsigned planes = 0;
+   for (unsigned k = 0; k <= APEX_HW_MAX_COLOR; k++) {
+      uint32_t flags = r[APEX_HW_PASS_ATTACHMENT(k)];
+      if (!(flags & 1))
+         continue;
+      unsigned plane = flags >> 8 & 15, format = flags >> 16 & 0xff, end = plane + 1;
+      if (k == APEX_HW_DEPTH_ATTACHMENT) {
+         if ((format & 7) == APEX_HW_DEPTH_NONE || (format & 7) > APEX_HW_D32F_S8)
+            return false;
+      } else {
+         if (!apex_hw_color_renderable(format))
+            return false;
+         if ((format & 15) == APEX_HW_CLASS_RGBA32) {
+            if (plane & 1)
+               return false;
+            end = plane + 2;
+         }
+      }
+      planes = MAX2(planes, end);
+   }
+   if (((uint64_t)planes << (util_logbase2(tw) + util_logbase2(th) + samples_log2)) > 65536)
+      return false;
+   /* The regions in pool order, each inside the pool with room for one bin
+    * chunk: the 512-byte header, the draw slots, the bin heads, the vertex
+    * outputs and the primitive records. */
+   uint64_t chunks = 512 + (uint64_t)r[8] + align64(bins * 4, 64) + r[9] + r[10];
+   return r[8] >= 1024 && r[10] >= 128 && chunks + 64 <= r[2];
 }
