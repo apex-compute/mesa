@@ -175,7 +175,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
          props.limits.maxComputeWorkGroupSize[0] == 256 &&
          props.limits.maxComputeWorkGroupSize[1] == 256 &&
          props.limits.maxComputeWorkGroupSize[2] == 64);
-   CHECK(strstr(props.deviceName, "non-conformant"));
+   CHECK(!strcmp(props.deviceName, "Apex"));
    PROC(GetPhysicalDeviceFeatures2KHR, get_features2);
    VkPhysicalDeviceRobustness2FeaturesEXT robustness = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,

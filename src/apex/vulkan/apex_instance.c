@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include "git_sha1.h"
 #include "apex_device.h"
 #include "apex_hw.h"
 #include "apex_job.h"
@@ -476,7 +477,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .apiVersion = APEX_DEVELOPMENT_API,
       .vendorID = VK_VENDOR_ID_APEX, .deviceID = 0xa15e,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
-      .deviceName = "Apex development (non-conformant)",
+      .deviceName = "Apex",
       .maxMemoryAllocationCount = 4096,
       .maxBoundDescriptorSets = MESA_VK_MAX_DESCRIPTOR_SETS,
       .maxPerStageDescriptorUniformBuffers = APEX_MAX_DESCRIPTORS,
@@ -562,7 +563,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxMemoryAllocationSize = APEX_MAX_ALLOCATION,
       /* Vulkan 1.2: depth/stencil resolves take sample 0. */
       .driverID = VK_DRIVER_ID_APEX,
-      .driverName = "Apex", .driverInfo = "Mesa development driver (non-conformant)",
+      .driverName = "Apex", .driverInfo = "Mesa " PACKAGE_VERSION MESA_GIT_SHA1,
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = true, .independentResolve = true,
@@ -674,7 +675,7 @@ apex_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallback
    }
    instance->physical_devices.try_create_for_drm = try_create_physical;
    instance->physical_devices.destroy = destroy_physical;
-   mesa_logw("Apex development driver: incomplete and non-conformant");
+   mesa_logw("Apex development driver");
    *out = vk_instance_to_handle(instance);
    return VK_SUCCESS;
 }
