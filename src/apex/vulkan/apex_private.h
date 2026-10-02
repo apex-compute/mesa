@@ -193,12 +193,7 @@ struct apex_command_buffer {
       uint32_t layers, view_mask, samples, color_count;
       struct apex_attachment color[APEX_HW_MAX_COLOR], depth;
       bool has_depth, has_stencil;
-      /* The pass as emitted: its record at IB dword `record`, rewritten to
-       * store everything when the pass splits. */
       struct apex_hw_pass pass;
-      uint32_t record;
-      /* Bin-pool use of the current pass portion. */
-      uint64_t draws, vertex_lines, primitives;
    } rendering;
 };
 

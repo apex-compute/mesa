@@ -80,7 +80,7 @@ struct apex_bo {
  * offline device for compiler tests: no memory, queue or submission. */
 #define APEX_PRIVATE_BYTES (2u * 1024 * 1024)
 /* The queue's bin pool (Docs/architecture.md, Pipeline and render passes):
- * the pass record, bin heads, then the draw-slot, vertex-output and
+ * the pass record, the draw slots, the bin heads, the vertex-output and
  * primitive regions and the bin chunks to the end. */
 #define APEX_BIN_POOL_BYTES (32u * 1024 * 1024)
 #define APEX_POOL_DRAW_BYTES (2u * 1024 * 1024)

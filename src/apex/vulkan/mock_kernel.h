@@ -334,9 +334,11 @@ mock_cp_stream(struct mock_kernel *k, uint64_t base, uint32_t mask, uint32_t *po
          memcpy(&k->state[p[0]], &p[1], (count - 1) * 4);
          break;
       case APEX_CP_BEGIN_PASS: {
-         /* The pass registers become the pass record at the pool's start. */
+         /* The pass registers become the pass record at the pool's start;
+          * the draw region holds at least one 1 KiB slot. */
          uint64_t pool = MOCK_U64(k->state, APEX_STATE_PASS);
-         MOCK_CHECK(!k->in_pass && !(pool & 63) && k->state[APEX_STATE_PASS + 2] >= 1u << 20);
+         MOCK_CHECK(!k->in_pass && !(pool & 63) && k->state[APEX_STATE_PASS + 2] >= 1u << 20 &&
+                    k->state[APEX_STATE_PASS + 8] >= 1024);
          mock_write(k, pool, &k->state[APEX_STATE_PASS], 512);
          k->in_pass = true;
          break;

@@ -697,12 +697,10 @@ emit_pass(struct apex_command_buffer *cmd)
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   cmd->rendering.record = cmd->ib.count + 2;
    apex_cp_set_state(&cmd->ib, APEX_STATE_PASS, APEX_HW_PASS_DWORDS, record);
    apex_cp_begin_pass(&cmd->ib);
    begin_work(cmd, APEX_CP_CLASS_GRAPHICS);
    cmd->rendering.active = true;
-   cmd->rendering.draws = cmd->rendering.vertex_lines = cmd->rendering.primitives = 0;
 }
 
 /* END_PASS, then the availability of the queries the pass ended. */
@@ -714,27 +712,6 @@ end_pass(struct apex_command_buffer *cmd)
    util_dynarray_foreach(&cmd->pass_availability, uint64_t, va)
       apex_cp_write(&cmd->ib, *va, APEX_CP_AFTER_PRIOR_WORK, 1, (uint32_t[1]){1});
    util_dynarray_clear(&cmd->pass_availability);
-}
-
-/* Ends the current pass portion with every attachment stored and none
- * resolved, and continues in a new portion that loads them: the bin pool
- * holds the binned geometry of one portion. */
-static void
-split_pass(struct apex_command_buffer *cmd)
-{
-   struct apex_hw_pass *pass = &cmd->rendering.pass;
-   struct apex_hw_pass portion = *pass;
-   for (unsigned k = 0; k <= APEX_HW_MAX_COLOR; k++) {
-      portion.attachment[k].store = true;
-      portion.attachment[k].resolve = false;
-   }
-   uint32_t record[APEX_HW_PASS_DWORDS];
-   if (!cmd->ib.failed && apex_hw_pass_record(&portion, record))
-      memcpy(&cmd->ib.words[cmd->rendering.record], record, sizeof(record));
-   end_pass(cmd);
-   for (unsigned k = 0; k <= APEX_HW_MAX_COLOR; k++)
-      pass->attachment[k].load = APEX_HW_LOAD;
-   emit_pass(cmd);
 }
 
 static void
@@ -960,30 +937,6 @@ hw_topology(VkPrimitiveTopology topology)
    return topology == VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA ? 3 : MIN2(topology, 5);
 }
 
-/* Bin-pool capacity of one pass portion (apex_device.h). */
-#define POOL_DRAWS (APEX_POOL_DRAW_BYTES / 1024)
-#define POOL_VERTEX_LINES (APEX_POOL_VERTEX_BYTES / 64)
-#define POOL_PRIMITIVES (APEX_POOL_PRIMITIVE_BYTES / 128)
-
-/* Starts a new pass portion when this draw's binned geometry would not fit
- * the bin pool's regions: `vertices` references and `primitives` records,
- * two records per point and line square or rectangle. */
-static void
-reserve_pool(struct apex_command_buffer *cmd, uint64_t draws, uint64_t vertices, uint64_t primitives)
-{
-   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   uint64_t lines = vertices * (cmd->vertex->vertex.stride / 64);
-   uint64_t records = primitives * (dyn->ia.primitive_topology <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 2 : 1);
-   if (cmd->rendering.draws + draws > POOL_DRAWS || cmd->rendering.vertex_lines + lines > POOL_VERTEX_LINES ||
-       cmd->rendering.primitives + records > POOL_PRIMITIVES) {
-      if (cmd->rendering.draws)
-         split_pass(cmd);
-   }
-   cmd->rendering.draws += draws;
-   cmd->rendering.vertex_lines += lines;
-   cmd->rendering.primitives += records;
-}
-
 static uint64_t
 primitive_count(VkPrimitiveTopology topology, uint64_t vertices)
 {
@@ -1170,27 +1123,18 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
 
 /* Multiview repeats the draw per view with the view index in user data;
  * the vertex program writes it as the layer. Transform feedback is not
- * active with multiview. */
+ * active with multiview. A pass whose bin pool fills splits into raster
+ * phases in the CP. */
 static void
 record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet,
             const struct indirect_draw *indirect)
 {
-   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    if (!cmd->rendering.active || !cmd->vertex) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    uint32_t views = cmd->rendering.view_mask ? cmd->rendering.view_mask : 1;
    u_foreach_bit(view, views) {
-      if (indirect) {
-         /* Indirect counts resolve on the device: reserve the draw slots and
-          * an eighth of the vertex and primitive regions per command. */
-         reserve_pool(cmd, indirect->count, MIN2((uint64_t)indirect->count * POOL_VERTEX_LINES / 8,
-                                                 POOL_VERTEX_LINES), POOL_PRIMITIVES / 8);
-      } else {
-         uint64_t vertices = (uint64_t)packet[0] * packet[1];
-         reserve_pool(cmd, 1, vertices, primitive_count(dyn->ia.primitive_topology, packet[0]) * packet[1]);
-      }
       if (!emit_draw_state(cmd, indexed, cmd->rendering.view_mask ? view : 0))
          return;
       for (uint32_t d = 0; view == ffs(views) - 1 && d < (indirect ? indirect->count : 1); d++)
