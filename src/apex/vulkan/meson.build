@@ -25,7 +25,7 @@ apex_entrypoints = custom_target('apex_entrypoints',
   depend_files : vk_entrypoints_gen_depend_files,
 )
 # Uninstalled development driver: instance creation requires APEX_DEVELOPMENT=1.
-apex_instance = static_library('apex_instance', ['apex_instance.c', apex_entrypoints],
+apex_instance = static_library('apex_instance', ['apex_instance.c', apex_entrypoints, sha1_h],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, idep_mesautil, dep_libdrm],
 )
