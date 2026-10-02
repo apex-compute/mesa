@@ -52,6 +52,8 @@ struct ctx {
    unsigned depth;
    /* Fragment masks: lanes not terminated, lanes not demoted, launch helpers. */
    uint32_t alive, covered, helper, root;
+   /* Vertex cull mask of the cull distances written so far. */
+   uint32_t cull;
    uint32_t out[48];
    uint8_t out_written[48];
    struct apex_header header;
@@ -1218,6 +1220,29 @@ static void store_output(struct ctx *c, nir_intrinsic_instr *i)
 {
    nir_io_semantics io = nir_intrinsic_io_semantics(i);
    unsigned component = nir_intrinsic_component(i), slot;
+   /* Cull distances follow the clip distances in the merged distance
+    * slots; cull distance k sets bit k of the cull mask when negative. */
+   unsigned clips = c->nir->info.clip_distance_array_size;
+   if (c->nir->info.stage == MESA_SHADER_VERTEX &&
+       (io.location == VARYING_SLOT_CLIP_DIST0 || io.location == VARYING_SLOT_CLIP_DIST1) &&
+       4 * (io.location - VARYING_SLOT_CLIP_DIST0) + component >= clips) {
+      if (!c->cull)
+         c->cull = constant(c, 0);
+      unsigned base = 4 * (io.location - VARYING_SLOT_CLIP_DIST0) + component - clips;
+      unsigned mask = nir_intrinsic_write_mask(i);
+      for (unsigned k = 0; k < i->src[0].ssa->num_components; k++) {
+         if (!(mask & (1u << k)))
+            continue;
+         uint32_t negative = op2(c, APEX_V_CMP_F, false, vector(c, src(c, i->src[0], k)), constant(c, 0));
+         last(c)->f[3] = apex_raw(2);
+         uint32_t bit = value(c, true, 1);
+         emit(c, APEX_V_CNDMASK, bit, constant(c, 0), constant(c, 1u << (base + k)), negative, 0);
+         uint32_t merged = value(c, true, 1);
+         emit(c, APEX_V_OR, merged, vector(c, c->cull), bit, 0, 0);
+         c->cull = merged;
+      }
+      return;
+   }
    if (c->nir->info.stage == MESA_SHADER_VERTEX) {
       slot = record_slot(c, io.location, &component);
    } else if (io.location == FRAG_RESULT_DEPTH) {
@@ -1253,6 +1278,15 @@ static void finish_outputs(struct ctx *c)
       for (unsigned s = 0; s < ARRAY_SIZE(c->out); s++)
          if (c->out[s])
             records = s + 1;
+      /* Record line 0 always holds point size, layer, viewport and the
+       * cull mask: unwritten ones read 1.0, 0, 0 and no culled distance. */
+      if (!c->out[1])
+         c->out[1] = value(c, true, 4);
+      static const uint32_t defaults[4] = {0x3f800000u, 0, 0, 0};
+      for (unsigned k = 0; k < 4; k++)
+         if (!(c->out_written[1] & (1u << k)))
+            emit(c, APEX_COPY, sub(c->out[1], k, 1), k == 3 && c->cull ? c->cull : constant(c, defaults[k]), 0, 0, 0);
+      records = MAX2(records, 2);
       unsigned stride = 64 * DIV_ROUND_UP(MAX2(records, 1), 4);
       c->header.output = stride;
       uint32_t base = value(c, false, 2);
@@ -2463,6 +2497,9 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          c.header.flags |= 1u << 3;
       if (nir->info.fs.early_fragment_tests || !(c.header.flags & 0x1e))
          c.header.flags |= 1u;
+      /* Sample shading runs every sample as its own lane. */
+      if (nir->info.fs.uses_sample_shading)
+         c.header.flags |= 1u << 7;
    }
    c.end = label(&c);
    c.restore = c.end;

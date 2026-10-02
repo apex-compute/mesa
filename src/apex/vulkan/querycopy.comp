@@ -1,51 +1,38 @@
 #version 450
 // vkCmdCopyQueryPoolResults: one invocation per query. Pool slots hold a
-// 64-bit value, or transform feedback's 32-bit primitives written and
-// needed, then a 32-bit availability word.
+// 64-bit value then a 32-bit availability word (apex_job.h).
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#include "apex_draw.h"
+#include "apex_job.h"
 layout(local_size_x = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
-const uint QUERY = 8u + APEX_DISPATCH_WORDS;
-uint word(uint i) { return root[QUERY + i]; }
-uint64_t address(uint i) { return uint64_t(word(i)) | (uint64_t(word(i + 1u)) << 32); }
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+uint64_t address(uint i) { return uint64_t(job(i)) | (uint64_t(job(i + 1u)) << 32); }
 
 void main()
 {
-   uint q = root[8u] * 16u + gl_GlobalInvocationID.x;
-   if (q >= word(APEX_QUERY_COUNT))
+   uint q = gl_GlobalInvocationID.x;
+   if (q >= job(APEX_QUERY_COUNT))
       return;
-   uint flags = word(APEX_QUERY_FLAGS);
+   uint flags = job(APEX_QUERY_FLAGS);
    Words slot = Words(address(APEX_QUERY_SLOT) + uint64_t(q) * APEX_QUERY_STRIDE);
-   Words dst = Words(address(APEX_QUERY_DST) + uint64_t(q) * word(APEX_QUERY_DST_STRIDE));
+   Words dst = Words(address(APEX_QUERY_DST) + uint64_t(q) * job(APEX_QUERY_DST_STRIDE));
    bool wide = (flags & 1u) != 0u;        // VK_QUERY_RESULT_64_BIT
    bool with_available = (flags & 4u) != 0u;
    bool partial = (flags & 8u) != 0u;
    uint available = slot.w[2];
    uint lo = slot.w[0], hi = slot.w[1];
-   bool pair = (flags & 0x10000u) != 0u;
-   uint values = pair ? 2u : 1u;
    if (available != 0u || partial) {
-      if (pair) {
-         dst.w[0] = lo;
-         dst.w[wide ? 2u : 1u] = hi;
-         if (wide) {
-            dst.w[1] = 0u;
-            dst.w[3] = 0u;
-         }
-      } else {
-         dst.w[0] = wide || hi == 0u ? lo : 0xffffffffu;
-         if (wide)
-            dst.w[1] = hi;
-      }
+      dst.w[0] = wide || hi == 0u ? lo : 0xffffffffu;
+      if (wide)
+         dst.w[1] = hi;
    }
    if (with_available) {
-      dst.w[wide ? 2u * values : values] = available;
+      dst.w[wide ? 2u : 1u] = available;
       if (wide)
-         dst.w[2u * values + 1u] = 0u;
+         dst.w[3] = 0u;
    }
 }

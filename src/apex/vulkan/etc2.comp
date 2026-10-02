@@ -1,23 +1,21 @@
 #version 450
 // ETC2/EAC blocks to an image's decoded plane: one invocation per texel.
-// Trailer words after the dispatch parameters (see apex_draw.h): the
-// region's first block and first decoded texel, their row and slice pitches,
-// the region's texel width, height and layers, and the block kind. ETC2
-// decodes to RGBA8 and EAC to 32-bit floats per channel. Ported from Mesa's
+// Job words (apex_job.h): the decoded plane's surface, the region's first
+// block with its row and slice pitches, the region's texel width, height and
+// layers, and the block kind. ETC2 decodes to RGBA8 and EAC to 32-bit floats
+// per channel. Ported from Mesa's
 // vk_texcompress_etc2.c, itself based on Granite's etc2.comp and eac.comp.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#include "apex_draw.h"
+#include "apex_job.h"
 layout(local_size_x = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
-const uint TRAILER = 8u;
-const uint DECODE = TRAILER + APEX_DISPATCH_WORDS;
-
-uint word(uint i) { return root[DECODE + i]; }
-uint64_t address(uint i) { return uint64_t(word(i)) | (uint64_t(word(i + 1u)) << 32); }
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+uint64_t address(uint i) { return uint64_t(job(i)) | (uint64_t(job(i + 1u)) << 32); }
+#include "apex_surface.glsl"
 
 uint flip(uint v) { return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24); }
 
@@ -147,24 +145,22 @@ vec4 decode_color(uvec2 raw, uint px, uint py, bool alpha1, float alpha)
 
 void main()
 {
-   uint width = word(APEX_DECODE_WIDTH), height = word(APEX_DECODE_HEIGHT);
-   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
-   if (item >= width * height * word(APEX_DECODE_LAYERS))
+   uvec3 p = gl_GlobalInvocationID;
+   if (p.x >= job(APEX_DECODE_EXTENT) || p.y >= job(APEX_DECODE_EXTENT + 1u) ||
+       p.z >= job(APEX_DECODE_EXTENT + 2u))
       return;
-   uint px = item % width, row = item / width;
-   uint py = row % height, layer = row / height;
-   uint kind = word(APEX_DECODE_KIND);
+   uint px = p.x, py = p.y, layer = p.z;
+   uint kind = job(APEX_DECODE_KIND);
    bool wide = kind == APEX_ETC2_RGBA8 || kind >= APEX_EAC_RG11;
-   uint64_t block = address(APEX_DECODE_SRC) + uint64_t(layer) * word(APEX_DECODE_SRC_SLICE) +
-                    uint64_t(py / 4u) * word(APEX_DECODE_SRC_ROW) + uint64_t(px / 4u) * (wide ? 16u : 8u);
+   uint64_t block = address(APEX_DECODE_SRC) + uint64_t(layer) * job(APEX_DECODE_SRC_SLICE) +
+                    uint64_t(py / 4u) * job(APEX_DECODE_SRC_ROW) + uint64_t(px / 4u) * (wide ? 16u : 8u);
    Words src = Words(block);
    uvec4 raw = uvec4(src.w[0], src.w[1], wide ? src.w[2] : 0u, wide ? src.w[3] : 0u);
    uint bx = px & 3u, by = py & 3u, lin = bx * 4u + by;
-   uint64_t texel = address(APEX_DECODE_DST) + uint64_t(layer) * word(APEX_DECODE_DST_SLICE) +
-                    uint64_t(py) * word(APEX_DECODE_DST_ROW);
+   uint64_t texel = surface_address(APEX_DECODE_DST, px, py, layer);
    if (kind >= APEX_EAC_R11) {
       bool is_signed = kind == APEX_EAC_R11_SNORM || kind == APEX_EAC_RG11_SNORM;
-      Words dst = Words(texel + uint64_t(px) * (wide ? 8u : 4u));
+      Words dst = Words(texel);
       dst.w[0] = floatBitsToUint(decode_alpha(raw.xy, lin, true, is_signed));
       if (wide)
          dst.w[1] = floatBitsToUint(decode_alpha(raw.zw, lin, true, is_signed));
@@ -174,5 +170,5 @@ void main()
    vec4 color = decode_color(kind == APEX_ETC2_RGBA8 ? raw.zw : raw.xy, bx, by, kind == APEX_ETC2_RGBA1,
                              alpha);
    uvec4 bytes = uvec4(round(clamp(color, 0.0, 1.0) * 255.0));
-   Words(texel + uint64_t(px) * 4u).w[0] = bytes.r | (bytes.g << 8) | (bytes.b << 16) | (bytes.a << 24);
+   Words(texel).w[0] = bytes.r | (bytes.g << 8) | (bytes.b << 16) | (bytes.a << 24);
 }

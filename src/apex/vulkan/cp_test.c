@@ -4,7 +4,7 @@
  * and a device recorded through Vulkan whose ring the command-processor model
  * in mock_kernel.h executes. Steady-state submission must issue no ioctl. */
 #include "apex_device.h"
-#include "apex_draw.h"
+#include "apex_job.h"
 #include "apex_pipeline.h"
 #include "mock_kernel.h"
 #include "vk_alloc.h"
@@ -219,6 +219,9 @@ test_device(const char *spirv_path)
    CHECK(device.private_arena.handle == 3 && k.gems[3].va == device.private_arena.va &&
          k.gems[3].va && !(k.gems[3].va % APEX_PRIVATE_BYTES) && k.gems[3].size == APEX_PRIVATE_BYTES &&
          !k.gems[3].flags && k.gems[3].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
+   /* The bin pool: 32 MiB of LOCAL the geometry front end writes. */
+   CHECK(device.bin_pool.handle == 4 && k.gems[4].size == APEX_BIN_POOL_BYTES && !k.gems[4].flags &&
+         k.gems[4].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkQueue queue;
@@ -234,7 +237,7 @@ test_device(const char *spirv_path)
       CHECK(v->MapMemory(dev, memory[t], 0, VK_WHOLE_SIZE, 0, (void **)&map[t]) == VK_SUCCESS);
       memset(map[t], 0, 65536);
    }
-   CHECK(k.gems[4].flags == 0 && k.gems[5].flags == APEX_GEM_SYSTEM);
+   CHECK(k.gems[5].flags == 0 && k.gems[6].flags == APEX_GEM_SYSTEM);
    VkBuffer local, system;
    const VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16384,
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -248,7 +251,7 @@ test_device(const char *spirv_path)
    CHECK(v->BindBufferMemory(dev, system, memory[1], 0) == VK_SUCCESS);
    const uint64_t local_va = vk_buffer_from_handle(local)->device_address;
    const uint64_t system_va = vk_buffer_from_handle(system)->device_address;
-   CHECK(local_va == k.gems[4].va && system_va == k.gems[5].va);
+   CHECK(local_va == k.gems[5].va && system_va == k.gems[6].va);
 
    VkEvent event;
    const VkEventCreateInfo ei = {.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
@@ -373,15 +376,15 @@ test_device(const char *spirv_path)
    CHECK(MOCK_U64(seen.last.state, APEX_STATE_COMPUTE_PRIVATE) == k.gems[3].va);
    CHECK(seen.last.state[APEX_STATE_COMPUTE_LOCAL] == 16 &&
          seen.last.state[APEX_STATE_COMPUTE_LOCAL + 1] == 1);
-   CHECK(seen.last.state[APEX_STATE_COMPUTE_USER + 2] == 3);
    uint64_t table = MOCK_U64(seen.last.state, APEX_STATE_COMPUTE_USER);
    CHECK(table && !(table & 63));
    struct apex_buffer_descriptor row;
    mock_read(&k, table, &row, sizeof(row));
    CHECK(((uint64_t)row.high << 32 | row.low) == local_va + 8192 && row.bytes == 4096);
-   struct apex_dispatch_parameters parameters;
-   mock_read(&k, table + apex_program_trailer(&p->program), &parameters, sizeof(parameters));
-   CHECK(parameters.base[0] == 0 && parameters.base[1] == 3 && parameters.groups[0] == 3);
+   /* User data s2:s3 address the trailer's grid. */
+   uint64_t grid = MOCK_U64(seen.last.state, APEX_STATE_COMPUTE_USER + 2);
+   CHECK(grid == table + apex_program_trailer(&p->program));
+   CHECK(mock_read32(&k, grid) == 3 && mock_read32(&k, grid + 4) == 1 && mock_read32(&k, grid + 8) == 1);
    CHECK(v->QueueWaitIdle(queue) == VK_SUCCESS);
 
    /* Steady state: resubmission reuses the retired arena and publishes by

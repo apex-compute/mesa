@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Internal kernels are SPIR-V embedded as C arrays.
 apex_internal_spv = []
-foreach kernel : ['setup', 'bin', 'copy', 'clear', 'timestamp', 'querycopy', 'resolve', 'etc2', 'xfb']
+foreach kernel : ['copy', 'clear', 'querycopy', 'etc2']
   apex_internal_spv += custom_target('apex_' + kernel + '_spv',
     input : kernel + '.comp', output : 'apex_' + kernel + '_spv.h',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.1',
                '-I' + meson.current_source_dir(), '--vn', 'apex_' + kernel + '_spv',
                '@INPUT@', '-o', '@OUTPUT@'],
-    depend_files : files('apex_draw.h'),
+    depend_files : files('apex_job.h', 'apex_surface.glsl'),
   )
 endforeach
 apex_pipeline = static_library('apex_pipeline',
-  ['apex_pipeline.c', 'apex_device.c', 'apex_cp.c', 'apex_graphics.c', 'apex_format.c', 'apex_texture.c', apex_internal_spv],
+  ['apex_pipeline.c', 'apex_device.c', 'apex_cmd.c', 'apex_cp.c', 'apex_hw.c', 'apex_graphics.c',
+   'apex_format.c', 'apex_texture.c', apex_internal_spv],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, idep_nir],
 )
@@ -147,7 +148,14 @@ test('apex-multiple-spirv', find_program('spirv-val'),
   args : ['--target-env', 'vulkan1.1', apex_multiple_spv], suite : ['apex'])
 test('apex-pipeline', apex_pipeline_test,
   args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv] + apex_bench_test_spv, suite : ['apex'], env : apex_test_env)
-apex_command_test = executable('apex-command-test', 'command_test.c',
+apex_hw_test = executable('apex-hw-test', 'hw_test.c',
+  include_directories : [inc_include, inc_src, inc_vulkan_util],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
+  link_with : [apex_pipeline, apex_nir, apex_rs],
+  link_language : 'cpp', install : false,
+)
+test('apex-hw', apex_hw_test, suite : ['apex'], env : apex_test_env)
+apex_cp_test = executable('apex-cp-test', 'cp_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
@@ -187,7 +195,7 @@ foreach stage : ['vert', 'frag']
   )
 endforeach
 apex_clip_spv = []
-foreach fixture : ['clip.vert', 'clip.frag', 'xfb.vert']
+foreach fixture : ['clip.vert', 'clip.frag']
   apex_clip_spv += custom_target('apex-' + fixture.replace('.', '-'),
     input : fixture, output : fixture + '.spv',
     command : [find_program('glslangValidator'), '-V', '--target-env', 'vulkan1.0', '@INPUT@', '-o', '@OUTPUT@'],

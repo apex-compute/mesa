@@ -1,85 +1,65 @@
 #version 450
-// Fills a rectangle of texels with one packed texel pattern under a bit mask
-// (one aspect of a depth/stencil texel): one invocation per 64-texel chunk of
-// a row. Texels of 1 or 2 bytes, and the partial words of 3- and 6-byte
-// texels, update with masked atomics so neighboring lanes never overwrite
-// each other.
+// Fills a width x height x planes region of a surface (apex_job.h) with one
+// packed texel pattern under a bit mask: one invocation per texel. Texels of
+// 1 or 2 bytes, and the partial words of 3- and 6-byte texels, update with
+// masked atomics so neighbouring lanes never overwrite each other.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#include "apex_draw.h"
+#include "apex_job.h"
 layout(local_size_x = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
-const uint TRAILER = 8u;
-const uint CLEAR = TRAILER + APEX_DISPATCH_WORDS;
-uint word(uint i) { return root[CLEAR + i]; }
-
-// Conditional rendering: the job does nothing when its predicate value is
-// zero, or nonzero if inverted (struct apex_dispatch_parameters).
-bool discarded()
-{
-   uint64_t va = uint64_t(root[TRAILER + APEX_DISPATCH_PREDICATE]) |
-                 (uint64_t(root[TRAILER + APEX_DISPATCH_PREDICATE + 1u]) << 32);
-   return va != 0ul && ((Words(va).w[0] == 0u) != (root[TRAILER + APEX_DISPATCH_PREDICATE + 2u] != 0u));
-}
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+#include "apex_surface.glsl"
 
 void main()
 {
-   if (discarded())
+   uvec3 p = gl_GlobalInvocationID;
+   if (p.x >= job(APEX_CLEAR_EXTENT) || p.y >= job(APEX_CLEAR_EXTENT + 1u) ||
+       p.z >= job(APEX_CLEAR_EXTENT + 2u))
       return;
-   uint width = word(APEX_CLEAR_WIDTH), chunks = (width + 63u) / 64u;
-   uint rows = word(APEX_CLEAR_ROWS);
-   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
-   if (item >= chunks * rows * word(APEX_CLEAR_LAYERS))
-      return;
-   uint row = item / chunks, chunk = item - row * chunks;
-   uint layer = row / rows;
-   row -= layer * rows;
-   uint bytes = word(APEX_CLEAR_BYTES);
-   uint64_t base = (uint64_t(word(APEX_CLEAR_DST)) | (uint64_t(word(APEX_CLEAR_DST + 1u)) << 32)) +
-                   uint64_t(layer) * word(APEX_CLEAR_SLICE) + uint64_t(row) * word(APEX_CLEAR_ROW);
-   uint end = min(width, chunk * 64u + 64u);
-   for (uint x = chunk * 64u; x < end; x++) {
-      uint64_t address = base + uint64_t(x) * bytes;
-      if ((bytes & 3u) != 0u && bytes > 2u) {
-         // Texel byte t of the pattern lands in byte misalign + t of the
-         // covering words.
-         uint misalign = uint(address & 3u);
-         Words words = Words(address & ~uint64_t(3));
-         for (uint k = 0u; k < (misalign + bytes + 3u) / 4u; k++) {
-            uint value = 0u, mask = 0u;
-            for (uint j = 0u; j < 4u; j++) {
-               uint t = k * 4u + j - misalign;
-               if (k * 4u + j >= misalign && t < bytes) {
-                  uint shift = (t & 3u) * 8u;
-                  value |= ((word(APEX_CLEAR_PATTERN + t / 4u) >> shift) & 0xffu) << (j * 8u);
-                  mask |= ((word(APEX_CLEAR_MASK + t / 4u) >> shift) & 0xffu) << (j * 8u);
-               }
-            }
-            if (mask == ~0u) {
-               words.w[k] = value;
-            } else if (mask != 0u) {
-               atomicAnd(words.w[k], ~mask);
-               atomicOr(words.w[k], value & mask);
+   uint bytes = job(APEX_CLEAR_BYTES);
+   uint64_t address = surface_address(APEX_CLEAR_DST, p.x, p.y, p.z);
+   if ((bytes & 3u) != 0u && bytes > 2u) {
+      // Texel byte t of the pattern lands in byte misalign + t of the
+      // covering words.
+      uint misalign = uint(address & 3u);
+      Words words = Words(address & ~uint64_t(3));
+      for (uint k = 0u; k < (misalign + bytes + 3u) / 4u; k++) {
+         uint value = 0u, mask = 0u;
+         for (uint j = 0u; j < 4u; j++) {
+            uint t = k * 4u + j - misalign;
+            if (k * 4u + j >= misalign && t < bytes) {
+               uint shift = (t & 3u) * 8u;
+               value |= ((job(APEX_CLEAR_PATTERN + t / 4u) >> shift) & 0xffu) << (j * 8u);
+               mask |= ((job(APEX_CLEAR_MASK + t / 4u) >> shift) & 0xffu) << (j * 8u);
             }
          }
-      } else if (bytes >= 4u) {
-         Words texel = Words(address);
-         for (uint k = 0u; k < bytes / 4u; k++) {
-            uint mask = word(APEX_CLEAR_MASK + k);
-            if (mask != 0u)
-               texel.w[k] = mask == ~0u ? word(APEX_CLEAR_PATTERN + k) :
-                            (texel.w[k] & ~mask) | (word(APEX_CLEAR_PATTERN + k) & mask);
+         if (mask == ~0u) {
+            words.w[k] = value;
+         } else if (mask != 0u) {
+            atomicAnd(words.w[k], ~mask);
+            atomicOr(words.w[k], value & mask);
          }
-      } else {
-         Words aligned = Words(address & ~uint64_t(3));
-         uint shift = uint(address & 3u) * 8u;
-         uint mask = ((bytes == 1u ? 0xffu : 0xffffu) & word(APEX_CLEAR_MASK)) << shift;
-         uint value = (word(APEX_CLEAR_PATTERN) << shift) & mask;
-         atomicAnd(aligned.w[0], ~mask);
-         atomicOr(aligned.w[0], value);
       }
+   } else if (bytes >= 4u) {
+      Words texel = Words(address);
+      for (uint k = 0u; k < bytes / 4u; k++) {
+         uint mask = job(APEX_CLEAR_MASK + k);
+         if (mask == ~0u) {
+            texel.w[k] = job(APEX_CLEAR_PATTERN + k);
+         } else if (mask != 0u) {
+            atomicAnd(texel.w[k], ~mask);
+            atomicOr(texel.w[k], job(APEX_CLEAR_PATTERN + k) & mask);
+         }
+      }
+   } else {
+      Words aligned = Words(address & ~uint64_t(3));
+      uint shift = uint(address & 3u) * 8u;
+      uint mask = ((bytes == 1u ? 0xffu : 0xffffu) & job(APEX_CLEAR_MASK)) << shift;
+      atomicAnd(aligned.w[0], ~mask);
+      atomicOr(aligned.w[0], (job(APEX_CLEAR_PATTERN) << shift) & mask);
    }
 }

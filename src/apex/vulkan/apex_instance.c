@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_device.h"
-#include "apex_draw.h"
+#include "apex_hw.h"
 #include "apex_entrypoints.h"
 #include "drm-uapi/apex_drm.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -23,6 +23,8 @@
 /* Development protocol only. This compute subset is not a conformant Vulkan
  * device. The library/manifest are uninstalled and instance creation is opt-in. */
 #define APEX_DEVELOPMENT_API VK_API_VERSION_1_3
+#define APEX_SAMPLE_COUNTS (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | \
+                            VK_SAMPLE_COUNT_8_BIT)
 
 struct apex_physical_device {
    struct vk_physical_device vk;
@@ -134,8 +136,7 @@ apex_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat form
    VkFormatFeatureFlags2 buffer = apex_format_features(format, true);
    /* Legacy flags hold bits 0..30; higher bits exist only in FormatFeatureFlags2. */
    const VkFormatFeatureFlags2 legacy = 0x7fffffffull;
-   /* ETC2/EAC images are optimal-tiling only. */
-   VkFormatFeatureFlags2 linear = apex_decoded_format(format, NULL) ? 0 : features;
+   VkFormatFeatureFlags2 linear = apex_linear_format_features(format);
    properties->formatProperties = (VkFormatProperties) {
       .linearTilingFeatures = (VkFormatFeatureFlags)(linear & legacy),
       .optimalTilingFeatures = (VkFormatFeatureFlags)(features & legacy),
@@ -317,8 +318,6 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_line_rasterization = true,
       .EXT_line_rasterization = true,
       .EXT_depth_clip_enable = true,
-      .EXT_transform_feedback = true,
-      .EXT_conditional_rendering = true,
       .KHR_vertex_attribute_divisor = true,
       .EXT_vertex_attribute_divisor = true,
       .EXT_scalar_block_layout = true,
@@ -377,25 +376,18 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .nullDescriptor = true,
       .maintenance5 = true,
       .provokingVertexLast = true,
-      /* Border colors need no format; they follow the view's component
-       * mapping (apex_texture.c). */
+      /* Border colors need no format; the texture unit replaces the
+       * format's channels before the view's component mapping. */
       .customBorderColors = true,
       .customBorderColorWithoutFormat = true,
       .borderColorSwizzle = true,
       .borderColorSwizzleFromImage = true,
-      /* GLES 2 correctness in the software raster (setup and fragment kernels). */
       .logicOp = true,
       .fillModeNonSolid = true,
       .alphaToOne = true,
       .shaderClipDistance = true,
       .shaderCullDistance = true,
-      /* The setup kernel's z planes follow depth clipping, independent of clamp. */
       .depthClipEnable = true,
-      /* One stream captured by the setup kernel in primitive order. */
-      .transformFeedback = true,
-      /* Draw, dispatch and clear kernels test the predicate (struct
-       * apex_dispatch_parameters); secondaries do not inherit it. */
-      .conditionalRendering = true,
       /* Vertex fetch divides the instance index by any divisor, zero repeating
        * the first instance. */
       .vertexAttributeInstanceRateDivisor = true,
@@ -403,10 +395,6 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .wideLines = true,
       .rectangularLines = true,
       .bresenhamLines = true,
-      .smoothLines = true,
-      .stippledRectangularLines = true,
-      .stippledBresenhamLines = true,
-      .stippledSmoothLines = true,
       .scalarBlockLayout = true,
       .samplerMirrorClampToEdge = true,
       .largePoints = true,
@@ -487,13 +475,12 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxStorageBufferRange = APEX_MAX_ALLOCATION,
       .maxPushConstantsSize = APEX_MAX_PUSH_CONSTANTS,
       .maxComputeSharedMemorySize = 32768,
-      /* Recording splits dispatches into native chunks. */
       .maxComputeWorkGroupCount = {65535, 65535, 65535},
       .maxComputeWorkGroupInvocations = 256,
       .maxComputeWorkGroupSize = {256,
                                   256, 64},
-      .maxImageDimension1D = 4096, .maxImageDimension2D = 4096, .maxImageDimension3D = 2048,
-      .maxImageDimensionCube = 4096, .maxImageArrayLayers = 256,
+      .maxImageDimension1D = 8192, .maxImageDimension2D = 8192, .maxImageDimension3D = 512,
+      .maxImageDimensionCube = 8192, .maxImageArrayLayers = 2048,
       .maxTexelBufferElements = 1 << 27,
       .maxSamplerAllocationCount = 4000,
       .bufferImageGranularity = 64,
@@ -503,15 +490,16 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxDescriptorSetSamplers = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetSampledImages = APEX_MAX_DESCRIPTORS,
       .maxDescriptorSetInputAttachments = 8,
-      .maxVertexInputAttributes = 32, .maxVertexInputBindings = APEX_DRAW_MAX_BINDINGS,
+      .maxVertexInputAttributes = APEX_HW_MAX_ATTRIBUTES, .maxVertexInputBindings = APEX_HW_MAX_BINDINGS,
       .maxVertexInputAttributeOffset = 2047, .maxVertexInputBindingStride = 2048,
-      .maxVertexOutputComponents = 128, .maxFragmentInputComponents = 128,
+      /* Varyings 30 and 31 carry clip distances to the fragment program. */
+      .maxVertexOutputComponents = 120, .maxFragmentInputComponents = 120,
       .maxFragmentOutputAttachments = 8, .maxFragmentCombinedOutputResources = 16,
       .maxColorAttachments = 8,
       .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 65535,
       .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
       .maxPushDescriptors = 32, .maxMultiviewViewCount = 32, .maxMultiviewInstanceIndex = (1u << 27) - 1,
-      .maxViewports = APEX_DRAW_MAX_VIEWPORTS, .maxViewportDimensions = {4096, 4096},
+      .maxViewports = APEX_HW_MAX_VIEWPORTS, .maxViewportDimensions = {4096, 4096},
       .viewportBoundsRange = {-8192.0f, 8191.0f}, .viewportSubPixelBits = 8,
       .subPixelPrecisionBits = 8, .subTexelPrecisionBits = 8, .mipmapPrecisionBits = 8,
       .minTexelBufferOffsetAlignment = 4,
@@ -519,19 +507,20 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .minInterpolationOffset = -0.5f, .maxInterpolationOffset = 0.4375f,
       .subPixelInterpolationOffsetBits = 4,
       .maxFramebufferWidth = 4096, .maxFramebufferHeight = 4096, .maxFramebufferLayers = 256,
-      .framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+      .framebufferColorSampleCounts = APEX_SAMPLE_COUNTS,
+      .framebufferDepthSampleCounts = APEX_SAMPLE_COUNTS,
+      .framebufferStencilSampleCounts = APEX_SAMPLE_COUNTS,
+      .framebufferNoAttachmentsSampleCounts = APEX_SAMPLE_COUNTS,
+      .sampledImageColorSampleCounts = APEX_SAMPLE_COUNTS,
+      .sampledImageIntegerSampleCounts = APEX_SAMPLE_COUNTS,
+      .sampledImageDepthSampleCounts = APEX_SAMPLE_COUNTS,
+      .sampledImageStencilSampleCounts = APEX_SAMPLE_COUNTS,
       .maxSampleMaskWords = 1, .discreteQueuePriorities = 2,
-      .pointSizeRange = {1.0f, 64.0f}, .pointSizeGranularity = 1.0f / 128.0f, .lineWidthRange = {1.0f, 16.0f},
+      /* Point sizes in eighths of a pixel up to 255.875. */
+      .pointSizeRange = {1.0f, 255.875f}, .pointSizeGranularity = 1.0f / 8.0f, .lineWidthRange = {1.0f, 16.0f},
       .lineWidthGranularity = 1.0f / 8.0f, .lineSubPixelPrecisionBits = 8,
       .maxClipDistances = 8, .maxCullDistances = 8, .maxCombinedClipAndCullDistances = 8,
-      .standardSampleLocations = true,
+      .standardSampleLocations = true, .strictLines = true,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .minMemoryMapAlignment = 4096,
       .minUniformBufferOffsetAlignment = 4,
@@ -561,7 +550,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = true, .independentResolve = true,
       .filterMinmaxSingleComponentFormats = true, .filterMinmaxImageComponentMapping = true,
-      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+      .framebufferIntegerColorSampleCounts = APEX_SAMPLE_COUNTS,
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
@@ -579,22 +568,16 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxBufferSize = APEX_MAX_ALLOCATION,
       /* VK_KHR_maintenance5: early-test shaders count samples after the
        * sample mask and multisample coverage; ONE swizzles of depth/stencil
-       * views read one; non-strict lines of any width are minor-axis parallelograms. */
+       * views read one; every line is a rectangle. */
       .earlyFragmentMultisampleCoverageAfterSampleCounting = false,
       .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
       .depthStencilSwizzleOneSupport = true,
       .polygonModePointSize = false,
-      .nonStrictSinglePixelWideLinesUseParallelogram = true,
-      .nonStrictWideLinesUseParallelogram = true,
+      .nonStrictSinglePixelWideLinesUseParallelogram = false,
+      .nonStrictWideLinesUseParallelogram = false,
       .provokingVertexModePerPipeline = true,
-      .transformFeedbackPreservesTriangleFanProvokingVertex = false,
       .maxCustomBorderColorSamplers = 4000,
       .maxVertexAttribDivisor = UINT32_MAX, .supportsNonZeroFirstInstance = true,
-      .maxTransformFeedbackStreams = 1, .maxTransformFeedbackBuffers = APEX_DRAW_MAX_XFB_BUFFERS,
-      .maxTransformFeedbackBufferSize = APEX_MAX_ALLOCATION,
-      .maxTransformFeedbackStreamDataSize = APEX_DRAW_MAX_XFB_OUTPUTS * 16,
-      .maxTransformFeedbackBufferDataSize = APEX_DRAW_MAX_XFB_OUTPUTS * 16,
-      .maxTransformFeedbackBufferDataStride = 2048, .transformFeedbackQueries = true,
       .drmHasRender = has_render,
       .drmRenderMajor = has_render ? major(render_stat.st_rdev) : 0,
       .drmRenderMinor = has_render ? minor(render_stat.st_rdev) : 0,

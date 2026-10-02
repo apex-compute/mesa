@@ -188,12 +188,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    VkPhysicalDeviceBorderColorSwizzleFeaturesEXT swizzle = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT, .pNext = &border,
    };
-   VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, .pNext = &swizzle,
-      .geometryStreams = VK_TRUE,
-   };
    VkPhysicalDeviceDepthClipEnableFeaturesEXT depth_clip = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &xfb,
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &swizzle,
    };
    VkPhysicalDeviceScalarBlockLayoutFeatures scalar = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
@@ -210,13 +206,10 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
          !provoking.transformFeedbackPreservesProvokingVertex);
    CHECK(border.customBorderColors && border.customBorderColorWithoutFormat);
    CHECK(swizzle.borderColorSwizzle && swizzle.borderColorSwizzleFromImage);
-   CHECK(xfb.transformFeedback && !xfb.geometryStreams && depth_clip.depthClipEnable);
+   CHECK(depth_clip.depthClipEnable);
    PROC(GetPhysicalDeviceProperties2KHR, get_properties2);
-   VkPhysicalDeviceTransformFeedbackPropertiesEXT xfb_props = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
-   };
    VkPhysicalDeviceDrmPropertiesEXT drm_props = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT, .pNext = &xfb_props,
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
    };
    VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR, .pNext = &drm_props,
@@ -235,8 +228,6 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    get_properties2(physical, &properties2);
    CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 1 &&
          robust_props.robustUniformBufferAccessSizeAlignment == 1);
-   CHECK(xfb_props.maxTransformFeedbackStreams == 1 && xfb_props.maxTransformFeedbackBuffers == 4 &&
-         xfb_props.transformFeedbackQueries && !xfb_props.transformFeedbackDraw);
    /* Zink matches its DRM fd's render node against these numbers. */
    CHECK(drm_props.hasRender && drm_props.renderMajor == 1 && drm_props.renderMinor == 3);
    CHECK(drm_props.hasPrimary && drm_props.primaryMajor == 1 && drm_props.primaryMinor == 5);
@@ -245,8 +236,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(maintenance5_props.earlyFragmentSampleMaskTestBeforeSampleCounting &&
          !maintenance5_props.earlyFragmentMultisampleCoverageAfterSampleCounting &&
          maintenance5_props.depthStencilSwizzleOneSupport && !maintenance5_props.polygonModePointSize &&
-         maintenance5_props.nonStrictSinglePixelWideLinesUseParallelogram &&
-         maintenance5_props.nonStrictWideLinesUseParallelogram);
+         !maintenance5_props.nonStrictSinglePixelWideLinesUseParallelogram &&
+         !maintenance5_props.nonStrictWideLinesUseParallelogram);
    PROC(EnumerateDeviceExtensionProperties, enumerate_extensions);
    VkExtensionProperties extensions[128];
    uint32_t extension_count = ARRAY_SIZE(extensions);
@@ -351,20 +342,16 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       get_format(physical, VK_FORMAT_MAX_ENUM - i, &format);
       CHECK(!format.linearTilingFeatures && !format.optimalTilingFeatures && !format.bufferFeatures);
    }
-   /* B10G11R11 renders and blends (GL 3.0 / GLES 3.0 EXT_packed_float); no storage. */
+   /* B10G11R11 has no texture-unit or ROP class: transfers and storage. */
    get_format(physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &format);
-   CHECK((format.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
-         (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
-          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
-         !(format.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
+   CHECK(format.optimalTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
       VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | transfer_features | sampled;
    CHECK(format.linearTilingFeatures == image_features && format.optimalTilingFeatures == image_features &&
          format.bufferFeatures == (texel | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT));
-   CHECK(props.limits.maxImageDimension2D == 4096 && props.limits.maxImageArrayLayers == 256);
+   CHECK(props.limits.maxImageDimension2D == 8192 && props.limits.maxImageArrayLayers == 2048);
    /* DRM_FORMAT_MOD_LINEAR only, for linear color formats. */
    PROC(GetPhysicalDeviceFormatProperties2KHR, get_format2);
    const VkFormat modifier_formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT,
@@ -433,12 +420,12 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    VkImageFormatProperties image_props;
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &image_props) == VK_SUCCESS);
-   CHECK(image_props.maxExtent.width == 4096 && image_props.maxExtent.height == 4096 && image_props.maxExtent.depth == 1);
-   CHECK(image_props.maxMipLevels == 13 && image_props.maxArrayLayers == 256 &&
+   CHECK(image_props.maxExtent.width == 8192 && image_props.maxExtent.height == 8192 && image_props.maxExtent.depth == 1);
+   CHECK(image_props.maxMipLevels == 14 && image_props.maxArrayLayers == 2048 &&
          image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT && image_props.maxResourceSize == (1ull << 31));
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
       VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_SUCCESS);
-   CHECK(image_props.maxExtent.depth == 2048 && image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
+   CHECK(image_props.maxExtent.depth == 512 && image_props.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
    CHECK(get_image_format(physical, VK_FORMAT_R32_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
       VK_IMAGE_USAGE_SAMPLED_BIT, 0, &image_props) == VK_SUCCESS);
    CHECK(get_image_format(physical, VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,

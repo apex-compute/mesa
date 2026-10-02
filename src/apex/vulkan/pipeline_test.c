@@ -8,6 +8,7 @@
 #include "vk_device.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
+#include "vk_pipeline.h"
 #include "vk_sampler.h"
 #include "util/u_math.h"
 #include "util/format_r11g11b10f.h"
@@ -368,10 +369,12 @@ test_dispatch(struct vk_physical_device *physical, const char *path, const char 
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
    struct apex_pipeline *p = apex_pipeline_from_handle(pipeline);
    CHECK(p->program.descriptor_count == (multiple ? 2 : 1) && p->program.push_size == (multiple ? 0 : 20));
+   /* A DISPATCH of programs with private memory fits the private arena. */
    uint64_t padded_private = (uint64_t)word(p->program.code.data + 24) * 16;
-   CHECK(p->program.max_workgroups && p->program.max_workgroups <= 1024);
-   CHECK(padded_private * p->program.max_workgroups <= 2097152);
-   CHECK(p->program.max_workgroups == 1024 || padded_private * (p->program.max_workgroups + 1) > 2097152);
+   CHECK(p->program.max_workgroups);
+   CHECK(padded_private ? padded_private * p->program.max_workgroups <= 2097152 &&
+                          padded_private * (p->program.max_workgroups + 1) > 2097152 :
+                          p->program.max_workgroups == UINT32_MAX);
    if (output) {
       char filename[4096];
       const char *name = multiple ? "mesa-multiple" : grid ? "mesa-dispatch-grid" : "mesa-dispatch";
@@ -478,16 +481,23 @@ load_module(const struct vk_device_dispatch_table *v, VkDevice dev, const char *
    return module;
 }
 
-/* A dynamic-rendering pipeline builds the vertex kernel (vertex fetch,
- * indexed and direct paths) and the fragment kernel; NIR validation runs
- * on every pass in debug builds. */
-/* `gles` adds the GLES 2 rasterization state: line polygon mode, wide
- * stippled smooth lines, a logic op, alpha to one and a depth/stencil
- * attachment; without `fragment_path` the vertex shader owns the depth-only
- * fragment kernel. */
+/* The program header fields of a graphics program (Docs/isa.md). */
+static void
+check_header(const struct apex_program *program, unsigned stage)
+{
+   const uint8_t *h = program->code.data;
+   CHECK(word(h) == 0x50585041 && h[4] == stage && !h[6] && !h[7]);
+   CHECK(word(h + 16) == (16 | 1u << 16) && word(h + 20) == 1 && !word(h + 24));
+}
+
+/* A dynamic-rendering pipeline compiles a P7 vertex and fragment program;
+ * NIR validation runs on every pass in debug builds. `gles` adds the GLES 2
+ * rasterization state: line polygon mode, wide lines, a logic op, alpha to
+ * one and a depth/stencil attachment. Checks the vertex program's output
+ * stride and the fragment program's input count. */
 static void
 test_draw_pipeline(struct apex_device *device, const char *vertex_path, const char *fragment_path,
-                   bool gles)
+                   bool gles, unsigned stride, unsigned inputs)
 {
    VkDevice dev = apex_device_to_handle(device);
    const struct vk_device_dispatch_table *v = &device->vk.dispatch_table;
@@ -500,9 +510,9 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
        .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = modules[1], .pName = "main"},
    };
    const VkVertexInputBindingDescription binding = {0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
-   /* RGBA32F position and an RGB8 color whose missing alpha fetch fills. */
+   /* RGBA32F position and a BGRA8 color the vertex program swizzles. */
    const VkVertexInputAttributeDescription attributes[2] = {
-      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R8G8B8_UNORM, 16},
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_B8G8R8A8_UNORM, 16},
    };
    const VkPipelineVertexInputStateCreateInfo vi = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -521,14 +531,8 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
       .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
    };
-   const VkPipelineRasterizationLineStateCreateInfoKHR line = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_KHR, .pNext = &provoking,
-      .lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR,
-      .stippledLineEnable = VK_TRUE, .lineStippleFactor = 3, .lineStipplePattern = 0xf0f0,
-   };
    const VkPipelineRasterizationStateCreateInfo rs = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-      .pNext = gles ? (const void *)&line : &provoking,
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .pNext = &provoking,
       .polygonMode = gles ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, .lineWidth = gles ? 3.0f : 1.0f,
    };
    const VkPipelineMultisampleStateCreateInfo ms = {
@@ -567,9 +571,25 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
       .pMultisampleState = &ms, .pDepthStencilState = gles ? &dss : NULL,
       .pColorBlendState = &cb, .pDynamicState = &ds, .layout = layout,
    };
-   VkPipeline pipeline;
-   CHECK(v->CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS);
-   v->DestroyPipeline(dev, pipeline, NULL);
+   VkPipeline handle;
+   CHECK(v->CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &handle) == VK_SUCCESS);
+   struct vk_pipeline *pipeline = vk_pipeline_from_handle(handle);
+   struct vk_shader *vs = pipeline->ops->get_shader(pipeline, MESA_SHADER_VERTEX);
+   struct vk_shader *fs = pipeline->ops->get_shader(pipeline, MESA_SHADER_FRAGMENT);
+   CHECK(vs && !fs == !fragment_path);
+   const struct apex_shader *vertex = container_of(vs, struct apex_shader, vk);
+   /* The record: position, the point size line, clip distances, varyings;
+    * 64 bytes per four vec4s. */
+   check_header(&vertex->program, 1);
+   const uint8_t *h = vertex->program.code.data;
+   CHECK(vertex->vertex.stride == stride && (h[28] | h[29] << 8) == stride);
+   if (fs) {
+      const struct apex_shader *fragment = container_of(fs, struct apex_shader, vk);
+      check_header(&fragment->program, 2);
+      h = fragment->program.code.data;
+      CHECK((h[28] & 1) && (h[30] | h[31] << 8) == inputs);
+   }
+   v->DestroyPipeline(dev, handle, NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);
    for (unsigned i = 0; i < 2; i++)
       if (modules[i])
@@ -627,14 +647,13 @@ test_small_floats(void)
    ralloc_free(b.shader);
 }
 
-/* Offline backend coverage of the software graphics and sampling paths:
- * the internal kernels, a draw pipeline and a compute shader sampling
- * two combined image samplers (fetch, nearest and linear with border
- * replacement). */
+/* Offline coverage of the graphics programs: a sampler's custom border, a
+ * linear 3D layout, the internal kernels, draw pipelines and a compute
+ * shader sampling two combined image samplers through the texture unit. */
 static void
 test_graphics_programs(struct vk_physical_device *physical, const char *texture_path,
                        const char *vertex_path, const char *fragment_path, const char *clip_path,
-                       const char *clip_fragment_path, const char *xfb_path)
+                       const char *clip_fragment_path)
 {
    struct apex_device device;
    const float priority = 1;
@@ -646,26 +665,12 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
    };
-   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
-   device.transport = APEX_TRANSPORT_DRM;
-   test_small_floats();
-   /* Border swizzles: format components, conversion to RGBA, view mapping. */
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1) == VK_SUCCESS);
+   /* Depth and stencil texels read (D or S, 0, 0, 1) through format words. */
 #define SW(r, g, b, a) ((r) | (g) << 3 | (b) << 6 | (a) << 9)
    const unsigned Z = APEX_SWIZZLE_0, O = APEX_SWIZZLE_1;
-   const VkComponentMapping identity = {0}, reversed = {
-      VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R};
-   CHECK(apex_border_swizzle(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &identity) == SW(0, 1, 2, 3));
-   CHECK(apex_border_swizzle(VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &reversed) == SW(3, 2, 1, 0));
-   CHECK(apex_border_swizzle(VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &identity) == SW(0, Z, Z, O));
-   CHECK(apex_border_swizzle(VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &reversed) == SW(O, Z, Z, 0));
-   CHECK(apex_border_swizzle(VK_FORMAT_A8_UNORM_KHR, VK_IMAGE_ASPECT_COLOR_BIT, &identity) == SW(Z, Z, Z, 3));
-   CHECK(apex_border_swizzle(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_IMAGE_ASPECT_COLOR_BIT, &identity) ==
-         SW(0, 1, 2, O));
-   const VkComponentMapping rrr1 = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
-                                    VK_COMPONENT_SWIZZLE_ONE};
-   CHECK(apex_border_swizzle(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, &rrr1) == SW(0, 0, 0, O));
-   CHECK(apex_border_swizzle(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, &identity) == SW(0, Z, Z, O));
-   /* Depth and stencil texels read (D or S, 0, 0, 1): word 0 bits 8..19. */
+   const VkComponentMapping identity = {0}, rrr1 = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                                                    VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
    uint32_t words[3];
    CHECK(apex_format_encode(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, &identity, words));
    CHECK(((words[0] >> 8) & 0xfff) == SW(0, Z, Z, O));
@@ -674,7 +679,7 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
    CHECK(apex_format_encode(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, &rrr1, words));
    CHECK(((words[0] >> 8) & 0xfff) == SW(0, 0, 0, O));
 #undef SW
-   /* Custom border colors reach the sampler row without a format. */
+   /* Custom border colors reach the sampler descriptor without a format. */
    VkDevice handle = apex_device_to_handle(&device);
    const VkSamplerCustomBorderColorCreateInfoEXT custom = {
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT,
@@ -685,10 +690,10 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
       .borderColor = VK_BORDER_COLOR_INT_CUSTOM_EXT};
    VkSampler sampler;
    CHECK(device.vk.dispatch_table.CreateSampler(handle, &sampler_info, NULL, &sampler) == VK_SUCCESS);
-   CHECK(!memcmp(&((struct apex_sampler *)vk_sampler_from_handle(sampler))->row[4],
-                 custom.customBorderColor.int32, 16));
+   const uint32_t *row = ((struct apex_sampler *)vk_sampler_from_handle(sampler))->row;
+   CHECK(!memcmp(&row[4], custom.customBorderColor.int32, 16) && (row[1] >> 29) == 3);
    device.vk.dispatch_table.DestroySampler(handle, sampler, NULL);
-   /* A 3D level's subresource spans its depth slices. */
+   /* A linear 3D level's subresource spans its depth slices. */
    const VkImageCreateInfo volume = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_3D, .format = VK_FORMAT_R16_UNORM, .extent = {32, 48, 56},
       .mipLevels = 2, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -706,16 +711,22 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
       CHECK(l->offset == (level ? 64 * 48 * 56 : 0) && l->rowPitch == 64 &&
             l->depthPitch == 64u * (48 >> level) && l->size == l->depthPitch * (56 >> level));
    }
-   /* Every internal kernel compiles through the backend. */
+   /* Every internal kernel and the empty fragment program compile. */
    for (unsigned k = 0; k < APEX_INTERNAL_COUNT; k++) {
       struct apex_program *internal;
       CHECK(apex_internal_program(&device, k, &internal) == VK_SUCCESS);
-      CHECK(internal->code.size > 48);
+      CHECK(internal->code.size > 64 && internal->code.data[4] == 0);
    }
-   test_draw_pipeline(&device, vertex_path, fragment_path, false);
-   test_draw_pipeline(&device, clip_path, clip_fragment_path, true);
-   test_draw_pipeline(&device, clip_path, NULL, true);
-   test_draw_pipeline(&device, xfb_path, fragment_path, false);
+   struct apex_program *empty;
+   CHECK(apex_empty_fragment_program(&device, &empty) == VK_SUCCESS);
+   check_header(empty, 2);
+   CHECK(!apex_program_late_depth(empty) && !apex_program_sample_shading(empty));
+   /* triangle: position, line 0's defaults, one varying: two lines. The
+    * clip fixture adds five clip and one cull distance and passes them as
+    * varyings 30 and 31: nine lines and 32 fragment inputs. */
+   test_draw_pipeline(&device, vertex_path, fragment_path, false, 64 * 2, 1);
+   test_draw_pipeline(&device, clip_path, clip_fragment_path, true, 64 * 9, 32);
+   test_draw_pipeline(&device, clip_path, NULL, true, 64 * 2, 0);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkShaderModule module = load_module(v, dev, texture_path);
@@ -740,8 +751,8 @@ test_graphics_programs(struct vk_physical_device *physical, const char *texture_
          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}};
    VkPipeline pipeline;
    CHECK(v->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS);
-   /* Buffer row, two three-row combined descriptors. */
-   CHECK(apex_pipeline_from_handle(pipeline)->program.descriptor_count == 7);
+   /* Buffer row, two combined descriptors of an image and a sampler row. */
+   CHECK(apex_pipeline_from_handle(pipeline)->program.descriptor_count == 5);
    v->DestroyPipeline(dev, pipeline, NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);
    v->DestroyDescriptorSetLayout(dev, set, NULL);
@@ -801,7 +812,7 @@ test_bench(struct vk_physical_device *physical, const char *path)
    const unsigned groups = 3, count = 2000, stride = groups * 256;
    const uint64_t table_va = 0x10000, src_va = 0x200000, dst_va = 0x400000;
    unsigned trailer = apex_program_trailer(program);
-   uint8_t *table = calloc(1, trailer + sizeof(struct apex_dispatch_parameters));
+   uint8_t *table = calloc(1, trailer + 16);
    uint32_t *src = malloc(count * 16), *dst = calloc(1, count * 16);
    for (unsigned i = 0; i < count * 4; i++)
       src[i] = util_cpu_to_le32(0x9e3779b9u * (i + 1));
@@ -813,12 +824,14 @@ test_bench(struct vk_physical_device *physical, const char *path)
    uint32_t *push_image = (void *)(table + (program->descriptor_count + 1) * sizeof(union apex_descriptor));
    push_image[0] = 2; /* copy */
    push_image[1] = count;
-   struct apex_dispatch_parameters *parameters = (void *)(table + trailer);
-   *parameters = (struct apex_dispatch_parameters){.base = {0, groups, groups}, .groups = {groups, 1, 1}};
+   /* The trailer's grid, which user data s2:s3 address. */
+   uint32_t *trailer_grid = (void *)(table + trailer);
+   trailer_grid[0] = groups;
+   trailer_grid[1] = trailer_grid[2] = 1;
    struct apex_sim_region regions[] = {
-      {table_va, table, trailer + sizeof(*parameters)}, {src_va, src, count * 16}, {dst_va, dst, count * 16},
+      {table_va, table, trailer + 16}, {src_va, src, count * 16}, {dst_va, dst, count * 16},
    };
-   uint32_t user[16] = {table_va}, grid[3] = {groups, 1, 1};
+   uint32_t user[16] = {table_va, 0, table_va + trailer}, grid[3] = {groups, 1, 1};
    char diagnostic[256] = "";
    if (apex_simulate(program->code.data, program->code.size, user, grid, 0, NULL, regions, 3,
                      diagnostic)) {
@@ -838,8 +851,7 @@ test_bench(struct vk_physical_device *physical, const char *path)
    apex_device_finish(&device);
 }
 
-/* The apex-bench scenes' graphics pipelines (software raster kernels until
- * the fixed-function path lands) compile without spills. */
+/* The apex-bench scenes' graphics pipelines compile without spills. */
 static void
 test_graphics(struct vk_physical_device *physical, const char *vs, const char *fs, bool game)
 {
@@ -931,7 +943,7 @@ test_graphics(struct vk_physical_device *physical, const char *vs, const char *f
 
 int main(int argc, char **argv)
 {
-   bool graphics = argc == 6 && !strcmp(argv[1], "--graphics");
+   bool graphics = argc == 7 && !strcmp(argv[1], "--graphics");
    CHECK(graphics || argc == 13 || argc == 14);
    const char *output = argc == 14 ? argv[13] : NULL;
    FILE *f = fopen(graphics ? argv[2] : argv[1], "rb");
@@ -962,6 +974,22 @@ int main(int argc, char **argv)
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
                                  &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
+   free(spirv);
+   if (graphics) {
+      test_graphics_programs(&physical, argv[2], argv[3], argv[4], argv[5], argv[6]);
+      vk_physical_device_finish(&physical);
+      vk_instance_finish(&instance);
+      puts("PASS Apex graphics programs: vertex and fragment program headers, distance varyings, "
+           "internal kernels, texture-unit sampling compile");
+      return 0;
+   }
+   f = fopen(argv[1], "rb");
+   CHECK(f && fseek(f, 0, SEEK_END) == 0);
+   size = ftell(f);
+   rewind(f);
+   spirv = malloc(size);
+   CHECK(spirv && fread(spirv, 1, size, f) == size);
+   CHECK(fclose(f) == 0);
    struct apex_device device = {0};
    const struct vk_device_dispatch_table dispatch = {
       .CreateComputePipelines = apex_CreateComputePipelines,

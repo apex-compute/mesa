@@ -9,10 +9,14 @@
 #include "util/bitset.h"
 #include "nir_builder.h"
 
-/* One native program and its descriptor-table layout: rows for every set
- * binding, the zero sentinel row, push constants and an immutable trailer.
- * The owner holds references to the set layouts. The binary uploads lazily
- * on the submit thread. `table` is false only for layout-less fixtures. */
+/* One P7 program and its descriptor-table layout: rows for every set
+ * binding, the zero sentinel row, push constants and the trailer
+ * (apex_job.h). The owner holds references to the set layouts. The binary
+ * uploads lazily on the submit thread. `table` is false only for
+ * layout-less fixtures. User data s0:s1 hold the table's GPUVA; compute
+ * user data s2:s3 the address of the dispatch grid, vertex user data s2 the
+ * view index. `max_workgroups` bounds a DISPATCH by the private arena. */
+#define APEX_USER_GRID 2
 struct apex_program {
    struct apex_compile_result code;
    struct apex_bo bo;
@@ -26,14 +30,14 @@ struct apex_program {
    BITSET_DECLARE(used_descriptors, APEX_MAX_DESCRIPTORS);
 };
 
-/* Byte offset of the immutable trailer after descriptors and push data. */
+/* Byte offset of the trailer after descriptors and push data. */
 static inline uint32_t
 apex_program_trailer(const struct apex_program *program)
 {
    return (program->descriptor_count + 1) * sizeof(union apex_descriptor) + program->push_size;
 }
 
-/* Fixed local shapes with 1-256 invocations. No API capability advertisement. */
+/* Fixed local shapes with 1-256 invocations. */
 struct apex_pipeline {
    struct vk_pipeline vk;
    struct apex_program program;
@@ -50,14 +54,11 @@ bool apex_program_layout(struct apex_program *program, uint32_t set_count,
                          VkShaderStageFlags stages);
 /* Lowers descriptors, push constants, global access and Int64 in place. */
 bool apex_program_lower_resources(struct apex_program *program, struct nir_shader *nir);
-/* Compiles lowered NIR and derives the private-extent workgroup limit. */
+/* Compiles lowered NIR and derives the private-arena workgroup limit. */
 VkResult apex_program_compile(struct vk_device *device, struct apex_program *program,
                               struct nir_shader *nir);
 void apex_program_finish(struct apex_device *device, struct apex_program *program);
-/* Whether conditional rendering discards the job (struct
- * apex_dispatch_parameters predicate at byte offset `trailer`). */
-nir_def *apex_predicate_discarded(nir_builder *b, unsigned trailer);
-/* Lowers texture instructions to the software sampler (apex_texture.c). */
+/* Lowers texture and image instructions (apex_texture.c). */
 bool apex_lower_textures(struct apex_program *program, struct nir_shader *nir);
 /* FP16 bits in the low half of a 32-bit value to FP32 bits, and back. */
 nir_def *apex_half_to_float(nir_builder *b, nir_def *h);

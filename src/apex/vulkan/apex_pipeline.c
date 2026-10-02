@@ -149,122 +149,20 @@ apex_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk,
    vk_pipeline_free(device, alloc, vk);
 }
 
-struct workgroup_lowering {
-   nir_variable *id, *grid;
-   nir_intrinsic_instr *native;
-};
-
+/* User data s2:s3 hold the address of the dispatch grid: the table's
+ * grid words, or the VkDispatchIndirectCommand of an indirect dispatch. The
+ * launch registers carry the workgroup, base included. */
 static bool
-lower_workgroup(nir_builder *b, nir_intrinsic_instr *i, void *data)
+lower_grid(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
-   struct workgroup_lowering *ctx = data;
-   nir_def *replacement;
-   b->cursor = nir_before_instr(&i->instr);
-   switch (i->intrinsic) {
-   case nir_intrinsic_load_num_workgroups:
-      replacement = nir_load_var(b, ctx->grid);
-      break;
-   case nir_intrinsic_load_workgroup_id:
-      /* The launch registers carry the native workgroup, base included. */
-      if (i == ctx->native)
-         return false;
-      replacement = nir_load_var(b, ctx->id);
-      break;
-   case nir_intrinsic_load_base_workgroup_id:
-      replacement = nir_imm_zero(b, 3, 32);
-      break;
-   case nir_intrinsic_load_global_invocation_id: {
-      nir_def *size = nir_imm_ivec3(b, b->shader->info.workgroup_size[0],
-         b->shader->info.workgroup_size[1], b->shader->info.workgroup_size[2]);
-      replacement = nir_iadd(b, nir_imul(b, nir_load_var(b, ctx->id), size),
-                             nir_load_local_invocation_id(b));
-      break;
-   }
-   default:
+   if (i->intrinsic != nir_intrinsic_load_num_workgroups)
       return false;
-   }
-   nir_def_rewrite_uses(&i->def, replacement);
-   nir_instr_remove(&i->instr);
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *address = nir_load_kernel_input(b, 2, 32, nir_imm_int(b, 0),
+                                            .base = APEX_USER_GRID * 4, .range = 8);
+   nir_def_replace(&i->def, nir_load_global_2x32(b, 3, 32, address, .align_mul = 4,
+      .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE));
    return true;
-}
-
-/* Each native workgroup runs linear workgroups first + native, stepping by
- * the stride below end. Indirect jobs read the grid from the
- * VkDispatchIndirectCommand and cover all of it. */
-static void
-wrap_workgroups(const struct apex_program *program, nir_shader *nir)
-{
-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   struct workgroup_lowering ctx = {
-      .id = nir_local_variable_create(impl, glsl_uvec_type(3), "workgroup"),
-      .grid = nir_local_variable_create(impl, glsl_uvec_type(3), "grid"),
-   };
-   nir_cf_list body;
-   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
-   nir_builder builder = nir_builder_at(nir_before_impl(impl));
-   nir_builder *b = &builder;
-   unsigned trailer = apex_program_trailer(program);
-   nir_def *words[11];
-   for (unsigned w = 0; w < 11; w++)
-      words[w] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_imm_int(b, trailer + w * 4),
-                               .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
-   nir_def *indirect = nir_vec2(b, words[6], words[7]);
-   nir_def *direct_grid = nir_vec3(b, words[3], words[4], words[5]);
-   nir_push_if(b, nir_ine_imm(b, nir_ior(b, words[6], words[7]), 0));
-   nir_def *loaded[3];
-   for (unsigned axis = 0; axis < 3; axis++)
-      loaded[axis] = nir_load_global_2x32(b, 1, 32,
-         nir_build_addr_iadd_imm(b, indirect, nir_address_format_2x32bit_global,
-                                 nir_var_mem_global, axis * 4), .align_mul = 4);
-   nir_def *indirect_grid = nir_vec(b, loaded, 3);
-   nir_def *indirect_end = nir_imul(b, nir_imul(b, loaded[0], loaded[1]), loaded[2]);
-   nir_pop_if(b, NULL);
-   nir_def *grid = nir_if_phi(b, indirect_grid, direct_grid);
-   nir_def *end = nir_if_phi(b, indirect_end, words[1]);
-   /* Conditional rendering discards the whole dispatch. */
-   end = nir_bcsel(b, apex_predicate_discarded(b, trailer), nir_imm_int(b, 0), end);
-   nir_store_var(b, ctx.grid, grid, 0x7);
-   nir_variable *linear = nir_local_variable_create(impl, glsl_uint_type(), "linear");
-   nir_def *native = nir_load_workgroup_id(b);
-   ctx.native = nir_def_as_intrinsic(native);
-   nir_store_var(b, linear, nir_iadd(b, words[0], nir_channel(b, native, 0)), 1);
-   nir_loop *loop = nir_push_loop(b);
-   nir_def *l = nir_load_var(b, linear);
-   nir_push_if(b, nir_uge(b, l, end));
-   nir_jump(b, nir_jump_break);
-   nir_pop_if(b, NULL);
-   nir_def *gx = nir_channel(b, grid, 0), *gy = nir_channel(b, grid, 1);
-   nir_def *row = nir_udiv(b, l, gx);
-   nir_def *origin = nir_vec3(b, words[8], words[9], words[10]);
-   nir_store_var(b, ctx.id, nir_iadd(b, origin, nir_vec3(b, nir_isub(b, l, nir_imul(b, row, gx)),
-                                                        nir_umod(b, row, gy), nir_udiv(b, row, gy))), 0x7);
-   nir_cf_reinsert(&body, b->cursor);
-   b->cursor = nir_after_cf_list(&loop->body);
-   /* Shared memory of one workgroup is reused by the next. */
-   if (nir->info.shared_size)
-      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
-   nir_store_var(b, linear, nir_iadd(b, l, words[2]), 1);
-   nir_pop_loop(b, loop);
-   nir_progress(true, impl, nir_metadata_none);
-   nir_shader_intrinsics_pass(nir, lower_workgroup, nir_metadata_control_flow, &ctx);
-}
-
-nir_def *
-apex_predicate_discarded(nir_builder *b, unsigned trailer)
-{
-   nir_def *words[3];
-   for (unsigned w = 0; w < 3; w++)
-      words[w] = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-                               nir_imm_int(b, trailer + (APEX_DISPATCH_PREDICATE + w) * 4),
-                               .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
-   nir_def *va = nir_vec2(b, words[0], words[1]);
-   nir_def *present = nir_ine_imm(b, nir_ior(b, words[0], words[1]), 0), *kept = nir_imm_false(b);
-   nir_push_if(b, present);
-   nir_def *zero = nir_ieq_imm(b, nir_load_global_2x32(b, 1, 32, va, .align_mul = 4), 0);
-   nir_def *discarded = nir_ine(b, zero, nir_ine_imm(b, words[2], 0));
-   nir_pop_if(b, NULL);
-   return nir_if_phi(b, discarded, kept);
 }
 
 static bool
@@ -380,10 +278,10 @@ apex_program_compile(struct vk_device *device, struct apex_program *program, nir
          fclose(f);
       }
    }
+   /* Wave k of a DISPATCH takes private base + 16 k private bytes: the
+    * device's private arena bounds the workgroups of one DISPATCH. */
    uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
-   /* The device's private arena holds this dispatch's padded private data. */
-   program->max_workgroups = program->table && extent ?
-      MIN2(1024, APEX_PRIVATE_BYTES / extent) : 1024;
+   program->max_workgroups = extent ? MIN2(APEX_PRIVATE_BYTES / extent, UINT32_MAX) : UINT32_MAX;
    return program->max_workgroups ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
@@ -453,8 +351,8 @@ create_compute_pipeline(struct vk_device *device,
          goto unsupported_layout;
       if (!apex_program_lower_resources(&pipeline->program, nir))
          goto unsupported_layout;
-      wrap_workgroups(&pipeline->program, nir);
    }
+   nir_shader_intrinsics_pass(nir, lower_grid, nir_metadata_control_flow, NULL);
    result = apex_program_compile(device, &pipeline->program, nir);
    ralloc_free(nir);
    if (result != VK_SUCCESS) {

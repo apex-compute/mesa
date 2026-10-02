@@ -7,12 +7,13 @@
 #include "vk_meta.h"
 #include "vk_sampler.h"
 #include "apex_format.h"
+#include "apex_job.h"
 #include "apex_cp.h"
 #include "util/vma.h"
 
+/* Internal compute kernels (apex_job.h). */
 enum apex_internal {
-   APEX_INTERNAL_SETUP, APEX_INTERNAL_BIN, APEX_INTERNAL_COPY, APEX_INTERNAL_CLEAR, APEX_INTERNAL_TIMESTAMP, APEX_INTERNAL_QUERY_COPY,
-   APEX_INTERNAL_RESOLVE, APEX_INTERNAL_ETC2, APEX_INTERNAL_XFB,
+   APEX_INTERNAL_COPY, APEX_INTERNAL_CLEAR, APEX_INTERNAL_QUERY_COPY, APEX_INTERNAL_ETC2,
    APEX_INTERNAL_COUNT
 };
 
@@ -50,6 +51,7 @@ struct apex_set_layout {
    uint32_t (*samplers)[8];
    struct apex_binding_layout bindings[];
 };
+/* `row` is the texture-unit sampler descriptor. */
 struct apex_sampler {
    struct vk_sampler vk;
    uint32_t row[8];
@@ -60,31 +62,12 @@ struct apex_sampler {
 struct apex_buffer_descriptor {
    uint32_t low, high, bytes, flags;
 };
-struct apex_image_descriptor {
-   uint32_t low, high, width, height, depth, row_stride, slice_stride, reserved;
-};
+/* A 32-byte table row: a buffer descriptor, a texture-unit image or sampler
+ * descriptor (apex_hw.h), a texel-buffer row or format words. */
 union apex_descriptor {
    struct apex_buffer_descriptor buffer;
-   struct apex_image_descriptor image;
+   uint32_t words[8];
 };
-
-/* Immutable trailer after descriptors and push constants, in little endian. */
-/* Compute jobs: base = first and end linear workgroup and the launch stride,
- * groups = API grid, indirect = VkDispatchIndirectCommand address supplying
- * the grid (zero for direct jobs), origin = vkCmdDispatchBase offset. Graphics
- * jobs use base[0] and groups[0..1] as their launch range. predicate =
- * conditional rendering's 32-bit value address (zero when unconditional):
- * the job does nothing when the value is zero, or nonzero if inverted. */
-struct apex_dispatch_parameters {
-   uint32_t base[3];
-   uint32_t groups[3];
-   uint32_t indirect[2];
-   uint32_t origin[3];
-   uint32_t predicate[2];
-   uint32_t inverted;
-};
-_Static_assert(sizeof(struct apex_dispatch_parameters) == APEX_DISPATCH_WORDS * 4,
-              "trailer words shared with the internal kernels");
 
 struct apex_bo {
    void *map;
@@ -96,6 +79,13 @@ struct apex_bo {
 /* Internal single-queue device on one user-mode ring. A negative fd builds an
  * offline device for compiler tests: no memory, queue or submission. */
 #define APEX_PRIVATE_BYTES (2u * 1024 * 1024)
+/* The queue's bin pool (Docs/architecture.md, Pipeline and render passes):
+ * the pass record, bin heads, then the draw-slot, vertex-output and
+ * primitive regions and the bin chunks to the end. */
+#define APEX_BIN_POOL_BYTES (32u * 1024 * 1024)
+#define APEX_POOL_DRAW_BYTES (2u * 1024 * 1024)
+#define APEX_POOL_VERTEX_BYTES (8u * 1024 * 1024)
+#define APEX_POOL_PRIMITIVE_BYTES (6u * 1024 * 1024)
 
 struct apex_device {
    struct vk_device vk;
@@ -117,20 +107,19 @@ struct apex_device {
    struct apex_ring ring;
    /* SIGNAL target retiring batch arenas without an interrupt. */
    struct apex_bo retire;
-   /* Private data of the one dispatch in flight: APEX_PRIVATE_BYTES of
-    * LOCAL at a 2 MiB-aligned GPUVA, the compute private base. */
+   /* Private data of the dispatches using private memory, one at a time:
+    * APEX_PRIVATE_BYTES of LOCAL at a 2 MiB-aligned GPUVA. */
    struct apex_bo private_arena;
+   /* The queue's bin pool, written by the geometry front end. */
+   struct apex_bo bin_pool;
    uint64_t sequence, kwait;
    struct list_head busy_arenas, free_arenas;
    /* A program upload since the last batch invalidates instruction caches. */
    bool programs_uploaded;
-   /* Internal programs, compiled on first use. */
+   /* Internal programs and the empty fragment program of depth-only draws,
+    * compiled on first use under memory_mutex. */
    struct apex_program *internal[APEX_INTERNAL_COUNT];
-   /* Indirect draw scratch and parameter block, created on first use under
-    * memory_mutex (see APEX_ARENA_* in apex_draw.h). */
-   struct apex_bo arena;
-   /* 4x resolve programs by format, compiled on first use. */
-   struct apex_program *resolve[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1];
+   struct apex_program *empty_fragment;
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
@@ -141,6 +130,13 @@ VkFormatFeatureFlags2 apex_format_features(VkFormat format, bool buffer);
 VkResult apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info, bool prime,
                                       VkImageFormatProperties2 *properties);
 bool apex_format_modifier_supported(VkFormat format);
+VkFormatFeatureFlags2 apex_linear_format_features(VkFormat format);
+
+VkResult apex_bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
+                        uint32_t gem_flags, uint64_t reserved_va, struct apex_bo *bo);
+struct apex_program;
+/* Uploads a program on first use; the next batch invalidates instruction caches. */
+VkResult apex_program_upload(struct apex_device *device, struct apex_program *program);
 
 VkResult apex_device_init(struct apex_device *device,
                           struct vk_physical_device *physical,

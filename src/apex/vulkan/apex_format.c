@@ -1,13 +1,11 @@
 /* SPDX-License-Identifier: MIT */
-/* Data-driven texel formats and sampler rows consumed by the software sampler
+/* Data-driven texel formats of texel buffers and storage images
  * (apex_texture.c). A format word triple describes up to four stored channels
  * as bit fields, so one decoder serves every plain format. */
 #include "apex_device.h"
-#include "apex_draw.h"
 #include "apex_format.h"
 #include "util/format/u_format.h"
 #include "vk_format.h"
-#include "vk_sampler.h"
 
 static uint32_t
 channel_type(const struct util_format_channel_description *ch)
@@ -101,77 +99,6 @@ apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponent
    }
    bool integer = util_format_is_pure_integer(pformat);
    out[0] |= integer << 20;
-   return true;
-}
-
-uint32_t
-apex_border_swizzle(VkFormat format, VkImageAspectFlags aspects, const VkComponentMapping *mapping)
-{
-   /* Replacement fills the format's components; conversion to RGBA then
-    * supplies zero color and one alpha, and depth or stencil reads red. */
-   bool present[4] = {true, false, false, false};
-   if (!(aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
-      const struct util_format_description *desc =
-         util_format_description(vk_format_to_pipe_format(format));
-      for (unsigned c = 0; c < 4; c++)
-         present[c] = desc && desc->swizzle[c] <= PIPE_SWIZZLE_W;
-   }
-   const VkComponentSwizzle view[4] = {mapping->r, mapping->g, mapping->b, mapping->a};
-   uint32_t out = 0;
-   for (unsigned c = 0; c < 4; c++) {
-      VkComponentSwizzle s = view[c] == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_R + c : view[c];
-      uint32_t select = s == VK_COMPONENT_SWIZZLE_ZERO ? APEX_SWIZZLE_0 : APEX_SWIZZLE_1;
-      if (s >= VK_COMPONENT_SWIZZLE_R && s <= VK_COMPONENT_SWIZZLE_A) {
-         unsigned f = s - VK_COMPONENT_SWIZZLE_R;
-         select = present[f] ? f : f == 3 ? APEX_SWIZZLE_1 : APEX_SWIZZLE_0;
-      }
-      out |= select << (3 * c);
-   }
-   return out;
-}
-
-void
-apex_sampler_encode(const VkSamplerCreateInfo *info, const struct vk_sampler *sampler,
-                    uint32_t out[8])
-{
-   const VkSamplerReductionModeCreateInfo *reduction =
-      vk_find_struct_const(info->pNext, SAMPLER_REDUCTION_MODE_CREATE_INFO);
-   uint32_t mode = reduction ? reduction->reductionMode : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
-   float values[3] = {info->mipLodBias, info->minLod, info->maxLod};
-   out[0] = (info->magFilter == VK_FILTER_LINEAR) |
-            (info->minFilter == VK_FILTER_LINEAR) << 1 |
-            (info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR) << 2 |
-            info->addressModeU << 4 | info->addressModeV << 8 | info->addressModeW << 12 |
-            (uint32_t)info->compareEnable << 16 | (info->compareEnable ? info->compareOp : 0) << 17 |
-            (uint32_t)info->unnormalizedCoordinates << 20 |
-            (mode == VK_SAMPLER_REDUCTION_MODE_MIN ? 1u : mode == VK_SAMPLER_REDUCTION_MODE_MAX ? 2u : 0u) << 21;
-   memcpy(&out[1], values, sizeof(values));
-   memcpy(&out[4], &sampler->border_color_value, 4 * sizeof(uint32_t));
-}
-
-/* Color attachments: plain formats of 8 to 128 bits whose channels are
- * normalized or pure integers of up to 32 bits, FP16, FP32 or unsigned
- * 11/10-bit floats, each within one word (see the fragment kernel in
- * apex_graphics.c). */
-bool
-apex_attachment_format_supported(enum pipe_format format)
-{
-   const struct util_format_description *desc = util_format_description(format);
-   /* R11G11B10 is described as an "other" layout with plain channel fields. */
-   if (!desc || (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN && format != PIPE_FORMAT_R11G11B10_FLOAT) ||
-       desc->block.width != 1 || desc->block.height != 1 || desc->block.bits < 8 ||
-       desc->block.bits > 128 || !util_is_power_of_two_nonzero(desc->block.bits))
-      return false;
-   for (unsigned c = 0; c < desc->nr_channels; c++) {
-      const struct util_format_channel_description *ch = &desc->channel[c];
-      bool integer = (ch->type == UTIL_FORMAT_TYPE_UNSIGNED || ch->type == UTIL_FORMAT_TYPE_SIGNED) &&
-                     (ch->normalized || ch->pure_integer);
-      /* Unsigned 11- and 10-bit floats: B10G11R11. */
-      bool fp = ch->type == UTIL_FORMAT_TYPE_FLOAT &&
-                (ch->size == 16 || ch->size == 32 || ch->size == 11 || ch->size == 10);
-      if ((ch->type != UTIL_FORMAT_TYPE_VOID && !integer && !fp) || ch->shift % 32 + ch->size > 32)
-         return false;
-   }
    return true;
 }
 

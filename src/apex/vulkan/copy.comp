@@ -1,62 +1,46 @@
 #version 450
-// Pitched copy of 32-bit words: one invocation per 64-word chunk of a row.
-// Trailer words after the dispatch parameters (see apex_draw.h):
-// source/destination address, row and slice pitches, words per row, rows
-// and layers. Addresses and pitches are 4-byte aligned. Element mode copies
-// strided 1- or 4-byte elements (one aspect of a depth/stencil texel) and
-// merges them into the destination under a mask with word atomics.
+// Element copy between two surfaces (apex_job.h): one invocation per element
+// of a width x height x planes region. Elements of 1 or 2 bytes, and masked
+// elements, merge into their destination word with atomics so neighbouring
+// lanes never overwrite each other.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#include "apex_draw.h"
-// One wave per workgroup keeps each launch far below the watchdog.
+#include "apex_job.h"
 layout(local_size_x = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
 
-const uint TRAILER = 8u;
-const uint COPY = TRAILER + APEX_DISPATCH_WORDS;
-
-uint word(uint i) { return root[COPY + i]; }
-uint64_t address(uint i) { return uint64_t(word(i)) | (uint64_t(word(i + 1u)) << 32); }
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+#include "apex_surface.glsl"
 
 void main()
 {
-   uint count = word(APEX_COPY_WORDS);
-   uint chunks = (count + 63u) / 64u;
-   uint item = root[TRAILER] * 16u + gl_GlobalInvocationID.x;
-   uint rows = word(APEX_COPY_ROWS);
-   if (item >= chunks * rows * word(APEX_COPY_LAYERS))
+   uvec3 p = gl_GlobalInvocationID;
+   if (p.x >= job(APEX_COPY_EXTENT) || p.y >= job(APEX_COPY_EXTENT + 1u) ||
+       p.z >= job(APEX_COPY_EXTENT + 2u))
       return;
-   uint row = item / chunks;
-   uint chunk = item - row * chunks;
-   uint layer = row / rows;
-   row -= layer * rows;
-   uint64_t src = address(APEX_COPY_SRC) + uint64_t(layer) * word(APEX_COPY_SRC_SLICE) +
-                  uint64_t(row) * word(APEX_COPY_SRC_ROW);
-   uint64_t dst = address(APEX_COPY_DST) + uint64_t(layer) * word(APEX_COPY_DST_SLICE) +
-                  uint64_t(row) * word(APEX_COPY_DST_ROW);
-   uint end = min(count, chunk * 64u + 64u);
-   uint element = word(APEX_COPY_ELEMENT);
-   if (element == 0u) {
+   uint bytes = job(APEX_COPY_BYTES);
+   uint64_t src = surface_address(APEX_COPY_SRC, p.x, p.y, p.z) + job(APEX_COPY_SRC_OFFSET);
+   uint64_t dst = surface_address(APEX_COPY_DST, p.x, p.y, p.z) + job(APEX_COPY_DST_OFFSET);
+   uint mask = job(APEX_COPY_MASK);
+   if (bytes >= 4u) {
       Words from = Words(src), to = Words(dst);
-      for (uint i = chunk * 64u; i < end; i++)
-         to.w[i] = from.w[i];
+      for (uint k = 0u; k < bytes / 4u; k++) {
+         uint value = from.w[k];
+         if (k == 0u && mask != ~0u) {
+            atomicAnd(to.w[0], ~mask);
+            atomicOr(to.w[0], value & mask);
+         } else {
+            to.w[k] = value;
+         }
+      }
       return;
    }
-   uint bits = element == 4u ? ~0u : (1u << (element * 8u)) - 1u;
-   uint mask = bits & word(APEX_COPY_DST_MASK);
-   for (uint i = chunk * 64u; i < end; i++) {
-      uint64_t s = src + uint64_t(i) * word(APEX_COPY_SRC_STRIDE);
-      uint64_t d = dst + uint64_t(i) * word(APEX_COPY_DST_STRIDE);
-      uint value = (Words(s & ~uint64_t(3)).w[0] >> (uint(s & 3u) * 8u)) & bits;
-      uint shift = uint(d & 3u) * 8u;
-      Words to = Words(d & ~uint64_t(3));
-      if (mask == ~0u) {
-         to.w[0] = value;
-      } else {
-         atomicAnd(to.w[0], ~(mask << shift));
-         atomicOr(to.w[0], (value & mask) << shift);
-      }
-   }
+   uint bits = (1u << (bytes * 8u)) - 1u;
+   uint value = (Words(src & ~uint64_t(3)).w[0] >> (uint(src & 3u) * 8u)) & bits;
+   uint shift = uint(dst & 3u) * 8u;
+   Words to = Words(dst & ~uint64_t(3));
+   atomicAnd(to.w[0], ~((bits & mask) << shift));
+   atomicOr(to.w[0], (value & mask) << shift);
 }
