@@ -761,6 +761,16 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
             }
         }
     }
+    // Every access of a value: (pc, first dword, dwords).
+    let mut accesses: BTreeMap<u32, Vec<(usize, u32, u32)>> = BTreeMap::new();
+    for (pc, o) in ops.iter().enumerate() {
+        let a = o.access();
+        for f in 0..4 {
+            if let (Some(_), Opnd::Val { id, off, n }) = (a[f], o.f[f]) {
+                accesses.entry(id).or_default().push((pc, off as u32, n as u32));
+            }
+        }
+    }
     let mut order: Vec<u32> = intervals.keys().copied().collect();
     order.sort_by_key(|id| (intervals[id].start, !fixed.contains_key(id), *id));
     let mut homes: BTreeMap<u32, u8> = BTreeMap::new();
@@ -772,8 +782,16 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
         let iv = &intervals[&id];
         active.retain(|a| intervals[a].end > iv.start);
         let limit = if v.class == Class::S { isa::SCALAR_REGISTERS } else { isa::VECTOR_REGISTERS };
-        // A value that dies copying itself into this group at its own place does not conflict.
+        // A value that dies copying itself into this group at its own place
+        // does not conflict when the group leaves those dwords untouched
+        // while the value lives.
         let into = copies.get(&id);
+        let untouched = |a: u32, delta: i32, pc: usize| {
+            let (lo, hi) = (delta, delta + values[a as usize].width as i32);
+            accesses.get(&id).into_iter().flatten().all(|&(at, off, n)| {
+                at == pc || at < intervals[&a].start || at >= pc || off as i32 >= hi || (off + n) as i32 <= lo
+            })
+        };
         let fits = |r: u8, homes: &BTreeMap<u32, u8>, active: &[u32]| {
             r as u32 + v.width as u32 <= limit as u32
                 && r % align[id as usize] == 0
@@ -783,6 +801,7 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
                     w.class == v.class && r < h + w.width && h < r + v.width
                         && !into.is_some_and(|list| list.iter().any(|&(s, delta, pc)| {
                             s == *a && h as i32 == r as i32 + delta && intervals[a].end == pc
+                                && untouched(s, delta, pc)
                         }))
                 })
         };

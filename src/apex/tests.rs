@@ -627,6 +627,37 @@ fn divergent_loop_lifetimes() {
 }
 
 #[test]
+fn copy_into_live_group() {
+    // a dies copying itself into g, but g holds another value while a lives:
+    // g = 0; g += a; store g; g = a. Sharing a's register would clear a.
+    let mut values = vec![Value { class: Class::S, width: 1 }];
+    let mut new = |class, width| {
+        values.push(Value { class, width });
+        values.len() as u32 - 1
+    };
+    use Class::{S, V};
+    let (a, g, root, offset) = (new(V, 1), new(V, 1), new(S, 2), new(V, 1));
+    let pair = Opnd::Val { id: root, off: 0, n: 2 };
+    let ops = vec![
+        mop(COPY, [Opnd::Val { id: root, off: 0, n: 1 }, phys(SCALAR), Opnd::None, Opnd::None]),
+        mop(COPY, [Opnd::Val { id: root, off: 1, n: 1 }, phys(SCALAR + 1), Opnd::None, Opnd::None]),
+        mop(op::V_SHL as u16, [v(offset), phys(isa::LANE), Opnd::Lit(2), Opnd::None]),
+        mop(op::V_ADD as u16, [v(a), phys(isa::LANE), Opnd::Lit(5), Opnd::None]),
+        mop(COPY, [v(g), Opnd::Lit(0), Opnd::None, Opnd::None]),
+        mop(op::V_ADD as u16, [v(g), v(g), v(a), Opnd::None]),
+        mop(op::GLOBAL_STORE as u16, [v(g), v(offset), pair, Opnd::None]),
+        mop(COPY, [v(g), v(a), Opnd::None, Opnd::None]),
+        Op { hi: 64, ..mop(op::GLOBAL_STORE as u16, [v(g), v(offset), pair, Opnd::None]) },
+        mop(op::S_ENDPGM as u16, [Opnd::None; 4]),
+    ];
+    let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
+    let mut m = vec![0u8; 128];
+    compute(&p, [1, 1, 1], 0, &mut m).unwrap();
+    assert_eq!(words(&m, 0, 16), (0..16).map(|l| l + 5).collect::<Vec<_>>());
+    assert_eq!(words(&m, 64, 16), (0..16).map(|l| l + 5).collect::<Vec<_>>());
+}
+
+#[test]
 fn coalescing_and_constants() {
     // Values copied into a group become the group; small constants fold inline.
     let mut values = vec![Value { class: Class::S, width: 1 }];
