@@ -193,8 +193,7 @@ int main(void)
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkMemoryFdPropertiesKHR props = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, objects[0], &props) == VK_SUCCESS);
-   /* Imports take either device-local type: device-only PRIME or LOCAL-resident. */
-   CHECK(props.memoryTypeBits == 6 && !live && closes == 1 && fcntl(objects[0], F_GETFD) >= 0);
+   CHECK(props.memoryTypeBits == 3 && !live && closes == 1 && fcntl(objects[0], F_GETFD) >= 0);
    CHECK(!ftruncate(fd, 4096)); /* Valid extent, but not a PRIME-exported object. */
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &props) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
    VkExportMemoryAllocateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
@@ -282,7 +281,7 @@ int main(void)
    CHECK(!live);
    import.pNext = &export;
    /* Owned LOCAL export/self-import must share the original handle in either
-    * free order; the import is a SYSTEM-typed view of the same object. */
+    * free order; the import is a view of the same object at either type. */
    for (unsigned order = 0; order < 2; order++) {
       ai.pNext = &export;
       ai.memoryTypeIndex = 0;
@@ -291,7 +290,7 @@ int main(void)
       CHECK(v->GetMemoryFdKHR(dev, &get, &import.fd) == VK_SUCCESS);
       import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
       ai.pNext = &import;
-      ai.memoryTypeIndex = 1;
+      ai.memoryTypeIndex = order;
       CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_SUCCESS);
       CHECK(live == 1);
       before = closes;

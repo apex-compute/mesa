@@ -378,6 +378,10 @@ apex_GetMemoryFdKHR(VkDevice dev, const VkMemoryGetFdInfoKHR *info, int *fd)
    return VK_SUCCESS;
 }
 
+/* Type 0 is LOCAL (BAR2 write-combined), type 1 SYSTEM (cached shmem); both
+ * are host coherent. */
+#define APEX_MEMORY_TYPES 3u
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits type,
                             int fd, VkMemoryFdPropertiesKHR *properties)
@@ -394,13 +398,9 @@ apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits t
    mtx_unlock(&device->memory_mutex);
    if (ret)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   properties->memoryTypeBits = 2; /* Imports are SYSTEM mappings. */
+   properties->memoryTypeBits = APEX_MEMORY_TYPES;
    return VK_SUCCESS;
 }
-
-/* Type 0 is LOCAL (BAR2 write-combined), type 1 SYSTEM (cached shmem); both
- * are host coherent. */
-#define APEX_MEMORY_TYPES 3u
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
@@ -419,9 +419,10 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    if ((import && (import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
                    import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ||
        (types & ~APEX_EXTERNAL_MEMORY_TYPES) ||
-       /* PRIME exports LOCAL objects; imports are SYSTEM mappings. */
-       (types && !import && info->memoryTypeIndex != 0) ||
-       (import && info->memoryTypeIndex != 1))
+       /* PRIME exports LOCAL objects. Imports take either type (Zink binds
+        * them from its device-local heap): the exporter owns the placement
+        * and the import is mapped by GPU VA only, routed as SYSTEM. */
+       (types && !import && info->memoryTypeIndex != 0))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    /* Every allocation has a device address; capture/replay is unsupported. */
    const VkMemoryAllocateFlagsInfo *flags = vk_find_struct_const(info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);

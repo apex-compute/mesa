@@ -277,8 +277,7 @@ int main(int argc, char **argv)
       CHECK(GetMemoryFdKHR(device, &get, &fd) == VK_SUCCESS);
       /* Imports admit the device-only PRIME and LOCAL-resident types. */
       VkMemoryFdPropertiesKHR props = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
-      CHECK(GetMemoryFdPropertiesKHR(device, get.handleType, fd, &props) == VK_SUCCESS &&
-            (props.memoryTypeBits & 2) && __builtin_popcount(props.memoryTypeBits) == 2);
+      CHECK(GetMemoryFdPropertiesKHR(device, get.handleType, fd, &props) == VK_SUCCESS && props.memoryTypeBits == 3);
       import.handleType = get.handleType;
       import.fd = fd;
       CHECK(AllocateMemory(device, &shared_allocate, NULL, &shared_memory) == VK_SUCCESS);
