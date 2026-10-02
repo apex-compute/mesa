@@ -358,9 +358,22 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       get_format(physical, VK_FORMAT_MAX_ENUM - i, &format);
       CHECK(!format.linearTilingFeatures && !format.optimalTilingFeatures && !format.bufferFeatures);
    }
-   /* B10G11R11 has no texture-unit or ROP class: transfers and storage. */
-   get_format(physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &format);
-   CHECK(format.optimalTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
+   /* The packed floats sample and filter through class 11 and do not
+    * render; 4444 samples, 1555 also renders and blends. */
+   const VkFormatFeatureFlags filtered = sampled | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+   const VkFormatFeatureFlags rendered = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+      VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+   const struct { VkFormat format; bool render; } new_formats[] = {
+      {VK_FORMAT_B10G11R11_UFLOAT_PACK32, false}, {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false},
+      {VK_FORMAT_R4G4B4A4_UNORM_PACK16, false}, {VK_FORMAT_A4B4G4R4_UNORM_PACK16, false},
+      {VK_FORMAT_A1R5G5B5_UNORM_PACK16, true}, {VK_FORMAT_B5G5R5A1_UNORM_PACK16, true},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(new_formats); i++) {
+      get_format(physical, new_formats[i].format, &format);
+      CHECK((format.optimalTilingFeatures & (filtered | rendered)) ==
+            (filtered | (new_formats[i].render ? rendered : 0)));
+   }
    get_format(physical, VK_FORMAT_R32_UINT, &format);
    VkFormatFeatureFlags image_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |

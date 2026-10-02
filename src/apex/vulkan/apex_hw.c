@@ -35,7 +35,8 @@ struct format_entry {
    uint8_t class, type, bgr;
 };
 
-/* Every color format the texture unit and the ROP store natively. */
+/* Every color format the texture unit samples; the ROP renders those
+ * apex_hw_color_renderable accepts. */
 static const struct format_entry formats[] = {
 #define T5(fmt, cls) \
    {VK_FORMAT_##fmt##_UNORM, APEX_HW_CLASS_##cls, APEX_HW_UNORM, 0}, \
@@ -71,9 +72,22 @@ static const struct format_entry formats[] = {
    {VK_FORMAT_A2B10G10R10_UINT_PACK32, APEX_HW_CLASS_RGB10A2, APEX_HW_UINT, 0},
    {VK_FORMAT_A2R10G10B10_UNORM_PACK32, APEX_HW_CLASS_RGB10A2, APEX_HW_UNORM, 1},
    {VK_FORMAT_A2R10G10B10_UINT_PACK32, APEX_HW_CLASS_RGB10A2, APEX_HW_UINT, 1},
+   /* The packed 16-bit classes: alpha low (UNORM) or high (ALPHA_FIRST),
+    * BGR swapping R and B. */
+   {VK_FORMAT_R4G4B4A4_UNORM_PACK16, APEX_HW_CLASS_4444, APEX_HW_UNORM, 0},
+   {VK_FORMAT_B4G4R4A4_UNORM_PACK16, APEX_HW_CLASS_4444, APEX_HW_UNORM, 1},
+   {VK_FORMAT_A4R4G4B4_UNORM_PACK16, APEX_HW_CLASS_4444, APEX_HW_ALPHA_FIRST, 0},
+   {VK_FORMAT_A4B4G4R4_UNORM_PACK16, APEX_HW_CLASS_4444, APEX_HW_ALPHA_FIRST, 1},
+   {VK_FORMAT_R5G5B5A1_UNORM_PACK16, APEX_HW_CLASS_1555, APEX_HW_UNORM, 0},
+   {VK_FORMAT_B5G5R5A1_UNORM_PACK16, APEX_HW_CLASS_1555, APEX_HW_UNORM, 1},
+   {VK_FORMAT_A1R5G5B5_UNORM_PACK16, APEX_HW_CLASS_1555, APEX_HW_ALPHA_FIRST, 0},
+   {VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR, APEX_HW_CLASS_1555, APEX_HW_ALPHA_FIRST, 1},
+   /* Class 11's packed unsigned floats, alpha reading one. */
+   {VK_FORMAT_B10G11R11_UFLOAT_PACK32, APEX_HW_CLASS_RGB10A2, APEX_HW_FLOAT, 0},
+   {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, APEX_HW_CLASS_RGB10A2, APEX_HW_SHARED_EXPONENT, 0},
 };
 
-static const unsigned class_channels[] = {0, 1, 2, 4, 1, 2, 4, 1, 2, 4, 3, 4, 1};
+static const unsigned class_channels[] = {0, 1, 2, 4, 1, 2, 4, 1, 2, 4, 3, 4, 1, 3, 4, 4};
 
 static const struct format_entry *
 find_format(VkFormat format)
@@ -114,10 +128,12 @@ apex_hw_texture_format(VkFormat format, VkImageAspectFlags aspect, uint8_t *code
    }
    }
    *code = APEX_HW_FORMAT(cls, type, bgr);
+   unsigned channels = cls == APEX_HW_CLASS_RGB10A2 && (type == APEX_HW_FLOAT || type == APEX_HW_SHARED_EXPONENT) ?
+                       3 : class_channels[cls];
    for (unsigned c = 0; c < 4; c++) {
       if (read >= 0)
          channel[c] = c == 0 ? read : c == 3 ? APEX_HW_SWIZZLE_1 : APEX_HW_SWIZZLE_0;
-      else if (c < class_channels[cls])
+      else if (c < channels)
          channel[c] = c;
       else
          channel[c] = c == 3 ? APEX_HW_SWIZZLE_1 : APEX_HW_SWIZZLE_0;
@@ -129,7 +145,8 @@ uint8_t
 apex_hw_color_format(VkFormat format)
 {
    const struct format_entry *e = find_format(format);
-   return e ? APEX_HW_FORMAT(e->class, e->type, e->bgr) : 0;
+   uint8_t code = e ? APEX_HW_FORMAT(e->class, e->type, e->bgr) : 0;
+   return apex_hw_color_renderable(code) ? code : 0;
 }
 
 enum apex_hw_depth

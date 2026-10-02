@@ -484,9 +484,35 @@ test_descriptors(void)
          code == (8 | 2u << 4) && ch[0] == 1);
    CHECK(apex_hw_texture_format(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT, &code, ch) && code == 4);
    CHECK(!apex_hw_texture_format(VK_FORMAT_R8G8B8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &code, ch));
-   CHECK(!apex_hw_texture_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_IMAGE_ASPECT_COLOR_BIT, &code, ch));
+   /* The packed 16-bit classes, 4444 (14) and 1555 (15): type 0 with alpha
+    * in the low field, type 6 in the high field, BGR swapping R and B. */
+   const struct { VkFormat format; uint8_t code; bool render; } packed[] = {
+      {VK_FORMAT_R4G4B4A4_UNORM_PACK16, 14, false}, {VK_FORMAT_B4G4R4A4_UNORM_PACK16, 14 | 0x80, false},
+      {VK_FORMAT_A4R4G4B4_UNORM_PACK16, 14 | 6u << 4, false},
+      {VK_FORMAT_A4B4G4R4_UNORM_PACK16, 14 | 6u << 4 | 0x80, false},
+      {VK_FORMAT_R5G5B5A1_UNORM_PACK16, 15, true}, {VK_FORMAT_B5G5R5A1_UNORM_PACK16, 15 | 0x80, true},
+      {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 15 | 6u << 4, true},
+      {VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR, 15 | 6u << 4 | 0x80, true},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(packed); i++) {
+      CHECK(apex_hw_texture_format(packed[i].format, VK_IMAGE_ASPECT_COLOR_BIT, &code, ch) &&
+            code == packed[i].code && ch[0] == 0 && ch[1] == 1 && ch[2] == 2 && ch[3] == 3);
+      CHECK(apex_hw_color_format(packed[i].format) == (packed[i].render ? packed[i].code : 0));
+   }
+   /* Class 11 with FLOAT is B10G11R11, with type 7 E5B9G9R9; alpha reads
+    * one and neither renders. */
+   CHECK(apex_hw_texture_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_IMAGE_ASPECT_COLOR_BIT, &code, ch) &&
+         code == (11 | 4u << 4) && ch[0] == 0 && ch[2] == 2 && ch[3] == APEX_HW_SWIZZLE_1);
+   CHECK(apex_hw_texture_format(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_IMAGE_ASPECT_COLOR_BIT, &code, ch) &&
+         code == (11 | 7u << 4) && ch[2] == 2 && ch[3] == APEX_HW_SWIZZLE_1);
+   CHECK(!apex_hw_color_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
+         !apex_hw_color_format(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32));
    CHECK(apex_hw_color_format(VK_FORMAT_A8B8G8R8_SRGB_PACK32) == (3 | 5u << 4) &&
          !apex_hw_color_format(VK_FORMAT_D16_UNORM));
+   /* The descriptor carries the byte at [47:40]. */
+   const struct apex_hw_image e5 = {.format = 11 | 7u << 4 | 0x80, .width = 1, .height = 1, .depth = 1, .levels = 1};
+   apex_hw_image_descriptor(&e5, d);
+   CHECK(field(d, 40, 4) == 11 && field(d, 44, 3) == 7 && field(d, 47, 1) == 1);
    CHECK(apex_hw_depth_format(VK_FORMAT_D16_UNORM) == 1 && apex_hw_depth_format(VK_FORMAT_X8_D24_UNORM_PACK32) == 2 &&
          apex_hw_depth_format(VK_FORMAT_D24_UNORM_S8_UINT) == 3 && apex_hw_depth_format(VK_FORMAT_D32_SFLOAT) == 4 &&
          apex_hw_depth_format(VK_FORMAT_S8_UINT) == 5 && apex_hw_depth_format(VK_FORMAT_D32_SFLOAT_S8_UINT) == 6);
@@ -512,7 +538,7 @@ test_descriptors(void)
          field(d, 16, 2) == 2 && field(d, 18, 1) == 0 && field(d, 19, 4) == 0);
    CHECK(field(d, 23, 14) == ((uint32_t)-640 & 0x3fff) && field(d, 37, 12) == 320 && field(d, 49, 12) == 4095 &&
          field(d, 61, 3) == 3 && field(d, 64, 64) == 0 && d[4] == f2u(0.5f) && d[7] == f2u(1.0f));
-   puts("PASS texture-unit descriptors: image and sampler bits, format classes, depth and stencil views");
+   puts("PASS texture-unit descriptors: image and sampler bits, format classes with 4444, 1555 and packed floats, depth and stencil views");
 }
 
 /* The internal copy kernel, compiled by p7-isa and run on the ISA model,

@@ -369,6 +369,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_shader_non_semantic_info = true,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
+      .EXT_4444_formats = true,
    };
    const struct vk_features features = {
       .timelineSemaphore = true,
@@ -462,6 +463,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .texelBufferAlignment = true,
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,
+      /* The texture unit's 4444 class samples both alpha-first orders. */
+      .formatA4R4G4B4 = true,
+      .formatA4B4G4R4 = true,
    };
    struct vk_properties properties = {
       .apiVersion = APEX_DEVELOPMENT_API,
