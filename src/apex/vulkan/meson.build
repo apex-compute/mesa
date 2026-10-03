@@ -54,7 +54,7 @@ apex_instance_test = executable('apex-instance-test', ['instance_test.c', apex_e
                '-Wl,--wrap=drmGetVersion', '-Wl,--wrap=drmFreeVersion',
                '-Wl,--wrap=drmGetCap', '-Wl,--wrap=drmSyncobjCreate',
                '-Wl,--wrap=drmSyncobjDestroy', '-Wl,--wrap=drmSyncobjWait',
-               '-Wl,--wrap=open64', '-Wl,--wrap=ioctl'],
+               '-Wl,--wrap=open64', '-Wl,--wrap=ioctl', '-Wl,--wrap=fstat64'],
   link_language : 'cpp', install : false,
 )
 test('apex-instance', apex_instance_test, args : ['--mock'], suite : ['apex'])

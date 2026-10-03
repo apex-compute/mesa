@@ -30,6 +30,8 @@ struct drm_apex_info {
 };
 
 #define APEX_GEM_SYSTEM (1u << 0) /* cached host shmem, GPU access over PCIe */
+/* Without SYSTEM: contiguous zero-filled LOCAL, the class of dumb buffers and
+ * the only one KMS scans out. */
 struct drm_apex_gem_create {
 	__u64 size; /* multiple of 4 KiB */
 	__u32 flags;

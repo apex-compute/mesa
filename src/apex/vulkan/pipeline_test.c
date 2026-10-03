@@ -772,8 +772,7 @@ test_bench(struct vk_physical_device *physical, const char *path)
       .queueCount = 1, .pQueuePriorities = &priority};
    const VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
-   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
-   device.transport = APEX_TRANSPORT_DRM;
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1) == VK_SUCCESS);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    FILE *f = fopen(path, "rb");
@@ -861,8 +860,7 @@ test_graphics(struct vk_physical_device *physical, const char *vs, const char *f
       .queueCount = 1, .pQueuePriorities = &priority};
    const VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
-   CHECK(apex_device_init(&device, physical, &di, NULL, -1, APEX_TRANSPORT_NATIVE) == VK_SUCCESS);
-   device.transport = APEX_TRANSPORT_DRM;
+   CHECK(apex_device_init(&device, physical, &di, NULL, -1) == VK_SUCCESS);
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkShaderModule modules[2];

@@ -182,8 +182,7 @@ apex_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physical,
                                             const VkPhysicalDeviceImageFormatInfo2 *info,
                                             VkImageFormatProperties2 *properties)
 {
-   VK_FROM_HANDLE(apex_physical_device, device, physical);
-   return apex_image_format_properties(info, device->prime_coherent, properties);
+   return apex_image_format_properties(info, properties);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -303,6 +302,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_external_memory = true,
       .KHR_external_memory_fd = true,
       .EXT_external_memory_dma_buf = true,
+      .EXT_image_drm_format_modifier = true,
+      /* Swapchain images take MUTABLE_FORMAT and a view format list. */
+      .KHR_swapchain_mutable_format = true,
       /* Mesa's DRM syncobj type supplies opaque-FD and sync-file payloads. */
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
@@ -314,7 +316,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_physical_device_drm = true,
       /* Foreign ownership transfers, like external ones, need no operation:
        * jobs serialize and PRIME memory is coherent at submission. */
-      .EXT_queue_family_foreign = caps.capabilities & APEX_DRM_CAP_PRIME_COHERENT,
+      .EXT_queue_family_foreign = true,
       .KHR_maintenance5 = true,
       .EXT_provoking_vertex = true,
       .EXT_transform_feedback = true,

@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <xf86drm.h>
 
@@ -21,10 +23,11 @@ static int fault, open_count, last_fd;
 /* DRM_APEX_INFO timestamp_hz the mock kernel reports, when nonzero. */
 static uint64_t timestamp_hz;
 static bool mock;
-/* Each render-node open is a fresh DRM file: a mock kernel on its memfd. */
+/* Each render-node open is a fresh DRM file: a mock kernel on its memfd,
+ * reported as the render node 226:128. The primary node is /dev/zero (1:5). */
 static struct mock_kernel kernels[32];
 static unsigned kernel_count;
-static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_RENDER] = "/apex-test/render"};
+static char *nodes[DRM_NODE_MAX] = {[DRM_NODE_PRIMARY] = "/dev/zero", [DRM_NODE_RENDER] = "/apex-test/render"};
 static drmPciDeviceInfo pci = {.vendor_id = 0x10ee, .device_id = 0xa15e};
 static drmPciBusInfo bus = {.domain = 0x1234, .bus = 7, .dev = 3, .func = 1};
 static drmDevice drm = {.nodes = nodes, .available_nodes = 1 << DRM_NODE_RENDER | 1 << DRM_NODE_PRIMARY,
@@ -43,6 +46,8 @@ int __wrap_drmSyncobjWait(int fd, uint32_t *handles, unsigned count,
 int __wrap_open64(const char *path, int flags, ...);
 int __real_open64(const char *path, int flags, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
+int __wrap_fstat64(int fd, struct stat64 *st);
+int __real_fstat64(int fd, struct stat64 *st);
 
 int __wrap_drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int count)
 {
@@ -86,6 +91,14 @@ int __wrap_open64(const char *path, int flags, ...)
    }
    CHECK(!(flags & O_CREAT));
    return __real_open64(path, flags);
+}
+int __wrap_fstat64(int fd, struct stat64 *st)
+{
+   int ret = __real_fstat64(fd, st);
+   for (unsigned i = 0; !ret && i < kernel_count; i++)
+      if (kernels[i].fd == fd)
+         st->st_rdev = makedev(226, 128);
+   return ret;
 }
 int __wrap_ioctl(int fd, unsigned long request, ...)
 {
@@ -242,7 +255,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 1 &&
          robust_props.robustUniformBufferAccessSizeAlignment == 1);
    /* Zink matches its DRM fd's render node against these numbers. */
-   CHECK(drm_props.hasRender && drm_props.renderMajor == 1 && drm_props.renderMinor == 3);
+   CHECK(drm_props.hasRender && drm_props.renderMajor == 226 && drm_props.renderMinor == 128);
    CHECK(drm_props.hasPrimary && drm_props.primaryMajor == 1 && drm_props.primaryMinor == 5);
    CHECK(provoking_props.provokingVertexModePerPipeline &&
          provoking_props.transformFeedbackPreservesTriangleFanProvokingVertex);
@@ -267,8 +280,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       bool found = false;
       for (unsigned e = 0; e < extension_count; e++)
          found |= !strcmp(extensions[e].extensionName, zink_extensions[i]);
-      /* Foreign queue ownership, modifiers and swapchains accompany dma-buf memory. */
-      CHECK(found == (i < 5 || coherent));
+      CHECK(found);
    }
    PROC(GetPhysicalDeviceMemoryProperties, get_memory);
    VkPhysicalDeviceMemoryProperties mem;
@@ -416,16 +428,13 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
    VkImageFormatProperties2 image_props2 = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
                                             .pNext = &external_props2};
-   CHECK(get_image_format2(physical, &image_info2, &image_props2) ==
-         (coherent ? VK_SUCCESS : VK_ERROR_FORMAT_NOT_SUPPORTED));
-   if (coherent) {
-      CHECK(image_props2.imageFormatProperties.maxMipLevels == 1 &&
-            image_props2.imageFormatProperties.maxArrayLayers == 1);
-      CHECK(external_props2.externalMemoryProperties.externalMemoryFeatures ==
-            (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
-            external_props2.externalMemoryProperties.compatibleHandleTypes ==
-            (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
-   }
+   CHECK(get_image_format2(physical, &image_info2, &image_props2) == VK_SUCCESS);
+   CHECK(image_props2.imageFormatProperties.maxMipLevels == 1 &&
+         image_props2.imageFormatProperties.maxArrayLayers == 1);
+   CHECK(external_props2.externalMemoryProperties.externalMemoryFeatures ==
+         (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+         external_props2.externalMemoryProperties.compatibleHandleTypes ==
+         (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
    modifier_info.drmFormatModifier = 0x0100000000000001ull;
    CHECK(get_image_format2(physical, &image_info2, &image_props2) == VK_ERROR_FORMAT_NOT_SUPPORTED);
    external_image.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;

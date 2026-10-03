@@ -214,14 +214,6 @@ unlock:
    return result;
 }
 
-/* Memory types: 0 explicit-transfer host, 1 device-only PRIME, the optional
- * host-coherent SYSTEM type, then LOCAL-resident storage with PRIME. */
-static uint32_t
-local_memory_types(const struct apex_device *device)
-{
-   return device->prime_coherent ? 1u << (2 + device->host_coherent) : 0;
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_GetMemoryFdKHR(VkDevice dev, const VkMemoryGetFdInfoKHR *info, int *fd)
 {
@@ -272,7 +264,6 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    *out = VK_NULL_HANDLE;
    if (info->memoryTypeIndex > 1)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   bool local = local_memory_types(device) & (1u << info->memoryTypeIndex);
    const VkImportMemoryFdInfoKHR *import = vk_find_struct_const(info->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    if (import && !import->handleType)
       import = NULL;
@@ -362,11 +353,6 @@ apex_MapMemory2(VkDevice dev, const VkMemoryMapInfo *info, void **out)
    if (!memory->data || info->flags || info->offset >= memory->vk.size ||
        (info->size != VK_WHOLE_SIZE && info->size > memory->vk.size - info->offset))
       return VK_ERROR_MEMORY_MAP_FAILED;
-   if (!memory->data) {
-      VkResult result = map_storage(device, memory);
-      if (result != VK_SUCCESS)
-         return result;
-   }
    *out = (uint8_t *)memory->data + info->offset;
    return VK_SUCCESS;
 }
@@ -430,7 +416,6 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
    struct apex_buffer *buffer = vk_buffer_create(&device->vk, info, alloc, sizeof(*buffer));
    if (!buffer)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   buffer->external_types = external ? external->handleTypes : 0;
    *out = apex_buffer_to_handle(buffer);
    return VK_SUCCESS;
 }
@@ -610,7 +595,7 @@ apex_linear_format_features(VkFormat format)
 #define APEX_MAX_LAYERS 2048u
 
 VkResult
-apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info, bool prime,
+apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
                              VkImageFormatProperties2 *properties)
 {
    properties->imageFormatProperties = (VkImageFormatProperties){0};
@@ -669,7 +654,7 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info, bool 
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
    if (external && external->handleType) {
-      if (!prime || apex_decoded_format(info->format, NULL) ||
+      if (apex_decoded_format(info->format, NULL) ||
           (external->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
            external->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -852,9 +837,6 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_GetDeviceImageMemoryRequirements(VkDevice dev,
    const VkDeviceImageMemoryRequirements *info, VkMemoryRequirements2 *out)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
-   const VkExternalMemoryImageCreateInfo *external =
-      vk_find_struct_const(info->pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_layout =
       vk_find_struct_const(info->pCreateInfo->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
    VkDeviceSize plane_offset = info->pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
@@ -868,7 +850,6 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_GetImageMemoryRequirements2(VkDevice dev,
    const VkImageMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *out)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_image, image, info->image);
    image_memory_requirements(image->plane_offset + image->size, image->layout.tiled || image->decoded, out);
 }
@@ -876,13 +857,9 @@ apex_GetImageMemoryRequirements2(VkDevice dev,
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo *infos)
 {
-   VK_FROM_HANDLE(apex_device, device, dev);
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
       VK_FROM_HANDLE(apex_image, image, infos[i].image);
-      if (image->vk.external_handle_types &&
-          !(local_memory_types(device) & (1u << mem->vk.memory_type_index)))
-         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       /* The image starts at its explicit DRM plane offset. */
       VkDeviceSize offset = infos[i].memoryOffset + image->plane_offset;
       unsigned alignment = image->layout.tiled || image->decoded ? APEX_HW_TILE : 64;
