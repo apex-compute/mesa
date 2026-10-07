@@ -560,7 +560,7 @@ test_copy_kernel(struct apex_device *device)
    uint32_t table[8 + APEX_TRAILER_WORDS + APEX_JOB_WORDS] = {0};
    table[3] = 1; /* robust sentinel row */
    uint32_t *grid = &table[8], *job = &table[APEX_JOB_BASE];
-   grid[0] = DIV_ROUND_UP(width, 16), grid[1] = height, grid[2] = 1;
+   grid[0] = DIV_ROUND_UP(width, 32), grid[1] = height, grid[2] = 1;
    uint32_t *s = &job[APEX_COPY_SRC], *t = &job[APEX_COPY_DST];
    s[APEX_SURFACE_VA] = src_va, s[APEX_SURFACE_FLAGS] = 1 << 4, s[APEX_SURFACE_PITCH] = width * bytes;
    s[APEX_SURFACE_TEXEL] = bytes;

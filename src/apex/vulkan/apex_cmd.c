@@ -1490,7 +1490,7 @@ apex_CmdCopyQueryPoolResults(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
       [APEX_QUERY_DST_STRIDE] = stride, [APEX_QUERY_COUNT] = count, [APEX_QUERY_FLAGS] = flags,
       [APEX_QUERY_VALUES] = qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2 : 1,
    };
-   internal_dispatch(cmd, APEX_INTERNAL_QUERY_COPY, words, (uint32_t[3]){DIV_ROUND_UP(count, 16), 1, 1}, 0, false);
+   internal_dispatch(cmd, APEX_INTERNAL_QUERY_COPY, words, (uint32_t[3]){DIV_ROUND_UP(count, 32), 1, 1}, 0, false);
 }
 
 /* ---- Transfers ---------------------------------------------------------- */
@@ -1606,7 +1606,7 @@ copy_surfaces(struct apex_command_buffer *cmd, const uint32_t src[APEX_SURFACE_W
    words[APEX_COPY_SRC_OFFSET] = src_offset;
    words[APEX_COPY_DST_OFFSET] = dst_offset;
    words[APEX_COPY_MASK] = mask;
-   internal_dispatch(cmd, APEX_INTERNAL_COPY, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, planes}, 0, false);
+   internal_dispatch(cmd, APEX_INTERNAL_COPY, words, (uint32_t[3]){DIV_ROUND_UP(width, 32), height, planes}, 0, false);
 }
 
 /* Element of one aspect within a texel: byte offset, bytes and the bits of
@@ -1758,7 +1758,7 @@ record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, u
    words[APEX_DECODE_EXTENT + 1] = height;
    words[APEX_DECODE_EXTENT + 2] = layers;
    words[APEX_DECODE_KIND] = kind;
-   internal_dispatch(cmd, APEX_INTERNAL_ETC2, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, layers}, 0, false);
+   internal_dispatch(cmd, APEX_INTERNAL_ETC2, words, (uint32_t[3]){DIV_ROUND_UP(width, 32), height, layers}, 0, false);
 }
 
 /* The clear kernel over layers x rect of one level: pattern and mask
@@ -1783,7 +1783,7 @@ record_clear(struct apex_command_buffer *cmd, const struct apex_image *image, un
    words[APEX_CLEAR_BYTES] = vk_format_get_blocksize(image->vk.format);
    memcpy(&words[APEX_CLEAR_PATTERN], pattern, 16);
    memcpy(&words[APEX_CLEAR_MASK], mask, 16);
-   internal_dispatch(cmd, APEX_INTERNAL_CLEAR, words, (uint32_t[3]){DIV_ROUND_UP(width, 16), height, planes}, 0, false);
+   internal_dispatch(cmd, APEX_INTERNAL_CLEAR, words, (uint32_t[3]){DIV_ROUND_UP(width, 32), height, planes}, 0, false);
 }
 
 static void
