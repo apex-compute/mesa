@@ -26,7 +26,7 @@
 
 /* Development protocol only. This compute subset is not a conformant Vulkan
  * device. The library/manifest are uninstalled and instance creation is opt-in. */
-#define APEX_DEVELOPMENT_API VK_API_VERSION_1_3
+#define APEX_DEVELOPMENT_API VK_API_VERSION_1_4
 #define APEX_SAMPLE_COUNTS (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | \
                             VK_SAMPLE_COUNT_8_BIT)
 
@@ -355,7 +355,6 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_buffer_device_address = true,
       .KHR_vulkan_memory_model = true,
       .EXT_host_query_reset = true,
-      .EXT_sampler_filter_minmax = true,
       .EXT_separate_stencil_usage = true,
       .EXT_private_data = true,
       .EXT_inline_uniform_block = true,
@@ -447,7 +446,6 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .hostQueryReset = true,
       .imagelessFramebuffer = true,
       .subgroupBroadcastDynamicId = true,
-      .samplerFilterMinmax = true,
       .bufferDeviceAddress = true,
       /* Vulkan 1.3. */
       .robustImageAccess = true,
@@ -555,7 +553,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* Descriptor bounds are checked without rounding, per 32-bit component. */
       .robustStorageBufferAccessSizeAlignment = 1,
       .robustUniformBufferAccessSizeAlignment = 1,
-      .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
+      .subgroupSize = 32, .minSubgroupSize = 32, .maxSubgroupSize = 32,
       .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
          VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
@@ -571,14 +569,20 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = true, .independentResolve = true,
-      .filterMinmaxSingleComponentFormats = true, .filterMinmaxImageComponentMapping = true,
       .framebufferIntegerColorSampleCounts = APEX_SAMPLE_COUNTS,
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      /* FP32 flushes subnormals; FP16 runs through FP32 and keeps them
+       * (Docs/isa.md, Numerics). Both round to nearest even and keep signed
+       * zeros, infinities and NaNs. */
+      .shaderDenormFlushToZeroFloat32 = true, .shaderDenormPreserveFloat32 = false,
+      .shaderDenormPreserveFloat16 = true,
+      .shaderRoundingModeRTEFloat16 = true, .shaderRoundingModeRTEFloat32 = true,
+      .shaderSignedZeroInfNanPreserveFloat16 = true, .shaderSignedZeroInfNanPreserveFloat32 = true,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
       /* Vulkan 1.3. */
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
-      .maxComputeWorkgroupSubgroups = 16,
+      .maxComputeWorkgroupSubgroups = 8,
       .maxInlineUniformBlockSize = APEX_MAX_INLINE_BYTES,
       .maxInlineUniformTotalSize = APEX_MAX_INLINE_BYTES,
       .maxPerStageDescriptorInlineUniformBlocks = 4,

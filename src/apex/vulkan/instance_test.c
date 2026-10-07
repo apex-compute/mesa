@@ -361,7 +361,6 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(format.linearTilingFeatures == (transfer_features | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
             sampled | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
             VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
          format.optimalTilingFeatures == format.linearTilingFeatures && format.bufferFeatures == texel);
    /* Maintenance5: enumerants beyond the defined formats report nothing. */
@@ -373,7 +372,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    /* The packed floats sample and filter through class 11 and do not
     * render; 4444 samples, 1555 also renders and blends. */
    const VkFormatFeatureFlags filtered = sampled | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+      VK_FORMAT_FEATURE_BLIT_SRC_BIT;
    const VkFormatFeatureFlags rendered = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
       VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
    const struct { VkFormat format; bool render; } new_formats[] = {

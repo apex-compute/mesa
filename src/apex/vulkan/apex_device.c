@@ -507,8 +507,7 @@ image_features(VkFormat format, bool linear)
       bool filter = type != APEX_HW_UINT && type != APEX_HW_SINT && !stencil &&
                     !(class == APEX_HW_CLASS_RGBA32 && type == APEX_HW_FLOAT);
       if (filter)
-         features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                     VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+         features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
       /* Comparison applies to D16, D24 and R32F images. */
       if (depth && format != VK_FORMAT_D32_SFLOAT_S8_UINT)
          features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
