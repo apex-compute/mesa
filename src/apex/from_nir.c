@@ -2138,7 +2138,8 @@ static nir_def *vertex_word(nir_builder *b, nir_def *descriptor, nir_def *byte, 
 
 /* The components in `mask` of attribute `location` through its binding's
  * descriptor and stride in the vertex input block (Docs/architecture.md,
- * State blocks): descriptor b at byte 16 b, stride b at byte 256 + 4 b. */
+ * State blocks): descriptor b at byte 16 b, stride b at byte 256 + 4 b,
+ * exact byte size b at byte 320 + 4 b. */
 static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const struct apex_vertex_input *vi,
                                        unsigned location, unsigned mask)
 {
@@ -2206,7 +2207,11 @@ static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const str
       }
    }
    if (vi->robust) {
-      nir_def *size = nir_channel(b, descriptor, 2);
+      /* The descriptor covers whole dwords; the binding's exact bytes at
+       * block byte 320 + 4 b bound the attribute. */
+      nir_def *size = nir_load_global_2x32(b, 1, 32,
+         nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 320 + 4 * a->binding),
+         .align_mul = 4, .access = constant);
       nir_def *inside = nir_iand(b, nir_ult(b, byte, size), nir_uge(b, size, nir_iadd_imm(b, byte, bytes)));
       u_foreach_bit(k, need)
          word[k] = nir_bcsel(b, inside, word[k], zero);

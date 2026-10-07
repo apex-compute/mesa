@@ -161,7 +161,7 @@ static void test_vertex_prolog(bool robust)
    uint8_t *data[4], *out = calloc(APEX_LANES, stride), block[512] = {0};
    unsigned bytes[4] = {7 * 40, 10 * 40, 64, 64};
    if (robust)
-      bytes[0] = 7 * 20;
+      bytes[0] = 7 * 19 + 5; /* vertex 19's byte attribute lies in the dword slack */
    struct apex_sim_region regions[6];
    for (unsigned n = 0; n < 4; n++) {
       data[n] = calloc(1, 512);
@@ -177,6 +177,7 @@ static void test_vertex_prolog(bool robust)
       uint32_t d[4] = {(uint32_t)va, va >> 32, align(bytes[n], 4), robust};
       memcpy(block + 16 * n, d, 16);
       memcpy(block + 256 + 4 * n, &strides[n], 4);
+      memcpy(block + 320 + 4 * n, &bytes[n], 4);
    }
    regions[4] = (struct apex_sim_region){0x800000, out, APEX_LANES * stride};
    regions[5] = (struct apex_sim_region){0x700000, block, sizeof(block)};
@@ -199,7 +200,7 @@ static void test_vertex_prolog(bool robust)
       unsigned v = first + l;
       union { float f; uint32_t u; } want[6][4];
       const uint8_t *a0 = data[0] + 7 * v + 1;
-      bool inside = !robust || 7 * v + 5 <= bytes[0];
+      bool inside = !robust || 7 * v + 5 <= bytes[0], byte_inside = !robust || 7 * v + 6 <= bytes[0];
       for (unsigned c = 0; c < 4; c++)
          want[0][c].f = inside ? (float)a0[(unsigned[]){2, 1, 0, 3}[c]] * (float)(1.0 / 255) : 0.0f;
       for (unsigned c = 0; c < 4; c++) {
@@ -220,7 +221,7 @@ static void test_vertex_prolog(bool robust)
          else
             want[4][c].u = c == 3;
       }
-      want[5][0].f = inside ? (float)(int8_t)data[0][7 * v + 5] : 0.0f;
+      want[5][0].f = byte_inside ? (float)(int8_t)data[0][7 * v + 5] : 0.0f;
       want[5][1].f = want[5][2].f = 0.0f;
       want[5][3].f = 1.0f;
       for (unsigned k = 0; k < 6; k++)

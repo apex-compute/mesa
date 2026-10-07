@@ -138,8 +138,9 @@ void apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk
 struct apex_hw_binding {
    uint64_t va, size;
 };
-/* Vertex input: a buffer descriptor (robust with the vertex program's
- * robustness) and the stride of each binding, and the clip-distance count. */
+/* Vertex input: each binding's buffer descriptor (robust with the vertex
+ * program's robustness; bytes rounded up to a dword), stride (dword 64 + b)
+ * and exact byte size (dword 80 + b), and the clip-distance count. */
 void apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
                                 const struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS],
                                 unsigned clip_distances, bool robust,

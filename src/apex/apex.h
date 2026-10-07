@@ -118,7 +118,8 @@ int apex_tool(const char *mode, const char *input, const char *output);
  * pipe_format; 0 when the pipeline has no attribute L) at byte `offset` of
  * an element of binding `binding`. A binding's elements are vertices, or
  * instances stepped every `divisor` instances (0: the first instance only).
- * With `robust`, an attribute reaching past its binding's bytes reads zero. */
+ * With `robust`, an attribute reaching past its binding's exact byte size
+ * (vertex input block dword 80 + b) reads zero. */
 struct apex_vertex_attribute { uint32_t format, binding, offset; };
 struct apex_vertex_binding { bool instance; uint32_t divisor; };
 struct apex_vertex_input {

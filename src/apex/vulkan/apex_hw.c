@@ -297,13 +297,15 @@ apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
    memset(out, 0, APEX_HW_VERTEX_INPUT_DWORDS * 4);
    for (unsigned b = 0; b < APEX_HW_MAX_BINDINGS; b++) {
       /* An ISA buffer descriptor whose size covers the binding's last
-       * dword: the prolog fetches attributes in whole dwords. */
+       * dword, since the prolog fetches whole dwords, and the exact size
+       * for the robust prolog's attribute bounds. */
       uint32_t *w = &out[4 * b];
       w[0] = (uint32_t)bindings[b].va;
       w[1] = (uint32_t)(bindings[b].va >> 32) & 0xff;
       w[2] = (uint32_t)MIN2(align64(bindings[b].size, 4), UINT32_MAX & ~3u);
       w[3] = robust;
       out[64 + b] = dyn->vi_binding_strides[b];
+      out[80 + b] = (uint32_t)MIN2(bindings[b].size, UINT32_MAX);
    }
    out[96] = clip_distances & 15;
 }

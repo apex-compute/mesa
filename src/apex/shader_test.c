@@ -213,6 +213,7 @@ static void vertex_binding(uint8_t *block, unsigned b, uint64_t va, uint32_t byt
    put(block + 16 * b + 8, bytes);
    put(block + 16 * b + 12, robust);
    put(block + 256 + 4 * b, stride);
+   put(block + 320 + 4 * b, bytes);
 }
 /* Standalone attribute location L reads four dwords of vertex v from
  * binding L at 16 v: base + v / 4 + c. */

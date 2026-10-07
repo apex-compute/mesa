@@ -67,6 +67,7 @@ test_vertex_input(void)
    CHECK(w[0] == 0x345678c0 && w[1] == 0x12 && w[2] == 4096 && w[3] == 1);
    CHECK(w[8] == 0x00001000 && w[9] == 0xab && w[10] == 0x10004 && w[11] == 1);
    CHECK(w[64] == 28 && w[65] == 0 && w[66] == 0x1000);
+   CHECK(w[80] == 4096 && w[81] == 0 && w[82] == 0x10003);
    for (unsigned k = 97; k < APEX_HW_VERTEX_INPUT_DWORDS; k++)
       CHECK(!w[k]);
    /* Dword 96: clip-distance count. */
