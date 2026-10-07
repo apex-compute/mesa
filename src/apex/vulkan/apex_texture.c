@@ -328,7 +328,7 @@ query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
          nir_def *c = nir_channel(b, coord, a);
          nir_def *d = axis ? nir_ddy(b, c) : nir_ddx(b, c);
          nir_def *scaled = nir_fmul(b, d, cube ? size[0] : size[a]);
-         length = nir_ffma(b, scaled, scaled, length);
+         length = nir_fmad(b, scaled, scaled, length);
       }
       rho = nir_fmax(b, rho, nir_fsqrt(b, length));
    }

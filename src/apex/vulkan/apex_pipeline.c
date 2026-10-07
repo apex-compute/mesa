@@ -255,11 +255,12 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
 }
 
 VkResult
-apex_program_compile(struct vk_device *device, struct apex_program *program, nir_shader *nir)
+apex_program_compile(struct vk_device *device, struct apex_program *program, nir_shader *nir,
+                     const struct apex_vertex_input *vi)
 {
    uint64_t invocations = nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
       nir->info.workgroup_size[2];
-   if (apex_from_nir(nir, &program->code))
+   if (apex_from_nir(nir, vi, &program->code))
       return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex compile: %s", program->code.diagnostic);
    uint32_t private_bytes;
@@ -278,9 +279,9 @@ apex_program_compile(struct vk_device *device, struct apex_program *program, nir
          fclose(f);
       }
    }
-   /* Wave k of a DISPATCH takes private base + 16 k private bytes: the
+   /* Wave k of a DISPATCH takes private base + 32 k private bytes: the
     * device's private arena bounds the workgroups of one DISPATCH. */
-   uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 16);
+   uint64_t extent = util_le32_to_cpu(private_bytes) * align64(invocations, 32);
    program->max_workgroups = extent ? MIN2(APEX_PRIVATE_BYTES / extent, UINT32_MAX) : UINT32_MAX;
    return program->max_workgroups ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
 }
@@ -301,7 +302,7 @@ create_compute_pipeline(struct vk_device *device,
       VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT |
       VK_PIPELINE_CREATE_2_ALLOW_DERIVATIVES_BIT | VK_PIPELINE_CREATE_2_DERIVATIVE_BIT |
       VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT;
-   /* Subgroups are always full and 16 wide. */
+   /* Subgroups are always full and 32 wide. */
    const VkPipelineShaderStageCreateFlags stage_flags =
       VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT |
       VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
@@ -312,7 +313,7 @@ create_compute_pipeline(struct vk_device *device,
    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroup =
       vk_find_struct_const(info->stage.pNext,
                            PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO);
-   if (subgroup && subgroup->requiredSubgroupSize != 16)
+   if (subgroup && subgroup->requiredSubgroupSize != 32)
       return VK_ERROR_FEATURE_NOT_PRESENT;
 
    /* No pipeline cache exists yet, so every accepted shader needs compilation. */
@@ -353,7 +354,7 @@ create_compute_pipeline(struct vk_device *device,
          goto unsupported_layout;
    }
    nir_shader_intrinsics_pass(nir, lower_grid, nir_metadata_control_flow, NULL);
-   result = apex_program_compile(device, &pipeline->program, nir);
+   result = apex_program_compile(device, &pipeline->program, nir, NULL);
    ralloc_free(nir);
    if (result != VK_SUCCESS) {
       apex_pipeline_destroy(device, &pipeline->vk, alloc);

@@ -60,7 +60,7 @@ fn encoding() {
     let fadd = Inst { op: op::V_ADD_F, hi: 1 << 8 | 1 << 12 | 1 << 14, ..add };
     assert!(fadd.validate().is_ok());
     // A literal replaces c; three-source forms cannot carry one.
-    assert!(Inst { op: op::V_FMA_F, a: LITERAL, hi: 0x3f80_0000, ..add }.validate().is_err());
+    assert!(Inst { op: op::V_MAD_F, a: LITERAL, hi: 0x3f80_0000, ..add }.validate().is_err());
     assert!(Inst { a: LITERAL, hi: 0x1234_5678, ..add }.validate().is_ok());
     assert!(Inst { op: op::V_CMP_U, d: SCALAR, b: LITERAL, hi: 7, ..add }.validate().is_err());
     // Pairs start at even registers; scalar loads write scalars.
@@ -156,7 +156,7 @@ fn header() {
     let jump = Program::new(Stage::Compute, vec![Inst { op: op::S_BRANCH, hi: 5, ..Inst::new(0) }]);
     assert!(jump.bytes().is_err());
     let mut wide = Program::new(Stage::Vertex, vec![Inst::new(op::S_ENDPGM)]);
-    wide.local = [32, 1, 1];
+    wide.local = [64, 1, 1];
     assert!(wide.bytes().is_err());
     let mut compute = Program::new(Stage::Compute, vec![Inst::new(op::S_ENDPGM)]);
     compute.local = [256, 1, 1];
@@ -170,7 +170,7 @@ fn header() {
     assert!(vertex.bytes().is_err());
 }
 
-/// Runs one compute wave of `text` with 16 lanes; returns the memory image.
+/// Runs one compute wave of `text` with `exec` lanes; returns the memory image.
 fn run_compute(text: &str, exec: u32, memory: &mut [u8], private: u32) -> Result<(), String> {
     let mut p = Program::new(Stage::Compute, isa::assemble(text)?);
     p.local = [exec, 1, 1];
@@ -201,7 +201,7 @@ fn arithmetic() {
          v_min_f v2, v1, 0x{nan:08x}\n\
          v_max_f v3, -0.0, 0\n\
          v_mul_f v4, v1, 0.5 \n\
-         v_fma_f v5, v1, v1, -v1\n\
+         v_mad_f v5, v1, v1, -v1\n\
          v_add_f v6, v1, -2.0 clamp\n\
          v_mov v7, 0x000000f0\n\
          v_bfe_i v7, v7, 0x0404\n\
@@ -221,19 +221,19 @@ fn arithmetic() {
          v_bfi v18, v18, v20, 0\n\
          v_sub_f v19, 0x{nan:08x}, v1\n\
          {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
-        store(2, 0), store(3, 64), store(4, 128), store(5, 192), store(6, 256), store(7, 320),
-        store(8, 384), store(9, 448), store(10, 512), store(11, 576), store(12, 640), store(13, 704),
-        store(14, 768), store(15, 832), store(16, 896), store(17, 960), store(18, 1024), store(19, 1088), "s_endpgm"
+        store(2, 0), store(3, 128), store(4, 256), store(5, 384), store(6, 512), store(7, 640),
+        store(8, 768), store(9, 896), store(10, 1024), store(11, 1152), store(12, 1280), store(13, 1408),
+        store(14, 1536), store(15, 1664), store(16, 1792), store(17, 1920), store(18, 2048), store(19, 2176), "s_endpgm"
     );
-    let mut m = vec![0u8; 2048];
-    run_compute(&text, 16, &mut m, 0).unwrap();
-    for l in 0..16u32 {
-        let f = |k: usize| f32::from_bits(words(&m, 64 * k, 16)[l as usize]);
-        let w = |k: usize| words(&m, 64 * k, 16)[l as usize];
+    let mut m = vec![0u8; 4096];
+    run_compute(&text, 32, &mut m, 0).unwrap();
+    for l in 0..32u32 {
+        let f = |k: usize| f32::from_bits(words(&m, 128 * k, 32)[l as usize]);
+        let w = |k: usize| words(&m, 128 * k, 32)[l as usize];
         assert_eq!(f(0), l as f32, "min returns the number");
         assert_eq!(w(1), 0, "max(-0, +0) = +0");
         assert_eq!(f(2), l as f32 * 0.5);
-        assert_eq!(f(3), (l as f32).mul_add(l as f32, -(l as f32)));
+        assert_eq!(f(3), l as f32 * l as f32 - l as f32);
         assert_eq!(f(4), (l as f32 - 2.0).clamp(0.0, 1.0));
         assert_eq!(w(5), 0xffff_ffff, "signed field 0xf");
         assert_eq!(w(6), (l >> 1) & 3);
@@ -243,7 +243,7 @@ fn arithmetic() {
         assert_eq!(w(10), 0, "saturating conversion");
         assert_eq!(w(11) >> 16, 0x3800, "0.5 in the high half");
         assert_eq!(f(12), 0.5);
-        assert_eq!(w(13), (0..4).fold(0, |r, k| r | ((l >> k) & 1) << (2 * k)) | 2);
+        assert_eq!(w(13), (0..5).fold(0, |r, k| r | ((l >> k) & 1) << (2 * k)) | 2);
         assert_eq!(f(14), 0.5);
         assert_eq!(w(15), (l < 4) as u32);
         assert_eq!(w(16), 0x5600, "(mask & insert) | (~mask & base)");
@@ -262,41 +262,44 @@ fn scalar_fp() {
     ];
     let forms = [
         ("add_f", "{d}, s4, s5"), ("add_f", "{d}, -s4, |s5| clamp"), ("mul_f", "{d}, s4, s5"),
-        ("mul_f", "{d}, |s4|, -s5 clamp"), ("fma_f", "{d}, s4, s5, s6"), ("fma_f", "{d}, -s4, s5, -|s6|"),
-        ("fma_f", "{d}, s4, s4, s6 clamp"), ("rcp", "{d}, s4"), ("rcp", "{d}, -|s5|"), ("rsq", "{d}, s6"),
+        ("mul_f", "{d}, |s4|, -s5 clamp"), ("mad_f", "{d}, s4, s5, s6"), ("mad_f", "{d}, -s4, s5, -|s6|"),
+        ("mad_f", "{d}, s4, s4, s6 clamp"), ("rcp", "{d}, s4"), ("rcp", "{d}, -|s5|"), ("rsq", "{d}, s6"),
         ("rsq", "{d}, |s4| clamp"),
     ];
     let mut text = String::new();
     for k in 0..cases.len() {
         text += &format!("s_load s[4:7], off, s[0:1] offset:{} size:2\n", 16 * k);
         for (f, (name, args)) in forms.iter().enumerate() {
-            let at = 1024 + 128 * (k * forms.len() + f);
+            let at = 1024 + 256 * (k * forms.len() + f);
             text += &format!("s_{name} {}\nv_mov v1, s8\n", args.replace("{d}", "s8"));
             text += &format!("v_{name} {}\n", args.replace("{d}", "v2"));
             text += &store(1, at as u32);
-            text += &store(2, at as u32 + 64);
+            text += &store(2, at as u32 + 128);
         }
     }
     text += "s_endpgm";
-    let mut m = vec![0u8; 1024 + 128 * cases.len() * forms.len()];
+    let mut m = vec![0u8; 1024 + 256 * cases.len() * forms.len()];
     for (k, c) in cases.iter().enumerate() {
         for (j, x) in c.iter().enumerate() {
             m[16 * k + 4 * j..16 * k + 4 * j + 4].copy_from_slice(&x.to_bits().to_le_bytes());
         }
     }
-    run_compute(&text, 16, &mut m, 0).unwrap();
+    run_compute(&text, 32, &mut m, 0).unwrap();
     let mut distinct = std::collections::BTreeSet::new();
+    // FP32 subnormal operands and results flush to zero of their sign.
+    let ftz = |x: f32| if x.is_subnormal() { f32::from_bits(x.to_bits() & 0x8000_0000) } else { x };
     for k in 0..cases.len() {
         for f in 0..forms.len() {
-            let at = 1024 + 128 * (k * forms.len() + f);
-            let (s, v) = (words(&m, at, 16), words(&m, at + 64, 16));
+            let at = 1024 + 256 * (k * forms.len() + f);
+            let (s, v) = (words(&m, at, 32), words(&m, at + 128, 32));
             assert!(s.iter().chain(&v).all(|&x| x == v[0]), "case {k} form {f}: s {:08x} v {:08x}", s[0], v[0]);
             distinct.insert(v[0]);
         }
         let [a, b, c] = cases[k];
-        let fma = a.mul_add(b, c);
-        if !fma.is_nan() {
-            assert_eq!(words(&m, 1024 + 128 * (k * forms.len() + 4), 1)[0], fma.to_bits(), "fma case {k}");
+        // The multiply-add rounds the product, then the sum.
+        let mad = ftz(ftz(ftz(a) * ftz(b)) + ftz(c));
+        if !mad.is_nan() {
+            assert_eq!(words(&m, 1024 + 256 * (k * forms.len() + 4), 1)[0], mad.to_bits(), "mad case {k}");
         }
     }
     assert!(distinct.len() > 40, "{} distinct results", distinct.len());
@@ -326,27 +329,27 @@ fn exec_and_cross_lane() {
          v_mov v8, s5\n\
          v_mov v9, s6\n\
          {}{}{}{}{}{}{}{}{}s_endpgm",
-        store(1, 0), store(3, 64), store(4, 128), store(5, 192), store(6, 256), store(7, 320),
-        store(8, 384), store(9, 448), store(2, 512)
+        store(1, 0), store(3, 128), store(4, 256), store(5, 384), store(6, 512), store(7, 640),
+        store(8, 768), store(9, 896), store(2, 1024)
     );
-    let mut m = vec![0u8; 1024];
-    run_compute(&text, 16, &mut m, 0).unwrap();
-    for l in 0..16u32 {
-        let w = |k: usize| words(&m, 64 * k, 16)[l as usize];
+    let mut m = vec![0u8; 2048];
+    run_compute(&text, 32, &mut m, 0).unwrap();
+    for l in 0..32u32 {
+        let w = |k: usize| words(&m, 128 * k, 32)[l as usize];
         assert_eq!(w(0), if l < 6 { 7 } else { 9 });
         assert_eq!(w(1), 113);
         assert_eq!(w(2), 115);
         assert_eq!(w(3), 100 + (l & !3) + 3 - (l & 3), "pattern 0x1b reverses each quad");
-        assert_eq!(w(4), (0xaaaa & ((1 << l) - 1) as u32).count_ones());
+        assert_eq!(w(4), (0xaaaa & ((1u64 << l) - 1) as u32).count_ones());
         assert_eq!(w(5), if l == 3 { 42 } else { 0 });
         assert_eq!(w(6), 0, "first active lane of the masked region");
         assert_eq!(w(7), 0x3f, "saveexec returns the old mask");
     }
     // Only launched lanes run; inactive source lanes read zero.
     let text = format!("v_add v1, lane, 1\nv_permlane v2, v1, 12\n{}s_endpgm", store(2, 0));
-    let mut m = vec![0u8; 64];
+    let mut m = vec![0u8; 128];
     run_compute(&text, 10, &mut m, 0).unwrap();
-    assert_eq!(words(&m, 0, 16), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(words(&m, 0, 32), [0; 32]);
 }
 
 #[test]
@@ -361,7 +364,7 @@ fn memory_model() {
                 s_buffer_load s9, off, s[4:7] offset:64 size:0\n\
                 v_mov v4, s8\nv_mov v5, s9\n\
                 global_store v4, v1, s[0:1] offset:256 size:0\n\
-                global_store v5, v1, s[0:1] offset:320 size:0\n\
+                global_store v5, v1, s[0:1] offset:384 size:0\n\
                 s_endpgm";
     let mut m = vec![0u8; 1024];
     for k in 0..16u32 {
@@ -371,40 +374,40 @@ fn memory_model() {
     for (k, d) in desc.iter().enumerate() {
         m[512 + 4 * k..516 + 4 * k].copy_from_slice(&d.to_le_bytes());
     }
-    run_compute(text, 16, &mut m, 0).unwrap();
+    run_compute(text, 32, &mut m, 0).unwrap();
     let got = words(&m, 0, 16);
     for k in 1..16 {
         assert_eq!(got[k], (k as u32 - 1) * 10 + 1, "in-order load/store per wave");
     }
     assert_eq!(words(&m, 64, 1), [0], "store past the range dropped");
     assert_eq!(words(&m, 256, 1), [141], "after this wave's store to the same dword");
-    assert_eq!(words(&m, 320, 1), [0], "scalar load past the range reads zero");
+    assert_eq!(words(&m, 384, 1), [0], "scalar load past the range reads zero");
     m[512 + 12] = 0;
-    assert!(run_compute(text, 16, &mut m, 0).unwrap_err().contains("fault"));
+    assert!(run_compute(text, 32, &mut m, 0).unwrap_err().contains("fault"));
 
-    // Private memory interleaves lanes: wave base + ((word + k) * 16 + lane) * 4.
+    // Private memory interleaves lanes: wave base + ((word + k) * 32 + lane) * 4.
     let text = "v_add v2, lane, 5\nv_add v3, lane, 6\nscratch_store v[2:3], off offset:4 size:1\n\
                 scratch_load v[4:5], off offset:4 size:1\nv_add v6, v4, v5\n\
                 v_shl v100, lane, 2\nglobal_store v6, v100, s[0:1] size:0\ns_endpgm";
-    let mut m = vec![0u8; 64];
-    run_compute(text, 16, &mut m, 12).unwrap();
-    assert_eq!(words(&m, 0, 16), (0..16).map(|l| 2 * l + 11).collect::<Vec<_>>());
-    assert!(run_compute(text, 16, &mut m, 8).unwrap_err().contains("fault"));
+    let mut m = vec![0u8; 128];
+    run_compute(text, 32, &mut m, 12).unwrap();
+    assert_eq!(words(&m, 0, 32), (0..32).map(|l| 2 * l + 11).collect::<Vec<_>>());
+    assert!(run_compute(text, 32, &mut m, 8).unwrap_err().contains("fault"));
 
     // Atomics at 32 and 64 bits; compare-exchange holds {new, compare}.
     let text = "v_mov v1, 1\nglobal_atomic v1, off, s[0:1] size:0 return:1\n\
-                v_mov v2, 5\nv_mov v3, 16\nglobal_atomic v[2:3], off, s[0:1] atomic:2 return:1\n\
+                v_mov v2, 5\nv_mov v3, 32\nglobal_atomic v[2:3], off, s[0:1] atomic:2 return:1\n\
                 v_mov v4, 0xffffffff\nv_mov v5, 0\nglobal_atomic v[4:5], off, s[0:1] offset:8 size:1\n\
-                v_shl v100, lane, 2\nglobal_store v1, v100, s[0:1] offset:64 size:0\n\
-                global_store v2, v100, s[0:1] offset:128 size:0\ns_endpgm";
-    let mut m = vec![0u8; 256];
+                v_shl v100, lane, 2\nglobal_store v1, v100, s[0:1] offset:128 size:0\n\
+                global_store v2, v100, s[0:1] offset:256 size:0\ns_endpgm";
+    let mut m = vec![0u8; 512];
     m[8] = 1;
-    run_compute(text, 16, &mut m, 0).unwrap();
-    assert_eq!(words(&m, 0, 1), [5], "16 increments then one exchange from 16 to 5");
-    assert_eq!(words(&m, 8, 2), [0xffff_fff1, 15], "1 + 16 * 0xffffffff carries into the high word");
-    let old = words(&m, 64, 16);
-    assert_eq!(old, (0..16).collect::<Vec<_>>());
-    assert_eq!(words(&m, 128, 16).iter().filter(|&&v| v == 16).count(), 1);
+    run_compute(text, 32, &mut m, 0).unwrap();
+    assert_eq!(words(&m, 0, 1), [5], "32 increments then one exchange from 32 to 5");
+    assert_eq!(words(&m, 8, 2), [0xffff_ffe1, 31], "1 + 32 * 0xffffffff carries into the high word");
+    let old = words(&m, 128, 32);
+    assert_eq!(old, (0..32).collect::<Vec<_>>());
+    assert_eq!(words(&m, 256, 32).iter().filter(|&&v| v == 32).count(), 1);
 }
 
 #[test]
@@ -412,25 +415,25 @@ fn control_and_barriers() {
     // Four waves: each writes shared memory, meets at the barrier, reads a neighbour.
     let text = "s_launch s2 imm:3\nv_mov v1, s2\nv_shl v2, v0, 2\nshared_store v1, v2 size:0\n\
                 s_fence imm:13\ns_barrier\n\
-                v_add v3, v0, 16\nv_and v3, v3, 63\nv_shl v3, v3, 2\nshared_load v4, v3 size:0\n\
+                v_add v3, v0, 32\nv_and v3, v3, 127\nv_shl v3, v3, 2\nshared_load v4, v3 size:0\n\
                 s_cmp_eq s3, s2, 3\ns_cbranch_nz s3 offset:1\nv_add v4, v4, 100\n\
                 global_store v4, v2, s[0:1] size:0\ns_endpgm";
     let mut p = Program::new(Stage::Compute, isa::assemble(text).unwrap());
-    p.local = [64, 1, 1];
-    p.shared = 256;
-    let mut m = vec![0u8; 256];
+    p.local = [128, 1, 1];
+    p.shared = 512;
+    let mut m = vec![0u8; 512];
     compute(&p, [1, 1, 1], 0, &mut m).unwrap();
-    let got = words(&m, 0, 64);
-    for i in 0..64u32 {
-        let neighbour = ((i + 16) % 64) / 16;
-        assert_eq!(got[i as usize], neighbour + if i / 16 == 3 { 0 } else { 100 });
+    let got = words(&m, 0, 128);
+    for i in 0..128u32 {
+        let neighbour = ((i + 32) % 128) / 32;
+        assert_eq!(got[i as usize], neighbour + if i / 32 == 3 { 0 } else { 100 });
     }
     // execz skips a region whose mask is empty.
     let text = format!("v_cmp_u s2, lane, 0, #2\ns_and_saveexec s3, s2\ns_cbranch_execz offset:1\ns_trap imm:1\n\
                         s_setexec s3\nv_mov v1, 3\n{}s_endpgm", store(1, 0));
-    let mut m = vec![0u8; 64];
-    run_compute(&text, 16, &mut m, 0).unwrap();
-    assert_eq!(words(&m, 0, 16), [3; 16]);
+    let mut m = vec![0u8; 128];
+    run_compute(&text, 32, &mut m, 0).unwrap();
+    assert_eq!(words(&m, 0, 32), [3; 32]);
 }
 
 #[test]
@@ -443,7 +446,7 @@ fn fragment_interpolation_and_export() {
     p.output = 1;
     p.inputs = vec![0, 0x80];
     let mut w = model::Wave { exec: 0x0ff0, attributes: vec![[0; model::BLOCK]; 2], ..Default::default() };
-    for l in 0..16 {
+    for l in 0..32 {
         w.vector[0][l] = (0.25 * (l & 3) as f32).to_bits();
         w.vector[1][l] = (0.5 * (l >> 2) as f32).to_bits();
         w.vector[3][l] = 0xff | ((l >= 8) as u32) << 8;
@@ -523,11 +526,11 @@ fn allocation_and_spilling() {
     assert!(stats.vector <= 128);
     assert!(!p.code.iter().any(|i| i.op == op::S_NOP), "the scoreboard owns hazards");
     let run = |p: &Program| {
-        let mut m = vec![0u8; 64];
+        let mut m = vec![0u8; 128];
         compute(p, [1, 1, 1], 0x100000, &mut m).unwrap();
-        words(&m, 0, 16)
+        words(&m, 0, 32)
     };
-    let expect = |n: u32| (0..16).map(|l| (0..n).map(|k| l + k * 3 + 1000).sum::<u32>()).collect::<Vec<_>>();
+    let expect = |n: u32| (0..32).map(|l| (0..n).map(|k| l + k * 3 + 1000).sum::<u32>()).collect::<Vec<_>>();
     assert_eq!(run(&p), expect(126));
     // Beyond the register file a compute program spills and still computes.
     let (p, stats) = pressure(140, Stage::Compute).unwrap();
@@ -610,20 +613,20 @@ fn divergent_loop_lifetimes() {
         mop(op::V_MUL_LO as u16, [v(x), v(trip), Opnd::Lit(10), Opnd::None]),
         mop(op::V_ADD as u16, [v(junk), v(trip), Opnd::Lit(77777), Opnd::None]),
         mop(op::V_ADD as u16, [v(t), v(junk), Opnd::Lit(1), Opnd::None]),
-        Op { hi: 64, ..mop(op::GLOBAL_STORE as u16, [v(t), v(offset), pair, Opnd::None]) },
+        Op { hi: 128, ..mop(op::GLOBAL_STORE as u16, [v(t), v(offset), pair, Opnd::None]) },
         mop(op::V_CMP_U as u16, [v(cmp), phys(isa::LANE), v(trip), Opnd::Raw(2)]),
         mop(op::S_AND as u16, [v(leaving), v(cmp), e, Opnd::None]),
         mop(op::S_ANDN2 as u16, [v(live), v(live), v(leaving), Opnd::None]),
         Op { imm: 1, ..mop(op::S_CBRANCH_NZ as u16, [Opnd::None, v(live), Opnd::None, Opnd::None]) },
-        mop(COPY, [e, Opnd::Lit(0xffff), Opnd::None, Opnd::None]),
+        mop(COPY, [e, Opnd::Lit(u32::MAX), Opnd::None, Opnd::None]),
         mop(op::GLOBAL_STORE as u16, [v(x), v(offset), pair, Opnd::None]),
         mop(op::S_ENDPGM as u16, [Opnd::None; 4]),
     ];
     let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
-    let mut m = vec![0u8; 128];
+    let mut m = vec![0u8; 256];
     compute(&p, [1, 1, 1], 0, &mut m).unwrap();
-    assert_eq!(words(&m, 0, 16), (0..16).map(|l| 10 * (l + 1)).collect::<Vec<_>>());
-    assert_eq!(words(&m, 64, 16), (0..16).map(|l| l + 1 + 77778).collect::<Vec<_>>());
+    assert_eq!(words(&m, 0, 32), (0..32).map(|l| 10 * (l + 1)).collect::<Vec<_>>());
+    assert_eq!(words(&m, 128, 32), (0..32).map(|l| l + 1 + 77778).collect::<Vec<_>>());
 }
 
 #[test]
@@ -647,14 +650,14 @@ fn copy_into_live_group() {
         mop(op::V_ADD as u16, [v(g), v(g), v(a), Opnd::None]),
         mop(op::GLOBAL_STORE as u16, [v(g), v(offset), pair, Opnd::None]),
         mop(COPY, [v(g), v(a), Opnd::None, Opnd::None]),
-        Op { hi: 64, ..mop(op::GLOBAL_STORE as u16, [v(g), v(offset), pair, Opnd::None]) },
+        Op { hi: 128, ..mop(op::GLOBAL_STORE as u16, [v(g), v(offset), pair, Opnd::None]) },
         mop(op::S_ENDPGM as u16, [Opnd::None; 4]),
     ];
     let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
-    let mut m = vec![0u8; 128];
+    let mut m = vec![0u8; 256];
     compute(&p, [1, 1, 1], 0, &mut m).unwrap();
-    assert_eq!(words(&m, 0, 16), (0..16).map(|l| l + 5).collect::<Vec<_>>());
-    assert_eq!(words(&m, 64, 16), (0..16).map(|l| l + 5).collect::<Vec<_>>());
+    assert_eq!(words(&m, 0, 32), (0..32).map(|l| l + 5).collect::<Vec<_>>());
+    assert_eq!(words(&m, 128, 32), (0..32).map(|l| l + 5).collect::<Vec<_>>());
 }
 
 #[test]

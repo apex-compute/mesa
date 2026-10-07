@@ -34,7 +34,7 @@ enum apex_opcode {
    APEX_S_SUB64 = 0x3c, APEX_S_SHL64 = 0x3d, APEX_S_FF1 = 0x3e, APEX_S_POPCNT = 0x3f,
    APEX_S_AND_SAVEEXEC = 0x40, APEX_S_OR_SAVEEXEC = 0x41, APEX_S_ANDN2_SAVEEXEC = 0x42,
    APEX_S_SETEXEC = 0x43, APEX_S_MEMTIME = 0x44, APEX_S_LAUNCH = 0x45, APEX_S_ADD_F = 0x46,
-   APEX_S_MUL_F = 0x47, APEX_S_FMA_F = 0x48, APEX_S_RCP = 0x49, APEX_S_RSQ = 0x4a, APEX_V_MOV = 0x60,
+   APEX_S_MUL_F = 0x47, APEX_S_MAD_F = 0x48, APEX_S_RCP = 0x49, APEX_S_RSQ = 0x4a, APEX_V_MOV = 0x60,
    APEX_V_ADD = 0x61, APEX_V_SUB = 0x62, APEX_V_MUL_LO = 0x63, APEX_V_MUL_HI_U = 0x64,
    APEX_V_MUL_HI_I = 0x65, APEX_V_AND = 0x66, APEX_V_OR = 0x67, APEX_V_XOR = 0x68,
    APEX_V_NOT = 0x69, APEX_V_SHL = 0x6a, APEX_V_SHR = 0x6b, APEX_V_ASHR = 0x6c,
@@ -44,7 +44,7 @@ enum apex_opcode {
    APEX_V_FFBL = 0x79, APEX_V_FFBH_U = 0x7a, APEX_V_FFBH_I = 0x7b, APEX_V_BFREV = 0x7c,
    APEX_V_PERM = 0x7d, APEX_V_MORTON = 0x7e, APEX_V_CNDMASK = 0x7f, APEX_V_CMP_I = 0x80,
    APEX_V_CMP_U = 0x81, APEX_V_CMP_F = 0x82, APEX_V_CMP_CLASS = 0x83, APEX_V_ADD_F = 0x84,
-   APEX_V_SUB_F = 0x85, APEX_V_MUL_F = 0x86, APEX_V_FMA_F = 0x87, APEX_V_MIN_F = 0x88,
+   APEX_V_SUB_F = 0x85, APEX_V_MUL_F = 0x86, APEX_V_MAD_F = 0x87, APEX_V_MIN_F = 0x88,
    APEX_V_MAX_F = 0x89, APEX_V_FLOOR = 0x8a, APEX_V_CEIL = 0x8b, APEX_V_TRUNC = 0x8c,
    APEX_V_RNDNE = 0x8d, APEX_V_FRACT = 0x8e, APEX_V_FREXP_MANT = 0x8f,
    APEX_V_FREXP_EXP = 0x90, APEX_V_LDEXP = 0x91, APEX_V_RCP = 0x92, APEX_V_RSQ = 0x93,
@@ -94,25 +94,52 @@ int apex_emit(const struct apex_op *, size_t, const struct apex_value *, size_t,
 
 /* Runs a program on the ISA reference model (Tooling/apex_isa, located by
  * the APEX_ISA environment variable): a compute grid, or one vertex or
- * fragment wave. Fragment waves take quad origins from v2 and coverage,
- * primitive slot and facing from v3; primitive p's attribute block holds
- * APEX_ATTRIBUTE_BLOCK dwords in the ring layout of Docs/isa.md. */
+ * fragment wave. Vertex waves take their header from s16-s23. Fragment
+ * waves take quad origins from v2 and coverage, primitive slot and facing
+ * from v3 (Docs/isa.md, Launch registers); primitive p's attribute block
+ * holds APEX_ATTRIBUTE_BLOCK dwords in the ring layout of Docs/isa.md. */
 #define APEX_ATTRIBUTE_BLOCK (8 + 12 * 32)
+#define APEX_LANES 32
 struct apex_sim_region { uint64_t gpuva; void *data; uint64_t size; };
 struct apex_sim_wave {
-   uint32_t exec, scalar[32], vector[72][16];
+   uint32_t exec, scalar[32], vector[8][APEX_LANES];
    const uint32_t *attributes;
    uint32_t primitives;
-   uint32_t exports[10][16][4], exported[10];
+   uint32_t exports[10][APEX_LANES][4], exported[10];
 };
 int apex_simulate(const uint8_t *program, size_t size, const uint32_t user[16],
                   const uint32_t groups[3], uint64_t private_base, struct apex_sim_wave *,
                   struct apex_sim_region *, size_t regions, char diagnostic[256]);
 
 int apex_tool(const char *mode, const char *input, const char *output);
+
+/* Vertex input state the vertex prolog compiles in (Docs/architecture.md,
+ * Compiler contract). Attribute location L reads `format` (an enum
+ * pipe_format; 0 when the pipeline has no attribute L) at byte `offset` of
+ * an element of binding `binding`. A binding's elements are vertices, or
+ * instances stepped every `divisor` instances (0: the first instance only).
+ * With `robust`, an attribute reaching past its binding's bytes reads zero. */
+struct apex_vertex_attribute { uint32_t format, binding, offset; };
+struct apex_vertex_binding { bool instance; uint32_t divisor; };
+struct apex_vertex_input {
+   struct apex_vertex_attribute attributes[16];
+   struct apex_vertex_binding bindings[16];
+   bool robust;
+};
+/* Whether the vertex prolog converts `format` (an enum pipe_format). */
+bool apex_vertex_format(uint32_t format);
+/* The vertex prolog on load_input of a shader after nir_lower_io: it reads
+ * the vertex input block address from s22-s23 (load_kernel_input at byte
+ * 88), the binding descriptors and strides from the block, and fetches each
+ * attribute at index * stride + offset with load_vertex_id, or
+ * load_base_instance + load_instance_id / divisor. NULL `vi` is the
+ * standalone layout: location L reads four 32-bit components of its type
+ * from binding L at offset 0 per vertex. False on an unsupported input. */
+bool apex_nir_lower_vertex_input(struct nir_shader *, const struct apex_vertex_input *vi);
 /* Mutates caller-owned NIR; the caller retains its lifetime and GLSL type ref.
- * Compute, vertex and fragment stages. */
-int apex_from_nir(struct nir_shader *, struct apex_compile_result *);
+ * Compute, vertex and fragment stages; `vi` is the vertex stage's input
+ * state (apex_nir_lower_vertex_input). */
+int apex_from_nir(struct nir_shader *, const struct apex_vertex_input *vi, struct apex_compile_result *);
 /* Late algebraic rules (apex_nir_algebraic.py). */
 bool apex_nir_opt_late(struct nir_shader *);
 /* Validates Vulkan 1.3 SPIR-V and compiles its first entry point (standalone). */

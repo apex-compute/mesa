@@ -289,91 +289,21 @@ apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk_samp
 
 /* ---- State blocks ------------------------------------------------------- */
 
-enum vertex_kind {
-   KIND_NONE, KIND_FLOAT32, KIND_UINT32, KIND_SINT32, KIND_UNORM8, KIND_SNORM8, KIND_UINT8,
-   KIND_SINT8, KIND_UNORM16, KIND_SNORM16, KIND_UINT16, KIND_SINT16, KIND_FLOAT16,
-   KIND_UNORM10_2, KIND_UINT10_2, KIND_USCALED8, KIND_SSCALED8, KIND_USCALED16, KIND_SSCALED16,
-};
-
-uint8_t
-apex_hw_vertex_format(VkFormat format, bool *swap_rb)
-{
-   static const struct { VkFormat base; unsigned kind; } families[] = {
-      {VK_FORMAT_R8_UNORM, KIND_UNORM8}, {VK_FORMAT_R8_SNORM, KIND_SNORM8},
-      {VK_FORMAT_R8_USCALED, KIND_USCALED8}, {VK_FORMAT_R8_SSCALED, KIND_SSCALED8},
-      {VK_FORMAT_R8_UINT, KIND_UINT8}, {VK_FORMAT_R8_SINT, KIND_SINT8},
-      {VK_FORMAT_R16_UNORM, KIND_UNORM16}, {VK_FORMAT_R16_SNORM, KIND_SNORM16},
-      {VK_FORMAT_R16_USCALED, KIND_USCALED16}, {VK_FORMAT_R16_SSCALED, KIND_SSCALED16},
-      {VK_FORMAT_R16_UINT, KIND_UINT16}, {VK_FORMAT_R16_SINT, KIND_SINT16},
-      {VK_FORMAT_R16_SFLOAT, KIND_FLOAT16},
-   };
-   *swap_rb = false;
-   /* R, RG, RGB and RGBA families of 8 and 16 bits: seven enumerants per
-    * family (UNORM, SNORM, USCALED, SSCALED, UINT, SINT, SRGB or SFLOAT);
-    * B8G8R8 sits between R8G8B8 and R8G8B8A8. */
-   static const unsigned eight[4] = {0, 7, 14, 28}, sixteen[4] = {0, 7, 14, 21};
-   for (unsigned f = 0; f < ARRAY_SIZE(families); f++) {
-      const unsigned *offsets = families[f].base < VK_FORMAT_R16_UNORM ? eight : sixteen;
-      for (unsigned n = 0; n < 4; n++)
-         if (families[f].base + offsets[n] == format)
-            return families[f].kind << 2 | n;
-   }
-   switch (format) {
-   case VK_FORMAT_R32_UINT: return KIND_UINT32 << 2;
-   case VK_FORMAT_R32_SINT: return KIND_SINT32 << 2;
-   case VK_FORMAT_R32_SFLOAT: return KIND_FLOAT32 << 2;
-   case VK_FORMAT_R32G32_UINT: return KIND_UINT32 << 2 | 1;
-   case VK_FORMAT_R32G32_SINT: return KIND_SINT32 << 2 | 1;
-   case VK_FORMAT_R32G32_SFLOAT: return KIND_FLOAT32 << 2 | 1;
-   case VK_FORMAT_R32G32B32_UINT: return KIND_UINT32 << 2 | 2;
-   case VK_FORMAT_R32G32B32_SINT: return KIND_SINT32 << 2 | 2;
-   case VK_FORMAT_R32G32B32_SFLOAT: return KIND_FLOAT32 << 2 | 2;
-   case VK_FORMAT_R32G32B32A32_UINT: return KIND_UINT32 << 2 | 3;
-   case VK_FORMAT_R32G32B32A32_SINT: return KIND_SINT32 << 2 | 3;
-   case VK_FORMAT_R32G32B32A32_SFLOAT: return KIND_FLOAT32 << 2 | 3;
-   case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return KIND_UNORM8 << 2 | 3;
-   case VK_FORMAT_A8B8G8R8_SNORM_PACK32: return KIND_SNORM8 << 2 | 3;
-   case VK_FORMAT_A8B8G8R8_USCALED_PACK32: return KIND_USCALED8 << 2 | 3;
-   case VK_FORMAT_A8B8G8R8_SSCALED_PACK32: return KIND_SSCALED8 << 2 | 3;
-   case VK_FORMAT_A8B8G8R8_UINT_PACK32: return KIND_UINT8 << 2 | 3;
-   case VK_FORMAT_A8B8G8R8_SINT_PACK32: return KIND_SINT8 << 2 | 3;
-   case VK_FORMAT_B8G8R8A8_UNORM: *swap_rb = true; return KIND_UNORM8 << 2 | 3;
-   case VK_FORMAT_B8G8R8A8_SNORM: *swap_rb = true; return KIND_SNORM8 << 2 | 3;
-   case VK_FORMAT_B8G8R8A8_UINT: *swap_rb = true; return KIND_UINT8 << 2 | 3;
-   case VK_FORMAT_B8G8R8A8_SINT: *swap_rb = true; return KIND_SINT8 << 2 | 3;
-   case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return KIND_UNORM10_2 << 2 | 3;
-   case VK_FORMAT_A2B10G10R10_UINT_PACK32: return KIND_UINT10_2 << 2 | 3;
-   case VK_FORMAT_A2R10G10B10_UNORM_PACK32: *swap_rb = true; return KIND_UNORM10_2 << 2 | 3;
-   case VK_FORMAT_A2R10G10B10_UINT_PACK32: *swap_rb = true; return KIND_UINT10_2 << 2 | 3;
-   default: return 0;
-   }
-}
-
 void
 apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
                            const struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS],
-                           unsigned clip_distances, uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS])
+                           unsigned clip_distances, bool robust, uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS])
 {
    memset(out, 0, APEX_HW_VERTEX_INPUT_DWORDS * 4);
-   const struct vk_vertex_input_state *vi = dyn->vi;
    for (unsigned b = 0; b < APEX_HW_MAX_BINDINGS; b++) {
-      bool instance = vi && (vi->bindings_valid & BITFIELD_BIT(b)) &&
-                      vi->bindings[b].input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
+      /* An ISA buffer descriptor whose size covers the binding's last
+       * dword: the prolog fetches attributes in whole dwords. */
       uint32_t *w = &out[4 * b];
       w[0] = (uint32_t)bindings[b].va;
-      w[1] = ((uint32_t)(bindings[b].va >> 32) & 0xff) | (uint32_t)instance << 8 |
-             (uint32_t)MIN2(dyn->vi_binding_strides[b], 0xffff) << 16;
-      w[2] = (uint32_t)MIN2(bindings[b].size, UINT32_MAX);
-      w[3] = instance ? vi->bindings[b].divisor : 0;
-   }
-   u_foreach_bit(a, vi ? vi->attributes_valid : 0) {
-      if (a >= APEX_HW_MAX_ATTRIBUTES)
-         break;
-      bool swap;
-      uint32_t *w = &out[64 + 2 * a];
-      w[0] = vi->attributes[a].binding | apex_hw_vertex_format(vi->attributes[a].format, &swap) << 8 |
-             (vi->attributes[a].offset & 0xffff) << 16;
-      w[1] = APEX_HW_ATTRIBUTE_REGISTER(a);
+      w[1] = (uint32_t)(bindings[b].va >> 32) & 0xff;
+      w[2] = (uint32_t)MIN2(align64(bindings[b].size, 4), UINT32_MAX & ~3u);
+      w[3] = robust;
+      out[64 + b] = dyn->vi_binding_strides[b];
    }
    out[96] = clip_distances & 15;
 }

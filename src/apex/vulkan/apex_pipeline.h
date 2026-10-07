@@ -54,9 +54,10 @@ bool apex_program_layout(struct apex_program *program, uint32_t set_count,
                          VkShaderStageFlags stages);
 /* Lowers descriptors, push constants, global access and Int64 in place. */
 bool apex_program_lower_resources(struct apex_program *program, struct nir_shader *nir);
-/* Compiles lowered NIR and derives the private-arena workgroup limit. */
+/* Compiles lowered NIR and derives the private-arena workgroup limit;
+ * `vi` is a vertex program's input state (apex_from_nir). */
 VkResult apex_program_compile(struct vk_device *device, struct apex_program *program,
-                              struct nir_shader *nir);
+                              struct nir_shader *nir, const struct apex_vertex_input *vi);
 void apex_program_finish(struct apex_device *device, struct apex_program *program);
 /* Lowers texture and image instructions (apex_texture.c). */
 bool apex_lower_textures(struct apex_program *program, struct nir_shader *nir);

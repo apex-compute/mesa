@@ -138,11 +138,11 @@ pub struct SimRegion {
 pub struct SimWave {
     exec: u32,
     scalar: [u32; 32],
-    vector: [[u32; 16]; 72],
+    vector: [[u32; model::LANES]; model::VECTORS],
     /// `primitives` attribute blocks of `model::BLOCK` dwords.
     attributes: *const u32,
     primitives: u32,
-    exports: [[[u32; 4]; 16]; 10],
+    exports: [[[u32; 4]; model::LANES]; 10],
     exported: [u32; 10],
 }
 
@@ -174,10 +174,10 @@ pub unsafe extern "C" fn apex_simulate(
                 let a = unsafe { std::slice::from_raw_parts(w.attributes, w.primitives as usize * model::BLOCK) };
                 a.chunks_exact(model::BLOCK).map(|c| c.try_into().unwrap()).collect()
             };
-            let init = model::Wave { exec: w.exec as u16, scalar: w.scalar, vector: w.vector, attributes: blocks };
+            let init = model::Wave { exec: w.exec, scalar: w.scalar, vector: w.vector, attributes: blocks };
             let e = model::run(bytes, &model::Launch::Wave(&init), &mut memory)?;
             w.exports = e.values;
-            w.exported = e.lanes.map(|x| x as u32);
+            w.exported = e.lanes;
         } else {
             model::run(bytes, &model::Launch::Compute { user: *user, groups: *groups, private_base }, &mut memory)?;
         }

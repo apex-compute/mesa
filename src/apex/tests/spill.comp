@@ -1,7 +1,7 @@
 #version 450
 // 136 dwords stay live across a uniform branch: allocation spills to private
 // memory and the results must survive the round trip.
-layout(local_size_x = 16) in;
+layout(local_size_x = 32) in;
 layout(std430, set = 0, binding = 0) buffer Source { uvec4 src[]; };
 layout(std430, set = 0, binding = 1) buffer Destination { uvec4 dst[]; };
 layout(push_constant) uniform Parameters { uint enable; } p;

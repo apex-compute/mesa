@@ -1134,15 +1134,15 @@ pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) ->
                     let width = values[victim as usize].width as u32;
                     if values[victim as usize].class == Class::S {
                         // Scalars spill into lanes of vector registers.
-                        let lane = lanes % 16;
-                        if lane == 0 || lane + width > 16 {
+                        let lane = lanes % 32;
+                        if lane == 0 || lane + width > 32 {
                             values.push(Value { class: Class::V, width: 1 });
                             align.push(1);
-                            lanes = lanes.next_multiple_of(16);
+                            lanes = lanes.next_multiple_of(32);
                             bank = values.len() as u32 - 1;
                             temps.insert(bank);
                         }
-                        spill_lanes(&mut ops, &mut values, &mut align, victim, bank, lanes % 16);
+                        spill_lanes(&mut ops, &mut values, &mut align, victim, bank, lanes % 32);
                         lanes += width;
                         stats_lanes += width;
                     } else {

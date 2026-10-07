@@ -11,11 +11,11 @@
 #extension GL_KHR_shader_subgroup_quad : require
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-layout(local_size_x = 64) in;
+layout(local_size_x = 128) in;
 layout(std430, set = 0, binding = 0) buffer Out { uint o[]; };
 layout(std430, set = 0, binding = 1) buffer Counter { uint counter; uint hist[16]; };
 layout(push_constant) uniform Parameters { uint limit; } p;
-shared uint tile[64];
+shared uint tile[128];
 void main()
 {
    uint l = gl_LocalInvocationIndex, g = gl_GlobalInvocationID.x;
@@ -32,15 +32,15 @@ void main()
    o[base + 1u] = subgroupAdd(l);
    o[base + 2u] = subgroupExclusiveAdd(l + 1u);
    o[base + 3u] = subgroupBallot((l & 3u) == 1u).x;
-   o[base + 4u] = subgroupShuffle(l * 3u, (gl_SubgroupInvocationID + 5u) & 15u);
-   o[base + 5u] = subgroupAll(l < 60u) ? 1u : 0u;
+   o[base + 4u] = subgroupShuffle(l * 3u, (gl_SubgroupInvocationID + 5u) & 31u);
+   o[base + 5u] = subgroupAll(l < 120u) ? 1u : 0u;
    o[base + 6u] = subgroupBroadcastFirst(l);
    tile[l] = l * l + gl_WorkGroupID.x;
    barrier();
-   o[base + 7u] = tile[63u - l] + tile[(l + 17u) & 63u];
+   o[base + 7u] = tile[127u - l] + tile[(l + 17u) & 127u];
    uint old = atomicAdd(counter, 1u);
    atomicAdd(hist[l & 15u], l);
-   o[base + 8u] = old < 64u * gl_NumWorkGroups.x ? 1u : 0u;
+   o[base + 8u] = old < 128u * gl_NumWorkGroups.x ? 1u : 0u;
    uint arr[8];
    for (uint k = 0u; k < 8u; k++)
       arr[k] = k * 11u + l;

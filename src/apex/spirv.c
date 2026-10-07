@@ -77,7 +77,7 @@ int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_
    nir_shader *nir = spirv_to_nir(words, count, NULL, stage, "main", &spv, &apex_nir_options);
    int result = 1;
    if (nir)
-      result = apex_from_nir(nir, out);
+      result = apex_from_nir(nir, NULL, out);
    else
       snprintf(out->diagnostic, sizeof(out->diagnostic), "SPIR-V translation failed");
    ralloc_free(nir);

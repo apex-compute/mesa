@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /* Graphics shaders as P7 vertex and fragment programs (Docs/isa.md) and the
- * internal compute kernels. Vertex attribute location L reads vector
- * registers 2 + 4L in the memory order of its components; vertex programs
- * store the output record, fragment programs export their targets. Fragment
+ * internal compute kernels. Vertex programs start with the compiler's
+ * vertex prolog for the pipeline's vertex input state and store the output
+ * record; fragment programs export their targets. Fragment
  * programs are specialized on the attachment formats: R8, RG8, RGBA8 and
  * BGRA8 UNORM and sRGB targets take UNORM16 codes (Docs/architecture.md,
  * ROP and tile buffer). Clip then cull distances also pass as varyings 30
@@ -66,29 +66,6 @@ distance_variable(nir_shader *nir, nir_variable_mode mode, unsigned offset)
 
 /* ---- Vertex stage -------------------------------------------------------- */
 
-/* BGR-ordered attribute formats arrive in memory order; swap red and blue. */
-static bool
-swap_attributes(nir_builder *b, nir_intrinsic_instr *i, void *data)
-{
-   const struct vk_vertex_input_state *vi = data;
-   if (i->intrinsic != nir_intrinsic_load_deref || i->def.num_components < 3)
-      return false;
-   nir_deref_instr *deref = nir_src_as_deref(i->src[0]);
-   if (deref->deref_type != nir_deref_type_var || deref->var->data.mode != nir_var_shader_in ||
-       deref->var->data.location < VERT_ATTRIB_GENERIC0)
-      return false;
-   unsigned location = deref->var->data.location - VERT_ATTRIB_GENERIC0;
-   bool swap = false;
-   if (!vi || location >= APEX_HW_MAX_ATTRIBUTES || !(vi->attributes_valid & BITFIELD_BIT(location)) ||
-       !apex_hw_vertex_format(vi->attributes[location].format, &swap) || !swap)
-      return false;
-   b->cursor = nir_after_instr(&i->instr);
-   unsigned swizzle[4] = {2, 1, 0, 3};
-   nir_def *swapped = nir_swizzle(b, &i->def, swizzle, i->def.num_components);
-   nir_def_rewrite_uses_after(&i->def, swapped);
-   return true;
-}
-
 /* Multiview: the view index is vertex user data s2 and the layer. */
 static bool
 lower_view_index(nir_builder *b, nir_intrinsic_instr *i, void *data)
@@ -106,9 +83,6 @@ lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, st
    unsigned varyings = d.clip + d.cull;
    NIR_PASS(_, nir, nir_split_per_member_structs);
    NIR_PASS(_, nir, nir_lower_returns);
-   if (state && state->vi)
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, swap_attributes, nir_metadata_control_flow,
-               (void *)state->vi);
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder builder = nir_builder_at(nir_after_impl(impl));
    nir_builder *b = &builder;
@@ -145,13 +119,12 @@ lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, st
  * draw's output vertices (apex_job.h, APEX_XFB_*). Invocations stride by
  * the dispatch over output vertex o = (instance * primitives + p) * n + k
  * of n-vertex primitives in Vulkan's topology order, up to the primitives
- * that fit every written buffer. Each fetches its attributes in software,
- * runs the vertex shader and stores the captured outputs at the buffer's
+ * that fit every written buffer. Each runs the vertex prolog and the vertex
+ * shader and stores the captured outputs at the buffer's
  * offset plus o times its stride. Strips and fans with primitive restart
  * find primitive p by scanning the indices. */
 struct capture {
    const struct apex_program *program;
-   const struct vk_vertex_input_state *vi;
    const nir_xfb_info *xfb;
    nir_def *flags, *first, *first_instance, *vertex_offset, *draw_index, *indexed;
    nir_def *vertex, *instance, *output, *state;
@@ -215,20 +188,12 @@ draw_word(nir_builder *b, const struct apex_program *program, nir_def *word)
    return nir_if_phi(b, loaded, direct);
 }
 
-/* `bytes` (1-4) bytes at byte offset `byte` as the low bits of a word. */
+/* The word holding byte offset `byte`, shifted so that byte is its low bits. */
 static nir_def *
-load_bytes(nir_builder *b, nir_def *address, nir_def *byte, unsigned bytes)
+load_bytes(nir_builder *b, nir_def *address, nir_def *byte)
 {
    nir_def *aligned = address_add(b, address, nir_iand_imm(b, byte, ~3u));
-   nir_def *shift = nir_ishl_imm(b, nir_iand_imm(b, byte, 3), 3);
-   nir_def *lo = nir_ushr(b, load_word(b, aligned), shift);
-   if (bytes == 1)
-      return lo;
-   nir_push_if(b, nir_ugt_imm(b, nir_iadd_imm(b, nir_iand_imm(b, byte, 3), bytes), 4));
-   nir_def *hi = load_word(b, address_add(b, aligned, nir_imm_int(b, 4)));
-   nir_def *joined = nir_ior(b, lo, nir_ishl(b, hi, nir_isub_imm(b, 32, shift)));
-   nir_pop_if(b, NULL);
-   return nir_if_phi(b, joined, lo);
+   return nir_ushr(b, load_word(b, aligned), nir_ishl_imm(b, nir_iand_imm(b, byte, 3), 3));
 }
 
 /* The index at draw position `position`, zero beyond the bound bytes;
@@ -241,7 +206,7 @@ fetch_index(nir_builder *b, struct capture *ctx, nir_def *position, nir_def **ma
    nir_def *end = nir_iadd(b, byte, nir_ishl(b, nir_imm_int(b, 1), shift));
    nir_def *zero = nir_imm_int(b, 0);
    nir_push_if(b, nir_uge(b, job_imm(b, ctx->program, APEX_XFB_INDEX_BYTES), end));
-   nir_def *word = load_bytes(b, job_address(b, ctx->program, APEX_XFB_INDEX), byte, 1);
+   nir_def *word = load_bytes(b, job_address(b, ctx->program, APEX_XFB_INDEX), byte);
    nir_pop_if(b, NULL);
    word = nir_if_phi(b, word, zero);
    *mask = nir_bcsel(b, nir_ieq_imm(b, shift, 2), nir_imm_int(b, ~0),
@@ -312,85 +277,6 @@ topology_vertex(nir_builder *b, nir_def *topology, nir_def *last, nir_def *j, ni
    return result;
 }
 
-/* One channel of a plain vertex format as FP32 or integer bits. */
-static nir_def *
-fetch_channel(nir_builder *b, const struct util_format_description *desc, unsigned c,
-              nir_def *address, nir_def *byte)
-{
-   const struct util_format_channel_description *ch = &desc->channel[c];
-   unsigned bits = ch->size, shift = ch->shift;
-   nir_def *value = load_bytes(b, address, nir_iadd_imm(b, byte, shift / 8), DIV_ROUND_UP(shift % 8 + bits, 8));
-   if (bits < 32)
-      value = nir_iand_imm(b, nir_ushr_imm(b, value, shift % 8), BITFIELD_MASK(bits));
-   switch (ch->type) {
-   case UTIL_FORMAT_TYPE_FLOAT:
-      return bits == 16 ? apex_half_to_float(b, value) : value;
-   case UTIL_FORMAT_TYPE_UNSIGNED:
-      if (ch->normalized)
-         return nir_fmul_imm(b, nir_u2f32(b, value), 1.0 / BITFIELD_MASK(bits));
-      return ch->pure_integer ? value : nir_u2f32(b, value);
-   case UTIL_FORMAT_TYPE_SIGNED: {
-      nir_def *extended = bits == 32 ? value : nir_ishr_imm(b, nir_ishl_imm(b, value, 32 - bits), 32 - bits);
-      if (ch->normalized)
-         return nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, extended), 1.0 / BITFIELD_MASK(bits - 1)),
-                         nir_imm_float(b, -1.0f));
-      return ch->pure_integer ? extended : nir_i2f32(b, extended);
-   }
-   default:
-      return nir_imm_int(b, 0);
-   }
-}
-
-/* Attribute `location` through its binding's words in the vertex-input
- * block; outside the bound bytes it reads (0, 0, 0, 1). */
-static nir_def *
-fetch_attribute(nir_builder *b, struct capture *ctx, unsigned location, unsigned component,
-                unsigned count, bool integer)
-{
-   const struct vk_vertex_input_state *vi = ctx->vi;
-   const struct util_format_description *desc = NULL;
-   if (vi && location < APEX_HW_MAX_ATTRIBUTES && (vi->attributes_valid & BITFIELD_BIT(location)))
-      desc = util_format_description(vk_format_to_pipe_format(vi->attributes[location].format));
-   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->block.bits > 128 ||
-       desc->channel[0].size > 32 || component + count > 4) {
-      ctx->invalid = true;
-      return nir_imm_zero(b, count, 32);
-   }
-   const struct vk_vertex_attribute_state *attr = &vi->attributes[location];
-   nir_def *block = job_address(b, ctx->program, APEX_XFB_VERTEX_INPUT);
-   nir_def *words = nir_load_global_2x32(b, 4, 32, address_add(b, block, nir_imm_int(b, 16 * attr->binding)),
-                                         .align_mul = 16);
-   nir_def *w1 = nir_channel(b, words, 1), *divisor = nir_channel(b, words, 3);
-   nir_def *address = nir_vec2(b, nir_channel(b, words, 0), nir_iand_imm(b, w1, 0xff));
-   /* Instance rate: firstInstance + (InstanceIndex - firstInstance) / divisor;
-    * a zero divisor repeats firstInstance. */
-   nir_def *stepped = nir_iadd(b, ctx->first_instance,
-                               nir_udiv(b, nir_isub(b, ctx->instance, ctx->first_instance),
-                                        nir_umax(b, divisor, nir_imm_int(b, 1))));
-   nir_def *instance = nir_bcsel(b, nir_ieq_imm(b, divisor, 0), ctx->first_instance, stepped);
-   nir_def *element = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, w1, 0x100), 0), instance, ctx->vertex);
-   nir_def *byte = nir_iadd_imm(b, nir_imul(b, element, nir_ushr_imm(b, w1, 16)), attr->offset);
-   nir_def *inside = nir_uge(b, nir_channel(b, words, 2), nir_iadd_imm(b, byte, desc->block.bits / 8));
-   nir_def *fallback[4], *fetched[4], *values[4];
-   for (unsigned c = 0; c < count; c++)
-      fallback[c] = component + c == 3 ? (integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f)) :
-                    nir_imm_int(b, 0);
-   nir_push_if(b, inside);
-   for (unsigned c = 0; c < count; c++) {
-      unsigned swizzle = desc->swizzle[component + c];
-      if (swizzle <= PIPE_SWIZZLE_W)
-         fetched[c] = fetch_channel(b, desc, swizzle, address, byte);
-      else if (swizzle == PIPE_SWIZZLE_1)
-         fetched[c] = integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f);
-      else
-         fetched[c] = nir_imm_int(b, 0);
-   }
-   nir_pop_if(b, NULL);
-   for (unsigned c = 0; c < count; c++)
-      values[c] = nir_if_phi(b, fetched[c], fallback[c]);
-   return nir_vec(b, values, count);
-}
-
 /* Stores the captured components of one output store. */
 static void
 capture_output(nir_builder *b, struct capture *ctx, nir_intrinsic_instr *i)
@@ -434,17 +320,12 @@ lower_capture(nir_builder *b, nir_intrinsic_instr *i, void *data)
    b->cursor = nir_before_instr(&i->instr);
    nir_def *replacement;
    switch (i->intrinsic) {
-   case nir_intrinsic_load_input: {
-      if (i->def.bit_size != 32) {
-         ctx->invalid = true;
+   case nir_intrinsic_load_kernel_input:
+      /* The prolog's vertex input block address (s22-s23). */
+      if (nir_intrinsic_base(i) != 88)
          return false;
-      }
-      nir_alu_type type = nir_intrinsic_dest_type(i);
-      replacement = fetch_attribute(b, ctx, nir_intrinsic_io_semantics(i).location - VERT_ATTRIB_GENERIC0,
-                                    nir_intrinsic_component(i), i->def.num_components,
-                                    nir_alu_type_get_base_type(type) != nir_type_float);
+      replacement = job_address(b, ctx->program, APEX_XFB_VERTEX_INPUT);
       break;
-   }
    case nir_intrinsic_store_output:
       capture_output(b, ctx, i);
       nir_instr_remove(&i->instr);
@@ -490,7 +371,7 @@ attribute_slots(const struct glsl_type *type, bool bindless)
 /* Builds the capture program of a vertex shader from its NIR; `program`
  * holds the vertex program's descriptor layout. */
 static VkResult
-build_capture(struct vk_device *device, nir_shader *nir, const struct vk_vertex_input_state *vi,
+build_capture(struct vk_device *device, nir_shader *nir, const struct apex_vertex_input *vi,
               struct apex_program *program)
 {
    NIR_PASS(_, nir, nir_split_per_member_structs);
@@ -509,7 +390,7 @@ build_capture(struct vk_device *device, nir_shader *nir, const struct vk_vertex_
          var->data.driver_location -= VERT_ATTRIB_GENERIC0;
    }
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, attribute_slots, 0);
-   if (!apex_program_lower_resources(program, nir))
+   if (!apex_program_lower_resources(program, nir) || !apex_nir_lower_vertex_input(nir, vi))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    const nir_xfb_info *xfb = nir->xfb_info;
    nir->xfb_info = NULL;
@@ -524,7 +405,7 @@ build_capture(struct vk_device *device, nir_shader *nir, const struct vk_vertex_
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
    nir_builder builder = nir_builder_at(nir_before_impl(impl));
    nir_builder *b = &builder;
-   struct capture ctx = {.program = program, .vi = vi, .xfb = xfb};
+   struct capture ctx = {.program = program, .xfb = xfb};
    nir_def *zero = nir_imm_int(b, 0);
    ctx.flags = job_imm(b, program, APEX_XFB_FLAGS);
    ctx.indexed = nir_ine_imm(b, nir_iand_imm(b, ctx.flags, APEX_XFB_FLAG_INDEXED), 0);
@@ -617,7 +498,7 @@ build_capture(struct vk_device *device, nir_shader *nir, const struct vk_vertex_
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    if (ctx.invalid)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   return apex_program_compile(device, program, nir);
+   return apex_program_compile(device, program, nir, NULL);
 }
 
 /* ---- Fragment stage ------------------------------------------------------ */
@@ -788,6 +669,28 @@ static const struct vk_shader_ops apex_shader_ops = {
    .get_executable_internal_representations = apex_shader_executable_representations,
 };
 
+/* The vertex prolog's input state; false when the pipeline's vertex input
+ * state is dynamic. */
+static bool
+vertex_input(const struct vk_graphics_pipeline_state *state, const struct vk_pipeline_robustness_state *rs,
+             struct apex_vertex_input *out)
+{
+   memset(out, 0, sizeof(*out));
+   if (!state || !state->vi)
+      return false;
+   const struct vk_vertex_input_state *vi = state->vi;
+   u_foreach_bit(a, vi->attributes_valid & BITFIELD_MASK(APEX_HW_MAX_ATTRIBUTES))
+      out->attributes[a] = (struct apex_vertex_attribute){
+         vk_format_to_pipe_format(vi->attributes[a].format), vi->attributes[a].binding, vi->attributes[a].offset,
+      };
+   u_foreach_bit(b, vi->bindings_valid & BITFIELD_MASK(APEX_HW_MAX_BINDINGS))
+      out->bindings[b] = (struct apex_vertex_binding){
+         vi->bindings[b].input_rate == VK_VERTEX_INPUT_RATE_INSTANCE, vi->bindings[b].divisor,
+      };
+   out->robust = rs && rs->vertex_inputs != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+   return true;
+}
+
 static VkResult
 compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
               const struct vk_graphics_pipeline_state *state, struct distances distances,
@@ -815,7 +718,11 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
                             VK_SHADER_STAGE_ALL_GRAPHICS))
       goto fail;
    nir_shader *capture = NULL;
+   struct apex_vertex_input vi;
    if (info->stage == MESA_SHADER_VERTEX) {
+      if (!vertex_input(state, info->robustness, &vi))
+         goto fail;
+      shader->vertex.robust = vi.robust;
       shader->vertex.clip_distances = nir->info.clip_distance_array_size;
       const nir_xfb_info *xfb = nir->xfb_info;
       if (xfb && xfb->output_count) {
@@ -838,7 +745,8 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
    }
    if (!apex_program_lower_resources(&shader->program, nir))
       goto fail;
-   result = apex_program_compile(device, &shader->program, nir);
+   result = apex_program_compile(device, &shader->program, nir,
+                                 info->stage == MESA_SHADER_VERTEX ? &vi : NULL);
    if (result != VK_SUCCESS)
       goto fail;
    if (info->stage == MESA_SHADER_VERTEX) {
@@ -851,7 +759,7 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
                                info->push_constant_range_count, info->push_constant_ranges,
                                VK_SHADER_STAGE_ALL_GRAPHICS))
          goto fail;
-      result = build_capture(device, capture, state ? state->vi : NULL, &shader->vertex.capture);
+      result = build_capture(device, capture, &vi, &shader->vertex.capture);
       if (result != VK_SUCCESS)
          goto fail;
       ralloc_free(capture);
@@ -1011,7 +919,7 @@ compile_internal(struct apex_device *device, nir_shader *nir, struct apex_progra
    if (nir) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_root, nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
-      result = apex_program_compile(&device->vk, program, nir);
+      result = apex_program_compile(&device->vk, program, nir, NULL);
    }
    ralloc_free(nir);
    if (result != VK_SUCCESS) {

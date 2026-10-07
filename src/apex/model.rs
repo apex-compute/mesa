@@ -17,37 +17,48 @@ pub struct Region<'a> {
 /// Dwords of one attribute block in the ring (Docs/isa.md, Vertex outputs
 /// and fragment inputs): two hidden rows and three rows per input.
 pub const BLOCK: usize = 8 + 12 * 32;
+pub const LANES: usize = 32;
+/// Launcher-written vector registers a wave description carries: v0 for
+/// vertex waves; v0, v1 and v4-v6 for fragment waves.
+pub const VECTORS: usize = 8;
 
-/// One vertex or fragment wave. Fragment waves take the header's quad
-/// origins from v2, coverage, primitive slot and facing from v3 (lane 4q for
-/// per-quad fields), and primitive p's block at ring dword p · BLOCK.
+/// One vertex or fragment wave. Vertex waves take the header from s16-s23.
+/// Fragment waves take the header's quad origins from v2, coverage,
+/// primitive slot and facing from v3 (lane 4q for per-quad fields), and
+/// primitive p's block at ring dword p · BLOCK.
 pub struct Wave {
-    pub exec: u16,
+    pub exec: u32,
     pub scalar: [u32; 32],
-    pub vector: [[u32; 16]; 72],
+    pub vector: [[u32; LANES]; VECTORS],
     pub attributes: Vec<[u32; BLOCK]>,
 }
 impl Default for Wave {
     fn default() -> Self {
-        Self { exec: 0xffff, scalar: [0; 32], vector: [[0; 16]; 72], attributes: Vec::new() }
+        Self { exec: u32::MAX, scalar: [0; 32], vector: [[0; LANES]; VECTORS], attributes: Vec::new() }
     }
 }
 
 pub enum Launch<'w> {
     /// A grid as the workgroup dispatcher launches it; wave k of the grid
-    /// has private base `private_base + k · 16 · private bytes`.
+    /// has private base `private_base + k · 32 · private bytes`.
     Compute { user: [u32; 16], groups: [u32; 3], private_base: u64 },
     Wave(&'w Wave),
 }
 
 /// Fragment exports by target: lane values and the lanes with coverage.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Exports {
-    pub values: [[[u32; 4]; 16]; 10],
-    pub lanes: [u16; 10],
+    pub values: [[[u32; 4]; LANES]; 10],
+    pub lanes: [u32; 10],
+}
+impl Default for Exports {
+    fn default() -> Self {
+        Self { values: [[[0; 4]; LANES]; 10], lanes: [0; 10] }
+    }
 }
 
 const PROGRAM: u64 = 0xf000_0000;
+const QUADS: usize = LANES / 4;
 
 /// A packed struct, first field in the most significant bits.
 #[derive(Default)]
@@ -71,80 +82,96 @@ impl Bits {
     }
 }
 
-fn identity(h: &mut Bits, stage: u64, exec: u16, tag: u64) {
-    h.push(stage, 2).push(1, 6).push(0, 6).push(0, 16).push(PROGRAM, 40).push(exec as u64, 16).push(tag, 8);
+/// WaveIdentity: stage, VMID, work (queue, sequence), program header, exec
+/// and tag.
+fn identity(h: &mut Bits, stage: u64, exec: u32, tag: u64) {
+    h.push(stage, 2).push(1, 6).push(0, 6).push(0, 16).push(PROGRAM, 40).push(exec as u64, 32).push(tag, 8);
 }
 
-/// WaveLaunch beat: kind (header, register, attribute), last, target,
-/// enable and 512 data bits.
-fn beat(kind: u64, target: u64, enable: u16, data: &Bits) -> Bits {
+/// WaveLaunch beat: kind (header, register, attribute, coverage), last,
+/// target, half (lanes 16-31 of a vector register), enable and 512 data
+/// bits.
+fn beat(kind: u64, target: u64, half: u64, enable: u16, data: &Bits) -> Bits {
     let mut b = Bits::default();
-    b.push(kind, 2).push(0, 1).push(target, 8).push(enable as u64, 16);
+    b.push(kind, 2).push(0, 1).push(target, 8).push(half, 1).push(enable as u64, 16);
     b.0.extend(&data.0);
-    assert_eq!(b.0.len(), 539);
+    assert_eq!(b.0.len(), 540);
     b
 }
-fn lanes(values: &[u32; 16]) -> Bits {
+fn dwords(values: &[u32]) -> Bits {
     let mut b = Bits::default();
-    b.array(&values.map(|v| v as u64), 32);
+    b.array(&values.iter().map(|&v| v as u64).collect::<Vec<_>>(), 32);
+    assert_eq!(b.0.len(), 512);
     b
+}
+/// Beats writing vector register `r` in two 16-lane halves.
+fn vector_beats(out: &mut Vec<Bits>, r: usize, row: &[u32; LANES]) {
+    for half in 0..2 {
+        out.push(beat(1, r as u64, half, 0xffff, &dwords(&row[16 * half as usize..16 * half as usize + 16])));
+    }
 }
 
 fn wave_beats(stage: u64, w: &Wave) -> Vec<Bits> {
     let mut h = Bits::default();
     identity(&mut h, stage, w.exec, 0);
     let s = |k: usize| w.scalar[k] as u64;
-    let mut skip = vec![];
+    let mut out = Vec::new();
     if stage == 1 {
-        h.push(s(16) | s(17) << 32, 40).push(s(18), 32).push(s(19), 32).push(s(20), 32).push(0, 282);
+        h.push(s(16) | s(17) << 32, 40).push(s(18), 32).push(s(19), 32).push(s(20), 32).push(s(21), 32);
+        h.push(s(22) | s(23) << 32, 40).push(0, 194);
+        out.push(beat(0, 0, 0, 0, &h));
     } else {
         let quad = |q: usize| (w.vector[2][4 * q] as u64, w.vector[3][4 * q] as u64);
-        let coverage: Vec<u64> =
-            (0..4).map(|q| (0..4).fold(0, |c, p| c | (w.vector[3][4 * q + p] as u64 & 0xff) << (8 * p))).collect();
-        h.push(0, 4).push(0, 2).push(0, 6).push(s(16) & 31, 5).push(w.attributes.len().min(4) as u64, 3);
-        h.array(&(0..4).map(|q| quad(q).0 & 0xffff).collect::<Vec<_>>(), 16);
-        h.array(&(0..4).map(|q| quad(q).0 >> 16).collect::<Vec<_>>(), 16);
-        h.array(&coverage, 32);
-        h.array(&(0..4).map(|q| (quad(q).1 >> 8) & 3).collect::<Vec<_>>(), 2);
-        h.array(&[(0..4).fold(0, |f, q| f | ((quad(q).1 >> 10) & 1) << q)], 4);
-        h.array(&(0..4).map(|p| (p * BLOCK) as u64).collect::<Vec<_>>(), 12);
-        h.push(0, 82);
-        skip = vec![2, 3];
+        let primitives = w.attributes.len().clamp(1, QUADS) as u64;
+        h.push(0, 4).push(0, 2).push(0, 6).push(s(16) & 31, 5).push(primitives - 1, 3);
+        h.array(&(0..QUADS).map(|q| (quad(q).0 & 0xffff) / 2).collect::<Vec<_>>(), 15);
+        h.array(&(0..QUADS).map(|q| (quad(q).0 >> 16) / 2).collect::<Vec<_>>(), 15);
+        h.array(&(0..QUADS).map(|q| (quad(q).1 >> 8) & 7).collect::<Vec<_>>(), 3);
+        h.array(&[(0..QUADS).fold(0, |f, q| f | ((quad(q).1 >> 11) & 1) << q)], 8);
+        h.array(&(0..QUADS).map(|p| (p * BLOCK) as u64).collect::<Vec<_>>(), 12);
+        h.push(0, 14);
+        out.push(beat(0, 0, 0, 0, &h));
+        let coverage: Vec<u32> = (0..QUADS)
+            .map(|q| (0..4).fold(0, |c, p| c | (w.vector[3][4 * q + p] & 0xff) << (8 * p)))
+            .collect();
+        let mut c = coverage.clone();
+        c.resize(16, 0);
+        out.push(beat(3, 0, 0, 0, &dwords(&c)));
     }
-    let mut out = vec![beat(0, 0, 0, &h)];
-    out.push(beat(1, 128, 0xffff, &lanes(&w.scalar[..16].try_into().unwrap())));
+    out.push(beat(1, 128, 0, 0xffff, &dwords(&w.scalar[..16])));
     for (r, row) in w.vector.iter().enumerate() {
-        if !skip.contains(&r) && (row.iter().any(|&v| v != 0) || r < 2) {
-            out.push(beat(1, r as u64, 0xffff, &lanes(row)));
+        let core = stage == 2 && (r == 2 || r == 3);
+        if !core && (row.iter().any(|&v| v != 0) || r == 0) {
+            vector_beats(&mut out, r, row);
         }
     }
-    let ring: Vec<u32> = w.attributes.iter().take(4).flatten().copied().collect();
+    let ring: Vec<u32> = w.attributes.iter().take(QUADS).flatten().copied().collect();
     for (row, chunk) in ring.chunks(16).enumerate() {
         let mut v = [0; 16];
         v[..chunk.len()].copy_from_slice(chunk);
-        out.push(beat(2, row as u64, 0xffff, &lanes(&v)));
+        out.push(beat(2, row as u64, 0, 0xffff, &dwords(&v)));
     }
     out
 }
 
 fn compute_beats(p: &crate::isa::Program, user: &[u32; 16], groups: [u32; 3], private_base: u64) -> Vec<Vec<Bits>> {
     let invocations = p.invocations();
-    let count = invocations.div_ceil(16);
+    let count = invocations.div_ceil(LANES as u32);
     let mut waves = Vec::new();
     let mut k = 0u64;
     for z in 0..groups[2] {
         for y in 0..groups[1] {
             for x in 0..groups[0] {
                 for wi in 0..count {
-                    let lanes_left = invocations - 16 * wi;
-                    let exec = if lanes_left >= 16 { 0xffff } else { (1u16 << lanes_left) - 1 };
+                    let lanes_left = invocations - LANES as u32 * wi;
+                    let exec = if lanes_left >= LANES as u32 { u32::MAX } else { (1u32 << lanes_left) - 1 };
                     let mut h = Bits::default();
                     identity(&mut h, 0, exec, k & 255);
-                    h.push(x as u64, 32).push(y as u64, 32).push(z as u64, 32).push(wi as u64, 4).push(count as u64, 5);
+                    h.push(x as u64, 32).push(y as u64, 32).push(z as u64, 32).push(wi as u64, 3).push(count as u64, 4);
                     h.push(p.shared.div_ceil(1024) as u64, 6);
                     h.push(p.local[0] as u64, 9).push(p.local[1] as u64, 9).push(p.local[2] as u64, 7);
-                    h.push(private_base + k * 16 * p.private as u64, 40).push(0, 242);
-                    waves.push(vec![beat(0, 0, 0, &h), beat(1, 128, 0xffff, &lanes(user))]);
+                    h.push(private_base + k * LANES as u64 * p.private as u64, 40).push(0, 228);
+                    waves.push(vec![beat(0, 0, 0, 0, &h), beat(1, 128, 0, 0xffff, &dwords(user))]);
                     k += 1;
                 }
             }

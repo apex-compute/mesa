@@ -4,6 +4,7 @@
 #include "apex.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include <stdio.h>
@@ -22,7 +23,7 @@ const struct nir_shader_compiler_options apex_nir_options = {
    .lower_pack_32_2x16_split = true, .lower_unpack_32_2x16_split = true,
    .lower_pack_64_2x32 = true, .lower_pack_split = true, .lower_extract_byte = false,
    .has_bitfield_select = true, .has_ldexp = true, .lower_device_index_to_zero = true,
-   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
+   .float_mul_add32 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
    .lower_int64_options = ~0, .lower_doubles_options = ~0,
    .max_unroll_iterations = 32,
 };
@@ -232,7 +233,7 @@ static uint32_t mask_to_flag(struct ctx *c, uint32_t m)
 }
 
 /* Class selection. A uniform value lives in scalar registers when a scalar
- * form computes it from scalar sources; FP add, multiply, FMA, reciprocal and
+ * form computes it from scalar sources; FP add, multiply, multiply-add, reciprocal and
  * its root have scalar forms with the vector forms' bits. */
 static bool scalar_alu(nir_op op)
 {
@@ -248,7 +249,8 @@ static bool scalar_alu(nir_op op)
    case nir_op_fneg: case nir_op_fabs: case nir_op_pack_64_2x32_split:
    case nir_op_unpack_64_2x32_split_x: case nir_op_unpack_64_2x32_split_y:
    case nir_op_u2u32: case nir_op_i2i32: case nir_op_fadd: case nir_op_fsub: case nir_op_fmul:
-   case nir_op_ffma: case nir_op_ffma_weak: case nir_op_frcp: case nir_op_frsq: case nir_op_fsat:
+   case nir_op_fmad: case nir_op_ffma: case nir_op_ffma_weak: case nir_op_frcp: case nir_op_frsq:
+   case nir_op_fsat:
       return true;
    default:
       return false;
@@ -271,7 +273,7 @@ static bool intrinsic_scalar(struct ctx *c, nir_intrinsic_instr *i)
    case nir_intrinsic_read_first_invocation: case nir_intrinsic_first_invocation:
    case nir_intrinsic_load_kernel_input: case nir_intrinsic_load_base_vertex:
    case nir_intrinsic_load_first_vertex: case nir_intrinsic_load_base_instance:
-   case nir_intrinsic_load_draw_id: case nir_intrinsic_load_push_constant:
+   case nir_intrinsic_load_instance_id: case nir_intrinsic_load_draw_id: case nir_intrinsic_load_push_constant:
    case nir_intrinsic_load_base_workgroup_id: case nir_intrinsic_load_workgroup_size:
       return true;
    case nir_intrinsic_load_ssbo: case nir_intrinsic_load_ubo:
@@ -388,7 +390,7 @@ static unsigned scalar_fp(unsigned op)
    switch (op) {
    case APEX_V_ADD_F: case APEX_V_SUB_F: return APEX_S_ADD_F;
    case APEX_V_MUL_F: return APEX_S_MUL_F;
-   case APEX_V_FMA_F: return APEX_S_FMA_F;
+   case APEX_V_MAD_F: return APEX_S_MAD_F;
    case APEX_V_RCP: return APEX_S_RCP;
    case APEX_V_RSQ: return APEX_S_RSQ;
    default: return 0;
@@ -678,7 +680,9 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
    case nir_op_fadd: fp_op(c, a, APEX_V_ADD_F); return;
    case nir_op_fsub: fp_op(c, a, APEX_V_SUB_F); return;
    case nir_op_fmul: fp_op(c, a, APEX_V_MUL_F); return;
-   case nir_op_ffma: case nir_op_ffma_weak: fp_op(c, a, APEX_V_FMA_F); return;
+   /* v_mad_f rounds the product and the sum; Vulkan's fma() precision is
+    * that of a multiply followed by an add. */
+   case nir_op_fmad: case nir_op_ffma: case nir_op_ffma_weak: fp_op(c, a, APEX_V_MAD_F); return;
    case nir_op_fmin: fp_op(c, a, APEX_V_MIN_F); return;
    case nir_op_fmax: fp_op(c, a, APEX_V_MAX_F); return;
    case nir_op_ffloor: fp_op(c, a, APEX_V_FLOOR); return;
@@ -1461,7 +1465,7 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
       emit(c, APEX_V_RCP, r, ma, 0, 0, 1u << 11);
       for (unsigned k = 0; k < 2; k++) {
          parts[k] = value(c, true, 1);
-         emit(c, APEX_V_FMA_F, parts[k], k ? tc : sc, r, half, 0);
+         emit(c, APEX_V_MAD_F, parts[k], k ? tc : sc, r, half, 0);
       }
       uint32_t index = op1(c, APEX_V_CVT_U_F, true, face);
       if (dim == 6) {
@@ -1631,10 +1635,10 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       alias(c, d, copy(c, false, apex_phys(APEX_SCALAR + 19)));
       return;
    case nir_intrinsic_load_num_subgroups:
-      alias(c, d, constant(c, DIV_ROUND_UP(c->header.local[0] * c->header.local[1] * c->header.local[2], 16)));
+      alias(c, d, constant(c, DIV_ROUND_UP(c->header.local[0] * c->header.local[1] * c->header.local[2], 32)));
       return;
    case nir_intrinsic_load_subgroup_size:
-      alias(c, d, constant(c, 16));
+      alias(c, d, constant(c, 32));
       return;
    case nir_intrinsic_load_kernel_input: {
       if (!nir_src_is_const(i->src[0])) {
@@ -1848,17 +1852,6 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
    case nir_intrinsic_load_interpolated_input: case nir_intrinsic_load_input: {
       nir_io_semantics io = nir_intrinsic_io_semantics(i);
       unsigned component = nir_intrinsic_component(i);
-      if (stage == MESA_SHADER_VERTEX) {
-         unsigned location = io.location - VERT_ATTRIB_GENERIC0;
-         if (io.location < VERT_ATTRIB_GENERIC0 || location >= 16 || d->bit_size != 32) {
-            failf(c, "unsupported vertex input", NULL);
-            return;
-         }
-         uint32_t g = define(c, d, true);
-         for (unsigned k = 0; k < d->num_components; k++)
-            emit(c, APEX_COPY, sub(g, k, 1), apex_phys(2 + 4 * location + component + k), 0, 0, 0);
-         return;
-      }
       if (stage != MESA_SHADER_FRAGMENT || d->bit_size != 32) {
          failf(c, "unsupported stage input", NULL);
          return;
@@ -1909,11 +1902,11 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       return;
    }
    case nir_intrinsic_load_front_face:
-      alias(c, d, op2(c, APEX_V_CMP_U, false, launch_bits(c, 10, 1), constant(c, 0)));
+      alias(c, d, op2(c, APEX_V_CMP_U, false, launch_bits(c, 11, 1), constant(c, 0)));
       last(c)->f[3] = apex_raw(1);
       return;
    case nir_intrinsic_load_sample_id:
-      alias(c, d, launch_bits(c, 12, 3));
+      alias(c, d, launch_bits(c, 13, 3));
       return;
    case nir_intrinsic_load_sample_mask_in:
       alias(c, d, launch_bits(c, 0, 8));
@@ -1929,7 +1922,8 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       alias(c, d, launch_vector(c, 0));
       return;
    case nir_intrinsic_load_instance_id:
-      alias(c, d, op2(c, APEX_V_SUB, true, apex_phys(1), apex_phys(APEX_SCALAR + 20)));
+      /* Waves hold one instance: s21 is its index, base included. */
+      alias(c, d, op2(c, APEX_S_SUB, false, apex_phys(APEX_SCALAR + 21), apex_phys(APEX_SCALAR + 20)));
       return;
    case nir_intrinsic_load_base_vertex: case nir_intrinsic_load_first_vertex:
       alias(c, d, copy(c, false, apex_phys(APEX_SCALAR + 19)));
@@ -2094,6 +2088,197 @@ static bool lower_texture_slots(nir_builder *b, nir_instr *instr, void *data)
    nir_tex_instr_add_src(t, nir_tex_src_backend1, words[0]);
    nir_tex_instr_add_src(t, nir_tex_src_backend2, words[1]);
    return true;
+}
+
+/* Vertex prolog (apex.h, apex_nir_lower_vertex_input). */
+bool apex_vertex_format(uint32_t format)
+{
+   const struct util_format_description *d = util_format_description(format);
+   if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->colorspace != UTIL_FORMAT_COLORSPACE_RGB ||
+       d->block.width != 1 || d->block.height != 1 || d->block.bits % 8 || d->block.bits > 128 ||
+       !d->nr_channels)
+      return false;
+   for (unsigned k = 0; k < d->nr_channels; k++) {
+      const struct util_format_channel_description *ch = &d->channel[k];
+      bool integer = ch->type == UTIL_FORMAT_TYPE_UNSIGNED || ch->type == UTIL_FORMAT_TYPE_SIGNED;
+      bool fp = ch->type == UTIL_FORMAT_TYPE_FLOAT && (ch->size == 16 || ch->size == 32);
+      if (!(integer || fp) || !ch->size || ch->size > 32 || ch->shift / 32 != (ch->shift + ch->size - 1) / 32)
+         return false;
+   }
+   return true;
+}
+
+/* One channel of a vertex format from the dword holding it. */
+static nir_def *vertex_channel(nir_builder *b, const struct util_format_channel_description *ch, nir_def *word)
+{
+   unsigned size = ch->size, shift = ch->shift % 32;
+   nir_def *v = size == 32 ? word : nir_iand_imm(b, nir_ushr_imm(b, word, shift), BITFIELD_MASK(size));
+   switch (ch->type) {
+   case UTIL_FORMAT_TYPE_FLOAT:
+      return size == 16 ? nir_channel(b, nir_unpack_half_2x16(b, v), 0) : v;
+   case UTIL_FORMAT_TYPE_UNSIGNED:
+      if (ch->normalized)
+         return nir_fmul_imm(b, nir_u2f32(b, v), 1.0 / BITFIELD_MASK(size));
+      return ch->pure_integer ? v : nir_u2f32(b, v);
+   default: {
+      nir_def *x = size == 32 ? word : nir_ishr_imm(b, nir_ishl_imm(b, word, 32 - shift - size), 32 - size);
+      if (ch->normalized)
+         return nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, x), 1.0 / BITFIELD_MASK(size - 1)), nir_imm_float(b, -1.0f));
+      return ch->pure_integer ? x : nir_i2f32(b, x);
+   }
+   }
+}
+
+static nir_def *vertex_word(nir_builder *b, nir_def *descriptor, nir_def *byte, bool speculate)
+{
+   return nir_load_ssbo(b, 1, 32, descriptor, byte, .align_mul = 4,
+                        .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER |
+                                  (speculate ? ACCESS_CAN_SPECULATE : 0));
+}
+
+/* The components in `mask` of attribute `location` through its binding's
+ * descriptor and stride in the vertex input block (Docs/architecture.md,
+ * State blocks): descriptor b at byte 16 b, stride b at byte 256 + 4 b. */
+static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const struct apex_vertex_input *vi,
+                                       unsigned location, unsigned mask)
+{
+   const struct apex_vertex_attribute *a = &vi->attributes[location];
+   nir_def *zero = nir_imm_int(b, 0), *out[4];
+   if (!a->format) {
+      for (unsigned k = 0; k < 4; k++)
+         out[k] = k == 3 ? nir_imm_float(b, 1.0f) : zero;
+      return nir_vec(b, out, 4);
+   }
+   if (!apex_vertex_format(a->format) || a->binding >= 16)
+      return NULL;
+   const struct util_format_description *d = util_format_description(a->format);
+   const struct apex_vertex_binding *binding = &vi->bindings[a->binding];
+   const enum gl_access_qualifier constant = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE;
+   nir_def *descriptor = nir_load_global_2x32(b, 4, 32,
+      nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 16 * a->binding),
+      .align_mul = 16, .access = constant);
+   nir_def *stride = nir_load_global_2x32(b, 1, 32,
+      nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 256 + 4 * a->binding),
+      .align_mul = 4, .access = constant);
+   nir_def *index;
+   if (!binding->instance)
+      index = nir_load_vertex_id(b);
+   else if (!binding->divisor)
+      index = nir_load_base_instance(b);
+   else
+      index = nir_iadd(b, nir_load_base_instance(b), nir_udiv_imm(b, nir_load_instance_id(b), binding->divisor));
+   nir_def *byte = nir_iadd_imm(b, nir_imul(b, index, stride), a->offset);
+   /* Vulkan aligns an attribute to its component size, or to the whole
+    * size of a packed format. */
+   unsigned bytes = d->block.bits / 8, words = DIV_ROUND_UP(bytes, 4);
+   unsigned align = d->is_array ? d->channel[0].size / 8 : bytes;
+   unsigned need = 0;
+   for (unsigned k = 0; k < 4; k++)
+      if (mask & BITFIELD_BIT(k) && d->swizzle[k] <= PIPE_SWIZZLE_W)
+         need |= BITFIELD_BIT(d->channel[d->swizzle[k]].shift / 32);
+   nir_def *word[4] = {0};
+   if (align % 4 == 0) {
+      u_foreach_bit(k, need)
+         word[k] = vertex_word(b, descriptor, nir_iadd_imm(b, byte, 4 * k), true);
+   } else {
+      /* Dword k of the attribute joins dwords k and k + 1 of the aligned
+       * window; the window's last dword loads only when the attribute
+       * reaches into it. */
+      nir_def *aligned = nir_iand_imm(b, byte, ~3u), *skew = nir_iand_imm(b, byte, 3);
+      nir_def *shift = nir_ishl_imm(b, skew, 3), *window[5] = {0};
+      for (unsigned k = 0; k <= words; k++) {
+         if (!((k < words && need & BITFIELD_BIT(k)) || (k && need & BITFIELD_BIT(k - 1))))
+            continue;
+         nir_def *at = nir_iadd_imm(b, aligned, 4 * k);
+         if (k < words) {
+            window[k] = vertex_word(b, descriptor, at, true);
+            continue;
+         }
+         nir_push_if(b, nir_ugt_imm(b, nir_iadd_imm(b, skew, bytes), 4 * words));
+         nir_def *last = vertex_word(b, descriptor, at, false);
+         nir_pop_if(b, NULL);
+         window[k] = nir_if_phi(b, last, zero);
+      }
+      u_foreach_bit(k, need) {
+         nir_def *joined = nir_ior(b, nir_ushr(b, window[k], shift),
+                                   nir_ishl(b, window[k + 1], nir_isub_imm(b, 32, shift)));
+         word[k] = nir_bcsel(b, nir_ieq_imm(b, skew, 0), window[k], joined);
+      }
+   }
+   if (vi->robust) {
+      nir_def *size = nir_channel(b, descriptor, 2);
+      nir_def *inside = nir_iand(b, nir_ult(b, byte, size), nir_uge(b, size, nir_iadd_imm(b, byte, bytes)));
+      u_foreach_bit(k, need)
+         word[k] = nir_bcsel(b, inside, word[k], zero);
+   }
+   bool integer = util_format_is_pure_integer(a->format);
+   for (unsigned k = 0; k < 4; k++) {
+      unsigned swizzle = d->swizzle[k];
+      if (!(mask & BITFIELD_BIT(k)) || swizzle == PIPE_SWIZZLE_0)
+         out[k] = zero;
+      else if (swizzle == PIPE_SWIZZLE_1)
+         out[k] = integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f);
+      else
+         out[k] = vertex_channel(b, &d->channel[swizzle], word[d->channel[swizzle].shift / 32]);
+   }
+   return nir_vec(b, out, 4);
+}
+
+bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input *vi)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct apex_vertex_input standalone = {0};
+   unsigned masks[16] = {0};
+   struct util_dynarray loads;
+   util_dynarray_init(&loads, NULL);
+   bool ok = true;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+         if (i->intrinsic != nir_intrinsic_load_input)
+            continue;
+         nir_src *offset = nir_get_io_offset_src(i);
+         unsigned location = nir_intrinsic_io_semantics(i).location - VERT_ATTRIB_GENERIC0;
+         unsigned component = nir_intrinsic_component(i), n = i->def.num_components;
+         if (!nir_src_is_const(*offset) || i->def.bit_size != 32 || component + n > 4 ||
+             nir_intrinsic_io_semantics(i).location < VERT_ATTRIB_GENERIC0 ||
+             (location += nir_src_as_uint(*offset)) >= 16) {
+            ok = false;
+            continue;
+         }
+         masks[location] |= BITFIELD_RANGE(component, n);
+         nir_alu_type type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(i));
+         standalone.attributes[location] = (struct apex_vertex_attribute){
+            type == nir_type_float ? PIPE_FORMAT_R32G32B32A32_FLOAT :
+            type == nir_type_int ? PIPE_FORMAT_R32G32B32A32_SINT : PIPE_FORMAT_R32G32B32A32_UINT,
+            location, 0,
+         };
+         util_dynarray_append(&loads, i);
+      }
+   }
+   if (!vi)
+      vi = &standalone;
+   if (ok && util_dynarray_num_elements(&loads, nir_intrinsic_instr *)) {
+      nir_builder builder = nir_builder_at(nir_before_impl(impl)), *b = &builder;
+      nir_def *block = nir_load_kernel_input(b, 2, 32, nir_imm_int(b, 0), .base = 88, .range = 8);
+      nir_def *values[16] = {0};
+      for (unsigned l = 0; l < 16 && ok; l++)
+         ok = !masks[l] || (values[l] = fetch_vertex_attribute(b, block, vi, l, masks[l]));
+      util_dynarray_foreach(&loads, nir_intrinsic_instr *, p) {
+         nir_intrinsic_instr *i = *p;
+         if (!ok)
+            break;
+         unsigned location = nir_intrinsic_io_semantics(i).location - VERT_ATTRIB_GENERIC0 +
+                             nir_src_as_uint(*nir_get_io_offset_src(i));
+         nir_def_replace(&i->def, nir_channels(b, values[location],
+                                               BITFIELD_RANGE(nir_intrinsic_component(i), i->def.num_components)));
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   util_dynarray_fini(&loads);
+   return ok;
 }
 
 static bool subword_roundtrip(const nir_instr *instr, const void *data)
@@ -2270,13 +2455,16 @@ static unsigned type_size(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
-int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
+int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct apex_compile_result *output)
 {
    *output = (struct apex_compile_result){0};
    mesa_shader_stage stage = nir->info.stage;
    if (stage != MESA_SHADER_COMPUTE && stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_FRAGMENT)
       return fail(output, "only compute, vertex and fragment shaders are supported");
    nir_validate_shader(nir, "Apex SPIR-V import");
+   /* FP32 flushes subnormals (Docs/isa.md, Numerics); constant folding
+    * gives the machine's bits. */
+   nir->info.float_controls_execution_mode |= FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32;
    bool zero_shared = nir->info.zero_initialize_shared_memory;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_shared) {
       if (var->constant_initializer) {
@@ -2285,7 +2473,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          zero_shared = true;
       }
    }
-   unsigned local[3] = {16, 1, 1};
+   unsigned local[3] = {32, 1, 1};
    if (stage == MESA_SHADER_COMPUTE) {
       unsigned invocations = 1;
       static const unsigned axis_limits[3] = {256, 256, 64};
@@ -2343,6 +2531,8 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
                nir_lower_io_use_interpolated_input_intrinsics);
       NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
    }
+   if (stage == MESA_SHADER_VERTEX && !apex_nir_lower_vertex_input(nir, vi))
+      return fail(output, "unsupported vertex input");
    if (zero_shared && nir->info.shared_size) {
       if (nir->info.shared_size > 32768)
          return fail(output, "shared memory exceeds 32768 bytes");
@@ -2381,7 +2571,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
    NIR_PASS(_, nir, nir_opt_idiv_const, 32);
    NIR_PASS(_, nir, nir_lower_idiv, &(nir_lower_idiv_options){0});
    const nir_lower_subgroups_options subgroups = {
-      .subgroup_size = 16, .ballot_bit_size = 32, .ballot_components = 1,
+      .subgroup_size = 32, .ballot_bit_size = 32, .ballot_components = 1,
       .lower_to_scalar = true, .lower_vote_ieq = true, .lower_vote_feq = true,
       .lower_vote_bool_eq = true, .lower_subgroup_masks = true, .lower_relative_shuffle = true,
       .lower_quad_broadcast_dynamic = true, .lower_quad_vote = true,
@@ -2480,7 +2670,7 @@ int apex_from_nir(nir_shader *nir, struct apex_compile_result *output)
          }
       }
       c.helper = value(&c, false, 1);
-      emit(&c, APEX_V_CMP_U, c.helper, launch_bits(&c, 11, 1), constant(&c, 0), apex_raw(1), 0);
+      emit(&c, APEX_V_CMP_U, c.helper, launch_bits(&c, 12, 1), constant(&c, 0), apex_raw(1), 0);
       if (terminates) {
          c.alive = exec_copy(&c);
          c.header.flags |= 1u << 1;

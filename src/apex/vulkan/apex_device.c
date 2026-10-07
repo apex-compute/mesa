@@ -478,8 +478,8 @@ apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInf
 }
 
 /* Image features follow the texture unit's and ROP's formats; texel and
- * storage access converts through format words; vertex fetch reads the
- * vertex input kinds. Linear images are 2D, single-level and single-sampled. */
+ * storage access converts through format words; the vertex prolog converts
+ * vertex formats. Linear images are 2D, single-level and single-sampled. */
 static VkFormatFeatureFlags2
 image_features(VkFormat format, bool linear)
 {
@@ -563,8 +563,7 @@ apex_format_features(VkFormat format, bool buffer)
       if (format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT)
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
-   bool swap;
-   if (apex_hw_vertex_format(format, &swap))
+   if (apex_vertex_format(pformat))
       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
    return features;
 }

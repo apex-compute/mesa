@@ -201,7 +201,7 @@ test_device(const char *spirv_path)
    struct vk_physical_device physical;
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
    const struct vk_properties properties = {
-      .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
+      .subgroupSize = 32, .minSubgroupSize = 32, .maxSubgroupSize = 32,
       .maxComputeWorkGroupCount = {65535, 65535, 65535}, .maxComputeWorkGroupSize = {256, 256, 64},
    };
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL, &properties,
@@ -719,7 +719,7 @@ test_graphics(const char *vertex_path, const char *fragment_path, const char *xf
    (void)vk_instance_to_handle(&instance);
    struct vk_physical_device physical;
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
-   const struct vk_properties properties = {.subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16};
+   const struct vk_properties properties = {.subgroupSize = 32, .minSubgroupSize = 32, .maxSubgroupSize = 32};
    const struct vk_features features = {.dynamicRendering = true, .transformFeedback = true};
    CHECK(vk_physical_device_init(&physical, &instance, NULL, &features, &properties,
                                  &physical_dispatch) == VK_SUCCESS);
@@ -919,10 +919,11 @@ test_graphics(const char *vertex_path, const char *fragment_path, const char *xf
    CHECK((mock_read32(&k, vs + 4) & 0xff) == 1 && (mock_read32(&k, fs + 4) & 0xff) == 2);
    uint32_t vi[128];
    mock_read(&k, MOCK_U64(d->state, APEX_STATE_VERTEX + 2), vi, sizeof(vi));
-   CHECK(vi[0] == (uint32_t)(buffer_va + 64) && vi[1] == (((buffer_va + 64) >> 32) | 32u << 16) &&
-         vi[2] == 4096 - 64);
-   CHECK(vi[64] == ((1u << 2 | 3) << 8) && vi[65] == 2 && vi[66] == ((4u << 2 | 3) << 8 | 16u << 16) &&
-         vi[67] == 6 && vi[96] == 0);
+   /* Binding 0's buffer descriptor and stride; the vertex prolog holds the
+    * attribute formats. */
+   CHECK(vi[0] == (uint32_t)(buffer_va + 64) && vi[1] == ((buffer_va + 64) >> 32) &&
+         vi[2] == 4096 - 64 && vi[3] == 0);
+   CHECK(vi[64] == 32 && vi[96] == 0);
    /* Topology TRIANGLE_STRIP; restart applies to indexed draws. */
    CHECK(d->state[APEX_STATE_VERTEX + 8] == 4 && !d->state[APEX_STATE_VERTEX + 9]);
    /* Fragment registers: raster, depth-stencil, blend and viewport blocks. */

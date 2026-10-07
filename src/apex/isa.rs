@@ -24,7 +24,7 @@ opcodes! {
     S_CMP_LT_U = 0x37, S_CMP_LE_I = 0x38, S_CMP_LE_U = 0x39, S_CSELECT = 0x3a, S_ADD64 = 0x3b,
     S_SUB64 = 0x3c, S_SHL64 = 0x3d, S_FF1 = 0x3e, S_POPCNT = 0x3f, S_AND_SAVEEXEC = 0x40,
     S_OR_SAVEEXEC = 0x41, S_ANDN2_SAVEEXEC = 0x42, S_SETEXEC = 0x43, S_MEMTIME = 0x44,
-    S_LAUNCH = 0x45, S_ADD_F = 0x46, S_MUL_F = 0x47, S_FMA_F = 0x48, S_RCP = 0x49, S_RSQ = 0x4a,
+    S_LAUNCH = 0x45, S_ADD_F = 0x46, S_MUL_F = 0x47, S_MAD_F = 0x48, S_RCP = 0x49, S_RSQ = 0x4a,
 
     V_MOV = 0x60, V_ADD = 0x61, V_SUB = 0x62, V_MUL_LO = 0x63, V_MUL_HI_U = 0x64,
     V_MUL_HI_I = 0x65, V_AND = 0x66, V_OR = 0x67, V_XOR = 0x68, V_NOT = 0x69, V_SHL = 0x6a,
@@ -33,7 +33,7 @@ opcodes! {
     V_ADDC = 0x76, V_SUBB = 0x77, V_POPCNT = 0x78, V_FFBL = 0x79, V_FFBH_U = 0x7a,
     V_FFBH_I = 0x7b, V_BFREV = 0x7c, V_PERM = 0x7d, V_MORTON = 0x7e, V_CNDMASK = 0x7f,
     V_CMP_I = 0x80, V_CMP_U = 0x81, V_CMP_F = 0x82, V_CMP_CLASS = 0x83, V_ADD_F = 0x84,
-    V_SUB_F = 0x85, V_MUL_F = 0x86, V_FMA_F = 0x87, V_MIN_F = 0x88, V_MAX_F = 0x89,
+    V_SUB_F = 0x85, V_MUL_F = 0x86, V_MAD_F = 0x87, V_MIN_F = 0x88, V_MAX_F = 0x89,
     V_FLOOR = 0x8a, V_CEIL = 0x8b, V_TRUNC = 0x8c, V_RNDNE = 0x8d, V_FRACT = 0x8e,
     V_FREXP_MANT = 0x8f, V_FREXP_EXP = 0x90, V_LDEXP = 0x91, V_RCP = 0x92, V_RSQ = 0x93,
     V_SQRT = 0x94, V_EXP2 = 0x95, V_LOG2 = 0x96, V_SIN = 0x97, V_COS = 0x98, V_CVT_F_U = 0x99,
@@ -135,7 +135,7 @@ pub enum Kind {
 /// Sources taking the FP modifiers (bit 0 a, 1 b, 2 c).
 pub fn fp_sources(op: u8) -> u32 {
     match op {
-        op::S_FMA_F | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => 7,
+        op::S_MAD_F | op::V_MAD_F | op::V_CUBEID..=op::V_CUBEMA => 7,
         op::S_ADD_F | op::S_MUL_F | op::V_ADD_F..=op::V_MUL_F | op::V_MIN_F | op::V_MAX_F | op::V_CMP_F | op::V_CVT_PK_F16 => 3,
         op::S_RCP | op::S_RSQ | op::V_FLOOR..=op::V_LDEXP | op::V_RCP..=op::V_COS | op::V_CVT_U_F | op::V_CVT_I_F | op::V_CMP_CLASS => 1,
         _ => 0,
@@ -181,7 +181,7 @@ pub fn fields(op: u8, hi: u32) -> Result<[Kind; 4], String> {
         op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC
         | op::S_RCP | op::S_RSQ => [S(Def, 1), SAny, None, None],
         op::S_SETEXEC => [None, SAny, None, None],
-        op::S_CSELECT | op::S_FMA_F => [S(Def, 1), SAny, SAny, SAny],
+        op::S_CSELECT | op::S_MAD_F => [S(Def, 1), SAny, SAny, SAny],
         op::S_ADD64 | op::S_SUB64 => [S(Def, 2), S(Use, 2), S(Use, 2), None],
         op::S_SHL64 => [S(Def, 2), S(Use, 2), SAny, None],
         op::S_MEMTIME => [S(Def, 2), None, None, None],
@@ -191,7 +191,7 @@ pub fn fields(op: u8, hi: u32) -> Result<[Kind; 4], String> {
         }
         op::V_MOV | op::V_NOT | op::V_POPCNT..=op::V_BFREV | op::V_FLOOR..=op::V_FREXP_EXP
         | op::V_RCP..=op::V_CVT_I_F | op::V_CVT_F16_LO | op::V_CVT_F16_HI => [V(Def, 1), Any, None, None],
-        op::V_BFI | op::V_PERM | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => [V(Def, 1), Any, Any, Any],
+        op::V_BFI | op::V_PERM | op::V_MAD_F | op::V_CUBEID..=op::V_CUBEMA => [V(Def, 1), Any, Any, Any],
         op::V_ADD_CO | op::V_SUB_CO => [V(Def, 1), Any, Any, S(Def, 1)],
         op::V_ADDC | op::V_SUBB | op::V_CNDMASK => [V(Def, 1), Any, Any, S(Use, 1)],
         op::V_CMP_I..=op::V_CMP_F => [S(Def, 1), Any, Any, Raw],
@@ -492,7 +492,7 @@ fn alu_roles(o: u8) -> [Role; 4] {
     match o {
         op::S_MOV | op::S_NOT | op::S_FF1 | op::S_POPCNT | op::S_AND_SAVEEXEC..=op::S_ANDN2_SAVEEXEC
         | op::S_RCP | op::S_RSQ => [Sd, Ss, None, None],
-        op::S_CSELECT | op::S_FMA_F => [Sd, Ss, Ss, Ss],
+        op::S_CSELECT | op::S_MAD_F => [Sd, Ss, Ss, Ss],
         op::S_ADD64 | op::S_SUB64 => [Sd2, Ss2, Ss2, None],
         op::S_SHL64 => [Sd2, Ss2, Ss, None],
         op::S_SETEXEC => [None, Ss, None, None],
@@ -501,7 +501,7 @@ fn alu_roles(o: u8) -> [Role; 4] {
         0x20..=0x4a => [Sd, Ss, Ss, None],
         op::V_MOV | op::V_NOT | op::V_POPCNT..=op::V_BFREV | op::V_FLOOR..=op::V_FREXP_EXP
         | op::V_RCP..=op::V_CVT_I_F | op::V_CVT_F16_LO | op::V_CVT_F16_HI => [Vd, Vs, None, None],
-        op::V_BFI | op::V_PERM | op::V_FMA_F | op::V_CUBEID..=op::V_CUBEMA => [Vd, Vs, Vs, Vs],
+        op::V_BFI | op::V_PERM | op::V_MAD_F | op::V_CUBEID..=op::V_CUBEMA => [Vd, Vs, Vs, Vs],
         op::V_ADD_CO | op::V_SUB_CO => [Vd, Vs, Vs, Sr],
         op::V_ADDC | op::V_SUBB | op::V_CNDMASK => [Vd, Vs, Vs, Ss],
         op::V_CMP_I | op::V_CMP_U => [Sd, Vs, Vs, Cond6],
@@ -814,7 +814,7 @@ pub struct Program {
 }
 impl Program {
     pub fn new(stage: Stage, code: Vec<Inst>) -> Self {
-        Self { stage, flags: 0, code, entry: 0, local: [16, 1, 1], shared: 0, private: 0, output: 0, inputs: Vec::new() }
+        Self { stage, flags: 0, code, entry: 0, local: [32, 1, 1], shared: 0, private: 0, output: 0, inputs: Vec::new() }
     }
     pub fn invocations(&self) -> u32 {
         self.local.iter().product()
@@ -829,7 +829,7 @@ impl Program {
             || !(1..=256).contains(&self.invocations())
             || self.shared > 32768
             || self.private % 4 != 0
-            || (!compute && (n != [16, 1, 1] || self.shared != 0 || self.private != 0))
+            || (!compute && (n != [32, 1, 1] || self.shared != 0 || self.private != 0))
             || (self.stage != Stage::Fragment && (self.flags != 0 || !self.inputs.is_empty()))
             || (self.stage == Stage::Fragment && self.output >> 9 != 0)
             || (self.stage == Stage::Vertex && (self.output % 64 != 0 || self.output > 0xffff))

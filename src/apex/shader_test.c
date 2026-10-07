@@ -19,6 +19,8 @@
 } } while (0)
 
 #define ROOT 0x100000ull
+#define VERTEX_INPUT 0x700000ull
+#define ALL 0xffffffffu
 #define ROOT_BYTES (64u * 2049u + 256u)
 #define PUSH (64u * 2049u)
 static unsigned slot(unsigned set, unsigned binding) { return 64 * (1 + 256 * set + binding); }
@@ -191,11 +193,38 @@ static void test_bench_compute(const char *dir)
    apex_compile_result_finish(&r);
 }
 
-static void vertex_inputs(struct apex_sim_wave *wave, unsigned location, unsigned n, float base)
+/* A vertex wave of 32 vertices with its vertex input block (Docs/
+ * architecture.md, State blocks) at VERTEX_INPUT. */
+static uint8_t *vertex_wave(struct world *w, struct apex_sim_wave *wave)
 {
-   for (unsigned c = 0; c < n; c++)
-      for (unsigned l = 0; l < 16; l++)
-         wave->vector[2 + 4 * location + c][l] = bits(base + l * 0.25f + c);
+   wave->exec = ALL;
+   wave->scalar[0] = (uint32_t)ROOT;
+   wave->scalar[16] = 0x800000;
+   wave->scalar[22] = (uint32_t)VERTEX_INPUT;
+   for (unsigned l = 0; l < APEX_LANES; l++)
+      wave->vector[0][l] = l;
+   return region(w, VERTEX_INPUT, 512);
+}
+/* Binding `b` over `bytes` at `va`, `stride` bytes per element. */
+static void vertex_binding(uint8_t *block, unsigned b, uint64_t va, uint32_t bytes, uint32_t stride, bool robust)
+{
+   put(block + 16 * b, (uint32_t)va);
+   put(block + 16 * b + 4, va >> 32);
+   put(block + 16 * b + 8, bytes);
+   put(block + 16 * b + 12, robust);
+   put(block + 256 + 4 * b, stride);
+}
+/* Standalone attribute location L reads four dwords of vertex v from
+ * binding L at 16 v: base + v / 4 + c. */
+static float vertex_value(unsigned v, unsigned c, float base) { return base + v * 0.25f + c; }
+static void vertex_inputs(struct world *w, uint8_t *block, unsigned location, float base)
+{
+   uint64_t va = 0x600000 + 0x1000 * location;
+   uint8_t *data = region(w, va, 16 * APEX_LANES);
+   for (unsigned v = 0; v < APEX_LANES; v++)
+      for (unsigned c = 0; c < 4; c++)
+         put(data + 16 * v + 4 * c, bits(vertex_value(v, c, base)));
+   vertex_binding(block, location, va, 16 * APEX_LANES, 16, false);
 }
 
 /* Vertex programs store {position}, {point size, layer, viewport, cull},
@@ -207,20 +236,18 @@ static void test_vertex(const char *dir, const char *name, unsigned varying_comp
    uint32_t stride = r.data[28] | r.data[29] << 8;
    CHECK(stride == 128);
    struct world w = {0};
-   uint8_t *out = region(&w, 0x800000, 16 * stride);
+   uint8_t *out = region(&w, 0x800000, APEX_LANES * stride);
    region(&w, ROOT, ROOT_BYTES);
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
-   wave->exec = 0xffff;
-   wave->scalar[0] = (uint32_t)ROOT;
-   wave->scalar[16] = 0x800000;
-   vertex_inputs(wave, 0, 4, 1.0f);
-   vertex_inputs(wave, 1, varying_components, -3.0f);
+   uint8_t *block = vertex_wave(&w, wave);
+   vertex_inputs(&w, block, 0, 1.0f);
+   vertex_inputs(&w, block, 1, -3.0f);
    run(&r, &w, wave->scalar, 1, wave);
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       for (unsigned c = 0; c < 4; c++)
-         CHECK(get(out + l * stride + 4 * c) == wave->vector[2 + c][l]);
+         CHECK(get(out + l * stride + 4 * c) == bits(vertex_value(l, c, 1.0f)));
       for (unsigned c = 0; c < varying_components; c++)
-         CHECK(get(out + l * stride + 64 + 4 * c) == wave->vector[6 + c][l]);
+         CHECK(get(out + l * stride + 64 + 4 * c) == bits(vertex_value(l, c, -3.0f)));
    }
    free(wave);
    world_free(&w);
@@ -236,7 +263,7 @@ static void test_transform(const char *dir)
    compile(dir, "transform.vert.spv", &r);
    uint32_t stride = r.data[28] | r.data[29] << 8;
    struct world w = {0};
-   uint8_t *out = region(&w, 0x800000, 16 * stride);
+   uint8_t *out = region(&w, 0x800000, APEX_LANES * stride);
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
    float m[2][4][4];
    for (unsigned k = 0; k < 2; k++)
@@ -246,18 +273,16 @@ static void test_transform(const char *dir)
             put(root + PUSH + 64 * k + 16 * c + 4 * e, bits(m[k][c][e]));
          }
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
-   wave->exec = 0xffff;
-   wave->scalar[0] = (uint32_t)ROOT;
-   wave->scalar[16] = 0x800000;
-   vertex_inputs(wave, 0, 4, 1.0f);
+   vertex_inputs(&w, vertex_wave(&w, wave), 0, 1.0f);
    run(&r, &w, wave->scalar, 1, wave);
    bool differs = false;
-   for (unsigned l = 0; l < 16; l++) {
-      float x = flt(wave->vector[2][l]), y = flt(wave->vector[3][l]), z = flt(wave->vector[4][l]);
+   for (unsigned l = 0; l < APEX_LANES; l++) {
+      float x = vertex_value(l, 0, 1.0f), y = vertex_value(l, 1, 1.0f), z = vertex_value(l, 2, 1.0f);
       for (unsigned e = 0; e < 4; e++) {
          const float (*a)[4] = m[0], (*b)[4] = m[1];
-         float position = fmaf(a[2][e], z, fmaf(a[0][e], x, a[1][e] * y)) + a[3][e];
-         differs |= position != fmaf(a[2][e], z, fmaf(a[0][e], x, fmaf(a[1][e], y, a[3][e])));
+         /* v_mad_f rounds the product and then the sum. */
+         float position = a[2][e] * z + (a[0][e] * x + a[1][e] * y) + a[3][e];
+         differs |= position != a[2][e] * z + (a[0][e] * x + (a[1][e] * y + a[3][e]));
          CHECK(get(out + l * stride + 4 * e) == bits(position));
          double exact = (double)b[0][e] * x + (double)b[1][e] * y + (double)b[2][e] * z + b[3][e];
          CHECK(fabs(flt(get(out + l * stride + 64 + 4 * e)) - exact) <= 2e-7 * fabs(exact));
@@ -273,9 +298,9 @@ static void test_transform(const char *dir)
  * (2q, 0), attribute block of primitive 0. */
 static void fragment_wave(struct apex_sim_wave *wave, uint32_t *attributes)
 {
-   wave->exec = 0xffff;
+   wave->exec = ALL;
    wave->scalar[0] = (uint32_t)ROOT;
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       wave->vector[0][l] = bits(0.03125f * (l & 3) + 0.25f * (l >> 2));
       wave->vector[1][l] = bits(0.0625f * (l >> 2));
       wave->vector[2][l] = 2 * (l >> 2);
@@ -293,7 +318,8 @@ static float interpolate(uint32_t *attributes, unsigned component, uint32_t i, u
 {
    float p0 = flt(*attribute(attributes, component, 0)), p10 = flt(*attribute(attributes, component, 1));
    float p20 = flt(*attribute(attributes, component, 2));
-   return fmaf(flt(j), p20, fmaf(flt(i), p10, p0));
+   /* v_interp: two multiply-adds, each rounding twice. */
+   return flt(j) * p20 + (flt(i) * p10 + p0);
 }
 
 static void test_fragment(const char *dir, const char *name, bool textured, bool modulated)
@@ -325,9 +351,9 @@ static void test_fragment(const char *dir, const char *name, bool textured, bool
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
    fragment_wave(wave, attributes);
    run(&r, &w, wave->scalar, 1, wave);
-   CHECK(wave->exported[0] == 0xffff);
+   CHECK(wave->exported[0] == ALL);
    const uint8_t *descriptor = root + slot(0, 0);
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       uint32_t i = wave->vector[0][l], j = wave->vector[1][l];
       /* A sample's coordinates are u and v: components 0 and 1. */
       for (unsigned c = 0; c < (textured ? 2 : 4); c++) {
@@ -365,8 +391,8 @@ static void test_mix(const char *dir)
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
    fragment_wave(wave, attributes);
    run(&r, &w, wave->scalar, 1, wave);
-   CHECK(wave->exported[0] == 0xffff);
-   for (unsigned l = 0; l < 16; l++) {
+   CHECK(wave->exported[0] == ALL);
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       uint32_t i = wave->vector[0][l], j = wave->vector[1][l];
       for (unsigned c = 0; c < 4; c++) {
          double a = interpolate(attributes, c, i, j), b = interpolate(attributes, 4 + c, i, j);
@@ -400,19 +426,19 @@ static void test_uniform(const char *dir)
    for (unsigned k = 0; k < sizeof(sets) / sizeof(sets[0]); k++) {
       struct world w = {0};
       uint8_t *root = region(&w, ROOT, ROOT_BYTES);
-      uint8_t *in = region(&w, 0x200000, 16 * 16);
-      uint8_t *out = region(&w, 0x300000, 16 * 2 * n * 4);
+      uint8_t *in = region(&w, 0x200000, APEX_LANES * 16);
+      uint8_t *out = region(&w, 0x300000, APEX_LANES * 2 * n * 4);
       for (unsigned c = 0; c < 4; c++) {
          put(root + PUSH + 4 * c, bits(sets[k][c]));
-         for (unsigned l = 0; l < 16; l++)
+         for (unsigned l = 0; l < APEX_LANES; l++)
             put(in + 16 * l + 4 * c, bits(sets[k][c]));
       }
-      buffer_descriptor(root + slot(0, 0), 0x200000, 16 * 16);
-      buffer_descriptor(root + slot(0, 1), 0x300000, 16 * 2 * n * 4);
+      buffer_descriptor(root + slot(0, 0), 0x200000, APEX_LANES * 16);
+      buffer_descriptor(root + slot(0, 1), 0x300000, APEX_LANES * 2 * n * 4);
       uint32_t user[16];
       root_user(user);
       run(&r, &w, user, 1, NULL);
-      for (unsigned l = 0; l < 16; l++)
+      for (unsigned l = 0; l < APEX_LANES; l++)
          for (unsigned f = 0; f < n; f++)
             CHECK(get(out + 4 * (2 * n * l + f)) == get(out + 4 * (2 * n * l + n + f)));
       world_free(&w);
@@ -439,7 +465,7 @@ static void test_hoist(const char *dir)
       struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
       fragment_wave(wave, attributes);
       run(&r, &w, wave->scalar, 1, wave);
-      for (unsigned l = 0; l < 16; l++) {
+      for (unsigned l = 0; l < APEX_LANES; l++) {
          uint32_t i = wave->vector[0][l], j = wave->vector[1][l];
          double v[3], length = 0;
          for (unsigned c = 0; c < 3; c++) {
@@ -478,7 +504,7 @@ static void test_captured(const char *dir, unsigned expected)
       struct world w = {0};
       uint8_t *root = region(&w, ROOT, ROOT_BYTES);
       region(&w, 0xa00000, 65536);
-      region(&w, 0x800000, 16 * 64 * 64);
+      region(&w, 0x800000, APEX_LANES * 64 * 64);
       region(&w, 0x900000, 64 * 64);
       for (unsigned set = 0; set < 8; set++) {
          for (unsigned b = 0; b < 256; b++) {
@@ -496,14 +522,15 @@ static void test_captured(const char *dir, unsigned expected)
       if (stage == APEX_FRAGMENT) {
          fragment_wave(wave, attributes);
       } else {
-         wave->exec = 0xffff;
-         wave->scalar[0] = (uint32_t)ROOT;
-         wave->scalar[16] = 0x800000;
+         /* Every binding reads the zeroed buffer. */
+         uint8_t *block = vertex_wave(&w, wave);
+         for (unsigned b = 0; b < 16; b++)
+            vertex_binding(block, b, 0xa00000, 65536, 16, true);
       }
       run(&r, &w, wave->scalar, 1, wave);
       /* Every lane exports unless the program discards (header flag bit 1). */
       if (stage == APEX_FRAGMENT && !(r.data[5] & 2))
-         CHECK(wave->exported[0] == 0xffff);
+         CHECK(wave->exported[0] == ALL);
       free(wave);
       free(attributes);
       world_free(&w);
@@ -522,9 +549,9 @@ static void test_features(const char *dir)
    const unsigned groups = 2, limit = 40;
    struct world w = {0};
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
-   uint8_t *out = region(&w, 0x200000, groups * 64 * 80);
+   uint8_t *out = region(&w, 0x200000, groups * 128 * 80);
    uint8_t *counter = region(&w, 0x300000, 17 * 4);
-   buffer_descriptor(root + slot(0, 0), 0x200000, groups * 64 * 80);
+   buffer_descriptor(root + slot(0, 0), 0x200000, groups * 128 * 80);
    buffer_descriptor(root + slot(0, 1), 0x300000, 17 * 4);
    put(root + PUSH, limit);
    uint32_t user[16];
@@ -533,8 +560,8 @@ static void test_features(const char *dir)
    /* Private arrays need the private base in s20-s21 (header bytes per lane). */
    run_private(&r, &w, user, groups, NULL, 0x10000000);
    uint32_t hist[16] = {0};
-   for (unsigned g = 0; g < groups * 64; g++) {
-      uint32_t l = g % 64, wave = l / 16, lane = l % 16, group = g / 64;
+   for (unsigned g = 0; g < groups * 128; g++) {
+      uint32_t l = g % 128, wave = l / 32, lane = l % 32, group = g / 128;
       const uint8_t *o = out + g * 80;
       uint32_t acc = 0;
       for (uint32_t k = 0; k < limit; k++) {
@@ -546,18 +573,18 @@ static void test_features(const char *dir)
       }
       CHECK(get(o) == acc);
       uint32_t sum = 0, prefix = 0;
-      for (unsigned k = 0; k < 16; k++) {
-         sum += 16 * wave + k;
+      for (unsigned k = 0; k < 32; k++) {
+         sum += 32 * wave + k;
          if (k < lane)
-            prefix += 16 * wave + k + 1;
+            prefix += 32 * wave + k + 1;
       }
       CHECK(get(o + 4) == sum);
       CHECK(get(o + 8) == prefix);
-      CHECK(get(o + 12) == 0x2222);
-      CHECK(get(o + 16) == (16 * wave + ((lane + 5) & 15)) * 3);
+      CHECK(get(o + 12) == 0x22222222);
+      CHECK(get(o + 16) == (32 * wave + ((lane + 5) & 31)) * 3);
       CHECK(get(o + 20) == (wave < 3));
-      CHECK(get(o + 24) == 16 * wave);
-      uint32_t a = 63 - l, b = (l + 17) & 63;
+      CHECK(get(o + 24) == 32 * wave);
+      uint32_t a = 127 - l, b = (l + 17) & 127;
       CHECK(get(o + 28) == a * a + group + b * b + group);
       CHECK(get(o + 32) == 1);
       hist[l & 15] += l;
@@ -582,12 +609,12 @@ static void test_features(const char *dir)
       CHECK(get(o + 64) == ((l ^ 1) | (l ^ 3) << 8));
       CHECK(get(o + 68) == ((l & ~3u) + 2) * 7);
       unsigned below = 0;
-      for (unsigned k = 16 * wave; k < l; k++)
+      for (unsigned k = 32 * wave; k < l; k++)
          below += k % 3 == 0;
       CHECK(get(o + 72) == below);
       CHECK(get(o + 76) == 4 * (l & ~3u) + 6);
    }
-   CHECK(get(counter) == groups * 64);
+   CHECK(get(counter) == groups * 128);
    for (unsigned k = 0; k < 16; k++)
       CHECK(get(counter + 4 + 4 * k) == hist[k]);
    world_free(&w);
@@ -601,7 +628,7 @@ static void test_spill(const char *dir)
    compile_spilling(dir, "spill.comp.spv", &r, true);
    struct world w = {0};
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
-   const unsigned words = 16 * 34 * 4;
+   const unsigned words = APEX_LANES * 34 * 4;
    uint8_t *src = region(&w, 0x200000, words * 4);
    uint8_t *dst = region(&w, 0x400000, words * 4);
    for (unsigned i = 0; i < words; i++)
@@ -612,7 +639,7 @@ static void test_spill(const char *dir)
    uint32_t user[16];
    root_user(user);
    run_private(&r, &w, user, 1, NULL, 0x10000000);
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       for (unsigned k = 0; k < 17; k++) {
          for (unsigned c = 0; c < 4; c++) {
             uint32_t b = get(src + 16 * (l * 34 + 17 + 16 - k) + 4 * c);
@@ -634,19 +661,19 @@ static void test_waterfall(const char *dir)
    struct world w = {0};
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
    uint8_t *src = region(&w, 0x200000, 3 * 256);
-   uint8_t *dst = region(&w, 0x300000, 64);
+   uint8_t *dst = region(&w, 0x300000, 128);
    for (unsigned b = 0; b < 3; b++) {
-      for (unsigned k = 0; k < 16; k++)
+      for (unsigned k = 0; k < APEX_LANES; k++)
          put(src + 256 * b + 4 * k, 1000 * (b + 1) + k);
-      buffer_descriptor(root + slot(0, b), 0x200000 + 256 * b, 64 + 16 * b);
+      buffer_descriptor(root + slot(0, b), 0x200000 + 256 * b, 128 + 16 * b);
    }
-   buffer_descriptor(root + slot(0, 3), 0x300000, 64);
+   buffer_descriptor(root + slot(0, 3), 0x300000, 128);
    uint32_t user[16];
    root_user(user);
    run(&r, &w, user, 1, NULL);
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       unsigned b = l % 3;
-      CHECK(get(dst + 4 * l) == 1000 * (b + 1) + l + (64 + 16 * b) / 4);
+      CHECK(get(dst + 4 * l) == 1000 * (b + 1) + l + (128 + 16 * b) / 4);
    }
    world_free(&w);
    apex_compile_result_finish(&r);
@@ -717,7 +744,7 @@ static void test_texture(const char *dir)
    struct world w = {0};
    uint8_t *root = region(&w, ROOT, ROOT_BYTES);
    uint8_t *image = region(&w, 0x900000, 64 * 4);
-   uint8_t *out = region(&w, 0x200000, 16 * 80);
+   uint8_t *out = region(&w, 0x200000, APEX_LANES * 80);
    uint8_t packed[8 * 4 * 4];
    for (unsigned k = 0; k < sizeof(packed); k++) {
       packed[k] = (uint8_t)(k * 29 + 5);
@@ -725,14 +752,14 @@ static void test_texture(const char *dir)
    }
    image_descriptor(root + slot(0, 0), 0x900000, 8, 4);
    sampler_descriptor(root + slot(0, 0) + 32);
-   buffer_descriptor(root + slot(0, 1), 0x200000, 16 * 80);
+   buffer_descriptor(root + slot(0, 1), 0x200000, APEX_LANES * 80);
    uint32_t user[16];
    root_user(user);
    run(&r, &w, user, 1, NULL);
    const uint8_t *d = root + slot(0, 0), *s = d + 32;
    const uint32_t fetch = 4u << 13 | FLAGS_2D, level = 1u << 13 | FLAGS_2D, gather = 5u << 13 | FLAGS_2D | 1u << 19;
    const uint32_t offset = level | (-3 & 15) | 7 << 4;
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       unsigned x = l % 8, y = l / 8;
       const uint8_t *o = out + 80 * l;
       float u = (x + 0.5f) / 8.0f, v = (y + 0.5f) / 4.0f;
@@ -768,15 +795,15 @@ static void test_kill(const char *dir, const char *name, bool demote)
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
    fragment_wave(wave, attributes);
    run(&r, &w, wave->scalar, 1, wave);
-   uint16_t survivors = 0;
-   for (unsigned l = 0; l < 16; l++) {
+   uint32_t survivors = 0;
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       float x = interpolate(attributes, 0, wave->vector[0][l], wave->vector[1][l]);
       if (demote ? !(x > 0.45f && x < 0.55f) : !(x > 0.45f))
          survivors |= 1u << l;
    }
-   CHECK(survivors != 0xffff && survivors);
+   CHECK(survivors != ALL && survivors);
    CHECK(wave->exported[0] == survivors);
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       if (!(survivors >> l & 1))
          continue;
       unsigned q = l & ~3u;
@@ -814,16 +841,16 @@ static void test_depth(const char *dir)
    }
    struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
    fragment_wave(wave, attributes);
-   for (unsigned l = 0; l < 16; l++) {
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       wave->vector[2][l] = (8 + 2 * (l >> 2) + (l & 1)) | (4 + ((l >> 1) & 1)) << 16;
       wave->vector[4][l] = bits(0.5f + 0.125f * (l & 3));
    }
    run(&r, &w, wave->scalar, 1, wave);
-   CHECK(wave->exported[0] == 0xffff);
-   for (unsigned l = 0; l < 16; l++) {
+   CHECK(wave->exported[0] == ALL);
+   for (unsigned l = 0; l < APEX_LANES; l++) {
       uint32_t p = wave->vector[2][l];
       float fx = (float)((int)(p & 0xffff) - 3) + 0.5f, fy = (float)((int)(p >> 16) - 1) + 0.5f;
-      float z = fmaf(fy, -0.03125f, fmaf(fx, 0.0625f, 0.5f));
+      float z = fy * -0.03125f + (fx * 0.0625f + 0.5f);
       float q = flt(wave->vector[4][l]);
       uint32_t i = bits(flt(wave->vector[0][l]) * q), j = bits(flt(wave->vector[1][l]) * q);
       CHECK(wave->exports[0][l][0] == bits(z));

@@ -2,7 +2,7 @@
 // Uniform FP arithmetic on the scalar unit: each expression runs on push
 // constants (uniform) and on the same values loaded per lane (divergent);
 // apex-shader-test compares the bits.
-layout(local_size_x = 16) in;
+layout(local_size_x = 32) in;
 layout(push_constant) uniform P { vec4 x; } p;
 layout(std430, set = 0, binding = 0) readonly buffer In { vec4 x[]; } lanes;
 layout(std430, set = 0, binding = 1) buffer Out { float o[]; };

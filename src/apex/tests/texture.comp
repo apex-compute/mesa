@@ -1,6 +1,6 @@
 #version 450
 // Texture instructions from compute: fetch, explicit level, gather, size, texel offsets.
-layout(local_size_x = 16) in;
+layout(local_size_x = 32) in;
 layout(set = 0, binding = 0) uniform sampler2D image;
 layout(std430, set = 0, binding = 1) buffer Output { vec4 o[]; };
 void main()

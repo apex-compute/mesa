@@ -487,7 +487,7 @@ check_header(const struct apex_program *program, unsigned stage)
 {
    const uint8_t *h = program->code.data;
    CHECK(word(h) == 0x50585041 && h[4] == stage && !h[6] && !h[7]);
-   CHECK(word(h + 16) == (16 | 1u << 16) && word(h + 20) == 1 && !word(h + 24));
+   CHECK(word(h + 16) == (32 | 1u << 16) && word(h + 20) == 1 && !word(h + 24));
 }
 
 /* A dynamic-rendering pipeline compiles a P7 vertex and fragment program;
@@ -510,7 +510,7 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
        .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = modules[1], .pName = "main"},
    };
    const VkVertexInputBindingDescription binding = {0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
-   /* RGBA32F position and a BGRA8 color the vertex program swizzles. */
+   /* RGBA32F position and a BGRA8 color the vertex prolog swizzles. */
    const VkVertexInputAttributeDescription attributes[2] = {
       {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_B8G8R8A8_UNORM, 16},
    };
@@ -966,7 +966,7 @@ int main(int argc, char **argv)
    struct vk_physical_device physical;
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
    const struct vk_properties properties = {
-      .subgroupSize = 16, .minSubgroupSize = 16, .maxSubgroupSize = 16,
+      .subgroupSize = 32, .minSubgroupSize = 32, .maxSubgroupSize = 32,
       .maxComputeWorkGroupCount = {1024, 1, 1}, .maxComputeWorkGroupSize = {16, 1, 1},
    };
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL,
@@ -1096,14 +1096,14 @@ int main(int argc, char **argv)
    device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-      .requiredSubgroupSize = 8,
+      .requiredSubgroupSize = 16,
    };
    batch[0] = infos[0];
    batch[0].stage.pNext = &subgroup;
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) ==
          VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(!mixed[0]);
-   subgroup.requiredSubgroupSize = 16;
+   subgroup.requiredSubgroupSize = 32;
    CHECK(apex_CreateComputePipelines(dev, VK_NULL_HANDLE, 1, batch, NULL, mixed) == VK_SUCCESS);
    device.vk.dispatch_table.DestroyPipeline(dev, mixed[0], NULL);
 

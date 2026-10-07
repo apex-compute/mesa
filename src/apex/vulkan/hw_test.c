@@ -12,6 +12,7 @@
 #include "apex_job.h"
 #include "vk_alloc.h"
 #include "vk_device.h"
+#include "vk_format.h"
 #include "vk_graphics_state.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
@@ -47,43 +48,42 @@ static void
 test_vertex_input(void)
 {
    struct vk_vertex_input_state vi = {
-      .bindings_valid = 0x5, .attributes_valid = 0x8003,
+      .bindings_valid = 0x5, .attributes_valid = 0x3,
       .bindings[0] = {.input_rate = VK_VERTEX_INPUT_RATE_VERTEX},
       .bindings[2] = {.input_rate = VK_VERTEX_INPUT_RATE_INSTANCE, .divisor = 7},
       .attributes[0] = {.binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = 12},
       .attributes[1] = {.binding = 2, .format = VK_FORMAT_R8G8B8A8_UNORM, .offset = 0x1234},
-      .attributes[15] = {.binding = 0, .format = VK_FORMAT_R16G16_SINT, .offset = 4},
    };
    struct vk_dynamic_graphics_state dyn = {.vi = &vi};
    dyn.vi_binding_strides[0] = 28;
    dyn.vi_binding_strides[2] = 0x1000;
    struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS] = {
-      [0] = {0x12345678c0ull, 4096}, [2] = {0xab00001000ull, 0x10000},
+      [0] = {0x12345678c0ull, 4096}, [2] = {0xab00001000ull, 0x10003},
    };
    uint32_t w[APEX_HW_VERTEX_INPUT_DWORDS];
-   apex_hw_vertex_input_block(&dyn, bindings, 5, w);
-   /* Binding b at dword 4b: GPUVA 31:0; GPUVA 39:32 in 7:0, per-instance 8,
-    * stride 31:16; bytes; divisor. */
-   CHECK(w[0] == 0x345678c0 && w[1] == (0x12 | 28u << 16) && w[2] == 4096 && w[3] == 0);
-   CHECK(w[8] == 0x00001000 && w[9] == (0xab | 1u << 8 | 0x1000u << 16) && w[10] == 0x10000 && w[11] == 7);
-   /* Attribute a at dword 64 + 2a: binding 3:0, format 15:8 (kind 6:2,
-    * components - 1 in 1:0), offset 31:16; first register 2 + 4a. */
-   CHECK(w[64] == (0 | (1u << 2 | 2) << 8 | 12u << 16) && w[65] == 2);   /* FLOAT32 x3 */
-   CHECK(w[66] == (2 | (4u << 2 | 3) << 8 | 0x1234u << 16) && w[67] == 6); /* UNORM8 x4 */
-   CHECK(w[94] == ((11u << 2 | 1) << 8 | 4u << 16) && w[95] == 62);        /* SINT16 x2 */
-   for (unsigned a = 2; a < 15; a++)
-      CHECK(!w[64 + 2 * a] && !w[65 + 2 * a]);
+   apex_hw_vertex_input_block(&dyn, bindings, 5, true, w);
+   /* Binding b at dword 4b: an ISA buffer descriptor {GPUVA 31:0, GPUVA
+    * 39:32, bytes rounded up to a dword, robust}; its stride at dword 64 + b. */
+   CHECK(w[0] == 0x345678c0 && w[1] == 0x12 && w[2] == 4096 && w[3] == 1);
+   CHECK(w[8] == 0x00001000 && w[9] == 0xab && w[10] == 0x10004 && w[11] == 1);
+   CHECK(w[64] == 28 && w[65] == 0 && w[66] == 0x1000);
+   for (unsigned k = 97; k < APEX_HW_VERTEX_INPUT_DWORDS; k++)
+      CHECK(!w[k]);
    /* Dword 96: clip-distance count. */
    CHECK(w[96] == 5);
-   bool swap;
-   CHECK(apex_hw_vertex_format(VK_FORMAT_B8G8R8A8_UNORM, &swap) == (4u << 2 | 3) && swap);
-   CHECK(apex_hw_vertex_format(VK_FORMAT_R16_SFLOAT, &swap) == 12u << 2 && !swap);
-   CHECK(apex_hw_vertex_format(VK_FORMAT_A2B10G10R10_UNORM_PACK32, &swap) == (13u << 2 | 3));
-   CHECK(apex_hw_vertex_format(VK_FORMAT_R8G8_USCALED, &swap) == (15u << 2 | 1));
-   CHECK(apex_hw_vertex_format(VK_FORMAT_R16G16B16_SSCALED, &swap) == (18u << 2 | 2));
-   CHECK(apex_hw_vertex_format(VK_FORMAT_R8G8B8_SINT, &swap) == (7u << 2 | 2));
-   CHECK(!apex_hw_vertex_format(VK_FORMAT_R64_SFLOAT, &swap));
-   puts("PASS vertex input block: bindings, attributes, registers 2 + 4L, clip count, kinds");
+   apex_hw_vertex_input_block(&dyn, bindings, 0, false, w);
+   CHECK(w[3] == 0 && w[11] == 0 && w[96] == 0);
+   /* The vertex prolog converts plain formats with 8- to 32-bit components. */
+   const VkFormat vertex[] = {
+      VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R16_SFLOAT, VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+      VK_FORMAT_R8G8_USCALED, VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R8G8B8_SINT, VK_FORMAT_R32G32B32A32_UINT,
+   };
+   for (unsigned k = 0; k < ARRAY_SIZE(vertex); k++)
+      CHECK(apex_vertex_format(vk_format_to_pipe_format(vertex[k])));
+   CHECK(!apex_vertex_format(vk_format_to_pipe_format(VK_FORMAT_R64_SFLOAT)) &&
+         !apex_vertex_format(vk_format_to_pipe_format(VK_FORMAT_R8G8B8A8_SRGB)) &&
+         !apex_vertex_format(vk_format_to_pipe_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32)));
+   puts("PASS vertex input block: binding descriptors, strides, clip count; prolog formats");
 }
 
 static void
@@ -603,7 +603,7 @@ main(void)
    (void)vk_instance_to_handle(&instance);
    struct vk_physical_device physical;
    const struct vk_physical_device_dispatch_table physical_dispatch = {0};
-   const struct vk_properties properties = {.subgroupSize = 16};
+   const struct vk_properties properties = {.subgroupSize = 32};
    CHECK(vk_physical_device_init(&physical, &instance, NULL, NULL, &properties, &physical_dispatch) == VK_SUCCESS);
    (void)vk_physical_device_to_handle(&physical);
    struct apex_device device;

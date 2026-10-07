@@ -3,6 +3,8 @@
  * paired global addresses, with every compiled program run on the ISA model. */
 #include "apex.h"
 #include "compiler/nir/nir_builder.h"
+#include "util/format/u_formats.h"
+#include "util/half_float.h"
 #include "util/u_math.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +39,7 @@ static nir_builder builder(nir_shader *s)
 /* Stores a constant through the raw root (SSBO index 0). */
 static nir_shader *shader(uint32_t constant)
 {
-   nir_shader *s = compute("Apex in-process compiler test", 16, 1, 1);
+   nir_shader *s = compute("Apex in-process compiler test", 32, 1, 1);
    nir_builder b = builder(s);
    nir_store_ssbo(&b, nir_imm_int(&b, constant), nir_imm_int(&b, 0), nir_imm_int(&b, 12),
                   .align_mul = 4);
@@ -46,7 +48,7 @@ static nir_shader *shader(uint32_t constant)
 
 static nir_shader *global_shader(unsigned load_alignment, unsigned store_alignment)
 {
-   nir_shader *s = compute("Apex paired global addresses", 16, 1, 1);
+   nir_shader *s = compute("Apex paired global addresses", 32, 1, 1);
    nir_builder bb = builder(s), *b = &bb;
    nir_def *descriptor[4];
    for (unsigned i = 0; i < 4; i++)
@@ -103,7 +105,7 @@ static void check_binary(const struct apex_compile_result *r, uint32_t constant)
 
 static void reject(nir_shader *nir, struct apex_compile_result *result, const char *diagnostic)
 {
-   CHECK(apex_from_nir(nir, result) != 0);
+   CHECK(apex_from_nir(nir, NULL, result) != 0);
    ralloc_free(nir);
    CHECK(!result->data && result->size == 0);
    CHECK(strstr(result->diagnostic, diagnostic));
@@ -119,16 +121,134 @@ static bool has_opcode(const struct apex_compile_result *r, uint8_t op)
    return false;
 }
 
+/* The vertex prolog on the ISA model: unaligned BGRA8, FP16 and SNORM16
+ * through dword windows, a packed 10:10:10:2 per-instance attribute with
+ * a divisor, a first-instance attribute and a scaled byte; with `robust`,
+ * vertices past binding 0's bytes read zero. */
+static void test_vertex_prolog(bool robust)
+{
+   static const struct { uint32_t format, binding, offset; bool integer; } attributes[6] = {
+      {PIPE_FORMAT_B8G8R8A8_UNORM, 0, 1}, {PIPE_FORMAT_R16G16_FLOAT, 1, 2},
+      {PIPE_FORMAT_R16G16B16_SNORM, 1, 4}, {PIPE_FORMAT_R10G10B10A2_UINT, 2, 0, true},
+      {PIPE_FORMAT_R32G32_SINT, 3, 0, true}, {PIPE_FORMAT_R8_SSCALED, 0, 5},
+   };
+   static const uint32_t strides[4] = {7, 10, 4, 8};
+   struct apex_vertex_input vi = {.robust = robust};
+   vi.bindings[2] = (struct apex_vertex_binding){true, 3};
+   vi.bindings[3] = (struct apex_vertex_binding){true, 0};
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, &apex_nir_options, "Apex vertex prolog");
+   nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "pos");
+   pos->data.location = VARYING_SLOT_POS;
+   nir_store_var(&b, pos, nir_imm_vec4(&b, 0, 0, 0, 1), 0xf);
+   for (unsigned k = 0; k < 6; k++) {
+      vi.attributes[k] = (struct apex_vertex_attribute){attributes[k].format, attributes[k].binding,
+                                                        attributes[k].offset};
+      const struct glsl_type *type = attributes[k].integer ? glsl_ivec4_type() : glsl_vec4_type();
+      nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in, type, "in");
+      in->data.location = VERT_ATTRIB_GENERIC0 + k;
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out, type, "out");
+      out->data.location = VARYING_SLOT_VAR0 + k;
+      nir_store_var(&b, out, nir_load_var(&b, in), 0xf);
+   }
+   struct apex_compile_result r = {0};
+   if (apex_from_nir(b.shader, &vi, &r))
+      fprintf(stderr, "%s\n", r.diagnostic);
+   ralloc_free(b.shader);
+   CHECK(r.data && !r.spills);
+   const unsigned stride = r.data[28] | r.data[29] << 8, first = 3, base_instance = 5, instance = 12;
+   CHECK(stride == 192);
+   /* Buffers: bytes, and FP16 words that are normal or zero. */
+   uint8_t *data[4], *out = calloc(APEX_LANES, stride), block[512] = {0};
+   unsigned bytes[4] = {7 * 40, 10 * 40, 64, 64};
+   if (robust)
+      bytes[0] = 7 * 20;
+   struct apex_sim_region regions[6];
+   for (unsigned n = 0; n < 4; n++) {
+      data[n] = calloc(1, 512);
+      for (unsigned k = 0; k < 512; k++)
+         data[n][k] = (uint8_t)(k * 151 + 17 * n + 3);
+      if (n == 1)
+         for (unsigned k = 0; k < 256; k++) {
+            uint16_t h = _mesa_float_to_half(((int)(k % 61) - 30) * 0.375f);
+            memcpy(data[n] + 2 * k, &h, 2);
+         }
+      uint64_t va = 0x400000 + 0x10000 * n;
+      regions[n] = (struct apex_sim_region){va, data[n], 512};
+      uint32_t d[4] = {(uint32_t)va, va >> 32, align(bytes[n], 4), robust};
+      memcpy(block + 16 * n, d, 16);
+      memcpy(block + 256 + 4 * n, &strides[n], 4);
+   }
+   regions[4] = (struct apex_sim_region){0x800000, out, APEX_LANES * stride};
+   regions[5] = (struct apex_sim_region){0x700000, block, sizeof(block)};
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   wave->exec = ~0u;
+   wave->scalar[16] = 0x800000;
+   wave->scalar[19] = first;
+   wave->scalar[20] = base_instance;
+   wave->scalar[21] = instance;
+   wave->scalar[22] = 0x700000;
+   for (unsigned l = 0; l < APEX_LANES; l++)
+      wave->vector[0][l] = first + l;
+   uint32_t user[16] = {0}, grid[3] = {1, 1, 1};
+   char diagnostic[256] = "";
+   if (apex_simulate(r.data, r.size, user, grid, 0, wave, regions, 6, diagnostic)) {
+      fprintf(stderr, "simulation: %s\n", diagnostic);
+      abort();
+   }
+   for (unsigned l = 0; l < APEX_LANES; l++) {
+      unsigned v = first + l;
+      union { float f; uint32_t u; } want[6][4];
+      const uint8_t *a0 = data[0] + 7 * v + 1;
+      bool inside = !robust || 7 * v + 5 <= bytes[0];
+      for (unsigned c = 0; c < 4; c++)
+         want[0][c].f = inside ? (float)a0[(unsigned[]){2, 1, 0, 3}[c]] * (float)(1.0 / 255) : 0.0f;
+      for (unsigned c = 0; c < 4; c++) {
+         uint16_t h;
+         memcpy(&h, data[1] + 10 * v + 2 + 2 * c, 2);
+         want[1][c].f = c < 2 ? _mesa_half_to_float(h) : c == 3 ? 1.0f : 0.0f;
+         int16_t x;
+         memcpy(&x, data[1] + 10 * v + 4 + 2 * c, 2);
+         want[2][c].f = c < 3 ? fmaxf((float)x * (float)(1.0 / 32767), -1.0f) : 1.0f;
+      }
+      uint32_t w;
+      memcpy(&w, data[2] + 4 * (base_instance + (instance - base_instance) / 3), 4);
+      for (unsigned c = 0; c < 4; c++)
+         want[3][c].u = c < 3 ? w >> (10 * c) & 1023 : w >> 30;
+      for (unsigned c = 0; c < 4; c++) {
+         if (c < 2)
+            memcpy(&want[4][c].u, data[3] + 8 * base_instance + 4 * c, 4);
+         else
+            want[4][c].u = c == 3;
+      }
+      want[5][0].f = inside ? (float)(int8_t)data[0][7 * v + 5] : 0.0f;
+      want[5][1].f = want[5][2].f = 0.0f;
+      want[5][3].f = 1.0f;
+      for (unsigned k = 0; k < 6; k++)
+         for (unsigned c = 0; c < 4; c++) {
+            uint32_t got = word(out + l * stride + 4 * (16 + 4 * k + c));
+            if (got != want[k][c].u)
+               fprintf(stderr, "lane %u attribute %u component %u: 0x%08x, expected 0x%08x\n", l, k, c, got,
+                       want[k][c].u);
+            CHECK(got == want[k][c].u);
+         }
+   }
+   for (unsigned n = 0; n < 4; n++)
+      free(data[n]);
+   free(out);
+   free(wave);
+   apex_compile_result_finish(&r);
+}
+
 int main(int argc, char **argv)
 {
    CHECK(argc >= 1 && argc <= 3);
    glsl_type_singleton_init_or_ref();
    struct apex_compile_result a = {0}, b = {0};
    nir_shader *nir = shader(0x13579bdf);
-   CHECK(apex_from_nir(nir, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, &a) == 0);
    ralloc_free(nir);
    nir = shader(0x2468ace0);
-   CHECK(apex_from_nir(nir, &b) == 0);
+   CHECK(apex_from_nir(nir, NULL, &b) == 0);
    ralloc_free(nir);
    CHECK(a.data != b.data);
    check_binary(&a, 0x13579bdf);
@@ -139,13 +259,13 @@ int main(int argc, char **argv)
    check_binary(&b, 0x2468ace0);
 
    {
-      nir_shader *init = compute("Apex private global initializer", 16, 1, 1);
+      nir_shader *init = compute("Apex private global initializer", 32, 1, 1);
       nir_builder ib = builder(init);
       nir_variable *var = nir_variable_create(init, nir_var_shader_temp, glsl_uint_type(), "initialized");
       var->constant_initializer = rzalloc(init, nir_constant);
       var->constant_initializer->values[0].u32 = 0x2468ace0;
       nir_store_ssbo(&ib, nir_load_var(&ib, var), nir_imm_int(&ib, 0), nir_imm_int(&ib, 12), .align_mul = 4);
-      CHECK(apex_from_nir(init, &a) == 0);
+      CHECK(apex_from_nir(init, NULL, &a) == 0);
       nir_intrinsic_instr *store = nir_instr_as_intrinsic(nir_block_last_instr(
          nir_start_block(nir_shader_get_entrypoint(init))));
       CHECK(store->intrinsic == nir_intrinsic_store_ssbo);
@@ -159,7 +279,7 @@ int main(int argc, char **argv)
    /* A conditional invariant load hoists only when speculatable; the loop
     * stores loaded + iteration for lanes below the iteration. */
    for (unsigned speculate = 0; speculate < 2; speculate++) {
-      nir_shader *s = compute("Apex conditional invariant load", 16, 1, 1);
+      nir_shader *s = compute("Apex conditional invariant load", 32, 1, 1);
       nir_builder lb = builder(s), *l = &lb;
       nir_function_impl *impl = nir_shader_get_entrypoint(s);
       nir_variable *index = nir_local_variable_create(impl, glsl_uint_type(), "index");
@@ -182,7 +302,7 @@ int main(int argc, char **argv)
       nir_pop_if(l, NULL);
       nir_store_var(l, index, nir_iadd_imm(l, iteration, 1), 1);
       nir_pop_loop(l, NULL);
-      if (apex_from_nir(s, &a))
+      if (apex_from_nir(s, NULL, &a))
          fprintf(stderr, "%s\n", a.diagnostic);
       CHECK(a.data);
       unsigned loads = 0;
@@ -199,22 +319,22 @@ int main(int argc, char **argv)
       }
       CHECK(loads == 1);
       ralloc_free(s);
-      uint8_t root[128] = {0};
+      uint8_t root[192] = {0};
       root[0] = 40;
       root[4] = 3;
       run(&a, root, sizeof(root), NULL, 0, 0);
-      for (unsigned k = 0; k < 16; k++)
+      for (unsigned k = 0; k < 32; k++)
          CHECK(word(root + 64 + 4 * k) == (k < 2 ? 42 : 0));
       apex_compile_result_finish(&a);
    }
 
    /* Workgroup shapes: header local size and per-lane launch values. */
    const unsigned valid_wide[][3] = {
-      {17, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16}, {256, 1, 1}, {1, 256, 1}, {1, 1, 64}, {3, 1, 1},
+      {33, 1, 1}, {16, 2, 1}, {4, 4, 4}, {4, 4, 16}, {256, 1, 1}, {1, 256, 1}, {1, 1, 64}, {3, 1, 1},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(valid_wide); i++) {
       nir = geometry_shader(valid_wide[i][0], valid_wide[i][1], valid_wide[i][2]);
-      CHECK(apex_from_nir(nir, &a) == 0);
+      CHECK(apex_from_nir(nir, NULL, &a) == 0);
       ralloc_free(nir);
       unsigned invocations = valid_wide[i][0] * valid_wide[i][1] * valid_wide[i][2];
       CHECK(word(a.data + 16) == (valid_wide[i][0] | valid_wide[i][1] << 16) &&
@@ -222,8 +342,8 @@ int main(int argc, char **argv)
       uint8_t *root = calloc(1, 1024 + 64);
       run(&a, root, 1024 + 64, NULL, 0, 0);
       for (unsigned k = 0; k < 256; k++) {
-         unsigned waves = DIV_ROUND_UP(invocations, 16);
-         CHECK(word(root + 4 * k) == (k < invocations ? k + k / 16 + (waves << 16) : 0));
+         unsigned waves = DIV_ROUND_UP(invocations, 32);
+         CHECK(word(root + 4 * k) == (k < invocations ? k + k / 32 + (waves << 16) : 0));
       }
       free(root);
       apex_compile_result_finish(&a);
@@ -251,7 +371,7 @@ int main(int argc, char **argv)
 
    const struct apex_op invalid = {.op = 0x200};
    const struct apex_value values[1] = {{0, 1}};
-   struct apex_header header = {.stage = APEX_COMPUTE, .local = {16, 1, 1}, .shared = 128,
+   struct apex_header header = {.stage = APEX_COMPUTE, .local = {32, 1, 1}, .shared = 128,
                                 .private_bytes = 32};
    CHECK(apex_emit(&invalid, 1, values, 1, &header, &a) != 0);
    CHECK(!a.data && !a.size && !strcmp(a.diagnostic, "opcode overflow"));
@@ -288,7 +408,7 @@ int main(int argc, char **argv)
          reject(nir, &a, "barrier");
          continue;
       }
-      CHECK(apex_from_nir(nir, &a) == 0);
+      CHECK(apex_from_nir(nir, NULL, &a) == 0);
       ralloc_free(nir);
       check_binary(&a, 17);
       CHECK(has_opcode(&a, APEX_S_FENCE) && !has_opcode(&a, APEX_S_BARRIER));
@@ -299,7 +419,7 @@ int main(int argc, char **argv)
    nb = builder(nir);
    nir_barrier(&nb, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
                .memory_modes = nir_var_mem_shared, .memory_semantics = NIR_MEMORY_ACQ_REL);
-   CHECK(apex_from_nir(nir, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, &a) == 0);
    ralloc_free(nir);
    CHECK(has_opcode(&a, APEX_S_BARRIER));
    check_binary(&a, 17);
@@ -307,7 +427,7 @@ int main(int argc, char **argv)
 
    /* Paired global addresses: descriptors in the root, data elsewhere. */
    nir = global_shader(4, 4);
-   CHECK(apex_from_nir(nir, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, &a) == 0);
    ralloc_free(nir);
    {
       const uint64_t data_va = 0xfeffff0000ull; /* the low word carries */
@@ -315,12 +435,12 @@ int main(int argc, char **argv)
       uint8_t root[64] = {0};
       uint32_t words[4] = {(uint32_t)data_va, data_va >> 32, (uint32_t)data_va, data_va >> 32};
       memcpy(root, words, sizeof(words));
-      for (unsigned k = 0; k < 16; k++) {
+      for (unsigned k = 0; k < 32; k++) {
          uint32_t v = 1000 + 3 * k;
          memcpy(data + 0x20090 + 4 * k, &v, 4);
       }
       run(&a, root, sizeof(root), data, data_va, 0x21000);
-      for (unsigned k = 0; k < 16; k++)
+      for (unsigned k = 0; k < 32; k++)
          CHECK(word(data + 132 + 4 * k) == (1000 + 3 * k) * 7 + k);
       free(data);
    }
@@ -333,27 +453,27 @@ int main(int argc, char **argv)
    reject(global_shader(2, 4), &a, "load_global_2x32");
    reject(global_shader(4, 2), &a, "store_global_2x32");
 
-   nir = compute("Apex unsigned saturating subtraction", 16, 1, 1);
+   nir = compute("Apex unsigned saturating subtraction", 32, 1, 1);
    nb = builder(nir);
    nir_def *offset = nir_ishl_imm(&nb, nir_load_local_invocation_index(&nb), 2);
    nir_def *left = nir_load_ssbo(&nb, 1, 32, nir_imm_int(&nb, 0), offset, .align_mul = 4);
-   nir_def *right = nir_load_ssbo(&nb, 1, 32, nir_imm_int(&nb, 0), nir_iadd_imm(&nb, offset, 64),
+   nir_def *right = nir_load_ssbo(&nb, 1, 32, nir_imm_int(&nb, 0), nir_iadd_imm(&nb, offset, 128),
                                   .align_mul = 4);
    nir_store_ssbo(&nb, nir_usub_sat(&nb, left, right), nir_imm_int(&nb, 0),
-                  nir_iadd_imm(&nb, offset, 128), .align_mul = 4);
-   CHECK(apex_from_nir(nir, &a) == 0);
+                  nir_iadd_imm(&nb, offset, 256), .align_mul = 4);
+   CHECK(apex_from_nir(nir, NULL, &a) == 0);
    ralloc_free(nir);
    {
-      uint8_t root[192] = {0};
-      for (unsigned k = 0; k < 16; k++) {
+      uint8_t root[384] = {0};
+      for (unsigned k = 0; k < 32; k++) {
          uint32_t l = k * 0x11111111u, r = 0x80000000u - k;
          memcpy(root + 4 * k, &l, 4);
-         memcpy(root + 64 + 4 * k, &r, 4);
+         memcpy(root + 128 + 4 * k, &r, 4);
       }
       run(&a, root, sizeof(root), NULL, 0, 0);
-      for (unsigned k = 0; k < 16; k++) {
+      for (unsigned k = 0; k < 32; k++) {
          uint32_t l = k * 0x11111111u, r = 0x80000000u - k;
-         CHECK(word(root + 128 + 4 * k) == (l > r ? l - r : 0));
+         CHECK(word(root + 256 + 4 * k) == (l > r ? l - r : 0));
       }
    }
    if (argc == 3) {
@@ -362,7 +482,9 @@ int main(int argc, char **argv)
       CHECK(fclose(f) == 0);
    }
    apex_compile_result_finish(&a);
+   test_vertex_prolog(false);
+   test_vertex_prolog(true);
    glsl_type_singleton_decref();
-   puts("PASS Apex in-process compiler: ownership, diagnostics, metadata, barriers and paired global addresses on the ISA model");
+   puts("PASS Apex in-process compiler: ownership, diagnostics, metadata, barriers, paired global addresses and the vertex prolog on the ISA model");
    return 0;
 }

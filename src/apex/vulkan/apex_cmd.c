@@ -1022,7 +1022,8 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view)
    /* Blocks: vertex input, raster, depth-stencil, blend, viewport. */
    uint32_t vi[APEX_HW_VERTEX_INPUT_DWORDS], raster[APEX_HW_RASTER_DWORDS];
    uint32_t ds[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS], vp[APEX_HW_VIEWPORT_DWORDS];
-   apex_hw_vertex_input_block(dyn, cmd->bindings, cmd->vertex->vertex.clip_distances, vi);
+   apex_hw_vertex_input_block(dyn, cmd->bindings, cmd->vertex->vertex.clip_distances,
+                              cmd->vertex->vertex.robust, vi);
    apex_hw_raster_block(dyn, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
    const struct apex_attachment *z = &cmd->rendering.depth;
    apex_hw_depth_stencil_block(dyn, z->image ? z->format : VK_FORMAT_UNDEFINED, cmd->rendering.has_depth,

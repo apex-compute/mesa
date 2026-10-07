@@ -123,11 +123,6 @@ void apex_hw_image_descriptor(const struct apex_hw_image *image, uint32_t d[8]);
 void apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk_sampler *sampler,
                                 uint32_t d[8]);
 
-/* Vertex attribute format byte {kind 6:2, components - 1 1:0}, 0 when vertex
- * fetch cannot read the format. `swap_rb` reports BGR component order, which
- * the vertex program swizzles. */
-uint8_t apex_hw_vertex_format(VkFormat format, bool *swap_rb);
-
 /* State blocks. */
 #define APEX_HW_VERTEX_INPUT_DWORDS 128
 #define APEX_HW_RASTER_DWORDS 16
@@ -139,17 +134,16 @@ uint8_t apex_hw_vertex_format(VkFormat format, bool *swap_rb);
 #define APEX_HW_MAX_ATTRIBUTES 16
 #define APEX_HW_MAX_VIEWPORTS 16
 #define APEX_HW_MAX_COLOR 8
-/* Vertex attribute location L lands at vector registers 2 + 4L .. 5 + 4L. */
-#define APEX_HW_ATTRIBUTE_REGISTER(location) (2 + 4 * (location))
 
 struct apex_hw_binding {
    uint64_t va, size;
 };
-/* Vertex input: bindings and strides, then the attributes of the dynamic
- * vertex input state. */
+/* Vertex input: a buffer descriptor (robust with the vertex program's
+ * robustness) and the stride of each binding, and the clip-distance count. */
 void apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
                                 const struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS],
-                                unsigned clip_distances, uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS]);
+                                unsigned clip_distances, bool robust,
+                                uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS]);
 /* `late_depth` when the fragment program tests depth at commit. */
 void apex_hw_raster_block(const struct vk_dynamic_graphics_state *dyn, bool sample_shading,
                           bool late_depth, uint32_t out[APEX_HW_RASTER_DWORDS]);
