@@ -710,7 +710,9 @@ load_of(VkAttachmentLoadOp op)
           op == VK_ATTACHMENT_LOAD_OP_CLEAR ? APEX_HW_CLEAR : APEX_HW_LOAD_DONT_CARE;
 }
 
-/* SET_STATE of the pass record, then BEGIN_PASS. */
+/* SET_STATE of the pass record, then BEGIN_PASS. Every pass bins into the
+ * queue's one bin pool, so the pass waits for the raster phases of the
+ * passes before it. */
 static void
 emit_pass(struct apex_command_buffer *cmd)
 {
@@ -726,6 +728,7 @@ emit_pass(struct apex_command_buffer *cmd)
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, 0);
    apex_cp_set_state(&cmd->ib, APEX_STATE_PASS, APEX_HW_PASS_DWORDS, record);
    apex_cp_begin_pass(&cmd->ib);
    begin_work(cmd, APEX_CP_CLASS_GRAPHICS);
