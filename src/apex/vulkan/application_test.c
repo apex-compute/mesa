@@ -245,11 +245,11 @@ int main(int argc, char **argv)
       buffer_info.pNext = &external_buffer;
       CHECK(CreateBuffer(device, &buffer_info, NULL, &shared_buffer) == VK_SUCCESS);
       GetBufferMemoryRequirements(device, shared_buffer, &requirements);
-      CHECK(requirements.memoryTypeBits == 2);
+      CHECK(requirements.memoryTypeBits == 3);
       VkExportMemoryAllocateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
          .handleTypes = external_buffer.handleTypes};
       VkMemoryAllocateInfo shared_allocate = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .pNext = &export, .allocationSize = requirements.size, .memoryTypeIndex = 1};
+         .pNext = &export, .allocationSize = requirements.size, .memoryTypeIndex = 0};
       VkDeviceMemory original = VK_NULL_HANDLE, alias;
       VkMemoryGetFdInfoKHR get = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
          .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
@@ -585,8 +585,9 @@ int main(int argc, char **argv)
             memcpy(&expected, &normalized, sizeof(expected));
          }
          if (foreign && pass && ((i >= 76 && i < 80) || i == 901)) expected = 0xfb000000 + i * 53;
+         if (!grid && !transfer && !external && pass && i >= 76 && i < 80)
+            expected = 0xdead0000 + i;
          if (coherent) {
-            if (pass && i >= 76 && i < 80) expected = 0xdead0000 + i;
             if (pass && i == 100) expected = 0x81c35a27;
             if (i == 120) expected = (expected & 0xff0000ff) |
                ((pass ? 0x81c35a27 : 0xca000000 + 100 * 37) & 0x00ffff00);
@@ -606,7 +607,7 @@ int main(int argc, char **argv)
             cpu_access(foreign_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
          }
       }
-      /* Only the coherent type exposes these unflushed edits to the GPU. */
+      /* Both memory types are host coherent: these unflushed edits reach the GPU. */
       if (!grid && !transfer) for (unsigned i = 76; i < 80; i++) words[i] = 0xdead0000 + i;
       if (coherent) words[100] = 0x81c35a27;
       if (grid) printf("PASS Apex loader dispatch: %ux%ux%u groups, local 3x2x2, %u words/guards\n",

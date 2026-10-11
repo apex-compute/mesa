@@ -215,7 +215,7 @@ main(int argc, char **argv)
       GD(GetMemoryFdKHR);
       uint32_t device_type = UINT32_MAX;
       for (uint32_t i = 0; i < memory.memoryTypeCount && device_type == UINT32_MAX; i++)
-         if (memory.memoryTypes[i].propertyFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+         if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
             device_type = i;
       CHECK(device_type != UINT32_MAX);
       VkDeviceMemory shared;
@@ -366,6 +366,12 @@ main(int argc, char **argv)
    CmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer, &(VkDeviceSize){0});
    CmdDraw(cmd, TRIANGLES * 3, 1, 0, 0);
    CmdEndRenderPass(cmd);
+   CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &(VkMemoryBarrier){
+                         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT}, 0, NULL, 0, NULL);
    /* Multisampled depth has no buffer copy; --msaa reads the resolved color. */
    for (unsigned i = 0; i < (samples > 1 ? 1 : 2); i++)
       CmdCopyImageToBuffer(cmd, images[samples > 1 ? 2 : i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
