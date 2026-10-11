@@ -2538,15 +2538,20 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    }
    if (stage == MESA_SHADER_VERTEX && !apex_nir_lower_vertex_input(nir, vi))
       return fail(output, "unsupported vertex input");
-   if (zero_shared && nir->info.shared_size) {
-      if (nir->info.shared_size > 32768)
-         return fail(output, "shared memory exceeds 32768 bytes");
-      NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 16);
-   }
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_function_temp, glsl_get_natural_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_function_temp, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+   /* shared_size is known once shared variables have explicit types. The
+    * zeroing loop stores 16-byte chunks, so the workgroup reserves whole
+    * chunks; its counter is a local variable. */
+   if (zero_shared && nir->info.shared_size) {
+      nir->info.shared_size = align(nir->info.shared_size, 16);
+      if (nir->info.shared_size > 32768)
+         return fail(output, "shared memory exceeds 32768 bytes");
+      NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 16);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   }
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo, nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global, nir_address_format_64bit_global);
