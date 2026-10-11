@@ -231,6 +231,11 @@ apex_program_layout(struct apex_program *program, uint32_t set_count,
          return false;
       program->push_size = MAX2(program->push_size, range->offset + range->size);
    }
+   /* A graphics stage sees only its own push range, while the vertex and
+    * fragment programs read one table: each reserves the whole push image so
+    * both place push data and the trailer alike. */
+   if (stages != VK_SHADER_STAGE_COMPUTE_BIT)
+      program->push_size = APEX_MAX_PUSH_CONSTANTS;
    return true;
 }
 
