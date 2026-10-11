@@ -569,6 +569,7 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
    unsigned varyings = d.clip + d.cull;
    NIR_PASS(_, nir, nir_split_per_member_structs);
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir), nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_var_copies);
    struct output_conversion conversion = {0};
    for (unsigned k = 0; state && state->rp && k < state->rp->color_attachment_count; k++)
       if (unorm16_target(state->rp->color_attachment_formats[k]))

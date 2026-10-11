@@ -490,6 +490,40 @@ check_header(const struct apex_program *program, unsigned stage)
    CHECK(word(h + 16) == (32 | 1u << 16) && word(h + 20) == 1 && !word(h + 24));
 }
 
+/* triangle.frag on the ISA model: a fragment wave with constant attributes
+ * exports the RGBA8 target as UNORM16 codes round(clamp(c) * 65535)
+ * (Docs/architecture.md, ROP and tile buffer). */
+static void
+check_unorm16_export(const struct apex_program *program)
+{
+   static const float color[4] = {0.25f, 1.5f, -0.5f, 0.75f};
+   static const uint32_t codes[4] = {16384, 65535, 0, 49151};
+   uint32_t attributes[APEX_ATTRIBUTE_BLOCK] = {0};
+   for (unsigned c = 0; c < 4; c++)
+      memcpy(&attributes[8 + c], &color[c], 4);
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   CHECK(wave);
+   wave->exec = ~0u;
+   for (unsigned l = 0; l < APEX_LANES; l++) {
+      wave->vector[2][l] = 2 * (l >> 2);
+      wave->vector[3][l] = 0xff;
+   }
+   wave->attributes = attributes;
+   wave->primitives = 1;
+   uint32_t grid[3] = {1, 1, 1};
+   char diagnostic[256] = "";
+   if (apex_simulate(program->code.data, program->code.size, wave->scalar, grid, 0, wave, NULL, 0,
+                     diagnostic)) {
+      fprintf(stderr, "simulation: %s\n", diagnostic);
+      abort();
+   }
+   CHECK(wave->exported[0] == ~0u);
+   for (unsigned l = 0; l < APEX_LANES; l++)
+      for (unsigned c = 0; c < 4; c++)
+         CHECK(wave->exports[0][l][c] == codes[c]);
+   free(wave);
+}
+
 /* A dynamic-rendering pipeline compiles a P7 vertex and fragment program;
  * NIR validation runs on every pass in debug builds. `gles` adds the GLES 2
  * rasterization state: line polygon mode, wide lines, a logic op, alpha to
@@ -588,6 +622,8 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
       check_header(&fragment->program, 2);
       h = fragment->program.code.data;
       CHECK((h[28] & 1) && (h[30] | h[31] << 8) == inputs);
+      if (!gles)
+         check_unorm16_export(&fragment->program);
    }
    v->DestroyPipeline(dev, handle, NULL);
    v->DestroyPipelineLayout(dev, layout, NULL);

@@ -209,7 +209,7 @@ test('apex-cp', apex_cp_test, args : [apex_pipeline_spv, apex_triangle_spv, apex
   env : apex_test_env)
 test('apex-graphics-programs', apex_pipeline_test,
   args : ['--graphics', apex_texture_spv, apex_triangle_spv, apex_clip_spv],
-  env : ['NIR_DEBUG=validate'], suite : ['apex'])
+  env : apex_test_env + {'NIR_DEBUG' : 'validate'}, suite : ['apex'])
 # Frame-time benchmark for the performance plan's desktop and game scenes.
 apex_bench = executable('apex-bench', 'bench.c',
   include_directories : inc_include, dependencies : [dep_dl, dep_m], install : false,
