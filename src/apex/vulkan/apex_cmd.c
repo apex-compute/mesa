@@ -432,12 +432,16 @@ program_private(const struct apex_program *program)
 
 /* SET_STATE of the compute registers and user data (s0:s1 table, s2:s3
  * grid address), then DISPATCH or DISPATCH_INDIRECT. Dispatches overlap
- * unless one uses the private arena, which they take in turn. */
+ * unless one uses the private arena, which they take in turn. The image of
+ * 8dc2b71e rewrites a DISPATCH the dispatcher has not yet taken with the
+ * next one's grid, so each dispatch also waits for the compute work before
+ * it. */
 static void
 emit_dispatch(struct apex_command_buffer *cmd, struct apex_program *program, struct apex_table *table,
               const uint32_t base[3], const uint32_t grid[3], uint64_t indirect)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, 0);
    if (program_private(program)) {
       if (cmd->private_pending)
          apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, 0);
