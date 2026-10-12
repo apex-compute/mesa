@@ -1260,13 +1260,64 @@ apex_CmdEndTransformFeedbackEXT(VkCommandBuffer handle, uint32_t first, uint32_t
    cmd->xfb.active = false;
 }
 
+/* A resumed draw shades again from its first vertex, so every draw's vertex
+ * outputs must fit the bin pool's vertex region. A larger direct draw splits
+ * into draws that fit: lists at whole primitives, strips repeating their
+ * shared vertices from an even start, instances apart. Fans, adjacency,
+ * patches and restarted index strips draw whole. */
+static void
+record_direct(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const unsigned instance = indexed ? 4 : 3;
+   uint32_t piece[5];
+   memcpy(piece, packet, (instance + 1) * sizeof(uint32_t));
+   uint32_t capacity = cmd->vertex ? APEX_POOL_VERTEX_BYTES / MAX2(cmd->vertex->vertex.stride, 64) : UINT32_MAX;
+   unsigned align, overlap;
+   switch (dyn->ia.primitive_topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: align = 1; overlap = 0; break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: align = 2; overlap = 0; break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: case VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA:
+      align = 3; overlap = 0; break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: align = 1; overlap = 1; break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: align = 2; overlap = 2; break;
+   default: align = 0; overlap = 0; break;
+   }
+   if ((uint64_t)packet[0] * packet[1] <= capacity || !align ||
+       (indexed && overlap && dyn->ia.primitive_restart_enable)) {
+      record_draw(cmd, indexed, packet, NULL);
+      return;
+   }
+   if (packet[0] <= capacity) {
+      for (uint32_t i = 0, step = capacity / packet[0]; i < packet[1]; i += step) {
+         piece[1] = MIN2(step, packet[1] - i);
+         piece[instance] = packet[instance] + i;
+         record_draw(cmd, indexed, piece, NULL);
+      }
+      return;
+   }
+   piece[1] = 1;
+   for (uint32_t i = 0; i < packet[1]; i++) {
+      piece[instance] = packet[instance] + i;
+      for (uint32_t start = 0; start + overlap < packet[0];) {
+         uint32_t n = MIN2(packet[0] - start, capacity);
+         if (start + n < packet[0])
+            n -= (n - overlap) % align;
+         piece[0] = n;
+         piece[2] = packet[2] + start;
+         record_draw(cmd, indexed, piece, NULL);
+         start += n - overlap;
+      }
+   }
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdDraw(VkCommandBuffer handle, uint32_t vertex_count, uint32_t instance_count,
              uint32_t first_vertex, uint32_t first_instance)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    if (vertex_count && instance_count)
-      record_draw(cmd, false, (uint32_t[4]){vertex_count, instance_count, first_vertex, first_instance}, NULL);
+      record_direct(cmd, false, (uint32_t[4]){vertex_count, instance_count, first_vertex, first_instance});
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -1275,8 +1326,8 @@ apex_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t insta
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    if (index_count && instance_count)
-      record_draw(cmd, true, (uint32_t[5]){index_count, instance_count, first_index,
-                                           (uint32_t)vertex_offset, first_instance}, NULL);
+      record_direct(cmd, true, (uint32_t[5]){index_count, instance_count, first_index,
+                                             (uint32_t)vertex_offset, first_instance});
 }
 
 static void
