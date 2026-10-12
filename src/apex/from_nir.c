@@ -778,13 +778,14 @@ static unsigned piece_dwords(struct alignment a, unsigned at, unsigned left, boo
    return 1;
 }
 
-/* A scalar load of `n` dwords into a new scalar group, in aligned pieces. */
+/* A scalar load into a new scalar group of `n` dwords, in aligned pieces
+ * covering its first `span`. */
 static uint32_t s_load(struct ctx *c, unsigned op, uint32_t base, uint32_t offset, int64_t imm,
-                       unsigned n, struct alignment a)
+                       unsigned n, unsigned span, struct alignment a)
 {
    uint32_t g = value(c, false, n);
-   for (unsigned k = 0; k < n;) {
-      unsigned piece = piece_dwords(a, 4 * k, n - k, true);
+   for (unsigned k = 0; k < span;) {
+      unsigned piece = piece_dwords(a, 4 * k, span - k, true);
       unsigned code = piece == 8 ? 3 : piece == 4 ? 2 : piece == 2 ? 1 : 0;
       emit(c, op, sub(g, k, piece), offset ? scalar(c, offset) : 0, base,
            0, mem_hi(imm + 4 * k, code));
@@ -902,6 +903,11 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       failf(c, "partial store write mask: ", nir_intrinsic_infos[i->intrinsic].name);
       return;
    }
+   /* A buffer access out of range returns zero as a whole (Docs/isa.md), so a
+    * load reads only through its last used dword: NIR pads vectorized loads
+    * to a vector size (Zink's default uniforms make seven dwords eight) past
+    * the end of a buffer sized to the data. */
+   unsigned span = store || atomic ? n : MAX2(util_last_bit(nir_def_components_read(&i->def)), 1);
    /* Source positions: [data], [descriptor], address. */
    unsigned data = 0, address;
    nir_src *desc_src = NULL;
@@ -948,7 +954,7 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       }
       if (reorder && uniform && !fall) {
          result = s_load(c, space == ROOT ? APEX_S_LOAD : APEX_S_BUFFER_LOAD, base, offset, imm, n,
-                         access_alignment(i));
+                         span, access_alignment(i));
          alias(c, &i->def, result);
          return;
       }
@@ -970,7 +976,7 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       }
       uint32_t pair = pair_value(c, src(c, i->src[address], 0));
       if (reorder && uniform) {
-         alias(c, &i->def, s_load(c, APEX_S_LOAD, pair_value(c, scalar(c, pair)), 0, 0, n,
+         alias(c, &i->def, s_load(c, APEX_S_LOAD, pair_value(c, scalar(c, pair)), 0, 0, n, span,
                                   access_alignment(i)));
          return;
       }
@@ -1028,8 +1034,9 @@ static void memory(struct ctx *c, nir_intrinsic_instr *i, enum space space, bool
       }
    } else {
       uint32_t d = fall ? value(c, true, n) : define(c, &i->def, true);
-      for (unsigned k = 0, piece; k < n; k += piece) {
-         piece = space == SCRATCH ? MIN2(n - k, 4) : piece_dwords(access_alignment(i), 4 * k, n - k, false);
+      unsigned loaded = fall ? n : span;
+      for (unsigned k = 0, piece; k < loaded; k += piece) {
+         piece = space == SCRATCH ? MIN2(loaded - k, 4) : piece_dwords(access_alignment(i), 4 * k, loaded - k, false);
          emit(c, op, sub(d, k, piece), a, b, 0, mem_hi(imm + 4 * k, piece - 1));
          if (reorder)
             last(c)->flags = APEX_REORDER;
@@ -1715,7 +1722,8 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
             last(c)->flags = APEX_REORDER;
          }
       } else {
-         alias(c, d, s_load(c, APEX_S_LOAD, root(c), offset, imm, d->num_components, access_alignment(i)));
+         alias(c, d, s_load(c, APEX_S_LOAD, root(c), offset, imm, d->num_components, d->num_components,
+                         access_alignment(i)));
       }
       return;
    }
