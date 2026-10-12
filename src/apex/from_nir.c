@@ -1604,16 +1604,19 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       nir_intrinsic_op o = i->intrinsic;
       bool y = o == nir_intrinsic_ddy || o == nir_intrinsic_ddy_coarse || o == nir_intrinsic_ddy_fine;
       bool fine = o == nir_intrinsic_ddx_fine || o == nir_intrinsic_ddy_fine;
-      if (d->num_components != 1 || d->bit_size != 32) {
+      if (d->bit_size != 32) {
          failf(c, "unsupported derivative width", NULL);
          return;
       }
-      uint32_t x = src(c, i->src[0], 0);
       /* Quad lanes: 0 (0,0), 1 (1,0), 2 (0,1), 3 (1,1). */
       unsigned hi_pattern = fine ? (y ? 0xee : 0xf5) : (y ? 0xaa : 0x55);
       unsigned lo_pattern = fine ? (y ? 0x44 : 0xa0) : 0x00;
-      emit(c, APEX_V_SUB_F, define(c, d, true), quadperm(c, x, hi_pattern),
-           quadperm(c, x, lo_pattern), 0, 0);
+      uint32_t g = define(c, d, true);
+      for (unsigned k = 0; k < d->num_components; k++) {
+         uint32_t x = src(c, i->src[0], k);
+         emit(c, APEX_V_SUB_F, sub(g, k, 1), quadperm(c, x, hi_pattern),
+              quadperm(c, x, lo_pattern), 0, 0);
+      }
       return;
    }
    case nir_intrinsic_load_subgroup_invocation:
