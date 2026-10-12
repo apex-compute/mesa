@@ -53,6 +53,15 @@ static const struct vk_instance_extension_table instance_extensions = {
    .KHR_display = true,
    .KHR_get_surface_capabilities2 = true,
    .KHR_get_display_properties2 = true,
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+   .KHR_wayland_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   .KHR_xcb_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XLIB_KHR
+   .KHR_xlib_surface = true,
+#endif
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -314,6 +323,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_timeline_semaphore = true,
       .EXT_robustness2 = true,
       .EXT_physical_device_drm = true,
+      .EXT_pci_bus_info = true,
       /* Foreign ownership transfers, like external ones, need no operation:
        * jobs serialize and PRIME memory is coherent at submission. */
       .EXT_queue_family_foreign = true,
@@ -616,6 +626,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .drmHasPrimary = has_primary,
       .drmPrimaryMajor = has_primary ? major(primary_stat.st_rdev) : 0,
       .drmPrimaryMinor = has_primary ? minor(primary_stat.st_rdev) : 0,
+      /* WSI matches a window system's GPU to this device by PCI address. */
+      .pciDomain = drm->businfo.pci->domain,
+      .pciBus = drm->businfo.pci->bus,
+      .pciDevice = drm->businfo.pci->dev,
+      .pciFunction = drm->businfo.pci->func,
    };
    /* Pipeline caches are valid only for the driver build that wrote them. */
    blake3_hasher cache_hash;
@@ -662,7 +677,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       destroy_physical(&physical->vk);
       return result;
    }
-   physical->wsi_device.supports_modifiers = false;
+   physical->wsi_device.supports_modifiers = true;
    physical->vk.wsi_device = &physical->wsi_device;
    *out = &physical->vk;
    return VK_SUCCESS;
