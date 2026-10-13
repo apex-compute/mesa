@@ -1272,7 +1272,10 @@ record_direct(struct apex_command_buffer *cmd, bool indexed, const uint32_t *pac
    const unsigned instance = indexed ? 4 : 3;
    uint32_t piece[5];
    memcpy(piece, packet, (instance + 1) * sizeof(uint32_t));
-   uint32_t capacity = cmd->vertex ? APEX_POOL_VERTEX_BYTES / MAX2(cmd->vertex->vertex.stride, 64) : UINT32_MAX;
+   /* A pass whose vertex region fills within assembly's four wave banks of
+    * its end stalls for up to seconds on every resume, or never finishes. */
+   uint32_t capacity = cmd->vertex ? APEX_POOL_VERTEX_BYTES / MAX2(cmd->vertex->vertex.stride, 64) - 4 * 32 :
+                       UINT32_MAX;
    unsigned align, overlap;
    switch (dyn->ia.primitive_topology) {
    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: align = 1; overlap = 0; break;
