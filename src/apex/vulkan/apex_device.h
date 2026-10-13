@@ -101,6 +101,7 @@ struct apex_device {
    /* Queue: ring, read-only status page and doorbell page. The submit thread
     * owns sequence, kwait, the arenas and ring.wptr. */
    uint32_t queue_id;
+   uint32_t queue_priority; /* drm_apex_queue_create priority */
    uint64_t status_va;
    void *status_map, *doorbell_map;
    struct apex_bo ring_bo;

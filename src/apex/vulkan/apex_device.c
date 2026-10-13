@@ -464,17 +464,27 @@ apex_GetBufferMemoryRequirements2(VkDevice dev, const VkBufferMemoryRequirements
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_BindBufferMemory2(VkDevice dev, uint32_t count, const VkBindBufferMemoryInfo *infos)
 {
+   VkResult result = VK_SUCCESS;
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
       VK_FROM_HANDLE(apex_buffer, buffer, infos[i].buffer);
+      VkResult bound = VK_SUCCESS;
       if (infos[i].memoryOffset % 64 || infos[i].memoryOffset > mem->vk.size ||
-          buffer->vk.size > mem->vk.size - infos[i].memoryOffset)
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      buffer->memory = mem;
-      buffer->offset = infos[i].memoryOffset;
-      buffer->vk.device_address = (mem->storage ? mem->storage->bo.va : 0) + buffer->offset;
+          buffer->vk.size > mem->vk.size - infos[i].memoryOffset) {
+         bound = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      } else {
+         buffer->memory = mem;
+         buffer->offset = infos[i].memoryOffset;
+         buffer->vk.device_address = (mem->storage ? mem->storage->bo.va : 0) + buffer->offset;
+      }
+      /* VK_KHR_maintenance6: each bind reports its own result. */
+      const VkBindMemoryStatus *status = vk_find_struct_const(infos[i].pNext, BIND_MEMORY_STATUS);
+      if (status)
+         *status->pResult = bound;
+      if (bound != VK_SUCCESS)
+         result = bound;
    }
-   return VK_SUCCESS;
+   return result;
 }
 
 /* Image features follow the texture unit's and ROP's formats; texel and
@@ -551,11 +561,15 @@ apex_format_features(VkFormat format, bool buffer)
    const struct util_format_description *desc = util_format_description(pformat);
    VkFormatFeatureFlags2 features = 0;
    uint32_t words[3];
-   if (util_format_is_srgb(pformat) || !desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+   /* Texel-buffer loads also decode the packed B10G11R11 and E5B9G9R9 floats;
+    * stores encode plain formats only. */
+   bool packed_float = pformat == PIPE_FORMAT_R11G11B10_FLOAT || pformat == PIPE_FORMAT_R9G9B9E5_FLOAT;
+   if (util_format_is_srgb(pformat) || !desc ||
+       (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN && !packed_float) ||
        !apex_format_encode(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, words))
       return 0;
    features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
-   if (!vk_format_is_depth_or_stencil(format) && desc->block.bits <= 128) {
+   if (!packed_float && !vk_format_is_depth_or_stencil(format) && desc->block.bits <= 128) {
       features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
@@ -855,18 +869,28 @@ apex_GetImageMemoryRequirements2(VkDevice dev,
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_BindImageMemory2(VkDevice dev, uint32_t count, const VkBindImageMemoryInfo *infos)
 {
+   VkResult result = VK_SUCCESS;
    for (unsigned i = 0; i < count; i++) {
       VK_FROM_HANDLE(apex_memory, mem, infos[i].memory);
       VK_FROM_HANDLE(apex_image, image, infos[i].image);
       /* The image starts at its explicit DRM plane offset. */
       VkDeviceSize offset = infos[i].memoryOffset + image->plane_offset;
       unsigned alignment = image->layout.tiled || image->decoded ? APEX_HW_TILE : 64;
-      if (infos[i].memoryOffset % alignment || offset > mem->vk.size || image->size > mem->vk.size - offset)
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      image->memory = mem;
-      image->offset = offset;
+      VkResult bound = VK_SUCCESS;
+      if (infos[i].memoryOffset % alignment || offset > mem->vk.size ||
+          image->size > mem->vk.size - offset) {
+         bound = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      } else {
+         image->memory = mem;
+         image->offset = offset;
+      }
+      const VkBindMemoryStatus *status = vk_find_struct_const(infos[i].pNext, BIND_MEMORY_STATUS);
+      if (status)
+         *status->pResult = bound;
+      if (bound != VK_SUCCESS)
+         result = bound;
    }
-   return VK_SUCCESS;
+   return result;
 }
 
 /* A subresource is one layer of a level, or every depth slice of a 3D level;
@@ -1758,9 +1782,12 @@ create_queue(struct apex_device *device)
    memset(device->retire.map, 0, 8);
    struct drm_apex_queue_create create = {
       .ring_va = device->ring_bo.va, .ring_bytes = APEX_RING_BYTES,
+      .priority = device->queue_priority,
    };
    if (ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_CREATE, &create))
-      return errno == ENODEV ? VK_ERROR_INCOMPATIBLE_DRIVER : VK_ERROR_INITIALIZATION_FAILED;
+      return errno == ENODEV ? VK_ERROR_INCOMPATIBLE_DRIVER :
+             errno == EACCES || errno == EPERM ? VK_ERROR_NOT_PERMITTED :
+             VK_ERROR_INITIALIZATION_FAILED;
    device->queue_id = create.queue_id;
    device->status_va = create.status_va;
    void *status = mmap(NULL, 4096, PROT_READ, MAP_SHARED, device->fd, create.status_offset);
@@ -1808,6 +1835,10 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
        info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
       return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex requires one unflagged queue from family 0");
+   /* HIGH and REALTIME take the kernel's high priority. */
+   const VkDeviceQueueGlobalPriorityCreateInfo *priority =
+      vk_find_struct_const(info->pQueueCreateInfos[0].pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
+   device->queue_priority = priority && priority->globalPriority >= VK_QUEUE_GLOBAL_PRIORITY_HIGH;
    struct drm_apex_info caps = {0};
    if (fd >= 0 && ioctl(fd, DRM_IOCTL_APEX_INFO, &caps))
       return VK_ERROR_INCOMPATIBLE_DRIVER;

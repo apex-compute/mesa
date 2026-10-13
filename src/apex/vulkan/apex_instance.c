@@ -99,6 +99,16 @@ apex_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical, uint32_t
          .timestampValidBits = 64,
          .queueCount = 1,
       };
+      /* LOW and MEDIUM run at the kernel's normal priority; HIGH needs the
+       * DRM master or CAP_SYS_NICE. */
+      VkQueueFamilyGlobalPriorityProperties *priorities =
+         vk_find_struct(prop->pNext, QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES);
+      if (priorities) {
+         priorities->priorityCount = 3;
+         priorities->priorities[0] = VK_QUEUE_GLOBAL_PRIORITY_LOW;
+         priorities->priorities[1] = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM;
+         priorities->priorities[2] = VK_QUEUE_GLOBAL_PRIORITY_HIGH;
+      }
    }
 }
 
@@ -328,6 +338,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
        * jobs serialize and PRIME memory is coherent at submission. */
       .EXT_queue_family_foreign = true,
       .KHR_maintenance5 = true,
+      .KHR_maintenance6 = true,
+      .EXT_pipeline_robustness = true,
+      .KHR_global_priority = true,
+      .KHR_shader_expect_assume = true,
+      .KHR_shader_float_controls2 = true,
       .EXT_provoking_vertex = true,
       .EXT_transform_feedback = true,
       .EXT_custom_border_color = true,
@@ -393,6 +408,12 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* Null descriptors are zero rows (see write_descriptor). */
       .nullDescriptor = true,
       .maintenance5 = true,
+      .maintenance6 = true,
+      .pushDescriptor = true,
+      .pipelineRobustness = true,
+      .globalPriorityQuery = true,
+      .shaderExpectAssume = true,
+      .shaderFloatControls2 = true,
       .provokingVertexLast = true,
       /* Capture programs write each primitive's vertices in the order of
        * its provoking-vertex mode, fans included (apex_graphics.c). */
@@ -531,8 +552,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 65535,
       .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
       .maxPushDescriptors = 32, .maxMultiviewViewCount = 32, .maxMultiviewInstanceIndex = (1u << 27) - 1,
-      .maxViewports = APEX_HW_MAX_VIEWPORTS, .maxViewportDimensions = {4096, 4096},
-      .viewportBoundsRange = {-8192.0f, 8191.0f}, .viewportSubPixelBits = 8,
+      .maxViewports = APEX_HW_MAX_VIEWPORTS,
+      /* Screen coordinates snap into signed Q17.8 and Mesa's guard band keeps
+       * every accepted vertex within ±2^16 pixels. */
+      .maxViewportDimensions = {16384, 16384},
+      .viewportBoundsRange = {-32768.0f, 32767.0f}, .viewportSubPixelBits = 8,
       .subPixelPrecisionBits = 8, .subTexelPrecisionBits = 8, .mipmapPrecisionBits = 8,
       .minTexelBufferOffsetAlignment = 4,
       .minTexelOffset = -8, .maxTexelOffset = 7, .minTexelGatherOffset = -8, .maxTexelGatherOffset = 7,
@@ -613,6 +637,18 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .polygonModePointSize = false,
       .nonStrictSinglePixelWideLinesUseParallelogram = false,
       .nonStrictWideLinesUseParallelogram = false,
+      /* VK_KHR_maintenance6: no multi-planar formats yet, so a combined
+       * image sampler takes one descriptor. */
+      .blockTexelViewCompatibleMultipleLayers = true,
+      .maxCombinedImageSamplerDescriptorCount = 1,
+      .fragmentShadingRateClampCombinerInputs = false,
+      /* VK_EXT_pipeline_robustness: buffer descriptors are always robust
+       * (out-of-range loads read zero, stores and atomics drop), and image
+       * accesses check every coordinate against its extent. */
+      .defaultRobustnessStorageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2,
+      .defaultRobustnessUniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2,
+      .defaultRobustnessVertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+      .defaultRobustnessImages = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS,
       .provokingVertexModePerPipeline = true,
       .maxCustomBorderColorSamplers = 4000,
       .maxVertexAttribDivisor = UINT32_MAX, .supportsNonZeroFirstInstance = true,
