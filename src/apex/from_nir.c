@@ -1264,7 +1264,8 @@ static void store_output(struct ctx *c, nir_intrinsic_instr *i)
       slot = io.location - FRAG_RESULT_DATA0 + io.dual_source_blend_index;
       if (io.dual_source_blend_index)
          c->header.output |= 1u << 8;
-      c->header.output |= 1u << slot;
+      else
+         c->header.output |= 1u << slot;
    } else {
       failf(c, "unsupported fragment output", NULL);
       return;
@@ -1321,11 +1322,15 @@ static void finish_outputs(struct ctx *c)
    for (int s = 9; s >= 0 && final < 0; s--)
       if (c->out[s])
          final = s;
+   /* With dual-source blending, output slot 1 is target 0's second source. */
+   bool dual = c->header.output & (1u << 8);
    for (int s = 0; s < 10; s++) {
       if (!c->out[s] && !(s == 0 && final < 0))
          continue;
       uint32_t data = c->out[s] ? c->out[s] : value(c, true, 4);
-      emit(c, APEX_EXP, apex_raw(s), data, apex_raw(s == final || final < 0 ? 1 : 0), 0, 0);
+      bool second = dual && s == 1;
+      emit(c, APEX_EXP, apex_raw(second ? 0 : s), data,
+           apex_raw((s == final || final < 0 ? 1 : 0) | (second ? 2 : 0)), 0, 0);
    }
 }
 
