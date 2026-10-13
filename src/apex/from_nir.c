@@ -2610,6 +2610,8 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       progress = false;
       NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
+      /* Scalarized 64-bit vector reductions become 64-bit compares. */
+      NIR_PASS(progress, nir, nir_lower_int64);
       NIR_PASS(progress, nir, nir_lower_phis_to_scalar, NULL, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_lower_pack);

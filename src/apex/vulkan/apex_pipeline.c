@@ -239,6 +239,19 @@ apex_program_layout(struct apex_program *program, uint32_t set_count,
    return true;
 }
 
+/* Buffer accesses become 32-bit components before descriptor lowering, which
+ * addresses buffers in dwords: 64-bit values split into pairs. */
+static nir_mem_access_size_align
+buffer_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bit_size, uint32_t align_mul,
+                   uint32_t align_offset, bool offset_is_const, enum gl_access_qualifier access,
+                   const void *data)
+{
+   return (nir_mem_access_size_align){
+      .num_components = MAX2(MIN2(bytes / 4, 4), 1), .bit_size = 32, .align = 4,
+      .shift = nir_mem_access_shift_method_scalar,
+   };
+}
+
 bool
 apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
 {
@@ -247,6 +260,10 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
+   const nir_lower_mem_access_bit_sizes_options buffer_sizes = {
+      .callback = buffer_access_size, .modes = nir_var_mem_ssbo | nir_var_mem_ubo,
+   };
+   NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &buffer_sizes);
    struct descriptor_lowering ctx = {.program = program};
    nir_shader_intrinsics_pass(nir, lower_resource, nir_metadata_control_flow, &ctx);
    nir_shader_intrinsics_pass(nir, lower_buffer, nir_metadata_none, &ctx);
