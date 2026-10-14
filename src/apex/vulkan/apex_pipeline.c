@@ -304,12 +304,27 @@ ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t arra
    return state->format ? state : NULL;
 }
 
+/* Texel offsets are immediates of the texture instruction, so a gather's
+ * dynamic offset moves its coordinates instead. */
+static bool
+dynamic_offset(const nir_instr *instr, const void *data)
+{
+   const nir_tex_instr *tex = nir_instr_as_tex(instr);
+   int offset = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   return offset >= 0 && !nir_src_is_const(tex->src[offset].src);
+}
+
 bool
 apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
 {
    /* YCbCr samples become a sample per plane and the colour conversion. */
    NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion, program);
-   const nir_lower_tex_options tex = {.lower_txp = ~0u, .lower_tg4_offsets = true};
+   /* Explicit gradients take two axes: 3D and cube samples with gradients
+    * select their level in the shader. */
+   const nir_lower_tex_options tex = {
+      .lower_txp = ~0u, .lower_tg4_offsets = true, .lower_txd_3d = true, .lower_txd_cube_map = true,
+      .lower_offset_filter = dynamic_offset,
+   };
    NIR_PASS(_, nir, nir_lower_tex, &tex);
    /* The texture unit takes one image and sampler per instruction, so a
     * non-uniform sampled image loops over its distinct descriptors. Texel

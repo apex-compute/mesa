@@ -41,7 +41,7 @@
  * slot (0 when the fragment stage reads no layer); the input record slots a
  * geometry shader reads. */
 struct link {
-   unsigned clip, cull, layer;
+   unsigned clip, cull, layer, primitive;
    uint64_t records;
 };
 
@@ -112,6 +112,17 @@ lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, st
             nir_store_var(&after, link, store->src[1].ssa, 1);
          }
       }
+   }
+   /* A geometry shader's gl_PrimitiveID, which its pass-through program
+    * carries, reaches a fragment stage reading it as a flat varying. */
+   nir_variable *primitive = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_ID);
+   if (primitive && d.primitive) {
+      primitive->data.location = d.primitive;
+      primitive->data.interpolation = INTERP_MODE_FLAT;
+   } else if (primitive) {
+      primitive->data.mode = nir_var_shader_temp;
+      nir_fixup_deref_modes(nir);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
    }
    if (state && state->mv && state->mv->view_mask) {
       /* gl_ViewIndex becomes load_view_index first. */
@@ -881,7 +892,10 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    };
    ctx.primitive_vertices = nir->info.gs.output_primitive == MESA_PRIM_POINTS ? 1 :
                             nir->info.gs.output_primitive == MESA_PRIM_LINE_STRIP ? 2 : 3;
-   ctx.max_primitives = MAX2(ctx.max_vertices + 1 - ctx.primitive_vertices, 1);
+   /* A strip of max_vertices vertices holds max_vertices + 1 - n
+    * primitives, at least one even when fewer vertices than one needs. */
+   ctx.max_primitives = ctx.max_vertices + 1 > ctx.primitive_vertices ?
+                        ctx.max_vertices + 1 - ctx.primitive_vertices : 1;
    unsigned vertices = input_vertices(nir->info.gs.input_primitive);
    /* One stream: geometryStreams is not reported. */
    NIR_PASS(_, nir, nir_lower_gs_intrinsics, nir_lower_gs_intrinsics_count_vertices_per_primitive);
@@ -1052,7 +1066,7 @@ build_passthrough(const nir_shader *geometry, const struct apex_program *program
                                  nir_imul_imm(b, nir_bcsel(b, culled, nir_imm_int(b, 0), vertex),
                                               16 * util_bitcount64(outputs)));
    nir_foreach_variable_with_modes(var, geometry, nir_var_shader_out) {
-      if (var->data.location == VARYING_SLOT_PRIMITIVE_ID || var->data.location >= 64)
+      if (var->data.location >= 64)
          continue;
       nir_variable *out = nir_variable_clone(var, nir);
       nir_shader_add_variable(nir, out);
@@ -1184,6 +1198,13 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
       layer = nir_imm_int(&start, 0);
    }
    nir_def *view = multiview ? layer : nir_imm_int(&start, 0);
+   nir_def *primitive = NULL;
+   if (d.primitive) {
+      nir_variable *in = nir_variable_create(nir, nir_var_shader_in, glsl_int_type(), "apex_link_primitive");
+      in->data.location = d.primitive;
+      in->data.interpolation = INTERP_MODE_FLAT;
+      primitive = nir_load_var(&start, in);
+   }
    nir_foreach_block(block, entry) {
       nir_foreach_instr_safe(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
@@ -1193,6 +1214,8 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
             nir_def_replace(&i->def, layer);
          else if (i->intrinsic == nir_intrinsic_load_view_index)
             nir_def_replace(&i->def, view);
+         else if (i->intrinsic == nir_intrinsic_load_primitive_id && primitive)
+            nir_def_replace(&i->def, primitive);
       }
    }
    nir_progress(true, entry, nir_metadata_control_flow);
@@ -1559,6 +1582,8 @@ fail:
    return result;
 }
 
+static unsigned free_slot(nir_shader *vertex, nir_shader *fragment, uint32_t taken);
+
 /* The varying slot linking the layer to a fragment stage that reads it, the
  * view index or an input attachment: the lowest of varyings 0-29 that
  * neither stage uses. Zero when the layer is always zero or no slot is free. */
@@ -1578,7 +1603,27 @@ layer_slot(nir_shader *vertex, nir_shader *fragment, bool multiview)
    }
    if (!reads || (!multiview && !nir_find_variable_with_location(vertex, nir_var_shader_out, VARYING_SLOT_LAYER)))
       return 0;
-   uint32_t used = 0;
+   return free_slot(vertex, fragment, 0);
+}
+
+/* The varying slot linking a geometry shader's gl_PrimitiveID to a fragment
+ * stage that reads it, beside the layer's slot; zero otherwise. */
+static unsigned
+primitive_slot(nir_shader *geometry, nir_shader *fragment, unsigned layer)
+{
+   bool reads = BITSET_TEST(fragment->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID);
+   nir_foreach_variable_with_modes(var, fragment, nir_var_system_value)
+      reads |= var->data.location == SYSTEM_VALUE_PRIMITIVE_ID;
+   if (!reads || !nir_find_variable_with_location(geometry, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_ID))
+      return 0;
+   return free_slot(geometry, fragment, layer ? BITFIELD_BIT(layer - VARYING_SLOT_VAR0) : 0);
+}
+
+/* The lowest of varyings 0-29 that neither stage uses nor `taken` holds. */
+static unsigned
+free_slot(nir_shader *vertex, nir_shader *fragment, uint32_t taken)
+{
+   uint32_t used = taken;
    nir_foreach_variable_with_modes(var, vertex, nir_var_shader_out)
       if (var->data.location >= VARYING_SLOT_VAR0)
          used |= BITFIELD_RANGE(var->data.location - VARYING_SLOT_VAR0,
@@ -1629,6 +1674,8 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
       if (link.clip + link.cull > 8)
          link.clip = link.cull = 0;
       link.layer = layer_slot(last, fragment, state && state->mv && state->mv->view_mask);
+      if (geometry)
+         link.primitive = primitive_slot(geometry, fragment, link.layer);
    }
    VkResult result = VK_SUCCESS;
    for (uint32_t i = 0; i < count; i++) {

@@ -2400,8 +2400,15 @@ static nir_def *subword_bits(nir_builder *b, nir_scalar s)
       return nir_ushr_imm(b, source, 16);
    case nir_op_f2f16: case nir_op_f2f16_rtne:
       return nir_pack_half_2x16_split(b, source, nir_imm_float(b, 0.0f));
-   case nir_op_f2f16_rtz:
-      return nir_pack_half_2x16_rtz_split(b, source, nir_imm_float(b, 0.0f));
+   case nir_op_f2f16_rtz: {
+      /* v_cvt_pk_f16 rounds to nearest even: a half whose magnitude
+       * exceeds the source steps one code toward zero, which also turns
+       * an overflow to infinity into the largest finite half. */
+      nir_def *half = nir_pack_half_2x16_split(b, source, nir_imm_float(b, 0.0f));
+      nir_def *away = nir_flt(b, nir_fabs(b, source),
+                              nir_fabs(b, nir_channel(b, nir_unpack_half_2x16(b, half), 0)));
+      return nir_bcsel(b, away, nir_iadd_imm(b, half, -1), half);
+   }
    case nir_op_f2i8: case nir_op_f2i16:
       return nir_iand_imm(b, nir_f2i32(b, source), BITFIELD_MASK(bits));
    case nir_op_f2u8: case nir_op_f2u16:
