@@ -1343,8 +1343,8 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
            const struct indirect_draw *indirect, uint32_t draw)
 {
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   struct apex_program *capture = cmd->xfb.active && cmd->vertex->vertex.capture.code.size ?
-      &cmd->vertex->vertex.capture : NULL;
+   struct apex_program *capture = cmd->xfb.active && cmd->vertex->capture.code.size ?
+      &cmd->vertex->capture : NULL;
    if (cmd->meta || (!capture && !cmd->xfb.query))
       return;
    /* Adjacency topologies capture their primitives without adjacent
@@ -1363,7 +1363,7 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
       relocs |= BITFIELD_BIT(APEX_XFB_STATE);
    }
    for (unsigned b = 0; b < APEX_XFB_BUFFERS; b++)
-      words[APEX_XFB_STRIDES + b / 2] |= (uint32_t)cmd->vertex->vertex.xfb_strides[b] << 16 * (b & 1);
+      words[APEX_XFB_STRIDES + b / 2] |= (uint32_t)cmd->vertex->xfb_strides[b] << 16 * (b & 1);
    uint32_t groups = 64;
    if (!indirect) {
       uint64_t vertices = input_primitives(topology, packet[0]) * 3 * (uint64_t)packet[1];
@@ -1424,14 +1424,18 @@ record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *p
    uint64_t record_va = scratch_block(cmd, inputs * in_stride);
    uint64_t output_va = scratch_block(cmd, invocations * gs->geometry.max_vertices * out_stride);
    uint64_t list_va = scratch_block(cmd, invocations * list_bytes);
-   uint64_t arguments_va = indirect ? scratch_block(cmd, 32) : 0;
+   /* Transform feedback of the geometry shader's outputs (driver draws are
+    * not counted); its capture program reads the draw arguments. */
+   struct apex_program *capture = !cmd->meta && gs->capture.code.size && (cmd->xfb.active || cmd->xfb.query) ?
+                                  &gs->capture : NULL;
+   uint64_t arguments_va = indirect || capture ? scratch_block(cmd, 32) : 0;
    const uint64_t scratch[4][2] = {
       {APEX_GS_RECORDS, record_va}, {APEX_GS_OUTPUT, output_va}, {APEX_GS_LIST, list_va},
       {APEX_GS_ARGUMENTS, arguments_va},
    };
    uint64_t scratch_relocs = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(scratch); i++) {
-      if (i == 3 && !indirect)
+      if (i == 3 && !arguments_va)
          continue;
       words[scratch[i][0]] = LO(scratch[i][1]);
       words[scratch[i][0] + 1] = HI(scratch[i][1]);
@@ -1456,6 +1460,27 @@ record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *p
       emit_dispatch(cmd, programs[k], table, (uint32_t[3]){0}, (uint32_t[3]){groups, 1, 1}, 0);
    }
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+   if (capture) {
+      uint32_t capture_words[APEX_JOB_WORDS];
+      memcpy(capture_words, words, sizeof(words));
+      uint32_t relocs = BITFIELD_BIT(APEX_DRAW_VERTEX_INPUT);
+      if (cmd->xfb.active) {
+         capture_words[APEX_GS_XFB_STATE] = LO(cmd->xfb.state);
+         capture_words[APEX_GS_XFB_STATE + 1] = HI(cmd->xfb.state);
+         relocs |= BITFIELD_BIT(APEX_GS_XFB_STATE);
+      }
+      capture_words[APEX_GS_XFB_QUERY] = LO(cmd->xfb.query);
+      capture_words[APEX_GS_XFB_QUERY + 1] = HI(cmd->xfb.query);
+      struct apex_table *table = table_create(cmd, capture, NULL, cmd->graphics_sets, cmd->graphics_push);
+      if (!table)
+         return;
+      table->trailer[0] = table->trailer[1] = table->trailer[2] = 1;
+      memcpy(&table->trailer[APEX_TRAILER_WORDS], capture_words, sizeof(capture_words));
+      table->relocs = (uint64_t)relocs << APEX_TRAILER_WORDS;
+      table->scratch_relocs = scratch_relocs << APEX_TRAILER_WORDS;
+      emit_dispatch(cmd, capture, table, (uint32_t[3]){0}, (uint32_t[3]){1, 1, 1}, 0);
+      apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+   }
    /* The pass-through program's table: the output records and capacity. */
    struct apex_table *table = table_create(cmd, &gs->geometry.draw, NULL, cmd->graphics_sets, cmd->graphics_push);
    if (!table)

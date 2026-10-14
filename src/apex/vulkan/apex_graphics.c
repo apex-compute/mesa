@@ -44,6 +44,8 @@
 struct link {
    unsigned clip, cull, layer, primitive;
    uint64_t records;
+   /* Varying slots a fragment stage reads; all when it is not known. */
+   uint64_t varyings;
 };
 
 static nir_variable *
@@ -502,6 +504,8 @@ draw_kernel(nir_shader *nir, const struct apex_vertex_input *vi, struct apex_pro
          var->data.driver_location -= VERT_ATTRIB_GENERIC0;
    }
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, attribute_slots, 0);
+   /* Array outputs leave constant offset arithmetic; the capture needs it folded. */
+   NIR_PASS(_, nir, nir_opt_constant_folding);
    if (!apex_program_lower_resources(program, nir) || !apex_nir_lower_vertex_input(nir, vi))
       return false;
    compute_kernel(nir);
@@ -764,7 +768,8 @@ struct geometry {
    unsigned max_vertices, max_primitives, primitive_vertices, invocations;
    nir_def *topology, *last, *start, *j, *primitives, *count, *instance;
    nir_def *records, *output, *list, *vertex_base, *null_index, *primitive_id, *invocation_id;
-   nir_variable *current[64], *written;
+   /* The vertex the outputs build and the list primitives written. */
+   nir_variable *next, *written;
 };
 
 static void
@@ -829,14 +834,17 @@ lower_geometry(nir_builder *b, nir_intrinsic_instr *i, struct geometry *ctx)
       }
       location += nir_src_as_uint(*offset);
       if (ctx->outputs & BITFIELD64_BIT(location)) {
-         /* Components land at their place in the slot's vec4. */
-         unsigned component = nir_intrinsic_component(i), n = i->src[0].ssa->num_components;
-         nir_def *channels[4];
-         for (unsigned x = 0; x < 4; x++)
-            channels[x] = x >= component && x < component + n ? nir_channel(b, i->src[0].ssa, x - component)
-                                                              : nir_imm_int(b, 0);
-         nir_store_var(b, ctx->current[location], nir_vec(b, channels, 4),
-                       (nir_intrinsic_write_mask(i) << component) & 0xf);
+         /* Outputs are undefined after EmitVertex, so stores go straight
+          * to the record of the vertex being built, while one remains. */
+         nir_def *next = nir_load_var(b, ctx->next);
+         nir_push_if(b, nir_ult_imm(b, next, ctx->max_vertices));
+         nir_def *record = address_add(b, ctx->output,
+            nir_imul_imm(b, nir_iadd(b, ctx->vertex_base, next), 16 * util_bitcount64(ctx->outputs)));
+         unsigned base = 16 * record_slot(ctx->outputs, location) + 4 * nir_intrinsic_component(i);
+         u_foreach_bit(c, nir_intrinsic_write_mask(i))
+            nir_store_global_2x32(b, nir_channel(b, i->src[0].ssa, c),
+                                  address_add(b, record, nir_imm_int(b, base + 4 * c)), .align_mul = 4);
+         nir_pop_if(b, NULL);
       }
       nir_instr_remove(&i->instr);
       return true;
@@ -847,13 +855,8 @@ lower_geometry(nir_builder *b, nir_intrinsic_instr *i, struct geometry *ctx)
          return true;
       }
       nir_def *v = i->src[0].ssa, *s = i->src[1].ssa;
-      nir_def *vertex = nir_iadd(b, ctx->vertex_base, v);
-      nir_def *record = address_add(b, ctx->output, nir_imul_imm(b, vertex, 16 * util_bitcount64(ctx->outputs)));
-      u_foreach_bit64(location, ctx->outputs)
-         nir_store_global_2x32(b, nir_load_var(b, ctx->current[location]),
-                               address_add(b, record, nir_imm_int(b, 16 * record_slot(ctx->outputs, location))),
-                               .align_mul = 4);
       emit_primitive(b, ctx, v, s);
+      nir_store_var(b, ctx->next, nir_iadd_imm(b, v, 1), 1);
       nir_instr_remove(&i->instr);
       return true;
    }
@@ -920,6 +923,7 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_shader_out)
       var->data.driver_location = var->data.location;
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, attribute_slots, 0);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
    if (!apex_program_lower_resources(program, nir))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    shader->geometry.inputs = inputs;
@@ -957,8 +961,7 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    ctx.output = job_address(b, program, APEX_GS_OUTPUT);
    ctx.list = job_address(b, program, APEX_GS_LIST);
    ctx.written = nir_local_variable_create(impl, glsl_uint_type(), "geometry_written");
-   u_foreach_bit64(location, ctx.outputs)
-      ctx.current[location] = nir_local_variable_create(impl, glsl_vec4_type(), "geometry_output");
+   ctx.next = nir_local_variable_create(impl, glsl_uint_type(), "geometry_next");
    /* An indirect draw's arguments: the list of every invocation that fits. */
    nir_def *arguments = job_address(b, program, APEX_GS_ARGUMENTS);
    nir_push_if(b, nir_iand(b, address_nonzero(b, arguments),
@@ -986,6 +989,7 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    ctx.vertex_base = nir_imul_imm(b, o, ctx.max_vertices);
    ctx.list = address_add(b, ctx.list, nir_imul_imm(b, o, 4 * ctx.max_primitives * ctx.primitive_vertices));
    nir_store_var(b, ctx.written, zero, 1);
+   nir_store_var(b, ctx.next, zero, 1);
    nir_cf_reinsert(&body, b->cursor);
    /* Unused list primitives index the culled vertex. */
    nir_def *null_index = nir_imul_imm(b, job_imm(b, program, APEX_GS_CAPACITY), ctx.max_vertices);
@@ -999,6 +1003,20 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    nir_pop_loop(b, NULL);
    b->cursor = nir_after_cf_list(&loop->body);
    nir_pop_loop(b, loop);
+   /* A direct draw rasterizes the list of every invocation it bounds; those
+    * past the ones that ran (fewer when a strip restarts) index the culled
+    * vertex. */
+   nir_push_if(b, nir_inot(b, address_nonzero(b, job_address(b, program, APEX_DRAW_INDIRECT))));
+   nir_def *capacity = job_imm(b, program, APEX_GS_CAPACITY), *u;
+   nir_def *list_words = nir_imm_int(b, ctx.max_primitives * ctx.primitive_vertices);
+   nir_def *unused = nir_imul(b, nir_isub(b, capacity, total), list_words);
+   nir_def *first_unused = address_add(b, job_address(b, program, APEX_GS_LIST),
+                                       nir_imul_imm(b, nir_imul(b, total, list_words), 4));
+   nir_loop *fill = invocation_loop(b, program, unused, &u);
+   nir_store_global_2x32(b, nir_imul_imm(b, capacity, ctx.max_vertices),
+                         address_add(b, first_unused, nir_ishl_imm(b, u, 2)), .align_mul = 4);
+   nir_pop_loop(b, fill);
+   nir_pop_if(b, NULL);
    nir_progress(true, impl, nir_metadata_none);
 
    struct util_dynarray list;
@@ -1018,6 +1036,139 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    if (ctx.draw.invalid)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    return apex_program_compile(device, program, nir, NULL);
+}
+
+/* Adds `value` to the u64 at `address`. */
+static void
+add_u64(nir_builder *b, nir_def *address, nir_def *value)
+{
+   nir_def *old = nir_load_global_2x32(b, 2, 32, address, .align_mul = 4);
+   nir_def *lo = nir_iadd(b, nir_channel(b, old, 0), value);
+   nir_def *hi = nir_iadd(b, nir_channel(b, old, 1), nir_b2i32(b, nir_ult(b, lo, value)));
+   nir_store_global_2x32(b, nir_vec2(b, lo, hi), address, .align_mul = 4);
+}
+
+/* The capture program of a geometry shader with transform feedback outputs
+ * (apex_job.h, APEX_GS_XFB_*). After the geometry program, one invocation
+ * walks the index list in invocation order: it counts the emitted
+ * primitives, writes the captured outputs of those that fit every written
+ * buffer from their output records, advances the buffers' offsets and adds
+ * to an active stream query. */
+static VkResult
+build_geometry_capture(struct vk_device *device, const nir_xfb_info *xfb, const struct apex_shader *shader,
+                       struct apex_program *program)
+{
+   const uint64_t outputs = shader->geometry.outputs;
+   for (unsigned o = 0; o < xfb->output_count; o++) {
+      const nir_xfb_output_info *out = &xfb->outputs[o];
+      if (out->data_is_16bit || xfb->buffer_to_stream[out->buffer] || out->location >= 64 ||
+          !(outputs & BITFIELD64_BIT(out->location)))
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   nir_builder builder = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &apex_nir_options,
+                                                        "apex_geometry_capture");
+   nir_builder *b = &builder;
+   nir_shader *nir = b->shader;
+   compute_kernel(nir);
+   if (!apex_program_lower_resources(program, nir)) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   const unsigned n = shader->geometry.primitive_vertices;
+   const unsigned record_bytes = 16 * util_bitcount64(outputs);
+   nir_push_if(b, nir_iand(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0),
+                           nir_ieq_imm(b, nir_channel(b, nir_load_workgroup_id(b), 0), 0)));
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *list = job_address(b, program, APEX_GS_LIST), *output = job_address(b, program, APEX_GS_OUTPUT);
+   nir_def *slots = nir_udiv_imm(b, load_word(b, job_address(b, program, APEX_GS_ARGUMENTS)), n);
+   nir_def *null_index = nir_imul_imm(b, job_imm(b, program, APEX_GS_CAPACITY), shader->geometry.max_vertices);
+   nir_def *state = job_address(b, program, APEX_GS_XFB_STATE);
+   nir_def *query = job_address(b, program, APEX_GS_XFB_QUERY);
+   nir_variable *slot_var = nir_local_variable_create(b->impl, glsl_uint_type(), "capture_slot");
+   nir_variable *count_var = nir_local_variable_create(b->impl, glsl_uint_type(), "capture_count");
+   nir_variable *fit_var = nir_local_variable_create(b->impl, glsl_uint_type(), "capture_fit");
+   /* The emitted primitives: list slots whose first index is a record. */
+   nir_store_var(b, slot_var, zero, 1);
+   nir_store_var(b, count_var, zero, 1);
+   nir_push_loop(b);
+   {
+      nir_def *slot = nir_load_var(b, slot_var);
+      nir_break_if(b, nir_uge(b, slot, slots));
+      nir_def *index = load_word(b, address_add(b, list, nir_imul_imm(b, slot, 4 * n)));
+      nir_def *count = nir_load_var(b, count_var);
+      nir_store_var(b, count_var, nir_bcsel(b, nir_ine(b, index, null_index), nir_iadd_imm(b, count, 1), count),
+                    1);
+      nir_store_var(b, slot_var, nir_iadd_imm(b, slot, 1), 1);
+   }
+   nir_pop_loop(b, NULL);
+   nir_def *needed = nir_load_var(b, count_var);
+   nir_store_var(b, fit_var, zero, 1);
+   nir_push_if(b, address_nonzero(b, state));
+   {
+      /* The primitives that fit every written buffer. */
+      nir_def *bases[APEX_XFB_BUFFERS] = {0}, *offsets[APEX_XFB_BUFFERS] = {0};
+      nir_def *fit = needed;
+      for (unsigned buffer = 0; buffer < APEX_XFB_BUFFERS; buffer++) {
+         if (!(xfb->buffers_written & BITFIELD_BIT(buffer)))
+            continue;
+         nir_def *words = address_add(b, state, nir_imm_int(b, 4 * (APEX_XFB_STATE_BUFFERS + 3 * buffer)));
+         bases[buffer] = nir_load_global_2x32(b, 2, 32, words, .align_mul = 4);
+         offsets[buffer] = load_word(b, address_add(b, state, nir_imm_int(b, 4 * buffer)));
+         nir_def *size = load_word(b, address_add(b, words, nir_imm_int(b, 8)));
+         nir_def *room = nir_udiv_imm(b, nir_isub(b, size, offsets[buffer]), n * xfb->buffers[buffer].stride);
+         fit = nir_umin(b, fit, nir_bcsel(b, nir_ult(b, offsets[buffer], size), room, zero));
+      }
+      nir_store_var(b, fit_var, fit, 1);
+      /* Write them in list order. */
+      nir_store_var(b, slot_var, zero, 1);
+      nir_store_var(b, count_var, zero, 1);
+      nir_push_loop(b);
+      {
+         nir_def *slot = nir_load_var(b, slot_var), *count = nir_load_var(b, count_var);
+         nir_break_if(b, nir_ior(b, nir_uge(b, slot, slots), nir_uge(b, count, fit)));
+         nir_def *entry = address_add(b, list, nir_imul_imm(b, slot, 4 * n));
+         nir_def *emitted = nir_ine(b, load_word(b, entry), null_index);
+         nir_push_if(b, emitted);
+         for (unsigned k = 0; k < n; k++) {
+            nir_def *record = address_add(b, output, nir_imul_imm(b, load_word(b, address_add(b, entry,
+                                                                    nir_imm_int(b, 4 * k))), record_bytes));
+            nir_def *vertex = nir_iadd_imm(b, nir_imul_imm(b, count, n), k);
+            for (unsigned o = 0; o < xfb->output_count; o++) {
+               const nir_xfb_output_info *out = &xfb->outputs[o];
+               unsigned stride = xfb->buffers[out->buffer].stride;
+               nir_def *base = nir_iadd(b, offsets[out->buffer], nir_imul_imm(b, vertex, stride));
+               u_foreach_bit(component, out->component_mask) {
+                  nir_def *value = load_word(b, address_add(b, record,
+                     nir_imm_int(b, 16 * record_slot(outputs, out->location) + 4 * component)));
+                  unsigned byte = out->offset + 4 * util_bitcount(out->component_mask & BITFIELD_MASK(component));
+                  nir_store_global_2x32(b, value, address_add(b, bases[out->buffer], nir_iadd_imm(b, base, byte)),
+                                        .align_mul = 4);
+               }
+            }
+         }
+         nir_pop_if(b, NULL);
+         nir_store_var(b, count_var, nir_iadd(b, count, nir_b2i32(b, emitted)), 1);
+         nir_store_var(b, slot_var, nir_iadd_imm(b, slot, 1), 1);
+      }
+      nir_pop_loop(b, NULL);
+      for (unsigned buffer = 0; buffer < APEX_XFB_BUFFERS; buffer++) {
+         if (!offsets[buffer])
+            continue;
+         nir_store_global_2x32(b, nir_iadd(b, offsets[buffer], nir_imul_imm(b, fit, n * xfb->buffers[buffer].stride)),
+                               address_add(b, state, nir_imm_int(b, 4 * buffer)), .align_mul = 4);
+      }
+   }
+   nir_pop_if(b, NULL);
+   nir_push_if(b, address_nonzero(b, query));
+   add_u64(b, query, nir_load_var(b, fit_var));
+   add_u64(b, address_add(b, query, nir_imm_int(b, 8)), needed);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+   nir_progress(true, b->impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   VkResult result = apex_program_compile(device, program, nir, NULL);
+   ralloc_free(nir);
+   return result;
 }
 
 /* Loads the components of `var` (or its element) from output record slot
@@ -1046,6 +1197,14 @@ copy_record(nir_builder *b, nir_def *record, uint64_t outputs, nir_deref_instr *
                      location + e * slots, component, false);
       return;
    }
+   if (glsl_type_is_struct_or_ifc(type)) {
+      for (unsigned f = 0; f < glsl_get_length(type); f++) {
+         const struct glsl_type *field = glsl_get_struct_field(type, f);
+         copy_record(b, record, outputs, nir_build_deref_struct(b, deref, f), field, location, 0, false);
+         location += glsl_count_attribute_slots(field, false);
+      }
+      return;
+   }
    if (!(outputs & BITFIELD64_BIT(location)) || glsl_get_bit_size(type) != 32)
       return;
    unsigned n = glsl_get_vector_elements(type);
@@ -1059,7 +1218,8 @@ copy_record(nir_builder *b, nir_def *record, uint64_t outputs, nir_deref_instr *
  * culls the vertex past the last record. Job word APEX_GS_OUTPUT and
  * APEX_GS_CAPACITY of its table locate the records. */
 static nir_shader *
-build_passthrough(const nir_shader *geometry, const struct apex_program *program, uint64_t outputs)
+build_passthrough(const nir_shader *geometry, const struct apex_program *program, uint64_t outputs,
+                  uint64_t varyings)
 {
    nir_builder builder = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, &apex_nir_options,
                                                         "apex_passthrough");
@@ -1074,7 +1234,9 @@ build_passthrough(const nir_shader *geometry, const struct apex_program *program
                                  nir_imul_imm(b, nir_bcsel(b, culled, nir_imm_int(b, 0), vertex),
                                               16 * util_bitcount64(outputs)));
    nir_foreach_variable_with_modes(var, geometry, nir_var_shader_out) {
-      if (var->data.location >= 64)
+      unsigned slots = var->data.compact ? 1 : glsl_count_attribute_slots(var->type, false);
+      if (var->data.location >= 64 || (var->data.location >= VARYING_SLOT_VAR0 &&
+          !(varyings & BITFIELD64_RANGE(var->data.location, MIN2(slots, 64 - var->data.location)))))
          continue;
       nir_variable *out = nir_variable_clone(var, nir);
       nir_shader_add_variable(nir, out);
@@ -1271,7 +1433,7 @@ apex_shader_destroy(struct vk_device *device, struct vk_shader *vk,
 {
    struct apex_shader *shader = container_of(vk, struct apex_shader, vk);
    apex_program_finish((struct apex_device *)device, &shader->program);
-   apex_program_finish((struct apex_device *)device, &shader->vertex.capture);
+   apex_program_finish((struct apex_device *)device, &shader->capture);
    apex_program_finish((struct apex_device *)device, &shader->geometry.draw);
    for (unsigned s = 0; s < ARRAY_SIZE(shader->set_layouts); s++)
       if (shader->set_layouts[s])
@@ -1399,8 +1561,8 @@ apex_shader_serialize(struct vk_device *device, const struct vk_shader *vk, stru
    blob_write_uint8(blob, shader->vertex.clip_distances);
    blob_write_uint8(blob, shader->vertex.robust);
    blob_write_uint8(blob, shader->vertex.stores);
-   blob_write_bytes(blob, shader->vertex.xfb_strides, sizeof(shader->vertex.xfb_strides));
-   write_program(blob, &shader->vertex.capture);
+   blob_write_bytes(blob, shader->xfb_strides, sizeof(shader->xfb_strides));
+   write_program(blob, &shader->capture);
    blob_write_uint64(blob, shader->vertex.records);
    write_program(blob, &shader->geometry.draw);
    blob_write_uint32(blob, shader->geometry.stride);
@@ -1512,13 +1674,14 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
       return VK_SUCCESS;
    }
    if (info->stage == MESA_SHADER_GEOMETRY) {
-      /* Transform feedback captures vertex shader outputs only. */
-      if ((nir->xfb_info && nir->xfb_info->output_count) ||
-          !apex_program_layout(&shader->geometry.draw, info->set_layout_count, info->set_layouts,
+      if (!apex_program_layout(&shader->geometry.draw, info->set_layout_count, info->set_layouts,
                                info->push_constant_range_count, info->push_constant_ranges,
                                VK_SHADER_STAGE_ALL_GRAPHICS))
          goto fail;
-      nir_shader *draw = build_passthrough(nir, &shader->geometry.draw, output_slots(nir));
+      const nir_xfb_info *xfb = nir->xfb_info && nir->xfb_info->output_count ? nir->xfb_info : NULL;
+      /* Interface block members are outputs at their own locations. */
+      NIR_PASS(_, nir, nir_split_per_member_structs);
+      nir_shader *draw = build_passthrough(nir, &shader->geometry.draw, output_slots(nir), link.varyings);
       result = build_geometry(device, nir, link.records, &shader->program, shader);
       if (result == VK_SUCCESS) {
          const struct apex_vertex_input none = {0};
@@ -1528,6 +1691,15 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
                   VK_ERROR_FEATURE_NOT_PRESENT;
       }
       ralloc_free(draw);
+      if (result == VK_SUCCESS && xfb) {
+         for (unsigned b = 0; b < APEX_XFB_BUFFERS; b++)
+            if (xfb->buffers_written & BITFIELD_BIT(b))
+               shader->xfb_strides[b] = xfb->buffers[b].stride;
+         result = apex_program_layout(&shader->capture, info->set_layout_count, info->set_layouts,
+                                      info->push_constant_range_count, info->push_constant_ranges,
+                                      VK_SHADER_STAGE_ALL_GRAPHICS) ?
+                  build_geometry_capture(device, xfb, shader, &shader->capture) : VK_ERROR_FEATURE_NOT_PRESENT;
+      }
       if (result != VK_SUCCESS)
          goto fail;
       const uint8_t *header = shader->geometry.draw.code.data;
@@ -1547,7 +1719,7 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
          capture = nir_shader_clone(NULL, nir);
          for (unsigned b = 0; b < APEX_XFB_BUFFERS; b++)
             if (xfb->buffers_written & BITFIELD_BIT(b))
-               shader->vertex.xfb_strides[b] = xfb->buffers[b].stride;
+               shader->xfb_strides[b] = xfb->buffers[b].stride;
       }
       if (!lower_vertex(nir, state, link))
          goto fail;
@@ -1573,11 +1745,11 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
    }
    if (capture) {
       result = VK_ERROR_FEATURE_NOT_PRESENT;
-      if (!apex_program_layout(&shader->vertex.capture, info->set_layout_count, info->set_layouts,
+      if (!apex_program_layout(&shader->capture, info->set_layout_count, info->set_layouts,
                                info->push_constant_range_count, info->push_constant_ranges,
                                VK_SHADER_STAGE_ALL_GRAPHICS))
          goto fail;
-      result = build_capture(device, capture, &vi, &shader->vertex.capture);
+      result = build_capture(device, capture, &vi, &shader->capture);
       if (result != VK_SUCCESS)
          goto fail;
       ralloc_free(capture);
@@ -1653,7 +1825,7 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
 {
    /* Clip and cull distances of the vertex stage reach a fragment stage
     * compiled with it as varyings. */
-   struct link link = {0};
+   struct link link = {.varyings = ~0ull};
    nir_shader *vertex = NULL, *geometry = NULL, *fragment = NULL;
    for (uint32_t i = 0; i < count; i++) {
       if (infos[i].stage == MESA_SHADER_VERTEX)
@@ -1676,6 +1848,20 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
       }
       /* Every record holds a slot. */
       link.records |= BITFIELD64_BIT(VARYING_SLOT_POS);
+   }
+   /* Pipelines are complete (no graphics pipeline libraries), so one
+    * without a fragment stage reads no varyings. */
+   if (fragment) {
+      link.varyings = 0;
+      nir_foreach_variable_with_modes(var, fragment, nir_var_shader_in) {
+         if (var->data.location >= 64)
+            continue;
+         unsigned n = var->data.compact ? DIV_ROUND_UP(glsl_get_length(var->type) + var->data.location_frac, 4) :
+                      glsl_count_attribute_slots(var->type, false);
+         link.varyings |= BITFIELD64_RANGE(var->data.location, MIN2(n, 64 - var->data.location));
+      }
+   } else if (state && !(state->shader_stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
+      link.varyings = 0;
    }
    nir_shader *last = geometry ? geometry : vertex;
    if (last && fragment) {
@@ -1728,8 +1914,8 @@ apex_deserialize(struct vk_device *device, struct blob_reader *blob, uint32_t ve
    shader->vertex.clip_distances = blob_read_uint8(blob);
    shader->vertex.robust = blob_read_uint8(blob);
    shader->vertex.stores = blob_read_uint8(blob);
-   blob_copy_bytes(blob, shader->vertex.xfb_strides, sizeof(shader->vertex.xfb_strides));
-   valid = valid && read_program(blob, &shader->vertex.capture, shader->set_layouts);
+   blob_copy_bytes(blob, shader->xfb_strides, sizeof(shader->xfb_strides));
+   valid = valid && read_program(blob, &shader->capture, shader->set_layouts);
    shader->vertex.records = blob_read_uint64(blob);
    valid = valid && read_program(blob, &shader->geometry.draw, shader->set_layouts);
    shader->geometry.stride = blob_read_uint32(blob);

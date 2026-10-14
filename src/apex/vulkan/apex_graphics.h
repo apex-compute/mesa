@@ -13,16 +13,16 @@ struct apex_shader {
    struct vk_shader vk;
    struct apex_program program;
    struct vk_descriptor_set_layout *set_layouts[MESA_VK_MAX_DESCRIPTOR_SETS];
+   /* The last pre-rasterization stage with transform feedback outputs: the
+    * capture program (code.size nonzero) and each buffer's stride. */
+   struct apex_program capture;
+   uint16_t xfb_strides[4];
    struct {
       /* Output record bytes per vertex and clip distances written; robust
        * vertex input bindings. */
       uint32_t stride;
       uint8_t clip_distances;
       bool robust;
-      /* With transform feedback outputs: the capture program (code.size
-       * nonzero) and each buffer's stride. */
-      struct apex_program capture;
-      uint16_t xfb_strides[4];
       /* Feeding a geometry shader: the input record slots written. */
       uint64_t records;
       /* Stores or atomics to memory, which a pass replayed per region would

@@ -138,6 +138,11 @@
 #define APEX_GS_ARGUMENTS 22          /* draw arguments VA lo, hi; 0 for a direct draw */
 #define APEX_GS_CAPACITY 24           /* geometry invocations whose output fits */
 #define APEX_GS_RECORD_CAPACITY 25    /* input records that fit: instances x the draw's vertex or index count */
+/* Transform feedback of a geometry shader: its capture program reads the
+ * output records and index list through the words above, with the draw
+ * arguments always written. */
+#define APEX_GS_XFB_STATE 26          /* transform feedback state VA lo, hi; 0 when inactive */
+#define APEX_GS_XFB_QUERY 28          /* stream query slot VA lo, hi; 0 without one */
 
 /* Adjacency without a geometry shader: the kernel writes the draw's
  * primitives without their adjacent vertices to a 32-bit index list, as a
