@@ -1855,13 +1855,15 @@ apex_GetDeviceImageSparseMemoryRequirements(VkDevice dev, const VkDeviceImageMem
 }
 
 /* The program uploads once, on first submission, into LOCAL through BAR2;
- * the next batch invalidates instruction caches. */
+ * the next batch invalidates instruction caches. The instruction cache
+ * prefetches three lines past each miss, so 256 executable bytes follow the
+ * code. */
 VkResult
 apex_program_upload(struct apex_device *device, struct apex_program *program)
 {
    if (program->bo.handle)
       return VK_SUCCESS;
-   VkResult result = apex_bo_create(device, program->code.size, APEX_VM_READ | APEX_VM_EXEC, 0, 0,
+   VkResult result = apex_bo_create(device, program->code.size + 256, APEX_VM_READ | APEX_VM_EXEC, 0, 0,
                                &program->bo);
    if (result != VK_SUCCESS)
       return result;
