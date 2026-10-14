@@ -62,7 +62,7 @@ struct drm_apex_vm_bind { /* synchronous */
 struct drm_apex_queue_create {
 	__u64 ring_va;    /* 4 KiB aligned, mapped readable in the file's VM */
 	__u32 ring_bytes; /* power of two, 4 KiB..1 MiB */
-	__u32 priority;   /* 0 normal, 1 high (DRM master or CAP_SYS_NICE) */
+	__u32 priority;   /* 0 normal, 1 high (CAP_SYS_NICE); the DRM master's process always runs high */
 	__u32 queue_id;   /* out */
 	__u32 reserved;
 	__u64 status_va;       /* out: read-only GPUVA of the status page */
