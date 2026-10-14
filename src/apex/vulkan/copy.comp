@@ -1,8 +1,8 @@
 #version 450
-// Element copy between two surfaces (apex_job.h): one invocation per element
-// of a width x height x planes region. Elements of 1 or 2 bytes, and masked
-// elements, merge into their destination word with atomics so neighbouring
-// lanes never overwrite each other.
+// Element copy between two surfaces (apex_job.h): one invocation per run of
+// elements along x of a width x height x planes region. Elements of 1 or 2
+// bytes, and masked elements, merge into their destination word with atomics
+// so neighbouring lanes never overwrite each other.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -17,22 +17,25 @@ uint job(uint i) { return root[APEX_JOB_BASE + i]; }
 void main()
 {
    uvec3 p = gl_GlobalInvocationID;
-   if (p.x >= job(APEX_COPY_EXTENT) || p.y >= job(APEX_COPY_EXTENT + 1u) ||
-       p.z >= job(APEX_COPY_EXTENT + 2u))
+   uint width = job(APEX_COPY_EXTENT), run = job(APEX_COPY_RUN), x = p.x * run;
+   if (x >= width || p.y >= job(APEX_COPY_EXTENT + 1u) || p.z >= job(APEX_COPY_EXTENT + 2u))
       return;
    uint bytes = job(APEX_COPY_BYTES);
-   uint64_t src = surface_address(APEX_COPY_SRC, p.x, p.y, p.z) + job(APEX_COPY_SRC_OFFSET);
-   uint64_t dst = surface_address(APEX_COPY_DST, p.x, p.y, p.z) + job(APEX_COPY_DST_OFFSET);
+   uint64_t src = surface_address(APEX_COPY_SRC, x, p.y, p.z) + job(APEX_COPY_SRC_OFFSET);
+   uint64_t dst = surface_address(APEX_COPY_DST, x, p.y, p.z) + job(APEX_COPY_DST_OFFSET);
    uint mask = job(APEX_COPY_MASK);
    if (bytes >= 4u) {
-      Words from = Words(src), to = Words(dst);
-      for (uint k = 0u; k < bytes / 4u; k++) {
-         uint value = from.w[k];
-         if (k == 0u && mask != ~0u) {
-            atomicAnd(to.w[0], ~mask);
-            atomicOr(to.w[0], value & mask);
-         } else {
-            to.w[k] = value;
+      uint src_step = surface_texel_bytes(APEX_COPY_SRC), dst_step = surface_texel_bytes(APEX_COPY_DST);
+      for (uint e = 0u; e < min(run, width - x); e++) {
+         Words from = Words(src + e * src_step), to = Words(dst + e * dst_step);
+         for (uint k = 0u; k < bytes / 4u; k++) {
+            uint value = from.w[k];
+            if (k == 0u && mask != ~0u) {
+               atomicAnd(to.w[0], ~mask);
+               atomicOr(to.w[0], value & mask);
+            } else {
+               to.w[k] = value;
+            }
          }
       }
       return;

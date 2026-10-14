@@ -1,6 +1,7 @@
 #version 450
-// BC1-BC7 blocks to an image's decoded plane: one invocation per texel. Job
-// words as for ETC2 (apex_job.h). BC1-BC3 and BC7 decode to RGBA8, BC4 and
+// BC1-BC7 blocks to an image's decoded plane: one invocation per 4x4 block,
+// which loads the block once and writes its texels. Job words as for ETC2
+// (apex_job.h). BC1-BC3 and BC7 decode to RGBA8, BC4 and
 // BC5 to 32-bit floats per channel and BC6H to half floats. BC6H and BC7
 // follow Mesa's texcompress_bptc_tmp.h.
 #extension GL_GOOGLE_include_directive : require
@@ -305,32 +306,17 @@ uvec4 bc7(uvec4 b, uint t)
    return result;
 }
 
-void main()
+// Texel t of the block, as its decoded plane's first one or two words.
+uvec2 decode(uint kind, uvec4 raw, uint t)
 {
-   uvec3 p = gl_GlobalInvocationID;
-   if (p.x >= job(APEX_DECODE_EXTENT) || p.y >= job(APEX_DECODE_EXTENT + 1u) ||
-       p.z >= job(APEX_DECODE_EXTENT + 2u))
-      return;
-   uint kind = job(APEX_DECODE_KIND);
    bool narrow = kind == APEX_BC1_RGB || kind == APEX_BC1_RGBA || kind == APEX_BC4 || kind == APEX_BC4_SNORM;
-   uint64_t block = address(APEX_DECODE_SRC) + uint64_t(p.z) * job(APEX_DECODE_SRC_SLICE) +
-                    uint64_t(p.y / 4u) * job(APEX_DECODE_SRC_ROW) + uint64_t(p.x / 4u) * (narrow ? 8u : 16u);
-   Words src = Words(block);
-   uvec4 raw = uvec4(src.w[0], src.w[1], narrow ? 0u : src.w[2], narrow ? 0u : src.w[3]);
-   uint t = (p.y & 3u) * 4u + (p.x & 3u);
-   Words dst = Words(surface_address(APEX_DECODE_DST, p.x, p.y, p.z));
    bool is_signed = kind == APEX_BC4_SNORM || kind == APEX_BC5_SNORM || kind == APEX_BC6H_SFLOAT;
-   if (kind == APEX_BC4 || kind == APEX_BC4_SNORM || kind == APEX_BC5 || kind == APEX_BC5_SNORM) {
-      dst.w[0] = floatBitsToUint(bc4(raw.xy, t, is_signed));
-      if (!narrow)
-         dst.w[1] = floatBitsToUint(bc4(raw.zw, t, is_signed));
-      return;
-   }
+   if (kind == APEX_BC4 || kind == APEX_BC4_SNORM || kind == APEX_BC5 || kind == APEX_BC5_SNORM)
+      return uvec2(floatBitsToUint(bc4(raw.xy, t, is_signed)),
+                   narrow ? 0u : floatBitsToUint(bc4(raw.zw, t, is_signed)));
    if (kind == APEX_BC6H_UFLOAT || kind == APEX_BC6H_SFLOAT) {
       uvec3 rgb = bc6(raw, t, is_signed);
-      dst.w[0] = rgb.r | (rgb.g << 16u);
-      dst.w[1] = rgb.b | (0x3c00u << 16u);
-      return;
+      return uvec2(rgb.r | (rgb.g << 16u), rgb.b | (0x3c00u << 16u));
    }
    uvec4 bytes;
    if (kind == APEX_BC7) {
@@ -344,5 +330,31 @@ void main()
          color.a = bc4(raw.xy, t, false);
       bytes = uvec4(round(clamp(color, 0.0, 1.0) * 255.0));
    }
-   dst.w[0] = bytes.r | (bytes.g << 8u) | (bytes.b << 16u) | (bytes.a << 24u);
+   return uvec2(bytes.r | (bytes.g << 8u) | (bytes.b << 16u) | (bytes.a << 24u), 0u);
+}
+
+void main()
+{
+   uvec3 p = gl_GlobalInvocationID;
+   uvec3 extent = uvec3(job(APEX_DECODE_EXTENT), job(APEX_DECODE_EXTENT + 1u), job(APEX_DECODE_EXTENT + 2u));
+   if (p.x * 4u >= extent.x || p.y * 4u >= extent.y || p.z >= extent.z)
+      return;
+   uint kind = job(APEX_DECODE_KIND);
+   bool narrow = kind == APEX_BC1_RGB || kind == APEX_BC1_RGBA || kind == APEX_BC4 || kind == APEX_BC4_SNORM;
+   bool wide = kind == APEX_BC5 || kind == APEX_BC5_SNORM || kind == APEX_BC6H_UFLOAT || kind == APEX_BC6H_SFLOAT;
+   Words src = Words(address(APEX_DECODE_SRC) + uint64_t(p.z) * job(APEX_DECODE_SRC_SLICE) +
+                     uint64_t(p.y) * job(APEX_DECODE_SRC_ROW) + uint64_t(p.x) * (narrow ? 8u : 16u));
+   uvec4 raw = uvec4(src.w[0], src.w[1], narrow ? 0u : src.w[2], narrow ? 0u : src.w[3]);
+   /* A block's row of four texels lies a texel apart in the plane. */
+   uint step = surface_texel_bytes(APEX_DECODE_DST);
+   for (uint row = 0u; row < 4u && p.y * 4u + row < extent.y; row++) {
+      uint64_t line = surface_address(APEX_DECODE_DST, p.x * 4u, p.y * 4u + row, p.z);
+      for (uint col = 0u; col < 4u && p.x * 4u + col < extent.x; col++) {
+         uvec2 texel = decode(kind, raw, row * 4u + col);
+         Words dst = Words(line + col * step);
+         dst.w[0] = texel.x;
+         if (wide)
+            dst.w[1] = texel.y;
+      }
+   }
 }

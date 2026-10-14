@@ -1906,7 +1906,13 @@ copy_surfaces(struct apex_command_buffer *cmd, const uint32_t src[APEX_SURFACE_W
    words[APEX_COPY_SRC_OFFSET] = src_offset;
    words[APEX_COPY_DST_OFFSET] = dst_offset;
    words[APEX_COPY_MASK] = mask;
-   internal_dispatch(cmd, APEX_INTERNAL_COPY, words, (uint32_t[3]){DIV_ROUND_UP(width, 32), height, planes}, 0, false);
+   /* Four elements along x per invocation where they lie a texel apart. */
+   bool run4 = bytes >= 4 && mask == ~0u &&
+               (!(src[APEX_SURFACE_FLAGS] & APEX_SURFACE_TILED) || !(src[APEX_SURFACE_ORIGIN] & 3)) &&
+               (!(dst[APEX_SURFACE_FLAGS] & APEX_SURFACE_TILED) || !(dst[APEX_SURFACE_ORIGIN] & 3));
+   words[APEX_COPY_RUN] = run4 ? 4 : 1;
+   internal_dispatch(cmd, APEX_INTERNAL_COPY, words,
+                     (uint32_t[3]){DIV_ROUND_UP(width, run4 ? 128 : 32), height, planes}, 0, false);
 }
 
 /* Element of one aspect within a texel: byte offset, bytes and the bits of
@@ -2058,8 +2064,13 @@ record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, u
    words[APEX_DECODE_EXTENT + 1] = height;
    words[APEX_DECODE_EXTENT + 2] = layers;
    words[APEX_DECODE_KIND] = kind;
-   internal_dispatch(cmd, kind >= APEX_BC1_RGB ? APEX_INTERNAL_BC : APEX_INTERNAL_ETC2, words,
-                     (uint32_t[3]){DIV_ROUND_UP(width, 32), height, layers}, 0, false);
+   /* The BC kernel takes a block per invocation, the ETC2 kernel a texel. */
+   if (kind >= APEX_BC1_RGB)
+      internal_dispatch(cmd, APEX_INTERNAL_BC, words,
+                        (uint32_t[3]){DIV_ROUND_UP(width, 128), DIV_ROUND_UP(height, 4), layers}, 0, false);
+   else
+      internal_dispatch(cmd, APEX_INTERNAL_ETC2, words,
+                        (uint32_t[3]){DIV_ROUND_UP(width, 32), height, layers}, 0, false);
 }
 
 /* The clear kernel over layers x rect of one level: pattern and mask

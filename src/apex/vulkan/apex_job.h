@@ -24,10 +24,12 @@
 #define APEX_SURFACE_WORDS 8
 #define APEX_SURFACE_TILED 1u
 
-/* Copy: one invocation per element of a width x height x planes region.
- * An element is `bytes` (1, 2, 4, 8 or 16) bytes at a byte offset within
- * each side's texel; the destination keeps bits outside `mask` (elements of
- * at most 4 bytes; ~0 otherwise). */
+/* Copy: one invocation per run of `run` (1 or 4) elements along x of a
+ * width x height x planes region. An element is `bytes` (1, 2, 4, 8 or 16)
+ * bytes at a byte offset within each side's texel; the destination keeps
+ * bits outside `mask` (elements of at most 4 bytes; ~0 otherwise). Runs of 4
+ * need whole-word elements, no mask and tiled sides whose x origin is a
+ * multiple of 4, where four elements along x lie a texel apart. */
 #define APEX_COPY_SRC 0
 #define APEX_COPY_DST 8
 #define APEX_COPY_EXTENT 16           /* width, height, planes */
@@ -35,6 +37,7 @@
 #define APEX_COPY_SRC_OFFSET 20
 #define APEX_COPY_DST_OFFSET 21
 #define APEX_COPY_MASK 22
+#define APEX_COPY_RUN 23
 
 /* Clear: one invocation per texel of a width x height x planes region; the
  * pattern's bits under the mask replace the texel's. */
@@ -44,8 +47,9 @@
 #define APEX_CLEAR_PATTERN 12         /* packed texel, 4 words */
 #define APEX_CLEAR_MASK 16            /* texel bits to write, 4 words */
 
-/* ETC2/EAC and BC decode: one invocation per texel of a width x height x
- * layers region, from its first block to the decoded plane. */
+/* ETC2/EAC and BC decode of a width x height x layers region, from its first
+ * block to the decoded plane: one ETC2/EAC invocation per texel, one BC
+ * invocation per block. */
 #define APEX_DECODE_DST 0             /* decoded plane surface */
 #define APEX_DECODE_SRC 8             /* first block VA lo, hi */
 #define APEX_DECODE_SRC_ROW 10        /* bytes per block row */

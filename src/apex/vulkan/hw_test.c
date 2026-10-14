@@ -549,7 +549,7 @@ test_descriptors(void)
 
 /* The internal copy kernel, compiled by p7-isa and run on the ISA model,
  * copies a linear buffer into a tiled image surface at the offsets of
- * apex_hw_texel_offset. */
+ * apex_hw_texel_offset, an element or a run of four per invocation. */
 static void
 test_copy_kernel(struct apex_device *device)
 {
@@ -562,17 +562,19 @@ test_copy_kernel(struct apex_device *device)
    uint32_t *src = malloc(width * height * bytes), *dst = calloc(1, layout.size);
    for (unsigned i = 0; i < width * height; i++)
       src[i] = 0x9e3779b9u * (i + 1);
+   for (unsigned run = 1; run <= 4; run += 3) {
+   memset(dst, 0, layout.size);
    uint32_t table[8 + APEX_TRAILER_WORDS + APEX_JOB_WORDS] = {0};
    table[3] = 1; /* robust sentinel row */
    uint32_t *grid = &table[8], *job = &table[APEX_JOB_BASE];
-   grid[0] = DIV_ROUND_UP(width, 32), grid[1] = height, grid[2] = 1;
+   grid[0] = DIV_ROUND_UP(width, 32 * run), grid[1] = height, grid[2] = 1;
    uint32_t *s = &job[APEX_COPY_SRC], *t = &job[APEX_COPY_DST];
    s[APEX_SURFACE_VA] = src_va, s[APEX_SURFACE_FLAGS] = 1 << 4, s[APEX_SURFACE_PITCH] = width * bytes;
    s[APEX_SURFACE_TEXEL] = bytes;
    t[APEX_SURFACE_VA] = dst_va, t[APEX_SURFACE_FLAGS] = APEX_SURFACE_TILED | 2 << 1 | 1 << 4;
    t[APEX_SURFACE_PITCH] = layout.level[0].pitch, t[APEX_SURFACE_TEXEL] = bytes;
    job[APEX_COPY_EXTENT] = width, job[APEX_COPY_EXTENT + 1] = height, job[APEX_COPY_EXTENT + 2] = 1;
-   job[APEX_COPY_BYTES] = bytes, job[APEX_COPY_MASK] = ~0u;
+   job[APEX_COPY_BYTES] = bytes, job[APEX_COPY_MASK] = ~0u, job[APEX_COPY_RUN] = run;
    struct apex_sim_region regions[] = {
       {table_va, table, sizeof(table)}, {src_va, src, width * height * bytes}, {dst_va, dst, layout.size},
    };
@@ -585,6 +587,7 @@ test_copy_kernel(struct apex_device *device)
    for (unsigned y = 0; y < height; y++)
       for (unsigned x = 0; x < width; x++)
          CHECK(dst[apex_hw_texel_offset(&layout, 0, 0, 0, x, y) / 4] == src[y * width + x]);
+   }
    free(src);
    free(dst);
    puts("PASS copy kernel on the ISA model: a linear buffer into the tiled layout");
