@@ -416,7 +416,7 @@ test_layout(void)
    static const unsigned sizes[5] = {1, 2, 4, 8, 16};
    for (unsigned s = 0; s < 5; s++) {
       struct apex_hw_layout layout;
-      apex_hw_layout_init(&layout, sizes[s], false, (VkExtent3D){100, 70, 1}, 3, 5, 1, true);
+      apex_hw_layout_init(&layout, sizes[s], (VkExtent2D){1, 1}, false, (VkExtent3D){100, 70, 1}, 3, 5, 1, true);
       CHECK(apex_hw_tile_width(sizes[s]) * apex_hw_tile_height(sizes[s]) * sizes[s] == 4096);
       for (unsigned y = 0; y < 70; y += 3)
          for (unsigned x = 0; x < 100; x++)
@@ -431,15 +431,15 @@ test_layout(void)
    }
    /* Samples and 3D slices are consecutive planes of a level. */
    struct apex_hw_layout ms;
-   apex_hw_layout_init(&ms, 4, false, (VkExtent3D){64, 64, 1}, 1, 1, 4, true);
+   apex_hw_layout_init(&ms, 4, (VkExtent2D){1, 1}, false, (VkExtent3D){64, 64, 1}, 1, 1, 4, true);
    CHECK(ms.level[0].pitch == 2 && ms.level[0].plane == 4 * 4096 && ms.size == 4 * 4 * 4096);
    CHECK(apex_hw_texel_offset(&ms, 0, 0, 3, 0, 0) == 3 * 4 * 4096);
    struct apex_hw_layout volume;
-   apex_hw_layout_init(&volume, 2, true, (VkExtent3D){64, 32, 8}, 2, 1, 1, true);
+   apex_hw_layout_init(&volume, 2, (VkExtent2D){1, 1}, true, (VkExtent3D){64, 32, 8}, 2, 1, 1, true);
    CHECK(volume.level[0].plane == 4096 && volume.level[1].offset == 8 * 4096 && volume.level[1].depth == 4);
    /* Linear levels: 64-byte aligned rows. */
    struct apex_hw_layout linear;
-   apex_hw_layout_init(&linear, 3, false, (VkExtent3D){30, 10, 1}, 1, 1, 1, false);
+   apex_hw_layout_init(&linear, 3, (VkExtent2D){1, 1}, false, (VkExtent3D){30, 10, 1}, 1, 1, 1, false);
    CHECK(linear.level[0].pitch == 128 && apex_hw_texel_offset(&linear, 0, 0, 0, 5, 2) == 2 * 128 + 15);
    puts("PASS tiled layout: Morton blocks and sub-blocks at every texel size, levels, layers, planes");
 }
@@ -553,7 +553,7 @@ test_copy_kernel(struct apex_device *device)
    CHECK(apex_internal_program(device, APEX_INTERNAL_COPY, &copy) == VK_SUCCESS);
    const unsigned width = 40, height = 9, bytes = 4;
    struct apex_hw_layout layout;
-   apex_hw_layout_init(&layout, bytes, false, (VkExtent3D){width, height, 1}, 1, 1, 1, true);
+   apex_hw_layout_init(&layout, bytes, (VkExtent2D){1, 1}, false, (VkExtent3D){width, height, 1}, 1, 1, 1, true);
    const uint64_t table_va = 0x100000, src_va = 0x200000, dst_va = 0x400000;
    uint32_t *src = malloc(width * height * bytes), *dst = calloc(1, layout.size);
    for (unsigned i = 0; i < width * height; i++)

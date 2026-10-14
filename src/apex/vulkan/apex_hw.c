@@ -181,8 +181,8 @@ apex_hw_tile_height(unsigned bytes)
 }
 
 void
-apex_hw_layout_init(struct apex_hw_layout *layout, unsigned bytes, bool three_d, VkExtent3D extent,
-                    unsigned levels, unsigned layers, unsigned samples, bool tiled)
+apex_hw_layout_init(struct apex_hw_layout *layout, unsigned bytes, VkExtent2D block, bool three_d,
+                    VkExtent3D extent, unsigned levels, unsigned layers, unsigned samples, bool tiled)
 {
    memset(layout, 0, sizeof(*layout));
    layout->tiled = tiled;
@@ -193,8 +193,8 @@ apex_hw_layout_init(struct apex_hw_layout *layout, unsigned bytes, bool three_d,
    uint64_t offset = 0;
    for (unsigned l = 0; l < levels; l++) {
       struct apex_hw_level *level = &layout->level[l];
-      level->width = u_minify(extent.width, l);
-      level->height = u_minify(extent.height, l);
+      level->width = DIV_ROUND_UP(u_minify(extent.width, l), block.width);
+      level->height = DIV_ROUND_UP(u_minify(extent.height, l), block.height);
       level->depth = three_d ? u_minify(extent.depth, l) : 1;
       unsigned planes = three_d ? level->depth : samples;
       if (tiled) {

@@ -711,16 +711,14 @@ image_layout(const VkImageCreateInfo *info, struct apex_image *image)
    bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
    bool tiled = info->tiling == VK_IMAGE_TILING_OPTIMAL && bw == 1 && bh == 1 &&
                 util_is_power_of_two_nonzero(bytes) && bytes <= 16;
-   const VkExtent3D blocks = {DIV_ROUND_UP(info->extent.width, bw), DIV_ROUND_UP(info->extent.height, bh),
-                              info->extent.depth};
-   apex_hw_layout_init(&image->layout, bytes, three_d, blocks, info->mipLevels, info->arrayLayers,
-                       info->samples, tiled);
+   apex_hw_layout_init(&image->layout, bytes, (VkExtent2D){bw, bh}, three_d, info->extent, info->mipLevels,
+                       info->arrayLayers, info->samples, tiled);
    VkDeviceSize size = image->layout.size;
    image->decoded = 0;
    VkFormat decoded = apex_decoded_format(format, NULL);
    if (decoded) {
-      apex_hw_layout_init(&image->decoded_layout, vk_format_get_blocksize(decoded), three_d, info->extent,
-                          info->mipLevels, info->arrayLayers, 1, true);
+      apex_hw_layout_init(&image->decoded_layout, vk_format_get_blocksize(decoded), (VkExtent2D){1, 1}, three_d,
+                          info->extent, info->mipLevels, info->arrayLayers, 1, true);
       image->decoded = align64(size, APEX_HW_TILE);
       size = image->decoded + image->decoded_layout.size;
    }

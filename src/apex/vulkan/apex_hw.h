@@ -73,10 +73,10 @@ struct apex_hw_layout {
 /* Tile width and height in texels of a texel size (1, 2, 4, 8, 16 bytes). */
 unsigned apex_hw_tile_width(unsigned bytes);
 unsigned apex_hw_tile_height(unsigned bytes);
-/* `extent` in texels (blocks for compressed formats); 3D images keep their
- * slices as planes. */
-void apex_hw_layout_init(struct apex_hw_layout *layout, unsigned bytes, bool three_d, VkExtent3D extent,
-                         unsigned levels, unsigned layers, unsigned samples, bool tiled);
+/* `extent` in texels; levels hold `block` texels per element of `bytes`
+ * (compressed formats) and 3D images keep their slices as planes. */
+void apex_hw_layout_init(struct apex_hw_layout *layout, unsigned bytes, VkExtent2D block, bool three_d,
+                         VkExtent3D extent, unsigned levels, unsigned layers, unsigned samples, bool tiled);
 /* Byte offset of texel (x, y) of `plane` (sample or 3D slice) of `level` in
  * `layer`. */
 uint64_t apex_hw_texel_offset(const struct apex_hw_layout *layout, unsigned level, unsigned layer,
