@@ -476,12 +476,33 @@ surface_words(const struct apex_hw_surface *s, uint32_t w[3])
    w[2] = s->layer_stride;
 }
 
+/* Planes: color attachments in order, 16-byte texels on even planes, then
+ * the depth-stencil attachment. */
+static unsigned
+pass_planes(const struct apex_hw_pass *pass)
+{
+   unsigned plane = 0;
+   for (unsigned k = 0; k <= APEX_HW_MAX_COLOR; k++) {
+      const struct apex_hw_attachment *a = &pass->attachment[k];
+      if (!a->present)
+         continue;
+      if (a->planes == 2)
+         plane = align(plane, 2);
+      plane += a->planes;
+   }
+   return plane;
+}
+
+int
+apex_hw_pass_selector(const struct apex_hw_pass *pass)
+{
+   return apex_hw_tile_selector(pass->samples, pass_planes(pass));
+}
+
 bool
 apex_hw_pass_record(struct apex_hw_pass *pass, uint32_t out[APEX_HW_PASS_DWORDS])
 {
    memset(out, 0, APEX_HW_PASS_DWORDS * 4);
-   /* Planes: color attachments in order, 16-byte texels on even planes,
-    * then the depth-stencil attachment. */
    unsigned plane = 0;
    for (unsigned k = 0; k <= APEX_HW_MAX_COLOR; k++) {
       struct apex_hw_attachment *a = &pass->attachment[k];

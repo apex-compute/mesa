@@ -197,6 +197,8 @@ struct apex_hw_pass {
 int apex_hw_tile_selector(unsigned samples, unsigned planes);
 unsigned apex_hw_selector_width(unsigned selector);
 unsigned apex_hw_selector_height(unsigned selector);
+/* The tile size selector of a pass, or -1 when no tile fits. */
+int apex_hw_pass_selector(const struct apex_hw_pass *pass);
 /* Writes the pass record; false when the raster back end would reject it
  * (apex_hw_pass_valid). */
 bool apex_hw_pass_record(struct apex_hw_pass *pass, uint32_t out[APEX_HW_PASS_DWORDS]);

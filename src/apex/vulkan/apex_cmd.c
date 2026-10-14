@@ -724,36 +724,94 @@ load_of(VkAttachmentLoadOp op)
           op == VK_ATTACHMENT_LOAD_OP_CLEAR ? APEX_HW_CLEAR : APEX_HW_LOAD_DONT_CARE;
 }
 
-/* SET_STATE of the pass record, then BEGIN_PASS. Every pass bins into the
+/* Region `index` of the pass's render area and the region count: bands of
+ * whole tile rows, or runs of tiles along one row when a row alone takes
+ * more bins than the raster back end. */
+static unsigned
+pass_region(const struct apex_hw_pass *pass, unsigned index, struct apex_hw_pass *region)
+{
+   *region = *pass;
+   int selector = apex_hw_pass_selector(pass);
+   if (selector < 0 || pass->x1 <= pass->x0 || pass->y1 <= pass->y0)
+      return 1;
+   unsigned tw = apex_hw_selector_width(selector), th = apex_hw_selector_height(selector);
+   unsigned columns = (pass->x1 - 1) / tw - pass->x0 / tw + 1, rows = (pass->y1 - 1) / th - pass->y0 / th + 1;
+   unsigned tiles = MAX2(APEX_HW_MAX_BINS / MAX2(pass->layers, 1), 1);
+   if ((uint64_t)columns * rows <= tiles)
+      return 1;
+   unsigned band = columns <= tiles ? tiles / columns : 1, run = columns <= tiles ? columns : tiles;
+   unsigned per_row = DIV_ROUND_UP(columns, run), count = DIV_ROUND_UP(rows, band) * per_row;
+   unsigned row = index / per_row * band, column = index % per_row * run;
+   unsigned tx0 = pass->x0 / tw + column, ty0 = pass->y0 / th + row;
+   region->x0 = MAX2(pass->x0, tx0 * tw);
+   region->y0 = MAX2(pass->y0, ty0 * th);
+   region->x1 = MIN2(pass->x1, (tx0 + run) * tw);
+   region->y1 = MIN2(pass->y1, (ty0 + band) * th);
+   return count;
+}
+
+/* SET_STATE of a pass record, then BEGIN_PASS. Every pass bins into the
  * queue's one bin pool, so the pass waits for the raster phases of the
  * passes before it. */
-static void
-emit_pass(struct apex_command_buffer *cmd)
+static bool
+begin_region(struct apex_command_buffer *cmd, unsigned index)
 {
-   struct apex_device *device = (void *)cmd->vk.base.device;
-   struct apex_hw_pass *pass = &cmd->rendering.pass;
-   pass->pool = device->queues[0].bin_pool.va;
-   pass->pool_bytes = APEX_BIN_POOL_BYTES;
-   pass->draw_bytes = APEX_POOL_DRAW_BYTES;
-   pass->vertex_bytes = APEX_POOL_VERTEX_BYTES;
-   pass->primitive_bytes = APEX_POOL_PRIMITIVE_BYTES;
+   struct apex_hw_pass region;
+   pass_region(&cmd->rendering.pass, index, &region);
    uint32_t record[APEX_HW_PASS_DWORDS];
-   if (!apex_hw_pass_record(pass, record)) {
+   if (!apex_hw_pass_record(&region, record)) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
+      return false;
    }
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, 0);
    apex_cp_set_state(&cmd->ib, APEX_STATE_PASS, APEX_HW_PASS_DWORDS, record);
    apex_cp_begin_pass(&cmd->ib);
    begin_work(cmd, APEX_CP_CLASS_GRAPHICS);
-   cmd->rendering.active = true;
+   return true;
 }
 
-/* END_PASS, then the availability of the queries the pass ended. */
+/* Begins a pass in its first region. With more regions, the body's first
+ * draw emits every state group, so each replay starts from it. */
+static void
+emit_pass(struct apex_command_buffer *cmd)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   struct apex_hw_pass *pass = &cmd->rendering.pass, region;
+   pass->pool = device->queues[0].bin_pool.va;
+   pass->pool_bytes = APEX_BIN_POOL_BYTES;
+   pass->draw_bytes = APEX_POOL_DRAW_BYTES;
+   pass->vertex_bytes = APEX_POOL_VERTEX_BYTES;
+   pass->primitive_bytes = APEX_POOL_PRIMITIVE_BYTES;
+   cmd->rendering.regions = pass_region(pass, 0, &region);
+   if (!begin_region(cmd, 0))
+      return;
+   cmd->rendering.active = true;
+   if (cmd->rendering.regions > 1) {
+      cmd->state.emitted = false;
+      cmd->rendering.body = cmd->ib.count;
+      cmd->rendering.body_predicate_va = cmd->predicate.on ? cmd->predicate.va : 0;
+      cmd->rendering.body_predicate_flags = cmd->predicate.on ? APEX_CP_PREDICATE_ENABLE |
+         (cmd->predicate.inverted ? APEX_CP_PREDICATE_INVERTED : 0) : 0;
+   }
+}
+
+/* END_PASS, each further region replaying the body, then the availability
+ * of the queries the pass ended. */
 static void
 end_pass(struct apex_command_buffer *cmd)
 {
+   uint32_t body = cmd->rendering.body, end = cmd->ib.count;
    apex_cp_end_pass(&cmd->ib);
+   for (unsigned r = 1; r < cmd->rendering.regions; r++) {
+      if (!begin_region(cmd, r))
+         break;
+      if (end > body) {
+         apex_cp_predicate(&cmd->ib, cmd->rendering.body_predicate_va, cmd->rendering.body_predicate_flags);
+         add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_IB, .offset = body});
+         apex_cp_indirect(&cmd->ib, 0, end - body);
+      }
+      apex_cp_end_pass(&cmd->ib);
+   }
    cmd->rendering.active = false;
    util_dynarray_foreach(&cmd->pass_availability, uint64_t, va)
       apex_cp_write(&cmd->ib, *va, APEX_CP_AFTER_PRIOR_WORK, 1, (uint32_t[1]){1});
@@ -2401,6 +2459,8 @@ apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
       case APEX_PATCH_SCRATCH:
          target = va + scratch_offset + patch->offset;
          break;
+      case APEX_PATCH_IB:
+         target = va + ib_offset + patch->offset * 4;
          break;
       default:
          target = va + patch->offset;

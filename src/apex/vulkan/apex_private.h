@@ -122,6 +122,7 @@ enum apex_patch_kind {
    APEX_PATCH_PROGRAM,   /* an uploaded program */
    APEX_PATCH_DATA,      /* an offset in the command buffer's data */
    APEX_PATCH_SCRATCH,   /* an offset in the command buffer's scratch */
+   APEX_PATCH_IB,        /* a dword of the command buffer's IB */
 };
 struct apex_patch {
    uint32_t dword;
@@ -211,6 +212,12 @@ struct apex_command_buffer {
       struct apex_attachment color[APEX_HW_MAX_COLOR], depth;
       bool has_depth, has_stencil;
       struct apex_hw_pass pass;
+      /* A pass of more bins than the raster back end takes renders in
+       * `regions` regions: the first records the body from IB dword `body`
+       * on, the others replay it after restoring the predicate packet's
+       * state at its start. */
+      uint32_t regions, body, body_predicate_flags;
+      uint64_t body_predicate_va;
    } rendering;
 };
 
