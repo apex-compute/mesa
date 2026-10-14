@@ -405,7 +405,9 @@ apex_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *info,
       vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
    if (external && (external->handleTypes & ~APEX_EXTERNAL_MEMORY_TYPES))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   if (info->flags || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+   /* Both queue families see the same coherent memory, so concurrent
+    * sharing needs nothing beyond exclusive. */
+   if (info->flags ||
        (vk_buffer_usage_flags(info) & ~(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
