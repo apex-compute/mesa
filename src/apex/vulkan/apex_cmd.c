@@ -719,11 +719,19 @@ load_of(VkAttachmentLoadOp op)
           op == VK_ATTACHMENT_LOAD_OP_CLEAR ? APEX_HW_CLEAR : APEX_HW_LOAD_DONT_CARE;
 }
 
+/* Bins of a region of a normal-priority pass. Each region ends at a yield
+ * point, so a compositor's pass waits for one region of another queue's pass
+ * rather than all of it: 32 tiles of the desktop frame raster in about 2 ms. */
+#define APEX_REGION_BINS 32u
+/* Vertices the further regions of a pass may process again in all, about
+ * 2 ms of geometry. */
+#define APEX_REPLAY_VERTICES 32768u
+
 /* Region `index` of the pass's render area and the region count: bands of
  * whole tile rows, or runs of tiles along one row when a row alone takes
- * more bins than the raster back end. */
+ * more than `bins` bins (at most the raster back end's). */
 static unsigned
-pass_region(const struct apex_hw_pass *pass, unsigned index, struct apex_hw_pass *region)
+pass_region(const struct apex_hw_pass *pass, unsigned bins, unsigned index, struct apex_hw_pass *region)
 {
    *region = *pass;
    int selector = apex_hw_pass_selector(pass);
@@ -731,7 +739,7 @@ pass_region(const struct apex_hw_pass *pass, unsigned index, struct apex_hw_pass
       return 1;
    unsigned tw = apex_hw_selector_width(selector), th = apex_hw_selector_height(selector);
    unsigned columns = (pass->x1 - 1) / tw - pass->x0 / tw + 1, rows = (pass->y1 - 1) / th - pass->y0 / th + 1;
-   unsigned tiles = MAX2(APEX_HW_MAX_BINS / MAX2(pass->layers, 1), 1);
+   unsigned tiles = MAX2(MIN2(bins, APEX_HW_MAX_BINS) / MAX2(pass->layers, 1), 1);
    if ((uint64_t)columns * rows <= tiles)
       return 1;
    unsigned band = columns <= tiles ? tiles / columns : 1, run = columns <= tiles ? columns : tiles;
@@ -752,7 +760,7 @@ static bool
 begin_region(struct apex_command_buffer *cmd, unsigned index)
 {
    struct apex_hw_pass region;
-   pass_region(&cmd->rendering.pass, index, &region);
+   pass_region(&cmd->rendering.pass, cmd->rendering.region_bins, index, &region);
    uint32_t record[APEX_HW_PASS_DWORDS];
    if (!apex_hw_pass_record(&region, record)) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -767,8 +775,9 @@ begin_region(struct apex_command_buffer *cmd, unsigned index)
    return true;
 }
 
-/* Begins a pass in its first region. With more regions, the body's first
- * draw emits every state group, so each replay starts from it. */
+/* Begins a pass in its first region. The body's first draw emits every
+ * state group, so a replay in a further region starts from it; end_pass()
+ * decides the regions once the body is known. */
 static void
 emit_pass(struct apex_command_buffer *cmd)
 {
@@ -779,17 +788,26 @@ emit_pass(struct apex_command_buffer *cmd)
    pass->draw_bytes = APEX_POOL_DRAW_BYTES;
    pass->vertex_bytes = APEX_POOL_VERTEX_BYTES;
    pass->primitive_bytes = APEX_POOL_PRIMITIVE_BYTES;
-   cmd->rendering.regions = pass_region(pass, 0, &region);
+   cmd->rendering.region_bins = APEX_HW_MAX_BINS;
+   cmd->rendering.regions = pass_region(pass, APEX_HW_MAX_BINS, 0, &region);
    if (!begin_region(cmd, 0))
       return;
    cmd->rendering.active = true;
-   if (cmd->rendering.regions > 1) {
-      cmd->state.emitted = false;
-      cmd->rendering.body = cmd->ib.count;
-      cmd->rendering.body_predicate_va = cmd->predicate.on ? cmd->predicate.va : 0;
-      cmd->rendering.body_predicate_flags = cmd->predicate.on ? APEX_CP_PREDICATE_ENABLE |
-         (cmd->predicate.inverted ? APEX_CP_PREDICATE_INVERTED : 0) : 0;
-   }
+   cmd->state.emitted = false;
+   cmd->rendering.body = cmd->ib.count;
+   cmd->rendering.body_predicate_va = cmd->predicate.on ? cmd->predicate.va : 0;
+   cmd->rendering.body_predicate_flags = cmd->predicate.on ? APEX_CP_PREDICATE_ENABLE |
+      (cmd->predicate.inverted ? APEX_CP_PREDICATE_INVERTED : 0) : 0;
+}
+
+/* Rewrites the first region's pass record in place. */
+static void
+rewrite_first_region(struct apex_command_buffer *cmd)
+{
+   struct apex_hw_pass region;
+   pass_region(&cmd->rendering.pass, cmd->rendering.region_bins, 0, &region);
+   if (!cmd->ib.failed)
+      apex_hw_pass_record(&region, cmd->ib.words + cmd->rendering.record);
 }
 
 /* END_PASS, each further region replaying the body, then the availability
@@ -797,6 +815,23 @@ emit_pass(struct apex_command_buffer *cmd)
 static void
 end_pass(struct apex_command_buffer *cmd)
 {
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   struct apex_hw_pass region;
+   /* A normal-priority queue's pass renders in regions of APEX_REGION_BINS
+    * bins, or larger ones when the replayed geometry would exceed
+    * APEX_REPLAY_VERTICES, unless replaying its body would change its
+    * results. */
+   if (!cmd->rendering.whole && !device->queues[0].priority) {
+      uint64_t limit = 1 + APEX_REPLAY_VERTICES / MAX2(cmd->rendering.vertices, 1);
+      unsigned bins = APEX_REGION_BINS, regions;
+      while ((regions = pass_region(&cmd->rendering.pass, bins, 0, &region)) > limit && bins < APEX_HW_MAX_BINS)
+         bins *= 2;
+      if (regions > cmd->rendering.regions && regions <= limit) {
+         cmd->rendering.region_bins = bins;
+         cmd->rendering.regions = regions;
+         rewrite_first_region(cmd);
+      }
+   }
    uint32_t body = cmd->rendering.body, end = cmd->ib.count;
    apex_cp_end_pass(&cmd->ib);
    for (unsigned r = 1; r < cmd->rendering.regions; r++) {
@@ -826,14 +861,12 @@ end_pass(struct apex_command_buffer *cmd)
 static void
 split_pass(struct apex_command_buffer *cmd)
 {
-   struct apex_hw_pass pass = cmd->rendering.pass, region;
+   struct apex_hw_pass pass = cmd->rendering.pass;
    for (unsigned k = 0; k < ARRAY_SIZE(pass.attachment); k++) {
       cmd->rendering.pass.attachment[k].store |= pass.attachment[k].present;
       cmd->rendering.pass.attachment[k].resolve = false;
    }
-   pass_region(&cmd->rendering.pass, 0, &region);
-   if (!cmd->ib.failed)
-      apex_hw_pass_record(&region, cmd->ib.words + cmd->rendering.record);
+   rewrite_first_region(cmd);
    end_pass(cmd);
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE);
    for (unsigned k = 0; k < ARRAY_SIZE(pass.attachment); k++)
@@ -1472,6 +1505,9 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
       return;
    }
    predicate(cmd, user_work(cmd));
+   cmd->rendering.whole |= cmd->geometry || cmd->vertex->vertex.stores || cmd->xfb.active;
+   cmd->rendering.vertices += indirect ? UINT32_MAX :
+      (uint64_t)packet[0] * packet[1] * MAX2(util_bitcount(cmd->rendering.view_mask), 1);
    uint32_t views = cmd->rendering.view_mask ? cmd->rendering.view_mask : 1;
    if (cmd->geometry) {
       u_foreach_bit(view, views) {
@@ -1783,6 +1819,7 @@ apex_CmdBeginQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    struct apex_query_pool *qp = apex_query_pool_from_handle(pool);
    uint64_t va = qp->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
+   cmd->rendering.whole |= cmd->rendering.active;
    if (qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
       apex_cp_write(&cmd->ib, va, APEX_CP_AFTER_PRIOR_WORK, 4, (uint32_t[4]){0});
       cmd->xfb.query = va;
@@ -1813,6 +1850,7 @@ apex_CmdEndQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t qu
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
    struct apex_query_pool *qp = apex_query_pool_from_handle(pool);
    uint64_t va = qp->bo.va + (uint64_t)query * APEX_QUERY_STRIDE;
+   cmd->rendering.whole |= cmd->rendering.active;
    if (qp->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
       cmd->xfb.query = 0;
       query_available(cmd, va);

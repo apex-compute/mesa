@@ -225,8 +225,14 @@ struct apex_command_buffer {
        * `regions` regions: the first records the body from IB dword `body`
        * on, the others replay it after restoring the predicate packet's
        * state at its start. `record` is the IB dword of the first region's
-       * pass record. */
-      uint32_t regions, body, record, body_predicate_flags;
+       * pass record and `region_bins` the bins a region takes. `whole` keeps
+       * the pass to the regions the hardware needs: replaying it would repeat
+       * a query, transform feedback, a geometry shader or vertex stores.
+       * `vertices` counts the body's direct draws' vertices, which every
+       * further region processes again; an indirect draw counts as unbounded. */
+      uint32_t regions, body, record, region_bins, body_predicate_flags;
+      uint64_t vertices;
+      bool whole;
       uint64_t body_predicate_va;
    } rendering;
 };

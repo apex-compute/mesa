@@ -130,7 +130,7 @@ struct apex_bo {
 struct apex_queue {
    struct vk_queue vk;
    uint32_t id;
-   uint32_t priority; /* drm_apex_queue_create priority */
+   uint32_t priority; /* the kernel's effective drm_apex_queue_create priority */
    /* The kernel's status page, and its kwait word in LOCAL. */
    uint64_t status_va, kwait_va;
    void *status_map, *doorbell_map;

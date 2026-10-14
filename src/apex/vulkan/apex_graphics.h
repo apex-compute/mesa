@@ -25,6 +25,9 @@ struct apex_shader {
       uint16_t xfb_strides[4];
       /* Feeding a geometry shader: the input record slots written. */
       uint64_t records;
+      /* Stores or atomics to memory, which a pass replayed per region would
+       * repeat. */
+      bool stores;
    } vertex;
    struct {
       /* The pass-through vertex program, its output record bytes and clip

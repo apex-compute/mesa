@@ -1390,6 +1390,7 @@ apex_shader_serialize(struct vk_device *device, const struct vk_shader *vk, stru
    blob_write_uint32(blob, shader->vertex.stride);
    blob_write_uint8(blob, shader->vertex.clip_distances);
    blob_write_uint8(blob, shader->vertex.robust);
+   blob_write_uint8(blob, shader->vertex.stores);
    blob_write_bytes(blob, shader->vertex.xfb_strides, sizeof(shader->vertex.xfb_strides));
    write_program(blob, &shader->vertex.capture);
    blob_write_uint64(blob, shader->vertex.records);
@@ -1532,6 +1533,7 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
          goto fail;
       shader->vertex.robust = vi.robust;
       shader->vertex.clip_distances = nir->info.clip_distance_array_size;
+      shader->vertex.stores = nir->info.writes_memory;
       const nir_xfb_info *xfb = nir->xfb_info;
       if (xfb && xfb->output_count) {
          capture = nir_shader_clone(NULL, nir);
@@ -1717,6 +1719,7 @@ apex_deserialize(struct vk_device *device, struct blob_reader *blob, uint32_t ve
    shader->vertex.stride = blob_read_uint32(blob);
    shader->vertex.clip_distances = blob_read_uint8(blob);
    shader->vertex.robust = blob_read_uint8(blob);
+   shader->vertex.stores = blob_read_uint8(blob);
    blob_copy_bytes(blob, shader->vertex.xfb_strides, sizeof(shader->vertex.xfb_strides));
    valid = valid && read_program(blob, &shader->vertex.capture, shader->set_layouts);
    shader->vertex.records = blob_read_uint64(blob);

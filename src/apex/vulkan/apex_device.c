@@ -2258,6 +2258,7 @@ create_queue(struct apex_device *device, struct apex_queue *queue, uint32_t fami
              errno == EACCES || errno == EPERM ? VK_ERROR_NOT_PERMITTED :
              VK_ERROR_INITIALIZATION_FAILED;
    queue->id = create.queue_id;
+   queue->priority = create.priority;
    queue->status_va = create.status_va;
    queue->kwait_va = create.kwait_va;
    void *status = mmap(NULL, 4096, PROT_READ, MAP_SHARED, device->fd, create.status_offset);
