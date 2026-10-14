@@ -1372,7 +1372,7 @@ static unsigned tex_dim(nir_tex_instr *t)
    switch (t->sampler_dim) {
    case GLSL_SAMPLER_DIM_1D: return t->is_array ? 4 : 0;
    case GLSL_SAMPLER_DIM_2D: case GLSL_SAMPLER_DIM_RECT: case GLSL_SAMPLER_DIM_EXTERNAL:
-   case GLSL_SAMPLER_DIM_MS:
+   case GLSL_SAMPLER_DIM_MS: case GLSL_SAMPLER_DIM_SUBPASS: case GLSL_SAMPLER_DIM_SUBPASS_MS:
       return t->is_array ? 5 : 1;
    case GLSL_SAMPLER_DIM_3D: return 2;
    case GLSL_SAMPLER_DIM_CUBE: return t->is_array ? 6 : 3;
@@ -2334,23 +2334,112 @@ bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input
    return ok;
 }
 
-static bool subword_roundtrip(const nir_instr *instr, const void *data)
+/* 8- and 16-bit values live in 32-bit registers. A subword value reaches the
+ * ALUs only through a conversion to 32 bits, which reads its bits zero
+ * extended from the 32-bit value it was narrowed or packed from. Neither
+ * function emits anything for a value it cannot follow. This runs after the
+ * optimization loop, whose packing rules would turn half-float packing back
+ * into conversions. */
+static nir_def *sign_extend(nir_builder *b, nir_def *x, unsigned bits)
+{
+   return nir_ishr_imm(b, nir_ishl_imm(b, x, 32 - bits), 32 - bits);
+}
+static bool subword_known(nir_scalar s)
+{
+   if (nir_scalar_is_const(s) || nir_scalar_is_undef(s))
+      return true;
+   if (!nir_scalar_is_alu(s))
+      return false;
+   nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+   unsigned from = x.def->bit_size;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_mov:
+      return subword_known(x);
+   case nir_op_u2u8: case nir_op_u2u16: case nir_op_i2i8: case nir_op_i2i16:
+      return from == 32 || (from < s.def->bit_size && subword_known(x));
+   case nir_op_f2f16: case nir_op_f2f16_rtne: case nir_op_f2f16_rtz:
+      return from == 32;
+   case nir_op_unpack_32_2x16_split_x: case nir_op_unpack_32_2x16_split_y:
+   case nir_op_f2i8: case nir_op_f2i16: case nir_op_f2u8: case nir_op_f2u16:
+      return from == 32;
+   default:
+      return false;
+   }
+}
+static nir_def *subword_bits(nir_builder *b, nir_scalar s)
+{
+   unsigned bits = s.def->bit_size;
+   if (nir_scalar_is_const(s))
+      return nir_imm_int(b, nir_scalar_as_uint(s) & BITFIELD_MASK(bits));
+   if (nir_scalar_is_undef(s))
+      return nir_undef(b, 1, 32);
+   nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+   unsigned from = x.def->bit_size;
+   nir_op op = nir_scalar_alu_op(s);
+   if (op == nir_op_mov)
+      return subword_bits(b, x);
+   if (from < 32) {
+      /* Widening between subword sizes. */
+      nir_def *narrow = subword_bits(b, x);
+      if (op == nir_op_u2u16 || op == nir_op_u2u8)
+         return narrow;
+      return nir_iand_imm(b, sign_extend(b, narrow, from), BITFIELD_MASK(bits));
+   }
+   nir_def *source = nir_mov_scalar(b, x);
+   switch (op) {
+   case nir_op_unpack_32_2x16_split_x:
+      return nir_iand_imm(b, source, 0xffff);
+   case nir_op_unpack_32_2x16_split_y:
+      return nir_ushr_imm(b, source, 16);
+   case nir_op_f2f16: case nir_op_f2f16_rtne:
+      return nir_pack_half_2x16_split(b, source, nir_imm_float(b, 0.0f));
+   case nir_op_f2f16_rtz:
+      return nir_pack_half_2x16_rtz_split(b, source, nir_imm_float(b, 0.0f));
+   case nir_op_f2i8: case nir_op_f2i16:
+      return nir_iand_imm(b, nir_f2i32(b, source), BITFIELD_MASK(bits));
+   case nir_op_f2u8: case nir_op_f2u16:
+      return nir_iand_imm(b, nir_f2u32(b, source), BITFIELD_MASK(bits));
+   default:
+      return nir_iand_imm(b, source, BITFIELD_MASK(bits));
+   }
+}
+static bool subword_conversion(const nir_instr *instr, const void *data)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
    const nir_alu_instr *a = nir_instr_as_alu(instr);
-   if (a->op != nir_op_u2u32 || a->def.num_components != 1)
+   unsigned from = a->src[0].src.ssa->bit_size;
+   if (!nir_op_infos[a->op].is_conversion || a->def.bit_size != 32 || a->def.num_components != 1 ||
+       (from != 8 && from != 16))
       return false;
-   nir_alu_instr *narrow = nir_def_as_alu_or_null(a->src[0].src.ssa);
-   return narrow && (narrow->op == nir_op_u2u8 || narrow->op == nir_op_u2u16) &&
-      narrow->src[0].src.ssa->bit_size == 32;
+   switch (a->op) {
+   case nir_op_u2u32: case nir_op_i2i32: case nir_op_u2f32: case nir_op_i2f32: case nir_op_b2b32:
+      break;
+   case nir_op_f2f32: case nir_op_f2i32: case nir_op_f2u32:
+      if (from != 16)
+         return false;
+      break;
+   default:
+      return false;
+   }
+   return subword_known(nir_scalar_chase_alu_src(nir_get_scalar((nir_def *)&a->def, 0), 0));
 }
-static nir_def *lower_subword_roundtrip(nir_builder *b, nir_instr *instr, void *data)
+static nir_def *lower_subword_conversion(nir_builder *b, nir_instr *instr, void *data)
 {
    nir_alu_instr *a = nir_instr_as_alu(instr);
-   nir_alu_instr *narrow = nir_def_as_alu_or_null(a->src[0].src.ssa);
-   nir_def *source = nir_channel(b, nir_ssa_for_alu_src(b, narrow, 0), a->src[0].swizzle[0]);
-   return nir_iand_imm(b, source, BITFIELD_MASK(narrow->def.bit_size));
+   nir_scalar x = nir_scalar_chase_alu_src(nir_get_scalar(&a->def, 0), 0);
+   unsigned from = x.def->bit_size;
+   nir_def *bits = subword_bits(b, x);
+   switch (a->op) {
+   case nir_op_u2u32: return bits;
+   case nir_op_i2i32: return sign_extend(b, bits, from);
+   case nir_op_u2f32: return nir_u2f32(b, bits);
+   case nir_op_i2f32: return nir_i2f32(b, sign_extend(b, bits, from));
+   case nir_op_f2f32: return nir_channel(b, nir_unpack_half_2x16(b, bits), 0);
+   case nir_op_f2i32: return nir_f2i32(b, nir_channel(b, nir_unpack_half_2x16(b, bits), 0));
+   case nir_op_f2u32: return nir_f2u32(b, nir_channel(b, nir_unpack_half_2x16(b, bits), 0));
+   default: return nir_ine_imm(b, bits, 0);
+   }
 }
 
 /* 64-bit global addresses become paired words of up to four dwords. */
@@ -2402,18 +2491,41 @@ access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits, uint32_t align_mul
                                       .shift = nir_mem_access_shift_method_scalar};
 }
 
-/* The ALUs compute in 32 bits: 8- and 16-bit integer arithmetic widens. */
+/* The ALUs compute in 32 bits: 8- and 16-bit integer arithmetic, phis and
+ * subgroup operations widen. Conversions and ops of sized results (packing)
+ * keep their sizes. */
 static unsigned
 alu_bit_size(const nir_instr *instr, void *data)
 {
+   if (instr->type == nir_instr_type_phi) {
+      unsigned bits = nir_instr_as_phi(instr)->def.bit_size;
+      return bits == 8 || bits == 16 ? 32 : 0;
+   }
+   if (instr->type == nir_instr_type_intrinsic) {
+      const nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+      switch (i->intrinsic) {
+      case nir_intrinsic_read_invocation: case nir_intrinsic_read_first_invocation:
+      case nir_intrinsic_shuffle: case nir_intrinsic_shuffle_xor: case nir_intrinsic_shuffle_up:
+      case nir_intrinsic_shuffle_down: case nir_intrinsic_quad_broadcast:
+      case nir_intrinsic_quad_swap_horizontal: case nir_intrinsic_quad_swap_vertical:
+      case nir_intrinsic_quad_swap_diagonal: case nir_intrinsic_reduce: case nir_intrinsic_inclusive_scan:
+      case nir_intrinsic_exclusive_scan:
+         return i->def.bit_size == 8 || i->def.bit_size == 16 ? 32 : 0;
+      default:
+         return 0;
+      }
+   }
    if (instr->type != nir_instr_type_alu)
       return 0;
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
-   if (nir_op_infos[alu->op].is_conversion)
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   if (info->is_conversion || (nir_alu_type_get_type_size(info->output_type) &&
+                               nir_alu_type_get_base_type(info->output_type) != nir_type_bool))
       return 0;
-   unsigned bits = alu->def.bit_size;
-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
-      bits = MIN2(bits, alu->src[i].src.ssa->bit_size == 1 ? 32 : alu->src[i].src.ssa->bit_size);
+   unsigned bits = alu->def.bit_size == 1 ? 32 : alu->def.bit_size;
+   for (unsigned i = 0; i < info->num_inputs; i++)
+      if (!nir_alu_type_get_type_size(info->input_types[i]))
+         bits = MIN2(bits, alu->src[i].src.ssa->bit_size == 1 ? 32 : alu->src[i].src.ssa->bit_size);
    return bits == 8 || bits == 16 ? 32 : 0;
 }
 
@@ -2571,9 +2683,10 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    }
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    /* Graphics launches have no private base: dynamically indexed locals
-    * become selects over registers. */
+    * and inputs become selects over registers and constant slots. */
    if (stage != MESA_SHADER_COMPUTE)
-      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, UINT32_MAX);
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp | nir_var_shader_in,
+               UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_opt_undef);
    /* Unroll before private arrays lower to memory, so constant indices
@@ -2598,6 +2711,8 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, type_size,
                nir_lower_io_use_interpolated_input_intrinsics);
       NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
+      /* Matrix columns and array elements index inputs by constant sums. */
+      NIR_PASS(_, nir, nir_opt_constant_folding);
    }
    if (stage == MESA_SHADER_VERTEX && !apex_nir_lower_vertex_input(nir, vi))
       return fail(output, "unsupported vertex input");
@@ -2659,12 +2774,10 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
       /* Scalarized 64-bit vector reductions become 64-bit compares. */
       NIR_PASS(progress, nir, nir_lower_int64);
-      NIR_PASS(progress, nir, nir_lower_bit_size, alu_bit_size, NULL);
       NIR_PASS(progress, nir, nir_lower_phis_to_scalar, NULL, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_lower_pack);
       NIR_PASS(progress, nir, nir_lower_alu);
-      NIR_PASS(progress, nir, nir_shader_lower_instructions, subword_roundtrip, lower_subword_roundtrip, NULL);
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
@@ -2676,6 +2789,14 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(progress, nir, nir_opt_peephole_select, &(nir_opt_peephole_select_options){.limit = 8});
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
+   /* 8- and 16-bit values widen once the loop settles: its algebraic rules
+    * narrow widened comparisons back, which would never settle. */
+   NIR_PASS(_, nir, nir_lower_bit_size, alu_bit_size, NULL);
+   NIR_PASS(_, nir, nir_shader_lower_instructions, subword_conversion, lower_subword_conversion, NULL);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
    const nir_load_store_vectorize_options vector_access = {
       .callback = vectorize,
       .modes = nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_shared | nir_var_mem_push_const,

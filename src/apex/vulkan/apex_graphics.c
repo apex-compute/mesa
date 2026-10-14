@@ -87,6 +87,8 @@ lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, st
    nir_builder builder = nir_builder_at(nir_after_impl(impl));
    nir_builder *b = &builder;
    if (state && state->mv && state->mv->view_mask) {
+      /* gl_ViewIndex becomes load_view_index first. */
+      NIR_PASS(_, nir, nir_lower_system_values);
       nir_variable *layer = stage_variable(nir, nir_var_shader_out, VARYING_SLOT_LAYER, glsl_int_type(),
                                            "apex_layer");
       nir_store_var(b, layer, nir_load_view_index(b), 1);
