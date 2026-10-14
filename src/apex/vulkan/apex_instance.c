@@ -351,6 +351,11 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float_controls2 = true,
       .KHR_shader_subgroup_rotate = true,
+      .KHR_8bit_storage = true,
+      .KHR_16bit_storage = true,
+      .KHR_shader_float16_int8 = true,
+      .KHR_load_store_op_none = true,
+      .KHR_shader_draw_parameters = true,
       .EXT_provoking_vertex = true,
       .EXT_transform_feedback = true,
       .EXT_custom_border_color = true,
@@ -425,6 +430,15 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* Rotates, clustered or not, lower to shuffles. */
       .shaderSubgroupRotate = true,
       .shaderSubgroupRotateClustered = true,
+      /* 8- and 16-bit integers compute in 32 bits; narrower storage-buffer
+       * stores update their dword atomically. */
+      /* The vertex launch header carries the draw index, base vertex and
+       * base instance. */
+      .shaderDrawParameters = true,
+      .shaderInt8 = true,
+      .shaderInt16 = true,
+      .storageBuffer8BitAccess = true,
+      .storageBuffer16BitAccess = true,
       .provokingVertexLast = true,
       /* Capture programs write each primitive's vertices in the order of
        * its provoking-vertex mode, fans included (apex_graphics.c). */

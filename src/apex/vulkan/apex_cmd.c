@@ -707,7 +707,9 @@ pack_depth_stencil(VkFormat format, float depth, uint8_t stencil, uint32_t texel
 static enum apex_hw_load
 load_of(VkAttachmentLoadOp op)
 {
-   return op == VK_ATTACHMENT_LOAD_OP_LOAD ? APEX_HW_LOAD :
+   /* LOAD_OP_NONE loads: a pass split into raster phases stores every
+    * attachment between them, which must leave an untouched one intact. */
+   return op == VK_ATTACHMENT_LOAD_OP_LOAD || op == VK_ATTACHMENT_LOAD_OP_NONE ? APEX_HW_LOAD :
           op == VK_ATTACHMENT_LOAD_OP_CLEAR ? APEX_HW_CLEAR : APEX_HW_LOAD_DONT_CARE;
 }
 
@@ -865,7 +867,7 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
             continue;
          }
          VkAttachmentLoadOp op = resuming ? VK_ATTACHMENT_LOAD_OP_LOAD : ops[i]->loadOp;
-         any_load |= op == VK_ATTACHMENT_LOAD_OP_LOAD;
+         any_load |= op == VK_ATTACHMENT_LOAD_OP_LOAD || op == VK_ATTACHMENT_LOAD_OP_NONE;
          all_clear &= op == VK_ATTACHMENT_LOAD_OP_CLEAR;
          if (op == VK_ATTACHMENT_LOAD_OP_CLEAR) {
             clear |= aspect;
