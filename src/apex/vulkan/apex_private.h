@@ -222,8 +222,9 @@ struct apex_command_buffer {
       /* A pass of more bins than the raster back end takes renders in
        * `regions` regions: the first records the body from IB dword `body`
        * on, the others replay it after restoring the predicate packet's
-       * state at its start. */
-      uint32_t regions, body, body_predicate_flags;
+       * state at its start. `record` is the IB dword of the first region's
+       * pass record. */
+      uint32_t regions, body, record, body_predicate_flags;
       uint64_t body_predicate_va;
    } rendering;
 };

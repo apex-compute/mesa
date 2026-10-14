@@ -764,6 +764,8 @@ begin_region(struct apex_command_buffer *cmd, unsigned index)
       return false;
    }
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, 0);
+   if (index == 0)
+      cmd->rendering.record = cmd->ib.count + 2;
    apex_cp_set_state(&cmd->ib, APEX_STATE_PASS, APEX_HW_PASS_DWORDS, record);
    apex_cp_begin_pass(&cmd->ib);
    begin_work(cmd, APEX_CP_CLASS_GRAPHICS);
@@ -816,6 +818,32 @@ end_pass(struct apex_command_buffer *cmd)
    util_dynarray_foreach(&cmd->pass_availability, uint64_t, va)
       apex_cp_write(&cmd->ib, *va, APEX_CP_AFTER_PRIOR_WORK, 1, (uint32_t[1]){1});
    util_dynarray_clear(&cmd->pass_availability);
+}
+
+/* A barrier inside the pass (dynamic rendering local read) ends it with
+ * every attachment stored and no resolve, rewriting the first region's
+ * record, then begins it again loading them, so input attachments read the
+ * writes before the barrier through the texture unit. Resolves wait for the
+ * final end. */
+static void
+split_pass(struct apex_command_buffer *cmd)
+{
+   struct apex_hw_pass pass = cmd->rendering.pass, region;
+   for (unsigned k = 0; k < ARRAY_SIZE(pass.attachment); k++) {
+      cmd->rendering.pass.attachment[k].store |= pass.attachment[k].present;
+      cmd->rendering.pass.attachment[k].resolve = false;
+   }
+   pass_region(&cmd->rendering.pass, 0, &region);
+   if (!cmd->ib.failed)
+      apex_hw_pass_record(&region, cmd->ib.words + cmd->rendering.record);
+   end_pass(cmd);
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE);
+   for (unsigned k = 0; k < ARRAY_SIZE(pass.attachment); k++)
+      if (pass.attachment[k].present)
+         pass.attachment[k].load = APEX_HW_LOAD;
+   cmd->rendering.pass = pass;
+   cmd->state.emitted = false;
+   emit_pass(cmd);
 }
 
 static void
@@ -2266,8 +2294,10 @@ static VKAPI_ATTR void VKAPI_CALL
 apex_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   if (cmd->rendering.active)
+   if (cmd->rendering.active) {
+      split_pass(cmd);
       return;
+   }
    VkPipelineStageFlags2 src = 0;
    VkAccessFlags2 access = 0;
    for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {

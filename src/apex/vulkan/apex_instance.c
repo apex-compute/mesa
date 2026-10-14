@@ -366,6 +366,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_scalar_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
+      .KHR_dynamic_rendering_local_read = true,
       .KHR_index_type_uint8 = true,
       .KHR_draw_indirect_count = true,
       .KHR_multiview = true,
@@ -442,6 +443,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* Multi-planar images sample each plane and convert in the compiler
        * (apex_texture.c, nir_vk_lower_ycbcr_tex). */
       .samplerYcbcrConversion = true,
+      /* A barrier inside the pass stores and reloads its attachments
+       * (apex_cmd.c, split_pass). */
+      .dynamicRenderingLocalRead = true,
       /* Buffer pointers are {table row, element, offset} values (apex_pipeline.c),
        * so they select, merge and compare like any value. */
       .variablePointersStorageBuffer = true,

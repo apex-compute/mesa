@@ -1135,6 +1135,31 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir), nir_var_shader_out);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
+   /* Attachment a takes the output location the pipeline maps to it
+    * (VkRenderingAttachmentLocationInfo); outputs no attachment takes drop. */
+   const struct vk_color_attachment_location_state *cal = state ? state->cal : NULL;
+   unsigned attachments = cal && state->rp ? state->rp->color_attachment_count : 0;
+   bool identity = true;
+   for (unsigned a = 0; a < attachments; a++)
+      identity &= cal->color_map[a] == a;
+   if (!identity) {
+      NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, true);
+      nir_foreach_shader_out_variable_safe(var, nir) {
+         if (var->data.location < FRAG_RESULT_DATA0)
+            continue;
+         unsigned location = var->data.location - FRAG_RESULT_DATA0;
+         int attachment = -1;
+         for (unsigned a = 0; a < attachments; a++)
+            if (cal->color_map[a] == location)
+               attachment = a;
+         if (attachment < 0)
+            var->data.mode = nir_var_shader_temp;
+         else
+            var->data.location = FRAG_RESULT_DATA0 + attachment;
+      }
+      nir_fixup_deref_modes(nir);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
+   }
    struct output_conversion conversion = {0};
    for (unsigned k = 0; state && state->rp && k < state->rp->color_attachment_count; k++)
       if (unorm16_target(state->rp->color_attachment_formats[k]))
@@ -1705,6 +1730,8 @@ apex_hash_state(struct vk_physical_device *physical, const struct vk_graphics_pi
                              sizeof(state->rp->color_attachment_formats));
          _mesa_blake3_update(&hash, &state->rp->color_attachment_count,
                              sizeof(state->rp->color_attachment_count));
+         if (state->cal)
+            _mesa_blake3_update(&hash, state->cal->color_map, sizeof(state->cal->color_map));
       }
    }
    if (state && state->ms && (stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
