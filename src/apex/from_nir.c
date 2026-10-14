@@ -267,7 +267,7 @@ static bool scalar_alu(nir_op op)
    case nir_op_extract_u16: case nir_op_extract_i16: case nir_op_bit_count: case nir_op_find_lsb:
    case nir_op_mov: case nir_op_vec2: case nir_op_vec3: case nir_op_vec4: case nir_op_vec5:
    case nir_op_vec8: case nir_op_vec16: case nir_op_bcsel: case nir_op_b2i32: case nir_op_b2f32:
-   case nir_op_fneg: case nir_op_fabs: case nir_op_pack_64_2x32_split:
+   case nir_op_b2b32: case nir_op_fneg: case nir_op_fabs: case nir_op_pack_64_2x32_split:
    case nir_op_unpack_64_2x32_split_x: case nir_op_unpack_64_2x32_split_y:
    case nir_op_u2u32: case nir_op_i2i32: case nir_op_fadd: case nir_op_fsub: case nir_op_fmul:
    case nir_op_fmad: case nir_op_ffma: case nir_op_ffma_weak: case nir_op_frcp: case nir_op_frsq:
@@ -289,7 +289,8 @@ static bool intrinsic_scalar(struct ctx *c, nir_intrinsic_instr *i)
    switch (i->intrinsic) {
    case nir_intrinsic_load_workgroup_id: case nir_intrinsic_load_subgroup_id:
    case nir_intrinsic_load_num_subgroups: case nir_intrinsic_load_subgroup_size:
-   case nir_intrinsic_shader_clock: case nir_intrinsic_ballot: case nir_intrinsic_read_invocation:
+   case nir_intrinsic_shader_clock: case nir_intrinsic_ballot: case nir_intrinsic_ballot_relaxed:
+   case nir_intrinsic_read_invocation:
    case nir_intrinsic_read_first_invocation: case nir_intrinsic_first_invocation:
    case nir_intrinsic_load_kernel_input: case nir_intrinsic_load_base_vertex:
    case nir_intrinsic_load_first_vertex: case nir_intrinsic_load_base_instance:
@@ -681,9 +682,9 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
       emit(c, APEX_V_CNDMASK, define(c, d, true), f, t, mask_of(c, cond, a->src[0].swizzle[0]), 0);
       return;
    }
-   case nir_op_b2i32: case nir_op_b2f32: {
+   case nir_op_b2i32: case nir_op_b2f32: case nir_op_b2b32: {
       nir_src b = a->src[0].src;
-      uint32_t one = constant(c, a->op == nir_op_b2i32 ? 1 : 0x3f800000u);
+      uint32_t one = constant(c, a->op == nir_op_b2i32 ? 1 : a->op == nir_op_b2f32 ? 0x3f800000u : ~0u);
       if (!b.ssa->divergent) {
          uint32_t fl = flag_of(c, b, a->src[0].swizzle[0]);
          if (a->op == nir_op_b2i32)
@@ -1775,7 +1776,7 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       return;
    }
    /* Subgroups. */
-   case nir_intrinsic_ballot: {
+   case nir_intrinsic_ballot: case nir_intrinsic_ballot_relaxed: {
       nir_src b = i->src[0];
       if (!b.ssa->divergent)
          emit(c, APEX_S_CSELECT, define(c, d, false), apex_phys(APEX_EXEC), constant(c, 0), flag_of(c, b, 0), 0);
@@ -2566,6 +2567,41 @@ static bool available_before(nir_src *src, void *before)
 {
    return nir_block_dominates(nir_def_block(src->ssa), before);
 }
+/* Booleans are lane masks, so a cross-lane read of one reads a 32-bit 0 or 1
+ * instead and compares it back. */
+static bool widen_boolean_lane_read(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   switch (i->intrinsic) {
+   case nir_intrinsic_shuffle: case nir_intrinsic_shuffle_xor: case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down: case nir_intrinsic_rotate: case nir_intrinsic_read_invocation:
+   case nir_intrinsic_read_first_invocation: case nir_intrinsic_quad_broadcast:
+   case nir_intrinsic_quad_swap_horizontal: case nir_intrinsic_quad_swap_vertical:
+   case nir_intrinsic_quad_swap_diagonal:
+      break;
+   default:
+      return false;
+   }
+   if (i->def.bit_size != 1)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_src_rewrite(&i->src[0], nir_b2i32(b, i->src[0].ssa));
+   i->def.bit_size = 32;
+   b->cursor = nir_after_instr(&i->instr);
+   nir_def *flag = nir_ine_imm(b, &i->def, 0);
+   nir_def_rewrite_uses_after(&i->def, flag);
+   return true;
+}
+
+/* A 32-bit boolean becomes a lane mask by comparing it with zero. */
+static bool lower_b2b1(nir_builder *b, nir_alu_instr *a, void *data)
+{
+   if (a->op != nir_op_b2b1)
+      return false;
+   b->cursor = nir_before_instr(&a->instr);
+   nir_def_replace(&a->def, nir_ine_imm(b, nir_ssa_for_alu_src(b, a, 0), 0));
+   return true;
+}
+
 static bool hoist_repeated(nir_shader *nir)
 {
    bool progress = false;
@@ -2785,6 +2821,9 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    bool progress;
    do {
       progress = false;
+      NIR_PASS(progress, nir, nir_shader_intrinsics_pass, widen_boolean_lane_read, nir_metadata_control_flow,
+               NULL);
+      NIR_PASS(progress, nir, nir_shader_alu_pass, lower_b2b1, nir_metadata_control_flow, NULL);
       NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
       /* Scalarized 64-bit vector reductions become 64-bit compares. */
