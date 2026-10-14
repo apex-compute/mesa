@@ -1484,7 +1484,7 @@ static void emit_tex(struct ctx *c, nir_tex_instr *t)
       failf(c, "explicit gradients take two axes", NULL);
       return;
    }
-   unsigned mask = t->is_shadow ? 1 : t->op == nir_texop_tg4 ? 0xf : nir_def_components_read(&t->def);
+   unsigned mask = t->op == nir_texop_tg4 ? 0xf : t->is_shadow ? 1 : nir_def_components_read(&t->def);
    if (!mask)
       mask = 1;
    bool compare = cmp >= 0 && !fetch;
