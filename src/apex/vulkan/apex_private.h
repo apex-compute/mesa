@@ -199,9 +199,10 @@ struct apex_command_buffer {
       bool active;
       uint64_t state, query;
    } xfb;
-   /* Occlusion query slots 0-7 in use, and availability writes waiting
-    * for the end of the render pass. */
-   uint8_t query_slots;
+   /* Occlusion query slots 0-7 in use, those whose query ended inside the
+    * current pass (it rasterizes at its end, so they stay taken until
+    * then), and availability writes waiting for the end of the pass. */
+   uint8_t query_slots, pass_query_slots;
    struct { uint64_t va; uint8_t slot; } queries[8];
    struct util_dynarray pass_availability;
    unsigned meta;
@@ -217,6 +218,9 @@ struct apex_command_buffer {
       VkRect2D area;
       uint32_t layers, view_mask, samples, color_count;
       struct apex_attachment color[APEX_HW_MAX_COLOR], depth;
+      /* Color resolves of a pass whose view mask is not a run from view 0,
+       * done per view after the pass ends. */
+      struct apex_attachment resolve[APEX_HW_MAX_COLOR];
       bool has_depth, has_stencil;
       struct apex_hw_pass pass;
       /* A pass of more bins than the raster back end takes renders in

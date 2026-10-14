@@ -89,7 +89,7 @@ clear_commands(struct apex_command_buffer *cmd)
    memset(&cmd->index, 0, sizeof(cmd->index));
    memset(&cmd->state, 0, sizeof(cmd->state));
    memset(&cmd->xfb, 0, sizeof(cmd->xfb));
-   cmd->query_slots = 0;
+   cmd->query_slots = cmd->pass_query_slots = 0;
    cmd->meta = 0;
    memset(&cmd->predicate, 0, sizeof(cmd->predicate));
    memset(&cmd->rendering, 0, sizeof(cmd->rendering));
@@ -815,16 +815,19 @@ end_pass(struct apex_command_buffer *cmd)
       apex_cp_end_pass(&cmd->ib);
    }
    cmd->rendering.active = false;
+   cmd->query_slots &= ~cmd->pass_query_slots;
+   cmd->pass_query_slots = 0;
    util_dynarray_foreach(&cmd->pass_availability, uint64_t, va)
       apex_cp_write(&cmd->ib, *va, APEX_CP_AFTER_PRIOR_WORK, 1, (uint32_t[1]){1});
    util_dynarray_clear(&cmd->pass_availability);
 }
 
-/* A barrier inside the pass (dynamic rendering local read) ends it with
- * every attachment stored and no resolve, rewriting the first region's
- * record, then begins it again loading them, so input attachments read the
- * writes before the barrier through the texture unit. Resolves wait for the
- * final end. */
+/* Ends the pass with every attachment stored and no resolve, rewriting the
+ * first region's record, then begins it again loading them: a barrier
+ * inside the pass (dynamic rendering local read) lets input attachments
+ * read the writes before it through the texture unit, and occlusion queries
+ * get back the counter slots of the queries that ended in it. Resolves wait
+ * for the final end. */
 static void
 split_pass(struct apex_command_buffer *cmd)
 {
@@ -916,6 +919,13 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    pass->x1 = CLAMP(x1, pass->x0, 0xffff);
    pass->y1 = CLAMP(y1, pass->y0, 0xffff);
    pass->layers = cmd->rendering.layers;
+   /* The pass covers layers 0 to the last view and its load op every one of
+    * them. A view mask that is not a run from view 0 leaves layers outside
+    * the mask, so those passes load every layer and clear the mask's views
+    * with a draw. */
+   bool partial = info->viewMask & (info->viewMask + 1);
+   VkClearAttachment clears[APEX_HW_MAX_COLOR + 1];
+   unsigned clear_count = 0;
    unsigned samples = 1;
    for (unsigned k = 0; k < info->colorAttachmentCount; k++) {
       const VkRenderingAttachmentInfo *a = &info->pColorAttachments[k];
@@ -929,13 +939,25 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       hw->format = apex_hw_color_format(color.format);
       hw->planes = format_planes(color.format);
       hw->load = resuming ? APEX_HW_LOAD : load_of(a->loadOp);
+      if (partial && hw->load == APEX_HW_CLEAR)
+         clears[clear_count++] = (VkClearAttachment){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                     .colorAttachment = k, .clearValue = a->clearValue};
+      if (partial)
+         hw->load = APEX_HW_LOAD;
       hw->store = cmd->rendering.suspending || a->storeOp == VK_ATTACHMENT_STORE_OP_STORE;
       hw->surface = surface_of(&color);
       pack_color(color.format, &a->clearValue.color, hw->clear);
       struct apex_attachment target = attachment(NULL, a->resolveImageView);
       if (a->resolveMode != VK_RESOLVE_MODE_NONE && target.image && !cmd->rendering.suspending) {
-         hw->resolve = true;
-         hw->resolve_surface = surface_of(&target);
+         if (partial) {
+            /* Resolving in the pass would rewrite the layers outside the
+             * mask, so the end resolves each view after storing. */
+            cmd->rendering.resolve[k] = target;
+            hw->store = true;
+         } else {
+            hw->resolve = true;
+            hw->resolve_surface = surface_of(&target);
+         }
       }
    }
    /* One depth-stencil attachment: the depth view, else the stencil view.
@@ -975,8 +997,9 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
          }
          store |= ops[i]->storeOp == VK_ATTACHMENT_STORE_OP_STORE;
       }
-      load = all_clear ? APEX_HW_CLEAR : any_load || clear ? APEX_HW_LOAD : APEX_HW_LOAD_DONT_CARE;
-      if (all_clear)
+      load = all_clear && !partial ? APEX_HW_CLEAR : any_load || clear || partial ? APEX_HW_LOAD :
+             APEX_HW_LOAD_DONT_CARE;
+      if (load == APEX_HW_CLEAR)
          clear = 0;
       struct apex_hw_attachment *hw = &pass->attachment[APEX_HW_DEPTH_ATTACHMENT];
       hw->present = true;
@@ -1000,19 +1023,39 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    pass->samples = samples;
    cmd->rendering.samples = samples;
    emit_pass(cmd);
-   if (clear) {
-      const VkClearAttachment c = {.aspectMask = clear, .clearValue.depthStencil = clear_value};
+   if (clear)
+      clears[clear_count++] = (VkClearAttachment){.aspectMask = clear, .clearValue.depthStencil = clear_value};
+   if (clear_count) {
       const VkClearRect rect = {.rect = info->renderArea, .layerCount = info->viewMask ? 1 : cmd->rendering.layers};
-      clear_attachments(cmd, 1, &c, 1, &rect, false);
+      clear_attachments(cmd, clear_count, clears, 1, &rect, false);
    }
 }
+
+static void resolve_pass(struct apex_command_buffer *cmd, const struct apex_attachment *from,
+                         const struct apex_attachment *to, VkRect2D area, unsigned layers);
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdEndRendering(VkCommandBuffer handle)
 {
    VK_FROM_HANDLE(apex_command_buffer, cmd, handle);
-   if (cmd->rendering.active)
-      end_pass(cmd);
+   if (!cmd->rendering.active)
+      return;
+   end_pass(cmd);
+   struct apex_attachment color[APEX_HW_MAX_COLOR], resolve[APEX_HW_MAX_COLOR];
+   memcpy(color, cmd->rendering.color, sizeof(color));
+   memcpy(resolve, cmd->rendering.resolve, sizeof(resolve));
+   uint32_t views = cmd->rendering.view_mask;
+   VkRect2D area = cmd->rendering.area;
+   for (unsigned k = 0; k < APEX_HW_MAX_COLOR; k++) {
+      if (!resolve[k].image)
+         continue;
+      u_foreach_bit(view, views) {
+         struct apex_attachment from = color[k], to = resolve[k];
+         from.layer += view;
+         to.layer += view;
+         resolve_pass(cmd, &from, &to, area, 1);
+      }
+   }
 }
 
 /* ---- Draws -------------------------------------------------------------- */
@@ -1750,6 +1793,9 @@ apex_CmdBeginQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
       cmd->xfb.query = va;
       return;
    }
+   /* Ending the pass frees the slots of the queries that ended in it. */
+   if (cmd->query_slots == 0xff && cmd->rendering.active && cmd->pass_query_slots)
+      split_pass(cmd);
    if (cmd->query_slots == 0xff) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -1782,7 +1828,10 @@ apex_CmdEndQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t qu
          continue;
       unsigned slot = cmd->queries[q].slot;
       cmd->queries[q].va = 0;
-      cmd->query_slots &= ~(1u << slot);
+      if (cmd->rendering.active)
+         cmd->pass_query_slots |= 1u << slot;
+      else
+         cmd->query_slots &= ~(1u << slot);
       apex_cp_query_end(&cmd->ib, slot, va);
       query_available(cmd, va);
       return;
@@ -2212,6 +2261,31 @@ apex_CmdBlitImage2(VkCommandBuffer handle, const VkBlitImageInfo2 *info)
    meta_end(cmd, &saved);
 }
 
+/* A pass that loads `layers` layers of a multisampled color region and
+ * resolves them from the tile buffer. */
+static void
+resolve_pass(struct apex_command_buffer *cmd, const struct apex_attachment *from,
+             const struct apex_attachment *to, VkRect2D area, unsigned layers)
+{
+   memset(&cmd->rendering, 0, sizeof(cmd->rendering));
+   struct apex_hw_pass *pass = &cmd->rendering.pass;
+   pass->x0 = MAX2(area.offset.x, 0);
+   pass->y0 = MAX2(area.offset.y, 0);
+   pass->x1 = MIN2(pass->x0 + area.extent.width, 0xffff);
+   pass->y1 = MIN2(pass->y0 + area.extent.height, 0xffff);
+   pass->layers = layers;
+   pass->samples = from->image->vk.samples;
+   struct apex_hw_attachment *a = &pass->attachment[0];
+   a->present = a->resolve = true;
+   a->load = APEX_HW_LOAD;
+   a->format = apex_hw_color_format(from->format);
+   a->planes = format_planes(from->format);
+   a->surface = surface_of(from);
+   a->resolve_surface = surface_of(to);
+   emit_pass(cmd);
+   end_pass(cmd);
+}
+
 /* Resolves run as passes that load the multisampled region and resolve
  * it from the tile buffer when source and destination align; vk_meta
  * resolves the others by sample fetches. */
@@ -2246,23 +2320,8 @@ apex_CmdResolveImage2(VkCommandBuffer handle, const VkResolveImageInfo2 *info)
          .image = dst, .format = dst->vk.format, .level = r->dstSubresource.mipLevel,
          .layer = r->dstSubresource.baseArrayLayer, .aspects = VK_IMAGE_ASPECT_COLOR_BIT,
       };
-      memset(&cmd->rendering, 0, sizeof(cmd->rendering));
-      struct apex_hw_pass *pass = &cmd->rendering.pass;
-      pass->x0 = MAX2(r->dstOffset.x, 0);
-      pass->y0 = MAX2(r->dstOffset.y, 0);
-      pass->x1 = MIN2(pass->x0 + r->extent.width, 0xffff);
-      pass->y1 = MIN2(pass->y0 + r->extent.height, 0xffff);
-      pass->layers = layers;
-      pass->samples = src->vk.samples;
-      struct apex_hw_attachment *a = &pass->attachment[0];
-      a->present = a->resolve = true;
-      a->load = APEX_HW_LOAD;
-      a->format = format;
-      a->planes = format_planes(src->vk.format);
-      a->surface = surface_of(&from);
-      a->resolve_surface = surface_of(&to);
-      emit_pass(cmd);
-      end_pass(cmd);
+      const VkRect2D area = {{r->dstOffset.x, r->dstOffset.y}, {r->extent.width, r->extent.height}};
+      resolve_pass(cmd, &from, &to, area, layers);
    }
 }
 
