@@ -771,6 +771,26 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
             }
         }
     }
+    // The vector sources each instruction reads: (value, first dword, dwords).
+    // The collector reads one register per bank per cycle and a register's
+    // bank is (register + wave slot) mod 4, so sources whose dwords are equal
+    // modulo 4 cost extra collector cycles whatever the slot.
+    let mut sources: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); ops.len()];
+    let mut source_pcs: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (pc, o) in ops.iter().enumerate() {
+        if o.op == COPY {
+            continue;
+        }
+        let a = o.access();
+        for f in 1..4 {
+            if let (Some(Access::Use | Access::DefUse), Opnd::Val { id, off, n }) = (a[f], o.f[f]) {
+                if values[id as usize].class == Class::V {
+                    sources[pc].push((id, off as u32, n as u32));
+                    source_pcs.entry(id).or_default().push(pc);
+                }
+            }
+        }
+    }
     let mut order: Vec<u32> = intervals.keys().copied().collect();
     order.sort_by_key(|id| (intervals[id].start, !fixed.contains_key(id), *id));
     let mut homes: BTreeMap<u32, u8> = BTreeMap::new();
@@ -830,7 +850,39 @@ fn allocate(ops: &[Op], values: &[Value], fixed: &BTreeMap<u32, u8>, align: &[u8
                     (free && r >= 0 && fits(r as u8, &homes, &active)).then_some(r as u8)
                 })
             };
-            match hinted.or_else(|| grouped(&active)).or_else(|| (0..limit).find(|&r| fits(r, &homes, &active))) {
+            // Among free registers, the one sharing fewest collector banks
+            // with the placed sources it is read beside.
+            let banked = |homes: &BTreeMap<u32, u8>, active: &[u32]| {
+                let conflicts = |r: u8| -> u32 {
+                    let mut count = 0;
+                    for &pc in source_pcs.get(&id).into_iter().flatten() {
+                        let mut mine = 0u8;
+                        let mut others = 0u8;
+                        for &(x, off, n) in &sources[pc] {
+                            let base = if x == id { Some(r as u32) } else { homes.get(&x).map(|&h| h as u32) };
+                            let Some(base) = base else { continue };
+                            for k in 0..n {
+                                let bank = 1u8 << ((base + off + k) % 4);
+                                if x == id { mine |= bank } else { others |= bank }
+                            }
+                        }
+                        count += (mine & others).count_ones();
+                    }
+                    count
+                };
+                let mut best: Option<(u32, u8)> = None;
+                for r in (0..limit).filter(|&r| fits(r, homes, active)) {
+                    let c = if v.class == Class::V { conflicts(r) } else { 0 };
+                    if best.is_none_or(|(bc, _)| c < bc) {
+                        best = Some((c, r));
+                    }
+                    if c == 0 {
+                        break;
+                    }
+                }
+                best.map(|(_, r)| r)
+            };
+            match hinted.or_else(|| grouped(&active)).or_else(|| banked(&homes, &active)) {
                 Some(r) => r,
                 None => {
                     let message = format!("{} register pressure exceeds {} registers",
