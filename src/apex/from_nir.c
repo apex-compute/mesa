@@ -136,6 +136,27 @@ static uint32_t op2(struct ctx *c, unsigned op, bool vec, uint32_t a, uint32_t b
    emit(c, op, d, a, b, 0, 0);
    return d;
 }
+
+/* A constant-field extract on the vector ALU: v_bfe runs on the
+ * transcendental unit at four lanes per clock. */
+static void vector_extract(struct ctx *c, uint32_t dst, uint32_t x, unsigned off, unsigned bits,
+                           bool sign)
+{
+   off &= 31;
+   bits = MIN2(bits, 32 - off);
+   if (bits == 0) {
+      emit(c, APEX_COPY, dst, constant(c, 0), 0, 0, 0);
+   } else if (sign) {
+      uint32_t up = 32 - off - bits ? op2(c, APEX_V_SHL, true, x, constant(c, 32 - off - bits)) : x;
+      emit(c, APEX_V_ASHR, dst, up, constant(c, 32 - bits), 0, 0);
+   } else {
+      uint32_t down = off ? op2(c, APEX_V_SHR, true, x, constant(c, off)) : x;
+      if (off + bits == 32)
+         emit(c, APEX_COPY, dst, down, 0, 0, 0);
+      else
+         emit(c, APEX_V_AND, dst, down, constant(c, (1u << bits) - 1), 0, 0);
+   }
+}
 static uint32_t label(struct ctx *c) { return ++c->labels; }
 static void place(struct ctx *c, uint32_t l)
 {
@@ -620,16 +641,25 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
       unsigned bits = a->op == nir_op_extract_u8 || a->op == nir_op_extract_i8 ? 8 : 16;
       bool sign = a->op == nir_op_extract_i8 || a->op == nir_op_extract_i16;
       unsigned k = nir_src_comp_as_uint(a->src[1].src, a->src[1].swizzle[0]);
-      emit(c, vec ? (sign ? APEX_V_BFE_I : APEX_V_BFE_U) : (sign ? APEX_S_BFE_I : APEX_S_BFE_U),
-           define(c, d, vec), alu_src(c, a, 0), constant(c, (k * bits) | bits << 8), 0, 0);
+      if (vec) {
+         vector_extract(c, define(c, d, true), alu_src(c, a, 0), k * bits, bits, sign);
+         return;
+      }
+      emit(c, sign ? APEX_S_BFE_I : APEX_S_BFE_U, define(c, d, false), alu_src(c, a, 0),
+           constant(c, (k * bits) | bits << 8), 0, 0);
       return;
    }
    case nir_op_ubitfield_extract: case nir_op_ibitfield_extract: {
       bool sign = a->op == nir_op_ibitfield_extract;
       uint32_t field;
       if (nir_src_is_const(a->src[1].src) && nir_src_is_const(a->src[2].src)) {
-         field = constant(c, (nir_src_comp_as_uint(a->src[1].src, a->src[1].swizzle[0]) & 31) |
-                          (MIN2(nir_src_comp_as_uint(a->src[2].src, a->src[2].swizzle[0]), 32) << 8));
+         unsigned off = nir_src_comp_as_uint(a->src[1].src, a->src[1].swizzle[0]) & 31;
+         unsigned bits = MIN2(nir_src_comp_as_uint(a->src[2].src, a->src[2].swizzle[0]), 32);
+         if (vec) {
+            vector_extract(c, define(c, d, true), alu_src(c, a, 0), off, bits, sign);
+            return;
+         }
+         field = constant(c, off | bits << 8);
       } else {
          uint32_t off = alu_src(c, a, 1), bits = alu_src(c, a, 2);
          bool v = is_vec(c, off) || is_vec(c, bits);
@@ -1195,7 +1225,9 @@ static uint32_t launch_vector(struct ctx *c, unsigned reg)
 }
 static uint32_t launch_bits(struct ctx *c, unsigned shift, unsigned bits)
 {
-   return op2(c, APEX_V_BFE_U, true, apex_phys(3), constant(c, shift | bits << 8));
+   uint32_t r = value(c, true, 1);
+   vector_extract(c, r, apex_phys(3), shift, bits, false);
+   return r;
 }
 /* Fragment input k is vertex output varying k (Docs/isa.md, Vertex outputs
  * and fragment inputs); its header byte carries the flat bit. */
