@@ -1223,11 +1223,137 @@ apex_shader_destroy(struct vk_device *device, struct vk_shader *vk,
    vk_shader_free(device, alloc, vk);
 }
 
-/* Binaries are not yet portable across layouts; caches recompile. */
-static bool
-apex_shader_serialize(struct vk_device *device, const struct vk_shader *shader, struct blob *blob)
+/* ---- Serialization -------------------------------------------------------
+ * A cached shader holds its programs and the set layouts they read: the
+ * program code and table metadata, then each layout's bindings and immutable
+ * samplers, with the hash that matches it to bound sets. */
+
+static unsigned
+layout_samplers(const struct apex_set_layout *layout)
 {
-   return false;
+   unsigned samplers = 0;
+   for (unsigned b = 0; b < layout->binding_count; b++)
+      if (layout->bindings[b].immutable != ~0u)
+         samplers = MAX2(samplers, layout->bindings[b].immutable + layout->bindings[b].count);
+   return samplers;
+}
+
+static void
+write_layout(struct blob *blob, const struct apex_set_layout *layout)
+{
+   unsigned samplers = layout_samplers(layout);
+   blob_write_uint32(blob, layout->vk.flags);
+   blob_write_bytes(blob, layout->vk.blake3, sizeof(layout->vk.blake3));
+   blob_write_uint32(blob, layout->vk.dynamic_descriptor_count);
+   blob_write_uint32(blob, layout->binding_count);
+   blob_write_uint32(blob, samplers);
+   blob_write_uint32(blob, layout->row_count);
+   blob_write_uint32(blob, layout->slot_count);
+   blob_write_uint8(blob, layout->pool_memory);
+   blob_write_bytes(blob, layout->counts, sizeof(layout->counts));
+   blob_write_bytes(blob, layout->bindings, layout->binding_count * sizeof(layout->bindings[0]));
+   blob_write_bytes(blob, layout->samplers, samplers * sizeof(layout->samplers[0]));
+}
+
+static struct apex_set_layout *
+read_layout(struct vk_device *device, struct blob_reader *blob)
+{
+   VkDescriptorSetLayoutCreateFlags flags = blob_read_uint32(blob);
+   blake3_hash hash;
+   blob_copy_bytes(blob, hash, sizeof(hash));
+   uint32_t dynamic = blob_read_uint32(blob);
+   uint32_t bindings = blob_read_uint32(blob), samplers = blob_read_uint32(blob);
+   if (blob->overrun || bindings > APEX_MAX_BINDINGS || samplers > APEX_MAX_SET_ROWS)
+      return NULL;
+   struct apex_set_layout *layout = apex_set_layout_alloc((struct apex_device *)device, flags,
+                                                          bindings, samplers);
+   if (!layout)
+      return NULL;
+   memcpy(layout->vk.blake3, hash, sizeof(hash));
+   layout->vk.dynamic_descriptor_count = dynamic;
+   layout->row_count = blob_read_uint32(blob);
+   layout->slot_count = blob_read_uint32(blob);
+   layout->pool_memory = blob_read_uint8(blob);
+   blob_copy_bytes(blob, layout->counts, sizeof(layout->counts));
+   blob_copy_bytes(blob, layout->bindings, bindings * sizeof(layout->bindings[0]));
+   blob_copy_bytes(blob, layout->samplers, samplers * sizeof(layout->samplers[0]));
+   return layout;
+}
+
+/* The program's layouts are the shader's; it records only their count. */
+static void
+write_program(struct blob *blob, const struct apex_program *program)
+{
+   blob_write_uint64(blob, program->code.size);
+   blob_write_bytes(blob, program->code.data, program->code.size);
+   blob_write_uint32(blob, program->code.instructions);
+   blob_write_uint32(blob, program->code.vector);
+   blob_write_uint32(blob, program->code.scalar);
+   blob_write_uint32(blob, program->code.spills);
+   blob_write_uint8(blob, program->table);
+   blob_write_uint32(blob, program->set_count);
+   blob_write_bytes(blob, program->set_offsets, sizeof(program->set_offsets));
+   blob_write_uint32(blob, program->descriptor_count);
+   blob_write_uint32(blob, program->push_size);
+   blob_write_uint32(blob, program->max_workgroups);
+   blob_write_bytes(blob, program->used_descriptors, sizeof(program->used_descriptors));
+}
+
+static bool
+read_program(struct blob_reader *blob, struct apex_program *program,
+             struct vk_descriptor_set_layout *const *layouts)
+{
+   uint64_t size = blob_read_uint64(blob);
+   const void *code = blob_read_bytes(blob, size);
+   if (blob->overrun)
+      return false;
+   apex_compile_result_load(&program->code, code, size);
+   program->code.instructions = blob_read_uint32(blob);
+   program->code.vector = blob_read_uint32(blob);
+   program->code.scalar = blob_read_uint32(blob);
+   program->code.spills = blob_read_uint32(blob);
+   program->table = blob_read_uint8(blob);
+   program->set_count = blob_read_uint32(blob);
+   blob_copy_bytes(blob, program->set_offsets, sizeof(program->set_offsets));
+   program->descriptor_count = blob_read_uint32(blob);
+   program->push_size = blob_read_uint32(blob);
+   program->max_workgroups = blob_read_uint32(blob);
+   blob_copy_bytes(blob, program->used_descriptors, sizeof(program->used_descriptors));
+   if (blob->overrun || program->set_count > MESA_VK_MAX_DESCRIPTOR_SETS)
+      return false;
+   for (unsigned s = 0; s < program->set_count; s++)
+      program->set_layouts[s] = (const void *)layouts[s];
+   return true;
+}
+
+static bool
+apex_shader_serialize(struct vk_device *device, const struct vk_shader *vk, struct blob *blob)
+{
+   const struct apex_shader *shader = container_of(vk, struct apex_shader, vk);
+   blob_write_uint32(blob, vk->stage);
+   for (unsigned s = 0; s < ARRAY_SIZE(shader->set_layouts); s++) {
+      blob_write_uint8(blob, shader->set_layouts[s] != NULL);
+      if (shader->set_layouts[s])
+         write_layout(blob, (const void *)shader->set_layouts[s]);
+   }
+   write_program(blob, &shader->program);
+   blob_write_uint32(blob, shader->vertex.stride);
+   blob_write_uint8(blob, shader->vertex.clip_distances);
+   blob_write_uint8(blob, shader->vertex.robust);
+   blob_write_bytes(blob, shader->vertex.xfb_strides, sizeof(shader->vertex.xfb_strides));
+   write_program(blob, &shader->vertex.capture);
+   blob_write_uint64(blob, shader->vertex.records);
+   write_program(blob, &shader->geometry.draw);
+   blob_write_uint32(blob, shader->geometry.stride);
+   blob_write_uint8(blob, shader->geometry.clip_distances);
+   blob_write_uint64(blob, shader->geometry.inputs);
+   blob_write_uint64(blob, shader->geometry.outputs);
+   blob_write_uint16(blob, shader->geometry.max_vertices);
+   blob_write_uint16(blob, shader->geometry.max_primitives);
+   blob_write_uint16(blob, shader->geometry.invocations);
+   blob_write_uint8(blob, shader->geometry.primitive_vertices);
+   blob_write_uint8(blob, shader->geometry.input_vertices);
+   return !blob->out_of_memory;
 }
 
 static VkResult
@@ -1498,7 +1624,45 @@ static VkResult
 apex_deserialize(struct vk_device *device, struct blob_reader *blob, uint32_t version,
                  const VkAllocationCallbacks *alloc, struct vk_shader **out)
 {
-   return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   mesa_shader_stage stage = blob_read_uint32(blob);
+   if (blob->overrun || (stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_GEOMETRY &&
+                         stage != MESA_SHADER_FRAGMENT))
+      return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   struct apex_shader *shader = vk_shader_zalloc(device, &apex_shader_ops, stage, alloc, sizeof(*shader));
+   if (!shader)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   bool valid = true;
+   for (unsigned s = 0; valid && s < ARRAY_SIZE(shader->set_layouts); s++) {
+      if (!blob_read_uint8(blob))
+         continue;
+      struct apex_set_layout *layout = read_layout(device, blob);
+      shader->set_layouts[s] = layout ? &layout->vk : NULL;
+      valid = layout != NULL;
+   }
+   valid = valid && read_program(blob, &shader->program, shader->set_layouts);
+   shader->vertex.stride = blob_read_uint32(blob);
+   shader->vertex.clip_distances = blob_read_uint8(blob);
+   shader->vertex.robust = blob_read_uint8(blob);
+   blob_copy_bytes(blob, shader->vertex.xfb_strides, sizeof(shader->vertex.xfb_strides));
+   valid = valid && read_program(blob, &shader->vertex.capture, shader->set_layouts);
+   shader->vertex.records = blob_read_uint64(blob);
+   valid = valid && read_program(blob, &shader->geometry.draw, shader->set_layouts);
+   shader->geometry.stride = blob_read_uint32(blob);
+   shader->geometry.clip_distances = blob_read_uint8(blob);
+   shader->geometry.inputs = blob_read_uint64(blob);
+   shader->geometry.outputs = blob_read_uint64(blob);
+   shader->geometry.max_vertices = blob_read_uint16(blob);
+   shader->geometry.max_primitives = blob_read_uint16(blob);
+   shader->geometry.invocations = blob_read_uint16(blob);
+   shader->geometry.primitive_vertices = blob_read_uint8(blob);
+   shader->geometry.input_vertices = blob_read_uint8(blob);
+   valid = valid && !blob->overrun;
+   if (!valid) {
+      apex_shader_destroy(device, &shader->vk, alloc);
+      return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   }
+   *out = &shader->vk;
+   return VK_SUCCESS;
 }
 
 static const struct nir_shader_compiler_options *

@@ -17,6 +17,8 @@ struct apex_compile_result {
    char diagnostic[1024];
 };
 void apex_compile_result_finish(struct apex_compile_result *);
+/* Holds a copy of serialized program bytes. */
+void apex_compile_result_load(struct apex_compile_result *, const uint8_t *data, size_t size);
 
 /* P7 ISA opcodes (isa.rs owns the encoding). */
 enum apex_opcode {

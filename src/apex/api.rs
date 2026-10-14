@@ -43,6 +43,18 @@ impl Default for CompileResult {
         Self { data: std::ptr::null_mut(), size: 0, instructions: 0, vector: 0, scalar: 0, spills: 0, diagnostic: [0; 1024] }
     }
 }
+/// Holds a copy of `size` program bytes at `data`, as a pipeline cache
+/// stores them.
+#[no_mangle]
+pub unsafe extern "C" fn apex_compile_result_load(result: &mut CompileResult, data: *const u8, size: usize) {
+    *result = CompileResult::default();
+    if size == 0 {
+        return;
+    }
+    let bytes: Box<[u8]> = unsafe { std::slice::from_raw_parts(data, size) }.into();
+    result.size = size;
+    result.data = Box::into_raw(bytes) as *mut u8;
+}
 #[no_mangle]
 pub unsafe extern "C" fn apex_compile_result_finish(result: &mut CompileResult) {
     if !result.data.is_null() {
