@@ -2737,6 +2737,7 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 16);
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    }
+   NIR_PASS(_, nir, nir_opt_access, &(nir_opt_access_options){.is_vulkan = true});
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo, nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global, nir_address_format_64bit_global);

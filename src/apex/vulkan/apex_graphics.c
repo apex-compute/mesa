@@ -1767,6 +1767,8 @@ compile_internal(struct apex_device *device, nir_shader *nir, struct apex_progra
    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
    if (nir) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_root, nir_metadata_control_flow, NULL);
+      /* Job words are readonly: uniform reads of them become scalar loads. */
+      NIR_PASS(_, nir, nir_opt_access, &(nir_opt_access_options){.is_vulkan = true});
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, nir_address_format_32bit_index_offset);
       result = apex_program_compile(&device->vk, program, nir, NULL);
    }

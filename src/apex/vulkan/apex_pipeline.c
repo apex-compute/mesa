@@ -301,6 +301,8 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
       .tex_src_callback = sampled_texture,
    };
    NIR_PASS(_, nir, nir_lower_non_uniform_access, &non_uniform);
+   /* Readonly buffer reads may reorder, so uniform ones become scalar loads. */
+   NIR_PASS(_, nir, nir_opt_access, &(nir_opt_access_options){.is_vulkan = true});
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_vec2_index_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
