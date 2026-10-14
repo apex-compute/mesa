@@ -17,19 +17,19 @@ uint64_t address(uint i) { return uint64_t(job(i)) | (uint64_t(job(i + 1u)) << 3
 
 uint draw(uint i)
 {
-   uint64_t params = address(APEX_XFB_PARAMS);
-   return params != 0ul ? Words(params).w[i] : job(APEX_XFB_DRAW + i);
+   uint64_t params = address(APEX_DRAW_INDIRECT);
+   return params != 0ul ? Words(params).w[i] : job(APEX_DRAW_COMMAND + i);
 }
 
 // Robust index fetch: indices beyond the bound bytes read zero.
 bool restart_at(uint position)
 {
-   uint flags = job(APEX_XFB_FLAGS);
+   uint flags = job(APEX_DRAW_FLAGS);
    uint shift = flags & 3u, bytes = 1u << shift;
    uint byte = (draw(2u) + position) << shift;
    uint value = 0u;
-   if (byte + bytes <= job(APEX_XFB_INDEX_BYTES)) {
-      uint64_t va = address(APEX_XFB_INDEX) + uint64_t(byte & ~3u);
+   if (byte + bytes <= job(APEX_DRAW_INDEX_BYTES)) {
+      uint64_t va = address(APEX_DRAW_INDICES) + uint64_t(byte & ~3u);
       value = Words(va).w[0] >> ((byte & 3u) * 8u);
    }
    uint mask = shift == 2u ? 0xffffffffu : (1u << (8u * bytes)) - 1u;
@@ -38,9 +38,9 @@ bool restart_at(uint position)
 
 uint primitives(uint count, uint topology, uint verts)
 {
-   uint flags = job(APEX_XFB_FLAGS);
-   bool restart = (flags & (APEX_XFB_FLAG_INDEXED | APEX_XFB_FLAG_RESTART)) ==
-                  (APEX_XFB_FLAG_INDEXED | APEX_XFB_FLAG_RESTART);
+   uint flags = job(APEX_DRAW_FLAGS);
+   bool restart = (flags & (APEX_DRAW_FLAG_INDEXED | APEX_DRAW_FLAG_RESTART)) ==
+                  (APEX_DRAW_FLAG_INDEXED | APEX_DRAW_FLAG_RESTART);
    if (restart && (topology == 2u || topology >= 4u)) {
       uint n = 0u, run = 0u;
       for (uint i = 0u; i < count; i++) {
@@ -76,10 +76,10 @@ void main()
       }
       return;
    }
-   uint64_t count_va = address(APEX_XFB_COUNT);
-   if (count_va != 0ul && job(APEX_XFB_DRAW_INDEX) >= Words(count_va).w[0])
+   uint64_t count_va = address(APEX_DRAW_COUNT);
+   if (count_va != 0ul && job(APEX_DRAW_NUMBER) >= Words(count_va).w[0])
       return;
-   uint topology = (job(APEX_XFB_FLAGS) >> 8u) & 7u;
+   uint topology = (job(APEX_DRAW_FLAGS) >> 8u) & 15u;
    uint verts = topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
    uint needed = primitives(draw(0u), topology, verts) * draw(1u);
    // Without active transform feedback the query counts needed only.

@@ -494,7 +494,7 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
                                    .queueCount = 1, .pQueuePriorities = &priority};
    VkDeviceCreateInfo device_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                      .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue};
-   VkPhysicalDeviceFeatures unsupported_features = {.geometryShader = VK_TRUE};
+   VkPhysicalDeviceFeatures unsupported_features = {.tessellationShader = VK_TRUE};
    device_info.pEnabledFeatures = &unsupported_features;
    VkDevice device;
    CHECK(create_device(physical, &device_info, NULL, &device) == VK_ERROR_FEATURE_NOT_PRESENT);

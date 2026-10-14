@@ -289,8 +289,7 @@ static bool intrinsic_scalar(struct ctx *c, nir_intrinsic_instr *i)
    switch (i->intrinsic) {
    case nir_intrinsic_load_workgroup_id: case nir_intrinsic_load_subgroup_id:
    case nir_intrinsic_load_num_subgroups: case nir_intrinsic_load_subgroup_size:
-   case nir_intrinsic_load_view_index: case nir_intrinsic_shader_clock:
-   case nir_intrinsic_ballot: case nir_intrinsic_read_invocation:
+   case nir_intrinsic_shader_clock: case nir_intrinsic_ballot: case nir_intrinsic_read_invocation:
    case nir_intrinsic_read_first_invocation: case nir_intrinsic_first_invocation:
    case nir_intrinsic_load_kernel_input: case nir_intrinsic_load_base_vertex:
    case nir_intrinsic_load_first_vertex: case nir_intrinsic_load_base_instance:
@@ -1286,6 +1285,19 @@ static void store_output(struct ctx *c, nir_intrinsic_instr *i)
       }
       return;
    }
+   if (c->nir->info.stage == MESA_SHADER_VERTEX && io.location == VARYING_SLOT_CULL_PRIMITIVE) {
+      /* A nonzero value culls every primitive of the vertex: all mask bits. */
+      if (!c->cull)
+         c->cull = constant(c, 0);
+      uint32_t culled = op2(c, APEX_V_CMP_U, false, vector(c, src(c, i->src[0], 0)), constant(c, 0));
+      last(c)->f[3] = apex_raw(1);
+      uint32_t bits = value(c, true, 1);
+      emit(c, APEX_V_CNDMASK, bits, constant(c, 0), constant(c, 0xff), culled, 0);
+      uint32_t merged = value(c, true, 1);
+      emit(c, APEX_V_OR, merged, vector(c, c->cull), bits, 0, 0);
+      c->cull = merged;
+      return;
+   }
    if (c->nir->info.stage == MESA_SHADER_VERTEX) {
       slot = record_slot(c, io.location, &component);
    } else if (io.location == FRAG_RESULT_DEPTH) {
@@ -1956,9 +1968,6 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       return;
    case nir_intrinsic_load_sample_mask_in:
       alias(c, d, launch_bits(c, 0, 8));
-      return;
-   case nir_intrinsic_load_view_index: case nir_intrinsic_load_layer_id:
-      alias(c, d, copy(c, false, apex_phys(APEX_SCALAR + 16)));
       return;
    case nir_intrinsic_store_output:
       store_output(c, i);

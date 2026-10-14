@@ -110,9 +110,9 @@ struct apex_table {
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint8_t push[APEX_MAX_PUSH_CONSTANTS];
    uint32_t trailer[APEX_TRAILER_WORDS + APEX_JOB_WORDS];
-   /* Trailer words w (bit w) whose pair {w, w + 1} holds a data offset,
-    * written as its GPUVA. */
-   uint64_t relocs;
+   /* Trailer words w (bit w) whose pair {w, w + 1} holds a data offset, or
+    * a scratch offset, written as its GPUVA. */
+   uint64_t relocs, scratch_relocs;
    uint64_t offset;      /* in the submission arena */
 };
 /* IB dwords (low, high) patched with a GPUVA at submission. */
@@ -121,6 +121,7 @@ enum apex_patch_kind {
    APEX_PATCH_GRID,      /* a table's trailer */
    APEX_PATCH_PROGRAM,   /* an uploaded program */
    APEX_PATCH_DATA,      /* an offset in the command buffer's data */
+   APEX_PATCH_SCRATCH,   /* an offset in the command buffer's scratch */
 };
 struct apex_patch {
    uint32_t dword;
@@ -146,8 +147,10 @@ struct apex_command_buffer {
     * holds the BARRIER classes of work issued since the last barrier. */
    struct apex_ib ib;
    uint32_t pending;
-   /* Submission data: state blocks (64-byte aligned), tables and patches. */
+   /* Submission data: state blocks (64-byte aligned), tables and patches;
+    * `scratch` bytes of uninitialized arena memory follow the IB. */
    struct util_dynarray data, patches;
+   uint64_t scratch;
    struct list_head tables, uploads, push_sets;
    /* push_sets owns push descriptor sets; pushed[] is the latest per set. */
    struct apex_descriptor_set *pushed[MESA_VK_MAX_DESCRIPTOR_SETS];
@@ -160,7 +163,7 @@ struct apex_command_buffer {
    /* Graphics bind point. */
    struct apex_bound_set *graphics_sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    uint8_t graphics_push[APEX_MAX_PUSH_CONSTANTS];
-   struct apex_shader *vertex, *fragment;
+   struct apex_shader *vertex, *geometry, *fragment;
    struct vk_vertex_input_state vertex_input;
    struct vk_sample_locations_state sample_locations;
    struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS];

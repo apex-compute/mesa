@@ -1892,7 +1892,8 @@ apex_arena_get(struct apex_device *device, struct apex_queue *queue, uint64_t by
    struct apex_arena *arena = calloc(1, sizeof(*arena));
    if (!arena)
       return NULL;
-   if (apex_bo_create(device, MAX2(util_next_power_of_two64(bytes), 65536), APEX_VM_READ, 0, 0,
+   /* Writable for the scratch that follows the IB (apex_cmd_prepare). */
+   if (apex_bo_create(device, MAX2(util_next_power_of_two64(bytes), 65536), APEX_VM_READ | APEX_VM_WRITE, 0, 0,
                  &arena->bo) != VK_SUCCESS) {
       free(arena);
       return NULL;

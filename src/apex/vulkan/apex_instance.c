@@ -489,6 +489,10 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .shaderStorageImageWriteWithoutFormat = true,
       .fragmentStoresAndAtomics = true,
       .vertexPipelineStoresAndAtomics = true,
+      /* Geometry shaders run as compute passes ahead of the draw
+       * (apex_graphics.c, Geometry shading). */
+      .geometryShader = true,
+      .shaderTessellationAndGeometryPointSize = true,
       /* Implemented 1.0 features. */
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
@@ -607,6 +611,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxVertexInputAttributeOffset = 2047, .maxVertexInputBindingStride = 2048,
       /* Varyings 30 and 31 carry clip distances to the fragment program. */
       .maxVertexOutputComponents = 120, .maxFragmentInputComponents = 120,
+      .maxGeometryShaderInvocations = 32, .maxGeometryInputComponents = 120,
+      .maxGeometryOutputComponents = 120, .maxGeometryOutputVertices = 256,
+      .maxGeometryTotalOutputComponents = 1024,
       .maxFragmentOutputAttachments = 8, .maxFragmentDualSrcAttachments = 1,
       .maxFragmentCombinedOutputResources = 16,
       .maxColorAttachments = 8,

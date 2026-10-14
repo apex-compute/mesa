@@ -86,19 +86,26 @@
 #define APEX_QUERY_FLAGS 6            /* VkQueryResultFlags */
 #define APEX_QUERY_VALUES 7           /* values per query: 1 or 2 */
 
-/* Transform feedback. A draw's capture program (the vertex program built as
- * a compute kernel, apex_graphics.c) and the bookkeeping kernel share these
- * job words. The draw's parameters are its VkDraw(Indexed)IndirectCommand
- * words, read from APEX_XFB_PARAMS when nonzero; a nonzero count address
- * skips draw APEX_XFB_DRAW_INDEX at or beyond the u32 it holds. */
-#define APEX_XFB_DRAW 0               /* 4 or 5 command words */
-#define APEX_XFB_PARAMS 5             /* indirect command VA lo, hi */
-#define APEX_XFB_COUNT 7              /* draw count VA lo, hi */
-#define APEX_XFB_DRAW_INDEX 9
-#define APEX_XFB_INDEX 10             /* index buffer VA lo, hi */
-#define APEX_XFB_INDEX_BYTES 12
-#define APEX_XFB_FLAGS 13             /* index type 1:0, indexed 2, restart 3, last provoking 4, topology 10:8 */
-#define APEX_XFB_VERTEX_INPUT 14      /* vertex-input block VA lo, hi */
+/* Kernels that redo a draw's vertex work: the transform feedback capture
+ * and bookkeeping, and geometry shading (apex_graphics.c). The draw's
+ * parameters are its VkDraw(Indexed)IndirectCommand words, read from
+ * APEX_DRAW_INDIRECT when nonzero; a nonzero count address skips draw
+ * APEX_DRAW_NUMBER at or beyond the u32 it holds. */
+#define APEX_DRAW_COMMAND 0           /* 4 or 5 command words */
+#define APEX_DRAW_INDIRECT 5          /* indirect command VA lo, hi */
+#define APEX_DRAW_COUNT 7             /* draw count VA lo, hi */
+#define APEX_DRAW_NUMBER 9
+#define APEX_DRAW_INDICES 10          /* index buffer VA lo, hi */
+#define APEX_DRAW_INDEX_BYTES 12
+#define APEX_DRAW_FLAGS 13            /* index type 1:0, indexed 2, restart 3, last provoking 4, topology 11:8 */
+#define APEX_DRAW_VERTEX_INPUT 14     /* vertex-input block VA lo, hi */
+#define APEX_DRAW_FLAG_INDEXED (1u << 2)
+#define APEX_DRAW_FLAG_RESTART (1u << 3)
+#define APEX_DRAW_FLAG_LAST (1u << 4)
+/* Workgroup width of the draw kernels. */
+#define APEX_DRAW_LOCAL 64
+
+/* Transform feedback: the capture program and the bookkeeping kernel. */
 #define APEX_XFB_STATE 16             /* state VA lo, hi */
 #define APEX_XFB_QUERY 18             /* stream query slot VA lo, hi; 0 without one */
 #define APEX_XFB_STRIDES 20           /* buffer strides, two per word, 16 bits each */
@@ -109,16 +116,23 @@
 #define APEX_XFB_LOAD 1
 #define APEX_XFB_STORE 2
 #define APEX_XFB_COUNTERS 0           /* load and store: 4 counter VAs lo, hi; 0 skips */
-#define APEX_XFB_FLAG_INDEXED (1u << 2)
-#define APEX_XFB_FLAG_RESTART (1u << 3)
-#define APEX_XFB_FLAG_LAST (1u << 4)
 /* State, 16 words from vkCmdBeginTransformFeedbackEXT: each buffer's byte
  * offset, then each buffer's {VA lo, VA hi, bytes}. */
 #define APEX_XFB_BUFFERS 4
 #define APEX_XFB_STATE_OFFSETS 0
 #define APEX_XFB_STATE_BUFFERS 4
 #define APEX_XFB_STATE_WORDS 16
-/* Capture workgroup width. */
-#define APEX_XFB_LOCAL 64
+
+/* Geometry shading: the vertex program writes every draw position's input
+ * record, the geometry program writes up to the stage's maximum vertices
+ * per invocation to the output records and as many list primitives to the
+ * index list, and an indirect draw's VkDrawIndexedIndirectCommand to the
+ * draw arguments. Invocations beyond the capacity write nothing. */
+#define APEX_GS_RECORDS 16            /* input records VA lo, hi */
+#define APEX_GS_OUTPUT 18             /* output records VA lo, hi */
+#define APEX_GS_LIST 20               /* index list VA lo, hi */
+#define APEX_GS_ARGUMENTS 22          /* draw arguments VA lo, hi; 0 for a direct draw */
+#define APEX_GS_CAPACITY 24           /* geometry invocations whose output fits */
+#define APEX_GS_RECORD_CAPACITY 25    /* input records that fit: instances x the draw's vertex or index count */
 
 #endif

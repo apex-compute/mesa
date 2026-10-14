@@ -81,8 +81,9 @@ clear_commands(struct apex_command_buffer *cmd)
    util_dynarray_clear(&cmd->patches);
    util_dynarray_clear(&cmd->pass_availability);
    cmd->pipeline = NULL;
-   cmd->vertex = cmd->fragment = NULL;
+   cmd->vertex = cmd->geometry = cmd->fragment = NULL;
    cmd->graphics_table = NULL;
+   cmd->scratch = 0;
    cmd->private_pending = false;
    memset(cmd->bindings, 0, sizeof(cmd->bindings));
    memset(&cmd->index, 0, sizeof(cmd->index));
@@ -218,6 +219,16 @@ data_block(struct apex_command_buffer *cmd, const void *bytes, unsigned size)
    }
    memset(out, 0, pad);
    memcpy(out + pad, bytes, size);
+   return offset;
+}
+
+/* Reserves `size` bytes of scratch, 256-byte aligned: arena memory the
+ * submission does not initialize. */
+static uint64_t
+scratch_block(struct apex_command_buffer *cmd, uint64_t size)
+{
+   uint64_t offset = align64(cmd->scratch, 256);
+   cmd->scratch = offset + size;
    return offset;
 }
 
@@ -561,6 +572,8 @@ apex_cmd_bind_shaders(struct vk_command_buffer *vk, uint32_t count,
       struct apex_shader *shader = shaders[i] ? container_of(shaders[i], struct apex_shader, vk) : NULL;
       if (stages[i] == MESA_SHADER_VERTEX)
          cmd->vertex = shader;
+      else if (stages[i] == MESA_SHADER_GEOMETRY)
+         cmd->geometry = shader;
       else if (stages[i] == MESA_SHADER_FRAGMENT)
          cmd->fragment = shader;
    }
@@ -575,7 +588,7 @@ struct saved_state {
    struct vk_dynamic_graphics_state dyn;
    struct vk_vertex_input_state vertex_input;
    struct vk_sample_locations_state sample_locations;
-   struct apex_shader *vertex, *fragment;
+   struct apex_shader *vertex, *geometry, *fragment;
    struct apex_pipeline *pipeline;
    struct apex_bound_set *sets[MESA_VK_MAX_DESCRIPTOR_SETS], *graphics_sets[MESA_VK_MAX_DESCRIPTOR_SETS];
    struct apex_descriptor_set *pushed[MESA_VK_MAX_DESCRIPTOR_SETS];
@@ -591,6 +604,7 @@ meta_begin(struct apex_command_buffer *cmd, struct saved_state *s)
    s->vertex_input = cmd->vertex_input;
    s->sample_locations = cmd->sample_locations;
    s->vertex = cmd->vertex;
+   s->geometry = cmd->geometry;
    s->fragment = cmd->fragment;
    s->pipeline = cmd->pipeline;
    memcpy(s->sets, cmd->sets, sizeof(s->sets));
@@ -619,6 +633,7 @@ meta_end(struct apex_command_buffer *cmd, struct saved_state *s)
    cmd->vk.dynamic_graphics_state.ms.sample_locations = &cmd->sample_locations;
    BITSET_ONES(cmd->vk.dynamic_graphics_state.dirty);
    cmd->vertex = s->vertex;
+   cmd->geometry = s->geometry;
    cmd->fragment = s->fragment;
    cmd->pipeline = s->pipeline;
    for (unsigned i = 0; i < ARRAY_SIZE(s->sets); i++) {
@@ -990,20 +1005,29 @@ primitive_count(VkPrimitiveTopology topology, uint64_t vertices)
    }
 }
 
+/* The rasterized stage of a geometry shader's draw: the pass-through
+ * program's table and the index list at scratch offset `list`, of list
+ * topology `topology`. */
+struct geometry_draw {
+   struct apex_table *table;
+   uint64_t list, list_bytes;
+   VkPrimitiveTopology topology;
+};
+
 /* The draw state registers, blocks and tables, emitted where they changed;
  * false when the draw cannot run. */
 static bool
-emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view)
+emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, const struct geometry_draw *geometry)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    if (!cmd->rendering.active || !cmd->vertex ||
-       (dyn->ia.primitive_topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN &&
+       (!geometry && dyn->ia.primitive_topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN &&
         dyn->ia.primitive_topology != VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA)) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
    }
-   struct apex_program *vs = &cmd->vertex->program, *fs;
+   struct apex_program *vs = geometry ? &cmd->geometry->geometry.draw : &cmd->vertex->program, *fs;
    if (cmd->fragment) {
       fs = &cmd->fragment->program;
    } else {
@@ -1013,7 +1037,11 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view)
          return false;
       }
    }
-   if (!cmd->graphics_table) {
+   if (geometry) {
+      /* The pass-through program reads the records through its own table. */
+      cmd->graphics_table = geometry->table;
+      geometry->table->programs[1] = fs;
+   } else if (!cmd->graphics_table) {
       cmd->graphics_table = table_create(cmd, vs, fs, cmd->graphics_sets, cmd->graphics_push);
       if (!cmd->graphics_table)
          return false;
@@ -1024,9 +1052,15 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view)
    /* Blocks: vertex input, raster, depth-stencil, blend, viewport. */
    uint32_t vi[APEX_HW_VERTEX_INPUT_DWORDS], raster[APEX_HW_RASTER_DWORDS];
    uint32_t ds[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS], vp[APEX_HW_VIEWPORT_DWORDS];
-   apex_hw_vertex_input_block(dyn, cmd->bindings, cmd->vertex->vertex.clip_distances,
-                              cmd->vertex->vertex.robust, vi);
-   apex_hw_raster_block(dyn, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
+   apex_hw_vertex_input_block(dyn, cmd->bindings, geometry ? cmd->geometry->geometry.clip_distances :
+                              cmd->vertex->vertex.clip_distances, !geometry && cmd->vertex->vertex.robust, vi);
+   if (geometry) {
+      struct vk_dynamic_graphics_state list = *dyn;
+      list.ia.primitive_topology = geometry->topology;
+      apex_hw_raster_block(&list, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
+   } else {
+      apex_hw_raster_block(dyn, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
+   }
    const struct apex_attachment *z = &cmd->rendering.depth;
    apex_hw_depth_stencil_block(dyn, z->image ? z->format : VK_FORMAT_UNDEFINED, cmd->rendering.has_depth,
                                cmd->rendering.has_stencil, ds);
@@ -1040,18 +1074,28 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view)
       state_block(cmd, 4, cmd->state.viewport, vp, ARRAY_SIZE(vp)),
    };
    /* Block identity is its data offset; the patch writes its GPUVA. */
-   const uint32_t vertex[11] = {
+   uint32_t vertex[11] = {
       0, 0, LO(blocks[0]), HI(blocks[0]),
       indexed ? LO(cmd->index.va) : 0, indexed ? HI(cmd->index.va) : 0,
       indexed ? (uint32_t)MIN2(cmd->index.size, UINT32_MAX) : 0, indexed ? cmd->index.type : 0,
       hw_topology(dyn->ia.primitive_topology), indexed && dyn->ia.primitive_restart_enable, ~0u,
    };
-   const struct apex_patch vertex_patches[2] = {
+   const struct apex_patch vertex_patches[3] = {
       {.dword = 0, .kind = APEX_PATCH_PROGRAM, .program = vs},
       {.dword = 2, .kind = APEX_PATCH_DATA, .offset = blocks[0]},
+      {.dword = 4, .kind = APEX_PATCH_SCRATCH, .offset = geometry ? geometry->list : 0},
    };
-   emit_registers(cmd, APEX_STATE_VERTEX, cmd->state.vertex, vertex, ARRAY_SIZE(vertex), vertex_patches, 2,
-                  cmd->state.vertex_program != vs);
+   if (geometry) {
+      /* The 32-bit index list; the scratch patch writes its address. */
+      vertex[4] = LO(geometry->list);
+      vertex[5] = HI(geometry->list);
+      vertex[6] = (uint32_t)MIN2(geometry->list_bytes, UINT32_MAX);
+      vertex[7] = 2;
+      vertex[8] = hw_topology(geometry->topology);
+      vertex[9] = 0;
+   }
+   emit_registers(cmd, APEX_STATE_VERTEX, cmd->state.vertex, vertex, ARRAY_SIZE(vertex), vertex_patches,
+                  geometry ? 3 : 2, cmd->state.vertex_program != vs);
    cmd->state.vertex_program = vs;
    /* Vertex user data: s0:s1 table, s2 view index. */
    if (!cmd->state.emitted || cmd->state.table != cmd->graphics_table || cmd->state.view != view) {
@@ -1097,6 +1141,39 @@ struct indirect_draw {
    uint32_t count, stride;
 };
 
+/* The job words describing draw `draw` (APEX_DRAW_*): its command words or
+ * indirect command, count buffer, index buffer, flags with `topology`, and
+ * the vertex input block at data offset `vertex_input`. */
+static void
+draw_words(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet,
+           const struct indirect_draw *indirect, uint32_t draw, uint32_t topology, uint64_t vertex_input,
+           uint32_t words[APEX_JOB_WORDS])
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   memset(words, 0, APEX_JOB_WORDS * 4);
+   words[APEX_DRAW_NUMBER] = draw;
+   words[APEX_DRAW_FLAGS] = (indexed ? cmd->index.type | APEX_DRAW_FLAG_INDEXED : 0) |
+                            (dyn->ia.primitive_restart_enable ? APEX_DRAW_FLAG_RESTART : 0) |
+                            (dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ?
+                             APEX_DRAW_FLAG_LAST : 0) | topology << 8;
+   words[APEX_DRAW_VERTEX_INPUT] = LO(vertex_input);
+   words[APEX_DRAW_VERTEX_INPUT + 1] = HI(vertex_input);
+   if (indexed) {
+      words[APEX_DRAW_INDICES] = LO(cmd->index.va);
+      words[APEX_DRAW_INDICES + 1] = HI(cmd->index.va);
+      words[APEX_DRAW_INDEX_BYTES] = MIN2(cmd->index.size, UINT32_MAX);
+   }
+   if (indirect) {
+      uint64_t params = indirect->va + (uint64_t)draw * indirect->stride;
+      words[APEX_DRAW_INDIRECT] = LO(params);
+      words[APEX_DRAW_INDIRECT + 1] = HI(params);
+      words[APEX_DRAW_COUNT] = LO(indirect->count_va);
+      words[APEX_DRAW_COUNT + 1] = HI(indirect->count_va);
+   } else {
+      memcpy(&words[APEX_DRAW_COMMAND], packet, (indexed ? 5 : 4) * 4);
+   }
+}
+
 /* Transform feedback and the stream query of one draw: after the compute
  * work before it, the capture program writes the captured outputs; after
  * that the bookkeeping kernel advances the offsets and the query. Driver
@@ -1111,17 +1188,12 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
    if (cmd->meta || (!capture && !cmd->xfb.query))
       return;
    uint32_t topology = hw_topology(dyn->ia.primitive_topology);
-   uint32_t words[APEX_JOB_WORDS] = {
-      [APEX_XFB_DRAW_INDEX] = draw,
-      [APEX_XFB_FLAGS] = (indexed ? cmd->index.type | APEX_XFB_FLAG_INDEXED : 0) |
-                         (dyn->ia.primitive_restart_enable ? APEX_XFB_FLAG_RESTART : 0) |
-                         (dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ?
-                          APEX_XFB_FLAG_LAST : 0) | topology << 8,
-      [APEX_XFB_VERTEX_INPUT] = LO(cmd->state.blocks[0]), [APEX_XFB_VERTEX_INPUT + 1] = HI(cmd->state.blocks[0]),
-      [APEX_XFB_QUERY] = LO(cmd->xfb.query), [APEX_XFB_QUERY + 1] = HI(cmd->xfb.query),
-      [APEX_XFB_MODE] = APEX_XFB_ADVANCE,
-   };
-   uint32_t relocs = BITFIELD_BIT(APEX_XFB_VERTEX_INPUT);
+   uint32_t words[APEX_JOB_WORDS];
+   draw_words(cmd, indexed, packet, indirect, draw, topology, cmd->state.blocks[0], words);
+   words[APEX_XFB_QUERY] = LO(cmd->xfb.query);
+   words[APEX_XFB_QUERY + 1] = HI(cmd->xfb.query);
+   words[APEX_XFB_MODE] = APEX_XFB_ADVANCE;
+   uint32_t relocs = BITFIELD_BIT(APEX_DRAW_VERTEX_INPUT);
    if (cmd->xfb.active) {
       words[APEX_XFB_STATE] = LO(cmd->xfb.state);
       words[APEX_XFB_STATE + 1] = HI(cmd->xfb.state);
@@ -1129,23 +1201,11 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
    }
    for (unsigned b = 0; b < APEX_XFB_BUFFERS; b++)
       words[APEX_XFB_STRIDES + b / 2] |= (uint32_t)cmd->vertex->vertex.xfb_strides[b] << 16 * (b & 1);
-   if (indexed) {
-      words[APEX_XFB_INDEX] = LO(cmd->index.va);
-      words[APEX_XFB_INDEX + 1] = HI(cmd->index.va);
-      words[APEX_XFB_INDEX_BYTES] = MIN2(cmd->index.size, UINT32_MAX);
-   }
    uint32_t groups = 64;
-   if (indirect) {
-      uint64_t params = indirect->va + (uint64_t)draw * indirect->stride;
-      words[APEX_XFB_PARAMS] = LO(params);
-      words[APEX_XFB_PARAMS + 1] = HI(params);
-      words[APEX_XFB_COUNT] = LO(indirect->count_va);
-      words[APEX_XFB_COUNT + 1] = HI(indirect->count_va);
-   } else {
-      memcpy(&words[APEX_XFB_DRAW], packet, (indexed ? 5 : 4) * 4);
+   if (!indirect) {
       uint64_t vertices = primitive_count(dyn->ia.primitive_topology, packet[0]) *
                           (topology == 0 ? 1 : topology <= 2 ? 2 : 3) * (uint64_t)packet[1];
-      groups = MIN2(DIV_ROUND_UP(vertices, APEX_XFB_LOCAL), 4096);
+      groups = MIN2(DIV_ROUND_UP(vertices, APEX_DRAW_LOCAL), 4096);
    }
    if (capture && groups) {
       struct apex_table *table = table_create(cmd, capture, NULL, cmd->graphics_sets, cmd->graphics_push);
@@ -1163,6 +1223,118 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
    internal_dispatch(cmd, APEX_INTERNAL_XFB, words, (uint32_t[3]){1, 1, 1}, relocs, true);
 }
 
+/* Input primitives of `vertices` positions, bounding a restarted strip's. */
+static uint64_t
+input_primitives(VkPrimitiveTopology topology, uint64_t vertices)
+{
+   static const unsigned size[10] = {1, 2, 2, 3, 3, 3, 4, 4, 6, 6};
+   static const unsigned shared[10] = {0, 0, 1, 0, 2, 2, 0, 3, 0, 4};
+   if (topology >= ARRAY_SIZE(size))
+      return 0;
+   if (!shared[topology])
+      return vertices / size[topology];
+   return vertices < size[topology] ? 0 : (vertices - shared[topology]) / (size[topology] - shared[topology]);
+}
+
+/* Scratch for one geometry draw. A direct draw takes what its invocations
+ * need, an indirect draw a fixed budget; both stop at the budget, and
+ * invocations beyond it draw nothing. */
+#define APEX_GS_BUDGET (64ull * 1024 * 1024)
+
+/* A draw through a geometry shader (apex_graphics.c, Geometry shading): the
+ * records and geometry programs, then the index list's draw, split to fit
+ * the bin pool's vertex region when direct. */
+static void
+record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet,
+                const struct indirect_draw *indirect, uint32_t draw, uint32_t view)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct apex_shader *gs = cmd->geometry;
+   struct apex_program *records = &cmd->vertex->program, *geometry = &gs->program;
+   const unsigned n = gs->geometry.primitive_vertices;
+   const uint64_t in_stride = 16 * util_bitcount64(gs->geometry.inputs);
+   const uint64_t out_stride = 16 * util_bitcount64(gs->geometry.outputs);
+   const uint64_t list_bytes = 4ull * gs->geometry.max_primitives * n;
+   const uint64_t per_invocation = gs->geometry.max_vertices * out_stride + list_bytes;
+   uint64_t inputs = APEX_GS_BUDGET / 4 / in_stride, invocations = APEX_GS_BUDGET * 3 / 4 / per_invocation;
+   if (!indirect) {
+      inputs = MIN2(inputs, (uint64_t)packet[0] * packet[1]);
+      invocations = MIN2(invocations, input_primitives(dyn->ia.primitive_topology, packet[0]) * packet[1] *
+                                      gs->geometry.invocations);
+   }
+   if (!inputs || !invocations)
+      return;
+   /* The vertex shader's own vertex input block, with its clip distances
+    * and robustness. */
+   uint32_t vi[APEX_HW_VERTEX_INPUT_DWORDS];
+   apex_hw_vertex_input_block(dyn, cmd->bindings, cmd->vertex->vertex.clip_distances, cmd->vertex->vertex.robust,
+                              vi);
+   uint64_t block = data_block(cmd, vi, sizeof(vi));
+   uint32_t words[APEX_JOB_WORDS];
+   draw_words(cmd, indexed, packet, indirect, draw, dyn->ia.primitive_topology, block, words);
+   uint64_t record_va = scratch_block(cmd, inputs * in_stride);
+   uint64_t output_va = scratch_block(cmd, invocations * gs->geometry.max_vertices * out_stride);
+   uint64_t list_va = scratch_block(cmd, invocations * list_bytes);
+   uint64_t arguments_va = indirect ? scratch_block(cmd, 32) : 0;
+   const uint64_t scratch[4][2] = {
+      {APEX_GS_RECORDS, record_va}, {APEX_GS_OUTPUT, output_va}, {APEX_GS_LIST, list_va},
+      {APEX_GS_ARGUMENTS, arguments_va},
+   };
+   uint64_t scratch_relocs = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(scratch); i++) {
+      if (i == 3 && !indirect)
+         continue;
+      words[scratch[i][0]] = LO(scratch[i][1]);
+      words[scratch[i][0] + 1] = HI(scratch[i][1]);
+      scratch_relocs |= BITFIELD64_BIT(scratch[i][0]);
+   }
+   words[APEX_GS_CAPACITY] = invocations;
+   words[APEX_GS_RECORD_CAPACITY] = inputs;
+   /* Records, then the geometry program, each after the work before it. */
+   const uint64_t work[2] = {inputs, invocations};
+   struct apex_program *programs[2] = {records, geometry};
+   for (unsigned k = 0; k < 2; k++) {
+      struct apex_table *table = table_create(cmd, programs[k], NULL, cmd->graphics_sets, cmd->graphics_push);
+      if (!table)
+         return;
+      uint32_t groups = MIN3(DIV_ROUND_UP(work[k], APEX_DRAW_LOCAL), 4096, programs[k]->max_workgroups);
+      table->trailer[0] = groups;
+      table->trailer[1] = table->trailer[2] = 1;
+      memcpy(&table->trailer[APEX_TRAILER_WORDS], words, sizeof(words));
+      table->relocs = (uint64_t)BITFIELD_BIT(APEX_DRAW_VERTEX_INPUT) << APEX_TRAILER_WORDS;
+      table->scratch_relocs = scratch_relocs << APEX_TRAILER_WORDS;
+      apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+      emit_dispatch(cmd, programs[k], table, (uint32_t[3]){0}, (uint32_t[3]){groups, 1, 1}, 0);
+   }
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+   /* The pass-through program's table: the output records and capacity. */
+   struct apex_table *table = table_create(cmd, &gs->geometry.draw, NULL, cmd->graphics_sets, cmd->graphics_push);
+   if (!table)
+      return;
+   memcpy(&table->trailer[APEX_TRAILER_WORDS], words, sizeof(words));
+   table->scratch_relocs = scratch_relocs << APEX_TRAILER_WORDS;
+   static const VkPrimitiveTopology lists[4] = {
+      0, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+   };
+   const struct geometry_draw list = {
+      .table = table, .list = list_va, .list_bytes = invocations * list_bytes, .topology = lists[n],
+   };
+   if (!emit_draw_state(cmd, true, view, &list))
+      return;
+   cmd->graphics_table = NULL;
+   if (indirect) {
+      add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_SCRATCH, .offset = arguments_va});
+      apex_cp_draw_indirect(&cmd->ib, true, 0, 1, 20, 0);
+      return;
+   }
+   /* Pieces of whole list primitives whose vertices fit the vertex region. */
+   uint64_t indices = invocations * gs->geometry.max_primitives * n;
+   uint32_t capacity = APEX_POOL_VERTEX_BYTES / MAX2(gs->geometry.stride, 64) - 4 * 32;
+   capacity -= capacity % n;
+   for (uint64_t first = 0; first < indices; first += capacity)
+      apex_cp_draw_indexed(&cmd->ib, MIN2(capacity, indices - first), 1, first, 0, 0);
+}
+
 /* Multiview repeats the draw per view with the view index in user data;
  * the vertex program writes it as the layer. Transform feedback is not
  * active with multiview. A pass whose bin pool fills splits into raster
@@ -1177,8 +1349,15 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
    }
    predicate(cmd, user_work(cmd));
    uint32_t views = cmd->rendering.view_mask ? cmd->rendering.view_mask : 1;
+   if (cmd->geometry) {
+      u_foreach_bit(view, views) {
+         for (uint32_t d = 0; d < (indirect ? indirect->count : 1); d++)
+            record_geometry(cmd, indexed, packet, indirect, d, cmd->rendering.view_mask ? view : 0);
+      }
+      return;
+   }
    u_foreach_bit(view, views) {
-      if (!emit_draw_state(cmd, indexed, cmd->rendering.view_mask ? view : 0))
+      if (!emit_draw_state(cmd, indexed, cmd->rendering.view_mask ? view : 0, NULL))
          return;
       for (uint32_t d = 0; view == ffs(views) - 1 && d < (indirect ? indirect->count : 1); d++)
          record_xfb(cmd, indexed, packet, indirect, d);
@@ -1285,7 +1464,8 @@ record_direct(struct apex_command_buffer *cmd, bool indexed, const uint32_t *pac
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: align = 2; overlap = 2; break;
    default: align = 0; overlap = 0; break;
    }
-   if ((uint64_t)packet[0] * packet[1] <= capacity || !align ||
+   /* A geometry shader's draw splits its own index list instead. */
+   if ((uint64_t)packet[0] * packet[1] <= capacity || !align || cmd->geometry ||
        (indexed && overlap && dyn->ia.primitive_restart_enable)) {
       record_draw(cmd, indexed, packet, NULL);
       return;
@@ -2074,7 +2254,7 @@ row_used(const struct apex_table *table, unsigned row)
 /* Writes a table into submission memory at `map`, GPUVA `va`. */
 static VkResult
 write_table(struct apex_device *device, const struct apex_table *table, void *map, uint64_t va,
-            uint64_t data_va)
+            uint64_t data_va, uint64_t scratch_va)
 {
    struct apex_program *program = table->programs[0];
    if (!program->table)
@@ -2092,8 +2272,9 @@ write_table(struct apex_device *device, const struct apex_table *table, void *ma
    uint32_t *trailer = (void *)((uint8_t *)rows + trailer_offset);
    for (unsigned w = 0; w < ARRAY_SIZE(table->trailer); w++)
       trailer[w] = util_cpu_to_le32(table->trailer[w]);
-   u_foreach_bit64(w, table->relocs) {
-      uint64_t target = data_va + (table->trailer[w] | (uint64_t)table->trailer[w + 1] << 32);
+   u_foreach_bit64(w, table->relocs | table->scratch_relocs) {
+      uint64_t base = table->scratch_relocs & BITFIELD64_BIT(w) ? scratch_va : data_va;
+      uint64_t target = base + (table->trailer[w] | (uint64_t)table->trailer[w + 1] << 32);
       trailer[w] = util_cpu_to_le32(LO(target));
       trailer[w + 1] = util_cpu_to_le32(HI(target));
    }
@@ -2173,7 +2354,7 @@ VkResult
 apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
                  struct apex_command_buffer *cmd, struct apex_arena **out, uint64_t *ib_va)
 {
-   /* Arena: the data blocks, the tables, then the IB. */
+   /* Arena: the data blocks, the tables, the IB, then the scratch. */
    uint64_t bytes = align64(cmd->data.size, 64);
    list_for_each_entry(struct apex_table, table, &cmd->tables, link) {
       table->offset = bytes;
@@ -2181,6 +2362,9 @@ apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
    }
    uint64_t ib_offset = bytes;
    bytes += (uint64_t)cmd->ib.count * 4;
+   uint64_t scratch_offset = align64(bytes, 256);
+   if (cmd->scratch)
+      bytes = scratch_offset + cmd->scratch;
    struct apex_arena *arena = apex_arena_get(device, queue, bytes);
    if (!arena)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -2191,7 +2375,8 @@ apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
    if (cmd->data.size)
       memcpy(map, cmd->data.data, cmd->data.size);
    list_for_each_entry(struct apex_table, table, &cmd->tables, link) {
-      VkResult result = write_table(device, table, map + table->offset, va + table->offset, va);
+      VkResult result = write_table(device, table, map + table->offset, va + table->offset, va,
+                                    va + scratch_offset);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -2213,6 +2398,10 @@ apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
          target = patch->program->bo.va;
          break;
       }
+      case APEX_PATCH_SCRATCH:
+         target = va + scratch_offset + patch->offset;
+         break;
+         break;
       default:
          target = va + patch->offset;
          break;

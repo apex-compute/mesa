@@ -5,7 +5,10 @@
 #include "vk_shader.h"
 #include "compiler/shader_enums.h"
 
-/* A graphics stage compiled to one P7 vertex or fragment program. */
+/* A graphics stage compiled to a P7 vertex or fragment program; a vertex
+ * shader feeding a geometry shader compiles to the records program and a
+ * geometry shader to the geometry program (apex_graphics.c, Geometry
+ * shading). */
 struct apex_shader {
    struct vk_shader vk;
    struct apex_program program;
@@ -20,7 +23,22 @@ struct apex_shader {
        * nonzero) and each buffer's stride. */
       struct apex_program capture;
       uint16_t xfb_strides[4];
+      /* Feeding a geometry shader: the input record slots written. */
+      uint64_t records;
    } vertex;
+   struct {
+      /* The pass-through vertex program, its output record bytes and clip
+       * distances. */
+      struct apex_program draw;
+      uint32_t stride;
+      uint8_t clip_distances;
+      /* Input and output record slots; per invocation, the vertices and list
+       * primitives of `primitive_vertices` vertices; invocations per input
+       * primitive of `input_vertices`. */
+      uint64_t inputs, outputs;
+      uint16_t max_vertices, max_primitives, invocations;
+      uint8_t primitive_vertices, input_vertices;
+   } geometry;
 };
 
 extern const struct vk_device_shader_ops apex_device_shader_ops;
