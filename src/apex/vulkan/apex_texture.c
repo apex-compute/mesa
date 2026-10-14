@@ -616,30 +616,33 @@ lower_anisotropy(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ct
        nir_alu_type_get_base_type(tex->dest_type) != nir_type_float || !texture_deref || !sampler_deref)
       return;
    b->cursor = nir_before_instr(&tex->instr);
-   nir_def *image = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false));
+   /* Only the sampler's count is read outside the branch, so samplers
+    * without anisotropy pay one row load. The branch is uniform per
+    * sampler, so quads stay whole for the implicit derivatives inside it. */
    nir_def *sampler = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(sampler_deref)), true));
+   nir_def *extra = bits(b, sampler, APEX_HW_SAMPLER_ANISOTROPY, 4);
+   const struct glsl_type *type = glsl_vector_type(GLSL_TYPE_FLOAT, tex->def.num_components);
+   nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
+   nir_variable *sum = nir_local_variable_create(impl, type, "anisotropy_sum");
+   nir_variable *k = nir_local_variable_create(impl, glsl_float_type(), "anisotropy_k");
+   nir_push_if(b, nir_ine_imm(b, extra, 0));
    nir_def *coord = tex_src(tex, nir_tex_src_coord);
    nir_def *xy = nir_trim_vector(b, coord, 2);
    nir_def *dx = tex->op == nir_texop_txd ? tex_src(tex, nir_tex_src_ddx) : nir_ddx(b, xy);
    nir_def *dy = tex->op == nir_texop_txd ? tex_src(tex, nir_tex_src_ddy) : nir_ddy(b, xy);
+   nir_def *image = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false));
    nir_def *size = nir_vec2(b, nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_WIDTH, 14), 1)),
                             nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_HEIGHT, 14), 1)));
    nir_def *px = nir_fmul(b, dx, size), *py = nir_fmul(b, dy, size);
    nir_def *lx = nir_fsqrt(b, nir_fdot(b, px, px));
    nir_def *ly = nir_fsqrt(b, nir_fdot(b, py, py));
    nir_def *major = nir_fmax(b, lx, ly);
-   nir_def *extra = bits(b, sampler, APEX_HW_SAMPLER_ANISOTROPY, 4);
    nir_def *count = nir_fceil(b, nir_fdiv(b, major, nir_fmax_imm(b, nir_fmin(b, lx, ly), 1e-6)));
    count = nir_fmin(b, nir_fmax_imm(b, count, 1.0), nir_u2f32(b, nir_iadd_imm(b, extra, 1)));
    nir_def *lod = nir_fmax_imm(b, nir_flog2(b, nir_fdiv(b, major, count)), -16.0);
    if (tex->op == nir_texop_txb)
       lod = nir_fadd(b, lod, tex_src(tex, nir_tex_src_bias));
    nir_def *axis = nir_bcsel(b, nir_fge(b, lx, ly), dx, dy);
-   const struct glsl_type *type = glsl_vector_type(GLSL_TYPE_FLOAT, tex->def.num_components);
-   nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
-   nir_variable *sum = nir_local_variable_create(impl, type, "anisotropy_sum");
-   nir_variable *k = nir_local_variable_create(impl, glsl_float_type(), "anisotropy_k");
-   nir_push_if(b, nir_ine_imm(b, extra, 0));
    nir_store_var(b, sum, nir_imm_zero(b, tex->def.num_components, 32), ~0u);
    nir_store_var(b, k, nir_imm_float(b, 0.0f), 1);
    nir_push_loop(b);
