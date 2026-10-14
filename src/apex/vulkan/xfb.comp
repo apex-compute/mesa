@@ -41,7 +41,7 @@ uint primitives(uint count, uint topology, uint verts)
    uint flags = job(APEX_DRAW_FLAGS);
    bool restart = (flags & (APEX_DRAW_FLAG_INDEXED | APEX_DRAW_FLAG_RESTART)) ==
                   (APEX_DRAW_FLAG_INDEXED | APEX_DRAW_FLAG_RESTART);
-   if (restart && (topology == 2u || topology >= 4u)) {
+   if (restart && (topology == 2u || topology == 4u || topology == 5u)) {
       uint n = 0u, run = 0u;
       for (uint i = 0u; i < count; i++) {
          run = restart_at(i) ? 0u : run + 1u;
@@ -55,6 +55,10 @@ uint primitives(uint count, uint topology, uint verts)
    case 1u: return count / 2u;
    case 2u: return count > 1u ? count - 1u : 0u;
    case 3u: return count / 3u;
+   case 6u: return count / 4u;
+   case 7u: return count > 3u ? count - 3u : 0u;
+   case 8u: return count / 6u;
+   case 9u: return count > 5u ? (count - 4u) / 2u : 0u;
    default: return count > 2u ? count - 2u : 0u;
    }
 }
@@ -80,7 +84,8 @@ void main()
    if (count_va != 0ul && job(APEX_DRAW_NUMBER) >= Words(count_va).w[0])
       return;
    uint topology = (job(APEX_DRAW_FLAGS) >> 8u) & 15u;
-   uint verts = topology == 0u ? 1u : topology <= 2u ? 2u : 3u;
+   // Adjacency topologies count their primitives without adjacent vertices.
+   uint verts = topology == 0u ? 1u : topology <= 2u || topology == 6u || topology == 7u ? 2u : 3u;
    uint needed = primitives(draw(0u), topology, verts) * draw(1u);
    // Without active transform feedback the query counts needed only.
    uint fit = state_va != 0ul ? needed : 0u;

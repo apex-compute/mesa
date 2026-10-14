@@ -19,6 +19,7 @@
 #include "apex_etc2_spv.h"
 #include "apex_bc_spv.h"
 #include "apex_xfb_spv.h"
+#include "apex_adjacency_spv.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_xfb_info.h"
@@ -301,7 +302,9 @@ restart_scan(nir_builder *b, struct capture *ctx, nir_def *count, nir_def *verts
 }
 
 /* Vertex k of primitive j of a run as a position from the run's start, in
- * Vulkan's topology order for the first or last provoking vertex. */
+ * Vulkan's topology order for the first or last provoking vertex. Adjacency
+ * topologies give their primitives' vertices without the adjacent ones;
+ * strips with adjacency are the strip of their even positions. */
 static nir_def *
 topology_vertex(nir_builder *b, nir_def *topology, nir_def *last, nir_def *j, nir_def *k)
 {
@@ -313,13 +316,34 @@ topology_vertex(nir_builder *b, nir_def *topology, nir_def *last, nir_def *j, ni
                                    nir_bcsel(b, k1, nir_iadd(b, j, even), nir_iadd_imm(b, j, 2)));
    nir_def *fan_first = nir_bcsel(b, k0, next, nir_bcsel(b, k1, nir_iadd_imm(b, j, 2), nir_imm_int(b, 0)));
    nir_def *fan_last = nir_bcsel(b, k0, nir_imm_int(b, 0), nir_iadd(b, j, k));
-   nir_def *values[6] = {
+   nir_def *strip = nir_bcsel(b, last, strip_last, strip_first);
+   nir_def *values[10] = {
       j, nir_iadd(b, nir_imul_imm(b, j, 2), k), nir_iadd(b, j, k), nir_iadd(b, nir_imul_imm(b, j, 3), k),
-      nir_bcsel(b, last, strip_last, strip_first), nir_bcsel(b, last, fan_last, fan_first),
+      strip, nir_bcsel(b, last, fan_last, fan_first),
+      nir_iadd(b, nir_imul_imm(b, j, 4), nir_iadd_imm(b, k, 1)), nir_iadd(b, j, nir_iadd_imm(b, k, 1)),
+      nir_iadd(b, nir_imul_imm(b, j, 6), nir_imul_imm(b, k, 2)), nir_imul_imm(b, strip, 2),
    };
-   nir_def *result = values[5];
-   for (int t = 4; t >= 0; t--)
+   nir_def *result = values[9];
+   for (int t = 8; t >= 0; t--)
       result = nir_bcsel(b, nir_ieq_imm(b, topology, t), values[t], result);
+   return result;
+}
+
+/* Input primitives of `count` positions of Vulkan topology `topology`. */
+static nir_def *
+input_primitives(nir_builder *b, nir_def *topology, nir_def *count)
+{
+   /* Per-topology vertices per list primitive and vertices a strip shares. */
+   static const unsigned size[10] = {1, 2, 2, 3, 3, 3, 4, 4, 6, 6};
+   static const unsigned shared[10] = {0, 0, 1, 0, 2, 2, 0, 3, 0, 4};
+   nir_def *result = nir_imm_int(b, 0);
+   for (unsigned t = 0; t < 10; t++) {
+      nir_def *n = shared[t] ? nir_bcsel(b, nir_ult_imm(b, count, size[t]), nir_imm_int(b, 0),
+                                         nir_udiv_imm(b, nir_iadd_imm(b, count, -(int)shared[t]),
+                                                      size[t] - shared[t]))
+                             : nir_udiv_imm(b, count, size[t]);
+      result = nir_bcsel(b, nir_ieq_imm(b, topology, t), n, result);
+   }
    return result;
 }
 
@@ -585,14 +609,16 @@ build_capture(struct vk_device *device, nir_shader *nir, const struct apex_verte
    ctx.state = job_address(b, program, APEX_XFB_STATE);
    nir_def *topology = nir_iand_imm(b, nir_ushr_imm(b, ctx.flags, 8), 15);
    nir_def *last = nir_ine_imm(b, nir_iand_imm(b, ctx.flags, APEX_DRAW_FLAG_LAST), 0);
+   /* Captured vertices per primitive: adjacency topologies capture their
+    * primitives without the adjacent vertices. */
+   nir_def *lines = nir_ior(b, nir_ult_imm(b, topology, 3), nir_ieq_imm(b, nir_iand_imm(b, topology, ~1), 6));
    nir_def *verts = nir_bcsel(b, nir_ieq_imm(b, topology, 0), nir_imm_int(b, 1),
-                              nir_bcsel(b, nir_ult_imm(b, topology, 3), nir_imm_int(b, 2), nir_imm_int(b, 3)));
-   nir_def *strip = nir_ior(b, nir_ieq_imm(b, topology, 2), nir_uge_imm(b, topology, 4));
+                              nir_bcsel(b, lines, nir_imm_int(b, 2), nir_imm_int(b, 3)));
+   nir_def *strip = nir_ior(b, nir_ieq_imm(b, topology, 2), nir_ieq_imm(b, nir_iand_imm(b, topology, ~1), 4));
    nir_def *restart = nir_iand(b, nir_iand(b, ctx.indexed, strip),
                                nir_ine_imm(b, nir_iand_imm(b, ctx.flags, APEX_DRAW_FLAG_RESTART), 0));
    /* Primitives per instance; none at or past the draw count. */
-   nir_def *runs = nir_bcsel(b, strip, nir_isub(b, nir_iadd_imm(b, count, 1), verts), nir_udiv(b, count, verts));
-   runs = nir_bcsel(b, nir_ult(b, count, verts), zero, runs);
+   nir_def *runs = input_primitives(b, topology, count);
    nir_push_if(b, restart);
    nir_def *scanned, *unused_start, *unused_ordinal;
    restart_scan(b, &ctx, count, verts, NULL, &scanned, &unused_start, &unused_ordinal);
@@ -730,24 +756,6 @@ input_position(nir_builder *b, nir_def *topology, nir_def *last, nir_def *j, nir
    value = nir_bcsel(b, nir_ieq_imm(b, topology, 7), nir_iadd(b, j, k), value);
    value = nir_bcsel(b, nir_ieq_imm(b, topology, 6), nir_iadd(b, nir_imul_imm(b, j, 4), k), value);
    return nir_bcsel(b, nir_ult_imm(b, topology, 6), topology_vertex(b, topology, last, j, k), value);
-}
-
-/* Input primitives of `count` positions of Vulkan topology `topology`. */
-static nir_def *
-input_primitives(nir_builder *b, nir_def *topology, nir_def *count)
-{
-   /* Per-topology vertices per list primitive and vertices a strip shares. */
-   static const unsigned size[10] = {1, 2, 2, 3, 3, 3, 4, 4, 6, 6};
-   static const unsigned shared[10] = {0, 0, 1, 0, 2, 2, 0, 3, 0, 4};
-   nir_def *result = nir_imm_int(b, 0);
-   for (unsigned t = 0; t < 10; t++) {
-      nir_def *n = shared[t] ? nir_bcsel(b, nir_ult_imm(b, count, size[t]), nir_imm_int(b, 0),
-                                         nir_udiv_imm(b, nir_iadd_imm(b, count, -(int)shared[t]),
-                                                      size[t] - shared[t]))
-                             : nir_udiv_imm(b, count, size[t]);
-      result = nir_bcsel(b, nir_ieq_imm(b, topology, t), n, result);
-   }
-   return result;
 }
 
 struct geometry {
@@ -1874,6 +1882,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which, stru
          [APEX_INTERNAL_ETC2] = {apex_etc2_spv, ARRAY_SIZE(apex_etc2_spv)},
          [APEX_INTERNAL_BC] = {apex_bc_spv, ARRAY_SIZE(apex_bc_spv)},
          [APEX_INTERNAL_XFB] = {apex_xfb_spv, ARRAY_SIZE(apex_xfb_spv)},
+         [APEX_INTERNAL_ADJACENCY] = {apex_adjacency_spv, ARRAY_SIZE(apex_adjacency_spv)},
       };
       struct spirv_capabilities caps = {
          .Shader = true, .Int64 = true, .PhysicalStorageBufferAddresses = true,

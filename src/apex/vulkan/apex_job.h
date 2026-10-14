@@ -139,4 +139,13 @@
 #define APEX_GS_CAPACITY 24           /* geometry invocations whose output fits */
 #define APEX_GS_RECORD_CAPACITY 25    /* input records that fit: instances x the draw's vertex or index count */
 
+/* Adjacency without a geometry shader: the kernel writes the draw's
+ * primitives without their adjacent vertices to a 32-bit index list, as a
+ * line or triangle list, and an indirect draw's
+ * VkDrawIndexedIndirectCommand to the draw arguments. Primitives beyond the
+ * capacity are not drawn. */
+#define APEX_ADJACENCY_LIST 16        /* index list VA lo, hi */
+#define APEX_ADJACENCY_ARGUMENTS 18   /* draw arguments VA lo, hi; 0 for a direct draw */
+#define APEX_ADJACENCY_CAPACITY 20    /* list primitives that fit */
+
 #endif

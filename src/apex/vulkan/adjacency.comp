@@ -1,0 +1,119 @@
+#version 450
+// Adjacency topologies without a geometry shader (apex_job.h): writes each
+// primitive's vertices, without the adjacent ones, to the index list as a
+// line or triangle list in provoking-vertex order, and an indirect draw's
+// arguments. The first invocation assembles a restarted strip serially.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_job.h"
+layout(local_size_x = APEX_DRAW_LOCAL) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+uint64_t address(uint i) { return uint64_t(job(i)) | (uint64_t(job(i + 1u)) << 32); }
+
+uint draw(uint i)
+{
+   uint64_t params = address(APEX_DRAW_INDIRECT);
+   return params != 0ul ? Words(params).w[i] : job(APEX_DRAW_COMMAND + i);
+}
+
+// The index at `position`, or the vertex without an index buffer. Robust:
+// indices beyond the bound bytes read zero.
+uint vertex_at(uint position, out bool restart)
+{
+   uint flags = job(APEX_DRAW_FLAGS);
+   restart = false;
+   if ((flags & APEX_DRAW_FLAG_INDEXED) == 0u)
+      return draw(2u) + position;
+   uint shift = flags & 3u, bytes = 1u << shift;
+   uint byte = (draw(2u) + position) << shift;
+   uint value = 0u;
+   if (byte + bytes <= job(APEX_DRAW_INDEX_BYTES)) {
+      uint64_t va = address(APEX_DRAW_INDICES) + uint64_t(byte & ~3u);
+      value = Words(va).w[0] >> ((byte & 3u) * 8u);
+   }
+   uint mask = shift == 2u ? 0xffffffffu : (1u << (8u * bytes)) - 1u;
+   restart = (value & mask) == mask;
+   return value & mask;
+}
+
+// Primitives of a run of `n` positions.
+uint primitives(uint topology, uint n)
+{
+   switch (topology) {
+   case 6u: return n / 4u;
+   case 7u: return n >= 4u ? n - 3u : 0u;
+   case 8u: return n / 6u;
+   default: return n >= 6u ? (n - 4u) / 2u : 0u;
+   }
+}
+
+// Position in its run of vertex k of primitive j. Strips with adjacency
+// draw the strip of their even positions.
+uint position_of(uint topology, bool last, uint j, uint k)
+{
+   switch (topology) {
+   case 6u: return 4u * j + 1u + k;
+   case 7u: return j + 1u + k;
+   case 8u: return 6u * j + 2u * k;
+   default: {
+      uint odd = j & 1u, even = odd ^ 1u;
+      uint first = k == 0u ? j : k == 1u ? j + 1u + odd : j + 1u + even;
+      uint final = k == 0u ? j + odd : k == 1u ? j + even : j + 2u;
+      return 2u * (last ? final : first);
+   }
+   }
+}
+
+void emit(uint p, uint start, uint j, uint topology, uint verts, bool last)
+{
+   Words list = Words(address(APEX_ADJACENCY_LIST));
+   bool restart;
+   for (uint k = 0u; k < verts; k++)
+      list.w[p * verts + k] = vertex_at(start + position_of(topology, last, j, k), restart);
+}
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x, stride = gl_NumWorkGroups.x * APEX_DRAW_LOCAL;
+   uint flags = job(APEX_DRAW_FLAGS);
+   uint topology = (flags >> 8u) & 15u, verts = topology <= 7u ? 2u : 3u;
+   bool last = (flags & APEX_DRAW_FLAG_LAST) != 0u;
+   bool indexed = (flags & APEX_DRAW_FLAG_INDEXED) != 0u;
+   uint capacity = job(APEX_ADJACENCY_CAPACITY);
+   uint64_t count_va = address(APEX_DRAW_COUNT);
+   bool skipped = count_va != 0ul && job(APEX_DRAW_NUMBER) >= Words(count_va).w[0];
+   uint count = skipped ? 0u : draw(0u), total = 0u;
+   if (indexed && (flags & APEX_DRAW_FLAG_RESTART) != 0u && (topology == 7u || topology == 9u)) {
+      if (id != 0u)
+         return;
+      uint start = 0u;
+      for (uint i = 0u; i <= count; i++) {
+         bool restart = false;
+         if (i < count)
+            vertex_at(i, restart);
+         if (i < count && !restart)
+            continue;
+         uint n = primitives(topology, i - start);
+         for (uint j = 0u; j < n && total < capacity; j++, total++)
+            emit(total, start, j, topology, verts, last);
+         start = i + 1u;
+      }
+   } else {
+      total = min(primitives(topology, count), capacity);
+      for (uint p = id; p < total; p += stride)
+         emit(p, 0u, p, topology, verts, last);
+   }
+   uint64_t arguments_va = address(APEX_ADJACENCY_ARGUMENTS);
+   if (id == 0u && arguments_va != 0ul) {
+      Words arguments = Words(arguments_va);
+      arguments.w[0] = total * verts;
+      arguments.w[1] = skipped ? 0u : draw(1u);
+      arguments.w[2] = 0u;
+      arguments.w[3] = indexed ? draw(3u) : 0u;
+      arguments.w[4] = indexed ? draw(4u) : draw(3u);
+   }
+}

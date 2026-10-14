@@ -1150,22 +1150,11 @@ hw_topology(VkPrimitiveTopology topology)
    return topology == VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA ? 3 : MIN2(topology, 5);
 }
 
-static uint64_t
-primitive_count(VkPrimitiveTopology topology, uint64_t vertices)
-{
-   switch (hw_topology(topology)) {
-   case 0: return vertices;
-   case 1: return vertices / 2;
-   case 2: return vertices > 1 ? vertices - 1 : 0;
-   case 3: return vertices / 3;
-   default: return vertices > 2 ? vertices - 2 : 0;
-   }
-}
-
-/* The rasterized stage of a geometry shader's draw: the pass-through
- * program's table and the index list at scratch offset `list`, of list
- * topology `topology`. */
-struct geometry_draw {
+/* An index list a draw rasterizes in place of its own: at scratch offset
+ * `list`, of list topology `topology`, with a geometry shader's pass-through
+ * program's table, or without a table for an adjacency draw's list of its
+ * vertex shader's vertices. */
+struct list_draw {
    struct apex_table *table;
    uint64_t list, list_bytes;
    VkPrimitiveTopology topology;
@@ -1174,16 +1163,17 @@ struct geometry_draw {
 /* The draw state registers, blocks and tables, emitted where they changed;
  * false when the draw cannot run. */
 static bool
-emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, const struct geometry_draw *geometry)
+emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, const struct list_draw *list)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    if (!cmd->rendering.active || !cmd->vertex ||
-       (!geometry && dyn->ia.primitive_topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN &&
+       (!list && dyn->ia.primitive_topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN &&
         dyn->ia.primitive_topology != VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA)) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
    }
+   const struct list_draw *geometry = list && list->table ? list : NULL;
    struct apex_program *vs = geometry ? &cmd->geometry->geometry.draw : &cmd->vertex->program, *fs;
    if (cmd->fragment) {
       fs = &cmd->fragment->program;
@@ -1211,10 +1201,10 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
    uint32_t ds[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS], vp[APEX_HW_VIEWPORT_DWORDS];
    apex_hw_vertex_input_block(dyn, cmd->bindings, geometry ? cmd->geometry->geometry.clip_distances :
                               cmd->vertex->vertex.clip_distances, !geometry && cmd->vertex->vertex.robust, vi);
-   if (geometry) {
-      struct vk_dynamic_graphics_state list = *dyn;
-      list.ia.primitive_topology = geometry->topology;
-      apex_hw_raster_block(&list, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
+   if (list) {
+      struct vk_dynamic_graphics_state listed = *dyn;
+      listed.ia.primitive_topology = list->topology;
+      apex_hw_raster_block(&listed, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
    } else {
       apex_hw_raster_block(dyn, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
    }
@@ -1240,19 +1230,19 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
    const struct apex_patch vertex_patches[3] = {
       {.dword = 0, .kind = APEX_PATCH_PROGRAM, .program = vs},
       {.dword = 2, .kind = APEX_PATCH_DATA, .offset = blocks[0]},
-      {.dword = 4, .kind = APEX_PATCH_SCRATCH, .offset = geometry ? geometry->list : 0},
+      {.dword = 4, .kind = APEX_PATCH_SCRATCH, .offset = list ? list->list : 0},
    };
-   if (geometry) {
+   if (list) {
       /* The 32-bit index list; the scratch patch writes its address. */
-      vertex[4] = LO(geometry->list);
-      vertex[5] = HI(geometry->list);
-      vertex[6] = (uint32_t)MIN2(geometry->list_bytes, UINT32_MAX);
+      vertex[4] = LO(list->list);
+      vertex[5] = HI(list->list);
+      vertex[6] = (uint32_t)MIN2(list->list_bytes, UINT32_MAX);
       vertex[7] = 2;
-      vertex[8] = hw_topology(geometry->topology);
+      vertex[8] = hw_topology(list->topology);
       vertex[9] = 0;
    }
    emit_registers(cmd, APEX_STATE_VERTEX, cmd->state.vertex, vertex, ARRAY_SIZE(vertex), vertex_patches,
-                  geometry ? 3 : 2, cmd->state.vertex_program != vs);
+                  list ? 3 : 2, cmd->state.vertex_program != vs);
    cmd->state.vertex_program = vs;
    /* Vertex user data: s0:s1 table, s2 view index. */
    if (!cmd->state.emitted || cmd->state.table != cmd->graphics_table || cmd->state.view != view) {
@@ -1331,6 +1321,19 @@ draw_words(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
    }
 }
 
+/* Input primitives of `vertices` positions, bounding a restarted strip's. */
+static uint64_t
+input_primitives(VkPrimitiveTopology topology, uint64_t vertices)
+{
+   static const unsigned size[10] = {1, 2, 2, 3, 3, 3, 4, 4, 6, 6};
+   static const unsigned shared[10] = {0, 0, 1, 0, 2, 2, 0, 3, 0, 4};
+   if (topology >= ARRAY_SIZE(size))
+      return 0;
+   if (!shared[topology])
+      return vertices / size[topology];
+   return vertices < size[topology] ? 0 : (vertices - shared[topology]) / (size[topology] - shared[topology]);
+}
+
 /* Transform feedback and the stream query of one draw: after the compute
  * work before it, the capture program writes the captured outputs; after
  * that the bookkeeping kernel advances the offsets and the query. Driver
@@ -1344,7 +1347,10 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
       &cmd->vertex->vertex.capture : NULL;
    if (cmd->meta || (!capture && !cmd->xfb.query))
       return;
-   uint32_t topology = hw_topology(dyn->ia.primitive_topology);
+   /* Adjacency topologies capture their primitives without adjacent
+    * vertices. */
+   uint32_t topology = dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA ?
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : dyn->ia.primitive_topology;
    uint32_t words[APEX_JOB_WORDS];
    draw_words(cmd, indexed, packet, indirect, draw, topology, cmd->state.blocks[0], words);
    words[APEX_XFB_QUERY] = LO(cmd->xfb.query);
@@ -1360,8 +1366,7 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
       words[APEX_XFB_STRIDES + b / 2] |= (uint32_t)cmd->vertex->vertex.xfb_strides[b] << 16 * (b & 1);
    uint32_t groups = 64;
    if (!indirect) {
-      uint64_t vertices = primitive_count(dyn->ia.primitive_topology, packet[0]) *
-                          (topology == 0 ? 1 : topology <= 2 ? 2 : 3) * (uint64_t)packet[1];
+      uint64_t vertices = input_primitives(topology, packet[0]) * 3 * (uint64_t)packet[1];
       groups = MIN2(DIV_ROUND_UP(vertices, APEX_DRAW_LOCAL), 4096);
    }
    if (capture && groups) {
@@ -1378,19 +1383,6 @@ record_xfb(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet
    }
    apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
    internal_dispatch(cmd, APEX_INTERNAL_XFB, words, (uint32_t[3]){1, 1, 1}, relocs, true);
-}
-
-/* Input primitives of `vertices` positions, bounding a restarted strip's. */
-static uint64_t
-input_primitives(VkPrimitiveTopology topology, uint64_t vertices)
-{
-   static const unsigned size[10] = {1, 2, 2, 3, 3, 3, 4, 4, 6, 6};
-   static const unsigned shared[10] = {0, 0, 1, 0, 2, 2, 0, 3, 0, 4};
-   if (topology >= ARRAY_SIZE(size))
-      return 0;
-   if (!shared[topology])
-      return vertices / size[topology];
-   return vertices < size[topology] ? 0 : (vertices - shared[topology]) / (size[topology] - shared[topology]);
 }
 
 /* Scratch for one geometry draw. A direct draw takes what its invocations
@@ -1473,7 +1465,7 @@ record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *p
    static const VkPrimitiveTopology lists[4] = {
       0, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
    };
-   const struct geometry_draw list = {
+   const struct list_draw list = {
       .table = table, .list = list_va, .list_bytes = invocations * list_bytes, .topology = lists[n],
    };
    if (!emit_draw_state(cmd, true, view, &list))
@@ -1492,6 +1484,79 @@ record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *p
       apex_cp_draw_indexed(&cmd->ib, MIN2(capacity, indices - first), 1, first, 0, 0);
 }
 
+/* A draw of an adjacency topology without a geometry shader: the adjacency
+ * kernel lists its primitives' other vertices, and the draw rasterizes the
+ * list with the vertex shader, split to fit the bin pool's vertex region
+ * when direct. An indirect or restarted draw takes its arguments from the
+ * kernel. */
+static void
+record_adjacency(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packet,
+                 const struct indirect_draw *indirect, uint32_t draw, uint32_t view)
+{
+   struct apex_device *device = (void *)cmd->vk.base.device;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const VkPrimitiveTopology topology = dyn->ia.primitive_topology;
+   const unsigned n = topology <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ? 2 : 3;
+   const bool restart = indexed && dyn->ia.primitive_restart_enable &&
+                        (topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
+                         topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY);
+   uint64_t primitives = APEX_GS_BUDGET / (4 * n);
+   if (!indirect)
+      primitives = MIN2(primitives, input_primitives(topology, packet[0]));
+   if (!primitives)
+      return;
+   uint32_t words[APEX_JOB_WORDS];
+   draw_words(cmd, indexed, packet, indirect, draw, topology, 0, words);
+   const uint64_t list_va = scratch_block(cmd, primitives * n * 4);
+   const uint64_t arguments_va = indirect || restart ? scratch_block(cmd, 32) : 0;
+   words[APEX_ADJACENCY_LIST] = LO(list_va);
+   words[APEX_ADJACENCY_LIST + 1] = HI(list_va);
+   words[APEX_ADJACENCY_ARGUMENTS] = LO(arguments_va);
+   words[APEX_ADJACENCY_ARGUMENTS + 1] = HI(arguments_va);
+   words[APEX_ADJACENCY_CAPACITY] = primitives;
+   struct apex_program *program;
+   VkResult result = apex_internal_program(device, APEX_INTERNAL_ADJACENCY, &program);
+   if (result != VK_SUCCESS) {
+      fail(cmd, result);
+      return;
+   }
+   struct apex_table *table = table_create(cmd, program, NULL, NULL, NULL);
+   if (!table)
+      return;
+   uint32_t groups = restart ? 1 : MIN3(DIV_ROUND_UP(primitives, APEX_DRAW_LOCAL), 4096, program->max_workgroups);
+   table->trailer[0] = groups;
+   table->trailer[1] = table->trailer[2] = 1;
+   memcpy(&table->trailer[APEX_TRAILER_WORDS], words, sizeof(words));
+   table->scratch_relocs = (BITFIELD64_BIT(APEX_ADJACENCY_LIST) |
+                            (arguments_va ? BITFIELD64_BIT(APEX_ADJACENCY_ARGUMENTS) : 0)) << APEX_TRAILER_WORDS;
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+   emit_dispatch(cmd, program, table, (uint32_t[3]){0}, (uint32_t[3]){groups, 1, 1}, 0);
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+   const struct list_draw list = {
+      .list = list_va, .list_bytes = primitives * n * 4,
+      .topology = n == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+   };
+   if (!emit_draw_state(cmd, true, view, &list))
+      return;
+   if (arguments_va) {
+      add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_SCRATCH, .offset = arguments_va});
+      apex_cp_draw_indirect(&cmd->ib, true, 0, 1, 20, 0);
+      return;
+   }
+   /* Pieces of whole list primitives, and of instances, whose vertices fit
+    * the vertex region. */
+   const uint64_t indices = primitives * n;
+   uint32_t capacity = APEX_POOL_VERTEX_BYTES / MAX2(cmd->vertex->vertex.stride, 64) - 4 * 32;
+   capacity -= capacity % n;
+   const int32_t offset = indexed ? (int32_t)packet[3] : 0;
+   const uint32_t first_instance = packet[indexed ? 4 : 3];
+   for (uint64_t first = 0; first < indices; first += capacity) {
+      uint32_t count = MIN2(capacity, indices - first), step = MAX2(capacity / count, 1);
+      for (uint32_t i = 0; i < packet[1]; i += step)
+         apex_cp_draw_indexed(&cmd->ib, count, MIN2(step, packet[1] - i), first, offset, first_instance + i);
+   }
+}
+
 /* Multiview repeats the draw per view with the view index in user data;
  * the vertex program writes it as the layer. Transform feedback is not
  * active with multiview. A pass whose bin pool fills splits into raster
@@ -1505,7 +1570,10 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
       return;
    }
    predicate(cmd, user_work(cmd));
-   cmd->rendering.whole |= cmd->geometry || cmd->vertex->vertex.stores || cmd->xfb.active;
+   const VkPrimitiveTopology topology = cmd->vk.dynamic_graphics_state.ia.primitive_topology;
+   const bool adjacency = !cmd->geometry && topology >= VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY &&
+                          topology <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+   cmd->rendering.whole |= cmd->geometry || adjacency || cmd->vertex->vertex.stores || cmd->xfb.active;
    cmd->rendering.vertices += indirect ? UINT32_MAX :
       (uint64_t)packet[0] * packet[1] * MAX2(util_bitcount(cmd->rendering.view_mask), 1);
    uint32_t views = cmd->rendering.view_mask ? cmd->rendering.view_mask : 1;
@@ -1513,6 +1581,16 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
       u_foreach_bit(view, views) {
          for (uint32_t d = 0; d < (indirect ? indirect->count : 1); d++)
             record_geometry(cmd, indexed, packet, indirect, d, cmd->rendering.view_mask ? view : 0);
+      }
+      return;
+   }
+   if (adjacency) {
+      u_foreach_bit(view, views) {
+         for (uint32_t d = 0; d < (indirect ? indirect->count : 1); d++) {
+            record_adjacency(cmd, indexed, packet, indirect, d, cmd->rendering.view_mask ? view : 0);
+            if (view == ffs(views) - 1)
+               record_xfb(cmd, indexed, packet, indirect, d);
+         }
       }
       return;
    }
