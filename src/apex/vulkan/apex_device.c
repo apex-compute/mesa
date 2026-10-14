@@ -499,7 +499,7 @@ image_features(VkFormat format, bool linear)
 {
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
                                           VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
-   /* ETC2/EAC images sample their decoded plane. */
+   /* ETC2/EAC and BC images sample their decoded plane. */
    if (apex_decoded_format(format, NULL))
       return linear ? 0 : transfer | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
                           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
@@ -665,8 +665,8 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
        ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && info->type != VK_IMAGE_TYPE_2D))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    /* External images are PRIME-shared bytes of the same allocation,
-    * importable and exportable as opaque fds or dma-bufs. ETC2/EAC images
-    * keep a private decoded plane and stay internal. */
+    * importable and exportable as opaque fds or dma-bufs. ETC2/EAC and BC
+    * images keep a private decoded plane and stay internal. */
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
    if (external && external->handleType) {

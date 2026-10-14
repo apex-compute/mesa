@@ -1789,8 +1789,8 @@ apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
    }
 }
 
-/* Re-decodes an ETC2/EAC region (texels, clamped to the level) into the
- * image's decoded plane after its blocks change. */
+/* Re-decodes an ETC2/EAC or BC region (texels, clamped to the level) into
+ * the image's decoded plane after its blocks change. */
 static void
 record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, unsigned level,
                    unsigned layer, unsigned layers, VkOffset3D offset, VkExtent3D extent)
@@ -1814,7 +1814,8 @@ record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, u
    words[APEX_DECODE_EXTENT + 1] = height;
    words[APEX_DECODE_EXTENT + 2] = layers;
    words[APEX_DECODE_KIND] = kind;
-   internal_dispatch(cmd, APEX_INTERNAL_ETC2, words, (uint32_t[3]){DIV_ROUND_UP(width, 32), height, layers}, 0, false);
+   internal_dispatch(cmd, kind >= APEX_BC1_RGB ? APEX_INTERNAL_BC : APEX_INTERNAL_ETC2, words,
+                     (uint32_t[3]){DIV_ROUND_UP(width, 32), height, layers}, 0, false);
 }
 
 /* The clear kernel over layers x rect of one level: pattern and mask

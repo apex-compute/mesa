@@ -546,6 +546,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
       .textureCompressionETC2 = true,
+      /* BC blocks decode at upload into a plane the texture unit samples. */
+      .textureCompressionBC = true,
       .texelBufferAlignment = true,
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,

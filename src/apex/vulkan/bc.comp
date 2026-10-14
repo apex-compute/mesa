@@ -1,0 +1,348 @@
+#version 450
+// BC1-BC7 blocks to an image's decoded plane: one invocation per texel. Job
+// words as for ETC2 (apex_job.h). BC1-BC3 and BC7 decode to RGBA8, BC4 and
+// BC5 to 32-bit floats per channel and BC6H to half floats. BC6H and BC7
+// follow Mesa's texcompress_bptc_tmp.h.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "apex_job.h"
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer Root { uint root[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+uint job(uint i) { return root[APEX_JOB_BASE + i]; }
+uint64_t address(uint i) { return uint64_t(job(i)) | (uint64_t(job(i + 1u)) << 32); }
+#include "apex_surface.glsl"
+
+// BC6H modes as main() numbers them: bit 0 valid, 1 transformed endpoints,
+// 2-4 partition bits, 5-9 endpoint bits, 10-12 index bits, then the three
+// 5-bit delta widths.
+const uint bc6_modes[18] = uint[18](
+   0x0294ad57u, 0x0318ccf7u, 0x0210ad77u, 0x05295141u, 0x02148d77u, 0x04a53163u,
+   0x02908d77u, 0x04211183u, 0x0294ad37u, 0x02109203u, 0x0294cd17u, 0u,
+   0x0298ad17u, 0u, 0x0314ad17u, 0u, 0x0318ccd5u, 0u);
+// Each mode's endpoint bit fields, in stream order from bc6_first[mode]:
+// endpoint 1:0, component 3:2, first bit 7:4, bits 12:8, reversed 13.
+const uint bc6_first[19] = uint[19](0, 19, 42, 60, 66, 86, 95, 115, 124, 143, 152, 171, 171, 192, 192, 213, 213, 236, 236);
+const uint bc6_fields[236] = uint[236](
+   0x0146u, 0x014au, 0x014bu, 0x0a00u, 0x0a04u, 0x0a08u, 0x0501u, 0x0147u, 0x0406u, 0x0505u,
+   0x010bu, 0x0407u, 0x0509u, 0x011bu, 0x040au, 0x0502u, 0x012bu, 0x0503u, 0x013bu, 0x0156u,
+   0x0147u, 0x0157u, 0x0700u, 0x010bu, 0x011bu, 0x014au, 0x0704u, 0x015au, 0x012bu, 0x0146u,
+   0x0708u, 0x013bu, 0x015bu, 0x014bu, 0x0601u, 0x0406u, 0x0605u, 0x0407u, 0x0609u, 0x040au,
+   0x0602u, 0x0603u, 0x0a00u, 0x0a04u, 0x0a08u, 0x0501u, 0x01a0u, 0x0406u, 0x0405u, 0x01a4u,
+   0x010bu, 0x0407u, 0x0409u, 0x01a8u, 0x011bu, 0x040au, 0x0502u, 0x012bu, 0x0503u, 0x013bu,
+   0x0a00u, 0x0a04u, 0x0a08u, 0x0a01u, 0x0a05u, 0x0a09u, 0x0a00u, 0x0a04u, 0x0a08u, 0x0401u,
+   0x01a0u, 0x0147u, 0x0406u, 0x0505u, 0x01a4u, 0x0407u, 0x0409u, 0x01a8u, 0x011bu, 0x040au,
+   0x0402u, 0x010bu, 0x012bu, 0x0403u, 0x0146u, 0x013bu, 0x0a00u, 0x0a04u, 0x0a08u, 0x0901u,
+   0x01a0u, 0x0905u, 0x01a4u, 0x0909u, 0x01a8u, 0x0a00u, 0x0a04u, 0x0a08u, 0x0401u, 0x01a0u,
+   0x014au, 0x0406u, 0x0405u, 0x01a4u, 0x010bu, 0x0407u, 0x0509u, 0x01a8u, 0x040au, 0x0402u,
+   0x011bu, 0x012bu, 0x0403u, 0x014bu, 0x013bu, 0x0a00u, 0x0a04u, 0x0a08u, 0x0801u, 0x22a0u,
+   0x0805u, 0x22a4u, 0x0809u, 0x22a8u, 0x0900u, 0x014au, 0x0904u, 0x0146u, 0x0908u, 0x014bu,
+   0x0501u, 0x0147u, 0x0406u, 0x0505u, 0x010bu, 0x0407u, 0x0509u, 0x011bu, 0x040au, 0x0502u,
+   0x012bu, 0x0503u, 0x013bu, 0x0a00u, 0x0a04u, 0x0a08u, 0x0401u, 0x26a0u, 0x0405u, 0x26a4u,
+   0x0409u, 0x26a8u, 0x0800u, 0x0147u, 0x014au, 0x0804u, 0x012bu, 0x0146u, 0x0808u, 0x013bu,
+   0x014bu, 0x0601u, 0x0406u, 0x0505u, 0x010bu, 0x0407u, 0x0509u, 0x011bu, 0x040au, 0x0602u,
+   0x0603u, 0x0800u, 0x010bu, 0x014au, 0x0804u, 0x0156u, 0x0146u, 0x0808u, 0x0157u, 0x014bu,
+   0x0501u, 0x0147u, 0x0406u, 0x0605u, 0x0407u, 0x0509u, 0x011bu, 0x040au, 0x0502u, 0x012bu,
+   0x0503u, 0x013bu, 0x0800u, 0x011bu, 0x014au, 0x0804u, 0x015au, 0x0146u, 0x0808u, 0x015bu,
+   0x014bu, 0x0501u, 0x0147u, 0x0406u, 0x0505u, 0x010bu, 0x0407u, 0x0609u, 0x040au, 0x0502u,
+   0x012bu, 0x0503u, 0x013bu, 0x0600u, 0x0147u, 0x010bu, 0x011bu, 0x014au, 0x0604u, 0x0156u,
+   0x015au, 0x012bu, 0x0146u, 0x0608u, 0x0157u, 0x013bu, 0x015bu, 0x014bu, 0x0601u, 0x0406u,
+   0x0605u, 0x0407u, 0x0609u, 0x040au, 0x0602u, 0x0603u);
+// Two- and three-subset partitions, two bits per texel.
+const uint partitions2[64] = uint[64](
+   0x50505050u, 0x40404040u, 0x54545454u, 0x54505040u, 0x50404000u, 0x55545450u, 0x55545040u, 0x54504000u,
+   0x50400000u, 0x55555450u, 0x55544000u, 0x54400000u, 0x55555440u, 0x55550000u, 0x55555500u, 0x55000000u,
+   0x55150100u, 0x00004054u, 0x15010000u, 0x00405054u, 0x00004050u, 0x15050100u, 0x05010000u, 0x40505054u,
+   0x00404050u, 0x05010100u, 0x14141414u, 0x05141450u, 0x01155440u, 0x00555500u, 0x15014054u, 0x05414150u,
+   0x44444444u, 0x55005500u, 0x11441144u, 0x05055050u, 0x05500550u, 0x11114444u, 0x41144114u, 0x44111144u,
+   0x15055054u, 0x01055040u, 0x05041050u, 0x05455150u, 0x14414114u, 0x50050550u, 0x41411414u, 0x00141400u,
+   0x00041504u, 0x00105410u, 0x10541000u, 0x04150400u, 0x50410514u, 0x41051450u, 0x05415014u, 0x14054150u,
+   0x41050514u, 0x41505014u, 0x40011554u, 0x54150140u, 0x50505500u, 0x00555050u, 0x15151010u, 0x54540404u);
+const uint partitions3[64] = uint[64](
+   0xaa685050u, 0x6a5a5040u, 0x5a5a4200u, 0x5450a0a8u, 0xa5a50000u, 0xa0a05050u, 0x5555a0a0u, 0x5a5a5050u,
+   0xaa550000u, 0xaa555500u, 0xaaaa5500u, 0x90909090u, 0x94949494u, 0xa4a4a4a4u, 0xa9a59450u, 0x2a0a4250u,
+   0xa5945040u, 0x0a425054u, 0xa5a5a500u, 0x55a0a0a0u, 0xa8a85454u, 0x6a6a4040u, 0xa4a45000u, 0x1a1a0500u,
+   0x0050a4a4u, 0xaaa59090u, 0x14696914u, 0x69691400u, 0xa08585a0u, 0xaa821414u, 0x50a4a450u, 0x6a5a0200u,
+   0xa9a58000u, 0x5090a0a8u, 0xa8a09050u, 0x24242424u, 0x00aa5500u, 0x24924924u, 0x24499224u, 0x50a50a50u,
+   0x500aa550u, 0xaaaa4444u, 0x66660000u, 0xa5a0a5a0u, 0x50a050a0u, 0x69286928u, 0x44aaaa44u, 0x66666600u,
+   0xaa444444u, 0x54a854a8u, 0x95809580u, 0x96969600u, 0xa85454a8u, 0x80959580u, 0xaa141414u, 0x96960000u,
+   0xaaaa1414u, 0xa05050a0u, 0xa0a5a5a0u, 0x96000000u, 0x40804080u, 0xa9a8a9a8u, 0xaaaaaa44u, 0x2a4a5254u);
+// Anchor texels of the second subset of two, and the second and third
+// of three, four bits per partition.
+const uint anchors[24] = uint[24](
+   0xffffffffu, 0xffffffffu, 0xf882282fu, 0x22882282u, 0xff8286ffu, 0x6ff22282u, 0x22ff8626u, 0xf22fffffu,
+   0xff38ff33u, 0x33566688u, 0xa633f833u, 0xff586885u, 0xf8a653f8u, 0xffff5f3fu, 0xa58555f3u, 0x33cfd8a5u,
+   0x83ff388fu, 0x8fffffffu, 0x8f8f3f8fu, 0x8affa6f3u, 0xa98aaf3fu, 0x8663f8f6u, 0xffffff3fu, 0x8ff3ffffu);
+
+// BC7 modes 0-7.
+const uint bc7_subsets[8] = uint[8](3u, 2u, 3u, 2u, 1u, 1u, 1u, 2u);
+const uint bc7_partition_bits[8] = uint[8](4u, 6u, 6u, 6u, 0u, 0u, 0u, 6u);
+const uint bc7_color_bits[8] = uint[8](4u, 6u, 5u, 7u, 5u, 7u, 7u, 5u);
+const uint bc7_alpha_bits[8] = uint[8](0u, 0u, 0u, 0u, 6u, 8u, 7u, 5u);
+const uint bc7_endpoint_pbits[8] = uint[8](1u, 0u, 0u, 1u, 0u, 0u, 1u, 1u);
+const uint bc7_shared_pbits[8] = uint[8](0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u);
+const uint bc7_index_bits[8] = uint[8](3u, 3u, 2u, 2u, 2u, 2u, 4u, 2u);
+const uint bc7_secondary_bits[8] = uint[8](0u, 0u, 0u, 0u, 3u, 2u, 0u, 0u);
+
+// Bits [offset, offset + count) of a block, count below 32.
+uint bits(uvec4 b, uint offset, uint count)
+{
+   uint word = offset >> 5u, shift = offset & 31u;
+   uint v = b[word] >> shift;
+   if (shift + count > 32u)
+      v |= b[word + 1u] << (32u - shift);
+   return v & ((1u << count) - 1u);
+}
+
+int sign_extend(uint v, uint n)
+{
+   return n == 0u ? 0 : int(v << (32u - n)) >> (32u - n);
+}
+
+// Opaque 565 color endpoints; BC2 and BC3 always take four colors.
+vec4 bc1(uvec2 raw, uint t, bool four, bool alpha)
+{
+   uint c0 = raw.x & 0xffffu, c1 = raw.x >> 16u;
+   uint index = (raw.y >> (2u * t)) & 3u;
+   const vec3 scale = vec3(31.0, 63.0, 31.0);
+   vec3 e0 = vec3(c0 >> 11u, (c0 >> 5u) & 63u, c0 & 31u) / scale;
+   vec3 e1 = vec3(c1 >> 11u, (c1 >> 5u) & 63u, c1 & 31u) / scale;
+   if (four || c0 > c1) {
+      const float weights[4] = float[4](0.0, 1.0, 1.0 / 3.0, 2.0 / 3.0);
+      return vec4(mix(e0, e1, weights[index]), 1.0);
+   }
+   if (index == 3u)
+      return vec4(0.0, 0.0, 0.0, alpha ? 0.0 : 1.0);
+   return vec4(mix(e0, e1, index == 2u ? 0.5 : float(index)), 1.0);
+}
+
+// A BC3 alpha or BC4 channel block; signed endpoints are SNORM8.
+float bc4(uvec2 raw, uint t, bool is_signed)
+{
+   int r0 = is_signed ? bitfieldExtract(int(raw.x), 0, 8) : int(raw.x & 0xffu);
+   int r1 = is_signed ? bitfieldExtract(int(raw.x), 8, 8) : int((raw.x >> 8u) & 0xffu);
+   float scale = is_signed ? 127.0 : 255.0;
+   float e0 = max(float(r0), -127.0) / scale, e1 = max(float(r1), -127.0) / scale;
+   uint index = bits(uvec4(raw, 0u, 0u), 16u + 3u * t, 3u);
+   if (index < 2u)
+      return index == 0u ? e0 : e1;
+   if (r0 > r1)
+      return mix(e0, e1, float(index - 1u) / 7.0);
+   if (index >= 6u)
+      return index == 7u ? 1.0 : (is_signed ? -1.0 : 0.0);
+   return mix(e0, e1, float(index - 1u) / 5.0);
+}
+
+uint anchor(uint table, uint p)
+{
+   return (anchors[table * 8u + p / 8u] >> (4u * (p % 8u))) & 15u;
+}
+
+bool is_anchor(uint subsets, uint p, uint t)
+{
+   return t == 0u || (subsets == 2u && anchor(0u, p) == t) ||
+          (subsets == 3u && (anchor(1u, p) == t || anchor(2u, p) == t));
+}
+
+uint anchors_before(uint subsets, uint p, uint t)
+{
+   if (t == 0u)
+      return 0u;
+   uint count = 1u;
+   if (subsets == 2u && t > anchor(0u, p))
+      count++;
+   if (subsets == 3u)
+      count += uint(t > anchor(1u, p)) + uint(t > anchor(2u, p));
+   return count;
+}
+
+int interpolate(int a, int b, uint index, uint index_bits)
+{
+   const int w2[4] = int[4](0, 21, 43, 64);
+   const int w3[8] = int[8](0, 9, 18, 27, 37, 46, 55, 64);
+   const int w4[16] = int[16](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+   int w = index_bits == 2u ? w2[index] : index_bits == 3u ? w3[index] : w4[index];
+   return ((64 - w) * a + w * b + 32) >> 6;
+}
+
+int unquantize(int v, uint n, bool is_signed)
+{
+   if (is_signed) {
+      if (n >= 16u || v == 0)
+         return v;
+      int a = abs(v);
+      a = a >= (1 << (n - 1u)) - 1 ? 0x7fff : ((a << 15) + 0x4000) >> (n - 1u);
+      return v < 0 ? -a : a;
+   }
+   if (n >= 15u || v == 0)
+      return v;
+   return v == (1 << n) - 1 ? 0xffff : ((v << 15) + 0x4000) >> (n - 1u);
+}
+
+// RGB half floats of a BC6H texel.
+uvec3 bc6(uvec4 b, uint t, bool is_signed)
+{
+   uint mode, offset;
+   if ((b.x & 2u) != 0u) {
+      mode = (((b.x >> 1u) & 0xeu) | (b.x & 1u)) + 2u;
+      offset = 5u;
+   } else {
+      mode = b.x & 3u;
+      offset = 2u;
+   }
+   uint m = bc6_modes[mode];
+   if ((m & 1u) == 0u)
+      return uvec3(0u);
+   uint partition_bits = (m >> 2u) & 7u, endpoint_bits = (m >> 5u) & 31u, index_bits = (m >> 10u) & 7u;
+   int e[12] = int[12](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+   for (uint f = bc6_first[mode]; f < bc6_first[mode + 1u]; f++) {
+      uint field = bc6_fields[f], n = (field >> 8u) & 31u;
+      uint value = bits(b, offset, n);
+      offset += n;
+      if ((field & 0x2000u) != 0u)
+         value = bitfieldReverse(value) >> (32u - n);
+      e[(field & 3u) * 3u + ((field >> 2u) & 3u)] |= int(value << ((field >> 4u) & 15u));
+   }
+   uint endpoints = partition_bits != 0u ? 4u : 2u;
+   if ((m & 2u) != 0u) {
+      /* Endpoints after the first are signed offsets from it. */
+      for (uint i = 3u; i < endpoints * 3u; i++)
+         e[i] = (e[i % 3u] + sign_extend(uint(e[i]), (m >> (13u + 5u * (i % 3u))) & 31u)) &
+                ((1 << endpoint_bits) - 1);
+   }
+   for (uint i = 0u; i < endpoints * 3u; i++)
+      e[i] = unquantize(is_signed ? sign_extend(uint(e[i]), endpoint_bits) : e[i], endpoint_bits, is_signed);
+   uint p = 0u, shape = 0u, subsets = 1u;
+   if (partition_bits != 0u) {
+      p = bits(b, offset, partition_bits);
+      offset += partition_bits;
+      shape = partitions2[p];
+      subsets = 2u;
+   }
+   offset += index_bits * t - anchors_before(subsets, p, t);
+   uint subset = (shape >> (2u * t)) & 3u;
+   uint index = bits(b, offset, index_bits - uint(is_anchor(subsets, p, t)));
+   uvec3 rgb;
+   for (uint c = 0u; c < 3u; c++) {
+      int v = interpolate(e[subset * 6u + c], e[subset * 6u + 3u + c], index, index_bits);
+      rgb[c] = uint(is_signed ? (v < 0 ? ((-v * 31) / 32) | 0x8000 : (v * 31) / 32) : (v * 31) / 64);
+   }
+   return rgb;
+}
+
+// Expands an n-bit component to 8 bits by replicating its high bits.
+uint expand(uint v, uint n)
+{
+   return (v << (8u - n)) | (v >> (2u * n - 8u));
+}
+
+uvec4 bc7(uvec4 b, uint t)
+{
+   if ((b.x & 0xffu) == 0u)
+      return uvec4(0u);
+   uint mode = findLSB(b.x & 0xffu);
+   uint offset = mode + 1u, subsets = bc7_subsets[mode];
+   uint p = bits(b, offset, bc7_partition_bits[mode]);
+   offset += bc7_partition_bits[mode];
+   uint shape = subsets == 2u ? partitions2[p] : subsets == 3u ? partitions3[p] : 0u;
+   uint rotation = 0u, selection = 0u;
+   if (mode == 4u || mode == 5u) {
+      rotation = bits(b, offset, 2u);
+      offset += 2u;
+   }
+   if (mode == 4u) {
+      selection = bits(b, offset, 1u);
+      offset += 1u;
+   }
+   uint color_bits = bc7_color_bits[mode], alpha_bits = bc7_alpha_bits[mode];
+   uint e[24];
+   for (uint c = 0u; c < 4u; c++) {
+      for (uint k = 0u; k < 2u * subsets; k++) {
+         uint n = c < 3u ? color_bits : alpha_bits;
+         e[k * 4u + c] = n != 0u ? bits(b, offset, n) : 255u;
+         offset += n;
+      }
+   }
+   uint components = alpha_bits != 0u ? 4u : 3u;
+   uint pbits = bc7_endpoint_pbits[mode] + bc7_shared_pbits[mode];
+   for (uint k = 0u; pbits != 0u && k < 2u * subsets; k++) {
+      /* Shared p-bits serve both endpoints of a subset. */
+      uint pbit = bits(b, offset + (bc7_shared_pbits[mode] != 0u ? k / 2u : k), 1u);
+      for (uint c = 0u; c < components; c++)
+         e[k * 4u + c] = (e[k * 4u + c] << 1u) | pbit;
+   }
+   offset += bc7_shared_pbits[mode] != 0u ? subsets : bc7_endpoint_pbits[mode] * 2u * subsets;
+   for (uint k = 0u; k < 2u * subsets; k++) {
+      for (uint c = 0u; c < 3u; c++)
+         e[k * 4u + c] = expand(e[k * 4u + c], color_bits + pbits);
+      if (alpha_bits != 0u)
+         e[k * 4u + 3u] = expand(e[k * 4u + 3u], alpha_bits + pbits);
+   }
+   uint before = anchors_before(subsets, p, t);
+   uint index_bits = bc7_index_bits[mode], secondary_bits = bc7_secondary_bits[mode];
+   uint secondary = offset + 16u * index_bits - subsets + secondary_bits * t - before;
+   offset += index_bits * t - before;
+   uint subset = (shape >> (2u * t)) & 3u;
+   uint anchored = uint(is_anchor(subsets, p, t));
+   uint i0 = bits(b, offset, index_bits - anchored);
+   uint i1 = secondary_bits != 0u ? bits(b, secondary, secondary_bits - anchored) : 0u;
+   /* Alpha takes the index the colors do not. */
+   bool swap = selection != 0u;
+   bool split = secondary_bits != 0u;
+   uvec4 result;
+   for (uint c = 0u; c < 4u; c++) {
+      bool second = c < 3u ? swap : split && !swap;
+      result[c] = uint(interpolate(int(e[subset * 8u + c]), int(e[subset * 8u + 4u + c]),
+                                   second ? i1 : i0, second ? secondary_bits : index_bits));
+   }
+   if (rotation != 0u) {
+      uint a = result[3];
+      result[3] = result[rotation - 1u];
+      result[rotation - 1u] = a;
+   }
+   return result;
+}
+
+void main()
+{
+   uvec3 p = gl_GlobalInvocationID;
+   if (p.x >= job(APEX_DECODE_EXTENT) || p.y >= job(APEX_DECODE_EXTENT + 1u) ||
+       p.z >= job(APEX_DECODE_EXTENT + 2u))
+      return;
+   uint kind = job(APEX_DECODE_KIND);
+   bool narrow = kind == APEX_BC1_RGB || kind == APEX_BC1_RGBA || kind == APEX_BC4 || kind == APEX_BC4_SNORM;
+   uint64_t block = address(APEX_DECODE_SRC) + uint64_t(p.z) * job(APEX_DECODE_SRC_SLICE) +
+                    uint64_t(p.y / 4u) * job(APEX_DECODE_SRC_ROW) + uint64_t(p.x / 4u) * (narrow ? 8u : 16u);
+   Words src = Words(block);
+   uvec4 raw = uvec4(src.w[0], src.w[1], narrow ? 0u : src.w[2], narrow ? 0u : src.w[3]);
+   uint t = (p.y & 3u) * 4u + (p.x & 3u);
+   Words dst = Words(surface_address(APEX_DECODE_DST, p.x, p.y, p.z));
+   bool is_signed = kind == APEX_BC4_SNORM || kind == APEX_BC5_SNORM || kind == APEX_BC6H_SFLOAT;
+   if (kind == APEX_BC4 || kind == APEX_BC4_SNORM || kind == APEX_BC5 || kind == APEX_BC5_SNORM) {
+      dst.w[0] = floatBitsToUint(bc4(raw.xy, t, is_signed));
+      if (!narrow)
+         dst.w[1] = floatBitsToUint(bc4(raw.zw, t, is_signed));
+      return;
+   }
+   if (kind == APEX_BC6H_UFLOAT || kind == APEX_BC6H_SFLOAT) {
+      uvec3 rgb = bc6(raw, t, is_signed);
+      dst.w[0] = rgb.r | (rgb.g << 16u);
+      dst.w[1] = rgb.b | (0x3c00u << 16u);
+      return;
+   }
+   uvec4 bytes;
+   if (kind == APEX_BC7) {
+      bytes = bc7(raw, t);
+   } else {
+      vec4 color = kind == APEX_BC1_RGB || kind == APEX_BC1_RGBA ?
+                   bc1(raw.xy, t, false, kind == APEX_BC1_RGBA) : bc1(raw.zw, t, true, false);
+      if (kind == APEX_BC2)
+         color.a = float(bits(raw, 4u * t, 4u)) / 15.0;
+      else if (kind == APEX_BC3)
+         color.a = bc4(raw.xy, t, false);
+      bytes = uvec4(round(clamp(color, 0.0, 1.0) * 255.0));
+   }
+   dst.w[0] = bytes.r | (bytes.g << 8u) | (bytes.b << 16u) | (bytes.a << 24u);
+}

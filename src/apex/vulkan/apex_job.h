@@ -44,8 +44,8 @@
 #define APEX_CLEAR_PATTERN 12         /* packed texel, 4 words */
 #define APEX_CLEAR_MASK 16            /* texel bits to write, 4 words */
 
-/* ETC2/EAC decode: one invocation per texel of a width x height x layers
- * region, from its first block to the decoded plane. */
+/* ETC2/EAC and BC decode: one invocation per texel of a width x height x
+ * layers region, from its first block to the decoded plane. */
 #define APEX_DECODE_DST 0             /* decoded plane surface */
 #define APEX_DECODE_SRC 8             /* first block VA lo, hi */
 #define APEX_DECODE_SRC_ROW 10        /* bytes per block row */
@@ -60,6 +60,18 @@
 #define APEX_EAC_R11_SNORM 4
 #define APEX_EAC_RG11 5
 #define APEX_EAC_RG11_SNORM 6
+/* BC kinds run the BC kernel; 8-byte blocks are BC1 and BC4. */
+#define APEX_BC1_RGB 7
+#define APEX_BC1_RGBA 8
+#define APEX_BC2 9
+#define APEX_BC3 10
+#define APEX_BC4 11
+#define APEX_BC4_SNORM 12
+#define APEX_BC5 13
+#define APEX_BC5_SNORM 14
+#define APEX_BC6H_UFLOAT 15
+#define APEX_BC6H_SFLOAT 16
+#define APEX_BC7 17
 
 /* Query slots: one 64-bit value (two for transform feedback streams:
  * primitives written, then needed), the 32-bit availability word at byte

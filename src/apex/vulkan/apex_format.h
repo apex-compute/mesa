@@ -23,8 +23,9 @@ enum apex_channel_type {
 
 bool apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping *mapping,
                         uint32_t out[3]);
-/* ETC2/EAC images keep a decoded plane: its format and the decode kind
- * (APEX_ETC2_* / APEX_EAC_*), or VK_FORMAT_UNDEFINED for other formats. */
+/* ETC2/EAC and BC images keep a decoded plane: its format and the decode
+ * kind (APEX_ETC2_*, APEX_EAC_*, APEX_BC*), or VK_FORMAT_UNDEFINED for other
+ * formats. */
 VkFormat apex_decoded_format(VkFormat format, uint32_t *kind);
 
 /* Table rows occupied by one element of a descriptor binding: combined
