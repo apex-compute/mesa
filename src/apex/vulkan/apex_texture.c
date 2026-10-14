@@ -326,40 +326,73 @@ tex_src(nir_tex_instr *tex, nir_tex_src_type type)
    return index < 0 ? NULL : tex->src[index].src.ssa;
 }
 
-/* textureQueryLod: the implicit level of detail from quad derivatives
- * scaled by the base level's size, before (y) and after (x) the view's
- * level clamp. */
+/* textureQueryLod: λ from the quad derivatives of the coordinates scaled by
+ * the base level's size, with the sampler's bias and no clamp (y), and the
+ * level a sample would read, clamped and rounded as sampling does (x). */
 static nir_def *
 query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
 {
    nir_def *coord = tex_src(tex, nir_tex_src_coord);
    bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
    unsigned dims = tex->sampler_dim == GLSL_SAMPLER_DIM_1D ? 1 :
-                   tex->sampler_dim == GLSL_SAMPLER_DIM_3D || cube ? 3 : 2;
+                   tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
    nir_def *size[3] = {
       nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_WIDTH, 14), 1)),
       nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_HEIGHT, 14), 1)),
       nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_DEPTH, 11), 1)),
    };
+   /* A cube's footprint is the derivative of its face coordinates sc / |ma|
+    * and tc / |ma|, which span the face's width over 2. */
+   nir_def *c[3] = {nir_channel(b, coord, 0), nir_channel(b, coord, 1), nir_channel(b, coord, 2)};
+   nir_def *z_major = NULL, *y_major = NULL;
+   if (cube) {
+      nir_def *ax = nir_fabs(b, c[0]), *ay = nir_fabs(b, c[1]), *az = nir_fabs(b, c[2]);
+      z_major = nir_iand(b, nir_fge(b, az, ax), nir_fge(b, az, ay));
+      y_major = nir_iand(b, nir_inot(b, z_major), nir_fge(b, ay, ax));
+   }
    nir_def *rho = nir_imm_float(b, 0.0f);
    for (unsigned axis = 0; axis < 2; axis++) {
+      nir_def *d[3];
+      for (unsigned a = 0; a < 3; a++)
+         d[a] = axis ? nir_ddy(b, c[a]) : nir_ddx(b, c[a]);
       nir_def *length = nir_imm_float(b, 0.0f);
-      for (unsigned a = 0; a < dims; a++) {
-         nir_def *c = nir_channel(b, coord, a);
-         nir_def *d = axis ? nir_ddy(b, c) : nir_ddx(b, c);
-         nir_def *scaled = nir_fmul(b, d, cube ? size[0] : size[a]);
-         length = nir_fmad(b, scaled, scaled, length);
+      if (cube) {
+         /* Major axis value and derivative, then the two minor axes. */
+         nir_def *ma = nir_bcsel(b, z_major, c[2], nir_bcsel(b, y_major, c[1], c[0]));
+         nir_def *dma = nir_bcsel(b, z_major, d[2], nir_bcsel(b, y_major, d[1], d[0]));
+         nir_def *s0 = nir_bcsel(b, z_major, c[0], nir_bcsel(b, y_major, c[0], c[2]));
+         nir_def *ds0 = nir_bcsel(b, z_major, d[0], nir_bcsel(b, y_major, d[0], d[2]));
+         nir_def *s1 = nir_bcsel(b, z_major, c[1], nir_bcsel(b, y_major, c[2], c[1]));
+         nir_def *ds1 = nir_bcsel(b, z_major, d[1], nir_bcsel(b, y_major, d[2], d[1]));
+         nir_def *inv = nir_frcp(b, nir_fmul(b, ma, ma));
+         nir_def *f0 = nir_fmul(b, nir_fsub(b, nir_fmul(b, ds0, ma), nir_fmul(b, s0, dma)), inv);
+         nir_def *f1 = nir_fmul(b, nir_fsub(b, nir_fmul(b, ds1, ma), nir_fmul(b, s1, dma)), inv);
+         nir_def *half = nir_fmul_imm(b, size[0], 0.5);
+         length = nir_fadd(b, nir_fmul(b, nir_fmul(b, f0, half), nir_fmul(b, f0, half)),
+                              nir_fmul(b, nir_fmul(b, f1, half), nir_fmul(b, f1, half)));
+      } else {
+         for (unsigned a = 0; a < dims; a++) {
+            nir_def *scaled = nir_fmul(b, d[a], size[a]);
+            length = nir_fmad(b, scaled, scaled, length);
+         }
       }
       rho = nir_fmax(b, rho, nir_fsqrt(b, length));
    }
    nir_def *bias = nir_fmul_imm(b, nir_i2f32(b, nir_ishr_imm(b, nir_ishl_imm(b,
       bits(b, sampler, APEX_HW_SAMPLER_BIAS, 14), 18), 18)), 1.0 / 256);
-   nir_def *min_lod = nir_fmul_imm(b, nir_u2f32(b, bits(b, sampler, APEX_HW_SAMPLER_MIN_LOD, 12)), 1.0 / 256);
+   nir_def *lambda = nir_fadd(b, nir_flog2(b, rho), bias);
+   nir_def *min_lod = nir_fmax(b,
+      nir_fmul_imm(b, nir_u2f32(b, bits(b, sampler, APEX_HW_SAMPLER_MIN_LOD, 12)), 1.0 / 256),
+      nir_fmul_imm(b, nir_u2f32(b, bits(b, image, APEX_HW_IMAGE_MIN_LOD, 12)), 1.0 / 256));
    nir_def *max_lod = nir_fmul_imm(b, nir_u2f32(b, bits(b, sampler, APEX_HW_SAMPLER_MAX_LOD, 12)), 1.0 / 256);
-   nir_def *lambda = nir_fmin(b, nir_fmax(b, nir_fadd(b, nir_flog2(b, rho), bias), min_lod), max_lod);
+   nir_def *clamped = nir_fmin(b, nir_fmax(b, lambda, min_lod), max_lod);
    nir_def *levels = bits(b, image, APEX_HW_IMAGE_LEVELS, 5);
    nir_def *max_level = nir_u2f32(b, nir_iadd_imm(b, nir_umax(b, levels, nir_imm_int(b, 1)), -1));
-   nir_def *level = nir_fmin(b, nir_fmax(b, lambda, nir_imm_float(b, 0.0f)), max_level);
+   nir_def *nearest = nir_ieq_imm(b, bits(b, sampler, 2, 1), 0);
+   nir_def *rounded = nir_bcsel(b, nir_fle_imm(b, clamped, 0.5f), nir_imm_float(b, 0.0f),
+                                nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, clamped, 0.5f)), -1.0f));
+   nir_def *level = nir_fmin(b, nir_fmax(b, nir_bcsel(b, nearest, rounded, clamped), nir_imm_float(b, 0.0f)),
+                             max_level);
    return nir_bcsel(b, nir_ieq_imm(b, levels, 0), nir_imm_zero(b, 2, 32), nir_vec2(b, level, lambda));
 }
 
