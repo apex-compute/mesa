@@ -350,6 +350,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_global_priority = true,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float_controls2 = true,
+      .KHR_shader_subgroup_rotate = true,
       .EXT_provoking_vertex = true,
       .EXT_transform_feedback = true,
       .EXT_custom_border_color = true,
@@ -421,6 +422,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .globalPriorityQuery = true,
       .shaderExpectAssume = true,
       .shaderFloatControls2 = true,
+      /* Rotates, clustered or not, lower to shuffles. */
+      .shaderSubgroupRotate = true,
+      .shaderSubgroupRotateClustered = true,
       .provokingVertexLast = true,
       /* Capture programs write each primitive's vertices in the order of
        * its provoking-vertex mode, fans included (apex_graphics.c). */
@@ -603,7 +607,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
          VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
          VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-         VK_SUBGROUP_FEATURE_QUAD_BIT,
+         VK_SUBGROUP_FEATURE_QUAD_BIT | VK_SUBGROUP_FEATURE_ROTATE_BIT |
+         VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT,
       /* Points are rejected only by the z planes and the guard band. */
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxPerSetDescriptors = APEX_MAX_DESCRIPTORS,
