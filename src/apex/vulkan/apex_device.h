@@ -87,21 +87,16 @@ struct apex_bo {
 #define APEX_POOL_VERTEX_BYTES (8u * 1024 * 1024)
 #define APEX_POOL_PRIMITIVE_BYTES (6u * 1024 * 1024)
 
-struct apex_device {
-   struct vk_device vk;
-   struct vk_device_dispatch_table cmd_dispatch;
-   struct vk_queue queue;
-   struct vk_meta_device meta;
-   int fd;
-   struct util_vma_heap va_heap;
-   mtx_t va_mutex;
-   /* Serializes PRIME handle lookup and final backing destruction. */
-   mtx_t memory_mutex;
-   struct list_head memories;
-   /* Queue: ring, read-only status page and doorbell page. The submit thread
-    * owns sequence, kwait, the arenas and ring.wptr. */
-   uint32_t queue_id;
-   uint32_t queue_priority; /* drm_apex_queue_create priority */
+/* Queue family 0 runs graphics, compute and transfer, family 1 transfer
+ * only; each family has one queue on its own kernel queue. */
+#define APEX_QUEUE_FAMILIES 2
+
+/* One kernel queue: ring, read-only status page and doorbell page. The
+ * queue's submitter owns sequence, kwait, the arenas and ring.wptr. */
+struct apex_queue {
+   struct vk_queue vk;
+   uint32_t id;
+   uint32_t priority; /* drm_apex_queue_create priority */
    uint64_t status_va;
    void *status_map, *doorbell_map;
    struct apex_bo ring_bo;
@@ -111,12 +106,26 @@ struct apex_device {
    /* Private data of the dispatches using private memory, one at a time:
     * APEX_PRIVATE_BYTES of LOCAL at a 2 MiB-aligned GPUVA. */
    struct apex_bo private_arena;
-   /* The queue's bin pool, written by the geometry front end. */
+   /* The queue's bin pool, written by the geometry front end; family 0 only. */
    struct apex_bo bin_pool;
    uint64_t sequence, kwait;
    struct list_head busy_arenas, free_arenas;
-   /* A program upload since the last batch invalidates instruction caches. */
+   /* A program upload since the queue's last batch invalidates its
+    * instruction caches. */
    bool programs_uploaded;
+};
+
+struct apex_device {
+   struct vk_device vk;
+   struct vk_device_dispatch_table cmd_dispatch;
+   struct apex_queue queues[APEX_QUEUE_FAMILIES];
+   struct vk_meta_device meta;
+   int fd;
+   struct util_vma_heap va_heap;
+   mtx_t va_mutex;
+   /* Serializes PRIME handle lookup and final backing destruction. */
+   mtx_t memory_mutex;
+   struct list_head memories;
    /* Internal programs and the empty fragment program of depth-only draws,
     * compiled on first use under memory_mutex. */
    struct apex_program *internal[APEX_INTERNAL_COUNT];

@@ -446,7 +446,8 @@ emit_dispatch(struct apex_command_buffer *cmd, struct apex_program *program, str
    begin_work(cmd, APEX_CP_CLASS_COMPUTE);
    uint32_t local[3];
    program_local_size(program, local);
-   const uint64_t private_base = device->private_arena.va;
+   /* A command buffer runs on the one queue of its pool's family. */
+   const uint64_t private_base = device->queues[cmd->vk.pool->queue_family_index].private_arena.va;
    const uint32_t compute[10] = {
       0, 0, local[0], local[1], local[2], base[0], base[1], base[2],
       LO(private_base), HI(private_base),
@@ -718,7 +719,7 @@ emit_pass(struct apex_command_buffer *cmd)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    struct apex_hw_pass *pass = &cmd->rendering.pass;
-   pass->pool = device->bin_pool.va;
+   pass->pool = device->queues[0].bin_pool.va;
    pass->pool_bytes = APEX_BIN_POOL_BYTES;
    pass->draw_bytes = APEX_POOL_DRAW_BYTES;
    pass->vertex_bytes = APEX_POOL_VERTEX_BYTES;
@@ -2259,8 +2260,8 @@ out:
 }
 
 VkResult
-apex_cmd_prepare(struct apex_device *device, struct apex_command_buffer *cmd,
-                 struct apex_arena **out, uint64_t *ib_va)
+apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
+                 struct apex_command_buffer *cmd, struct apex_arena **out, uint64_t *ib_va)
 {
    /* Arena: the data blocks, the tables, then the IB. */
    uint64_t bytes = align64(cmd->data.size, 64);
@@ -2270,10 +2271,10 @@ apex_cmd_prepare(struct apex_device *device, struct apex_command_buffer *cmd,
    }
    uint64_t ib_offset = bytes;
    bytes += (uint64_t)cmd->ib.count * 4;
-   struct apex_arena *arena = apex_arena_get(device, bytes);
+   struct apex_arena *arena = apex_arena_get(device, queue, bytes);
    if (!arena)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   list_addtail(&arena->link, &device->busy_arenas);
+   list_addtail(&arena->link, &queue->busy_arenas);
    arena->sequence = UINT64_MAX;
    uint8_t *map = arena->bo.map;
    uint64_t va = arena->bo.va;

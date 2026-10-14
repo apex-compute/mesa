@@ -46,15 +46,19 @@ static VkResult
 check_status(struct vk_device *vk)
 {
    struct apex_device *device = (void *)vk;
-   const volatile uint32_t *status = device->status_map;
-   if (!(status[APEX_STATUS_STATE / 4] & (APEX_STATUS_FAULTED | APEX_STATUS_RESET)))
-      return VK_SUCCESS;
-   struct drm_apex_queue_status query = {.queue_id = device->queue_id};
-   int ret = ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_STATUS, &query);
-   return vk_device_set_lost(vk, "Apex queue fault (state %#x, status %u, unit %u, address %#" PRIx64
-                             ", errno %d)", ret ? 0 : query.state, query.fault_status,
-                             query.fault_unit, (uint64_t)query.fault_address,
-                             ret ? errno : query.error);
+   for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++) {
+      const struct apex_queue *queue = &device->queues[f];
+      const volatile uint32_t *status = queue->status_map;
+      if (!status || !(status[APEX_STATUS_STATE / 4] & (APEX_STATUS_FAULTED | APEX_STATUS_RESET)))
+         continue;
+      struct drm_apex_queue_status query = {.queue_id = queue->id};
+      int ret = ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_STATUS, &query);
+      return vk_device_set_lost(vk, "Apex queue fault (state %#x, status %u, unit %u, address %#" PRIx64
+                                ", errno %d)", ret ? 0 : query.state, query.fault_status,
+                                query.fault_unit, (uint64_t)query.fault_address,
+                                ret ? errno : query.error);
+   }
+   return VK_SUCCESS;
 }
 
 static int
@@ -1532,35 +1536,38 @@ apex_program_upload(struct apex_device *device, struct apex_program *program)
    if (result != VK_SUCCESS)
       return result;
    memcpy(program->bo.map, program->code.data, program->code.size);
-   device->programs_uploaded = true;
+   for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++)
+      device->queues[f].programs_uploaded = true;
    return VK_SUCCESS;
 }
 
 /* Batches retire at the SIGNAL of their sequence into `retire`. */
 static uint64_t
-retired_sequence(const struct apex_device *device)
+retired_sequence(const struct apex_queue *queue)
 {
-   return *(const volatile uint64_t *)device->retire.map;
+   return *(const volatile uint64_t *)queue->retire.map;
 }
 
 static void
-retire_arenas(struct apex_device *device)
+retire_arenas(struct apex_queue *queue)
 {
-   uint64_t retired = retired_sequence(device);
-   list_for_each_entry_safe(struct apex_arena, arena, &device->busy_arenas, link) {
+   uint64_t retired = retired_sequence(queue);
+   list_for_each_entry_safe(struct apex_arena, arena, &queue->busy_arenas, link) {
       if (arena->sequence > retired)
          break;
       list_del(&arena->link);
-      list_addtail(&arena->link, &device->free_arenas);
+      list_addtail(&arena->link, &queue->free_arenas);
    }
 }
 
-/* Waits for the batch of `sequence` to retire; false on loss or timeout. */
+/* Waits for the queue's batch of `sequence` to retire; false on loss or
+ * timeout. */
 static bool
-wait_retired(struct apex_device *device, uint64_t sequence, uint64_t timeout_ns)
+wait_retired(struct apex_device *device, struct apex_queue *queue, uint64_t sequence,
+             uint64_t timeout_ns)
 {
    uint64_t deadline = os_time_get_nano() + timeout_ns;
-   while (retired_sequence(device) < sequence) {
+   while (retired_sequence(queue) < sequence) {
       if (vk_device_check_status(&device->vk) != VK_SUCCESS || os_time_get_nano() >= deadline)
          return false;
       nanosleep(&(struct timespec){.tv_nsec = 20000}, NULL);
@@ -1579,11 +1586,11 @@ destroy_arena(struct apex_device *device, struct apex_arena *arena)
 /* Reuses the smallest retired arena that fits, else creates a power-of-two
  * LOCAL arena; steady-state submission makes no allocation ioctl. */
 struct apex_arena *
-apex_arena_get(struct apex_device *device, uint64_t bytes)
+apex_arena_get(struct apex_device *device, struct apex_queue *queue, uint64_t bytes)
 {
-   retire_arenas(device);
+   retire_arenas(queue);
    struct apex_arena *best = NULL;
-   list_for_each_entry(struct apex_arena, arena, &device->free_arenas, link)
+   list_for_each_entry(struct apex_arena, arena, &queue->free_arenas, link)
       if (arena->bo.size >= bytes && (!best || arena->bo.size < best->bo.size))
          best = arena;
    if (best) {
@@ -1606,7 +1613,7 @@ apex_arena_get(struct apex_device *device, uint64_t bytes)
  * for syncobj signals, a KFENCE with its kernel fences. The doorbell store
  * publishes it; no ioctl runs without syncobj waits or signals. */
 static VkResult
-submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
+submit_batch(struct apex_device *device, struct apex_queue *queue, struct vk_queue_submit *submit)
 {
    VkResult result = vk_device_check_status(&device->vk);
    if (result != VK_SUCCESS)
@@ -1622,12 +1629,12 @@ submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
       goto out;
    for (uint32_t i = 0; i < count; i++) {
       struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
-      result = apex_cmd_prepare(device, cmd, &arenas[i], &ib_va[i]);
+      result = apex_cmd_prepare(device, queue, cmd, &arenas[i], &ib_va[i]);
       if (result != VK_SUCCESS)
          goto out;
       ib_dwords[i] = cmd->ib.count;
    }
-   uint64_t sequence = device->sequence + 1;
+   uint64_t sequence = queue->sequence + 1;
    /* Every syncobj wait of the batch shares one kwait value. */
    uint64_t kwait = 0;
    for (uint32_t i = 0; i < submit->wait_count; i++) {
@@ -1640,9 +1647,9 @@ submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
          goto out;
       }
       if (!kwait)
-         kwait = device->kwait + 1;
+         kwait = queue->kwait + 1;
       struct drm_apex_queue_wait args = {
-         .queue_id = device->queue_id, .syncobj = sync->syncobj,
+         .queue_id = queue->id, .syncobj = sync->syncobj,
          .point = wait->wait_value, .value = kwait,
       };
       if (ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_WAIT, &args)) {
@@ -1651,13 +1658,13 @@ submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
       }
    }
    if (kwait)
-      device->kwait = kwait;
+      queue->kwait = kwait;
    const struct apex_cp_batch batch = {
-      .acquire_cache = device->programs_uploaded ?
+      .acquire_cache = queue->programs_uploaded ?
          APEX_CP_CACHE_INSTRUCTION | APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE : 0,
-      .kwait_va = device->status_va + APEX_STATUS_KWAIT, .kwait_value = kwait,
+      .kwait_va = queue->status_va + APEX_STATUS_KWAIT, .kwait_value = kwait,
       .ib_count = count, .ib_va = ib_va, .ib_dwords = ib_dwords,
-      .retire_va = device->retire.va, .sequence = sequence,
+      .retire_va = queue->retire.va, .sequence = sequence,
       .kfence = submit->signal_count != 0,
    };
    apex_cp_batch(&ring_words, &batch);
@@ -1665,14 +1672,14 @@ submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto out;
    }
-   if (!apex_ring_reserve(&device->ring, ring_words.count, 5000000000ull)) {
+   if (!apex_ring_reserve(&queue->ring, ring_words.count, 5000000000ull)) {
       result = vk_device_set_lost(&device->vk, "Apex ring did not drain");
       goto out;
    }
-   apex_ring_write(&device->ring, ring_words.words, ring_words.count);
-   apex_ring_publish(&device->ring);
-   device->sequence = sequence;
-   device->programs_uploaded = false;
+   apex_ring_write(&queue->ring, ring_words.words, ring_words.count);
+   apex_ring_publish(&queue->ring);
+   queue->sequence = sequence;
+   queue->programs_uploaded = false;
    for (uint32_t i = 0; i < count; i++)
       arenas[i]->sequence = sequence;
    result = VK_SUCCESS;
@@ -1680,7 +1687,7 @@ submit_batch(struct apex_device *device, struct vk_queue_submit *submit)
       const struct vk_sync_signal *signal = &submit->signals[i];
       struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(signal->sync);
       struct drm_apex_queue_fence args = {
-         .queue_id = device->queue_id, .syncobj = sync ? sync->syncobj : 0,
+         .queue_id = queue->id, .syncobj = sync ? sync->syncobj : 0,
          .seqno = sequence, .point = signal->signal_value,
       };
       if (!sync || ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_FENCE, &args)) {
@@ -1693,7 +1700,7 @@ out:
    for (uint32_t i = 0; arenas && i < count; i++) {
       if (arenas[i] && arenas[i]->sequence == UINT64_MAX) {
          list_del(&arenas[i]->link);
-         list_addtail(&arenas[i]->link, &device->free_arenas);
+         list_addtail(&arenas[i]->link, &queue->free_arenas);
       }
    }
    apex_ib_finish(&ring_words);
@@ -1704,11 +1711,12 @@ out:
 }
 
 static VkResult
-submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
+submit_queue(struct vk_queue *vk, struct vk_queue_submit *submit)
 {
-   struct apex_device *device = (struct apex_device *)queue->base.device;
-   if (vk_queue_submit_has_bind(submit) || submit->is_protected || !device->ring.map)
-      return vk_queue_set_lost(queue, "unsupported Apex submission");
+   struct apex_device *device = (struct apex_device *)vk->base.device;
+   struct apex_queue *queue = container_of(vk, struct apex_queue, vk);
+   if (vk_queue_submit_has_bind(submit) || submit->is_protected || !queue->ring.map)
+      return vk_queue_set_lost(vk, "unsupported Apex submission");
    for (unsigned i = 0; i < submit->command_buffer_count; i++) {
       struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
       list_for_each_entry(struct apex_upload, upload, &cmd->uploads, link) {
@@ -1717,23 +1725,24 @@ submit_queue(struct vk_queue *queue, struct vk_queue_submit *submit)
          uint64_t va = upload->reserved_va;
          upload->reserved_va = 0;
          if (apex_bo_create(device, upload->size, APEX_VM_READ, 0, va, &upload->bo) != VK_SUCCESS)
-            return vk_queue_set_lost(queue, "Apex update allocation failed");
+            return vk_queue_set_lost(vk, "Apex update allocation failed");
          memcpy(upload->bo.map, upload->data, upload->size);
       }
    }
-   if (submit_batch(device, submit) != VK_SUCCESS)
-      return vk_queue_set_lost(queue, "Apex submission failed");
+   if (submit_batch(device, queue, submit) != VK_SUCCESS)
+      return vk_queue_set_lost(vk, "Apex submission failed");
    return VK_SUCCESS;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_QueueWaitIdle(VkQueue handle)
 {
-   VK_FROM_HANDLE(vk_queue, queue, handle);
-   struct apex_device *device = (void *)queue->base.device;
+   VK_FROM_HANDLE(vk_queue, vk, handle);
+   struct apex_device *device = (void *)vk->base.device;
+   struct apex_queue *queue = container_of(vk, struct apex_queue, vk);
    if (device->vk.physical->supported_sync_types)
       return vk_common_QueueWaitIdle(handle);
-   if (device->ring.map && !wait_retired(device, device->sequence, UINT64_MAX))
+   if (queue->ring.map && !wait_retired(device, queue, queue->sequence, UINT64_MAX))
       return VK_ERROR_DEVICE_LOST;
    return vk_device_is_lost(&device->vk) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
@@ -1758,87 +1767,94 @@ apex_GetSemaphoreCounterValue(VkDevice dev, VkSemaphore semaphore, uint64_t *val
 
 #define APEX_RING_BYTES (64 * 1024)
 
-/* The ring, the private arena and the bin pool live in LOCAL, the
+/* The ring, the private arena and family 0's bin pool live in LOCAL, the
  * retirement word in SYSTEM; the kernel supplies the status page and
  * doorbell mappings. */
 static VkResult
-create_queue(struct apex_device *device)
+create_queue(struct apex_device *device, struct apex_queue *queue, uint32_t family)
 {
-   VkResult result = apex_bo_create(device, APEX_RING_BYTES, APEX_VM_READ, 0, 0, &device->ring_bo);
+   VkResult result = apex_bo_create(device, APEX_RING_BYTES, APEX_VM_READ, 0, 0, &queue->ring_bo);
    if (result == VK_SUCCESS)
-      result = host_words_create(device, 4096, &device->retire);
+      result = host_words_create(device, 4096, &queue->retire);
    if (result == VK_SUCCESS) {
       mtx_lock(&device->va_mutex);
       uint64_t va = util_vma_heap_alloc(&device->va_heap, APEX_PRIVATE_BYTES, APEX_PRIVATE_BYTES);
       mtx_unlock(&device->va_mutex);
       result = va ? apex_bo_create(device, APEX_PRIVATE_BYTES, APEX_VM_READ | APEX_VM_WRITE, 0, va,
-                              &device->private_arena) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                              &queue->private_arena) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
-   if (result == VK_SUCCESS)
+   if (result == VK_SUCCESS && family == 0)
       result = apex_bo_create(device, APEX_BIN_POOL_BYTES, APEX_VM_READ | APEX_VM_WRITE, 0, 0,
-                              &device->bin_pool);
+                              &queue->bin_pool);
    if (result != VK_SUCCESS)
       return result;
-   memset(device->retire.map, 0, 8);
+   memset(queue->retire.map, 0, 8);
    struct drm_apex_queue_create create = {
-      .ring_va = device->ring_bo.va, .ring_bytes = APEX_RING_BYTES,
-      .priority = device->queue_priority,
+      .ring_va = queue->ring_bo.va, .ring_bytes = APEX_RING_BYTES,
+      .priority = queue->priority,
    };
    if (ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_CREATE, &create))
       return errno == ENODEV ? VK_ERROR_INCOMPATIBLE_DRIVER :
              errno == EACCES || errno == EPERM ? VK_ERROR_NOT_PERMITTED :
              VK_ERROR_INITIALIZATION_FAILED;
-   device->queue_id = create.queue_id;
-   device->status_va = create.status_va;
+   queue->id = create.queue_id;
+   queue->status_va = create.status_va;
    void *status = mmap(NULL, 4096, PROT_READ, MAP_SHARED, device->fd, create.status_offset);
    void *doorbell = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd,
                          create.doorbell_offset);
-   device->status_map = status == MAP_FAILED ? NULL : status;
-   device->doorbell_map = doorbell == MAP_FAILED ? NULL : doorbell;
-   if (!device->status_map || !device->doorbell_map)
+   queue->status_map = status == MAP_FAILED ? NULL : status;
+   queue->doorbell_map = doorbell == MAP_FAILED ? NULL : doorbell;
+   if (!queue->status_map || !queue->doorbell_map)
       return VK_ERROR_INITIALIZATION_FAILED;
-   device->ring = (struct apex_ring) {
-      .map = device->ring_bo.map, .dwords = APEX_RING_BYTES / 4,
-      .status = device->status_map, .doorbell = device->doorbell_map,
+   queue->ring = (struct apex_ring) {
+      .map = queue->ring_bo.map, .dwords = APEX_RING_BYTES / 4,
+      .status = queue->status_map, .doorbell = queue->doorbell_map,
    };
    return VK_SUCCESS;
 }
 
 static void
-destroy_queue(struct apex_device *device)
+destroy_queue(struct apex_device *device, struct apex_queue *queue)
 {
-   if (device->status_va) {
-      struct drm_apex_queue_destroy destroy = {.queue_id = device->queue_id};
+   if (queue->status_va) {
+      struct drm_apex_queue_destroy destroy = {.queue_id = queue->id};
       ioctl(device->fd, DRM_IOCTL_APEX_QUEUE_DESTROY, &destroy);
    }
-   if (device->status_map)
-      munmap(device->status_map, 4096);
-   if (device->doorbell_map)
-      munmap(device->doorbell_map, 4096);
-   device->status_map = device->doorbell_map = NULL;
-   device->status_va = 0;
-   device->ring = (struct apex_ring){0};
-   apex_bo_finish(device, &device->bin_pool);
-   apex_bo_finish(device, &device->private_arena);
-   apex_bo_finish(device, &device->retire);
-   apex_bo_finish(device, &device->ring_bo);
+   if (queue->status_map)
+      munmap(queue->status_map, 4096);
+   if (queue->doorbell_map)
+      munmap(queue->doorbell_map, 4096);
+   queue->status_map = queue->doorbell_map = NULL;
+   queue->status_va = 0;
+   queue->ring = (struct apex_ring){0};
+   apex_bo_finish(device, &queue->bin_pool);
+   apex_bo_finish(device, &queue->private_arena);
+   apex_bo_finish(device, &queue->retire);
+   apex_bo_finish(device, &queue->ring_bo);
 }
 
 VkResult
 apex_device_init(struct apex_device *device, struct vk_physical_device *physical,
                   const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, int fd)
 {
-   if (info->queueCreateInfoCount != 1)
+   if (!info->queueCreateInfoCount || info->queueCreateInfoCount > APEX_QUEUE_FAMILIES)
       return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "Apex requires one queue create info, received %u", info->queueCreateInfoCount);
-   if (info->pQueueCreateInfos[0].queueFamilyIndex ||
-       info->pQueueCreateInfos[0].queueCount != 1 || info->pQueueCreateInfos[0].flags)
-      return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "Apex requires one unflagged queue from family 0");
-   /* HIGH and REALTIME take the kernel's high priority. */
-   const VkDeviceQueueGlobalPriorityCreateInfo *priority =
-      vk_find_struct_const(info->pQueueCreateInfos[0].pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
-   device->queue_priority = priority && priority->globalPriority >= VK_QUEUE_GLOBAL_PRIORITY_HIGH;
+                       "Apex takes one or two queue create infos, received %u", info->queueCreateInfoCount);
+   memset(device->queues, 0, sizeof(device->queues));
+   bool requested[APEX_QUEUE_FAMILIES] = {false};
+   for (uint32_t i = 0; i < info->queueCreateInfoCount; i++) {
+      const VkDeviceQueueCreateInfo *q = &info->pQueueCreateInfos[i];
+      if (q->queueFamilyIndex >= APEX_QUEUE_FAMILIES || q->queueCount != 1 || q->flags ||
+          requested[q->queueFamilyIndex])
+         return vk_errorf(physical, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "Apex takes one unflagged queue from each of families 0 and 1");
+      /* HIGH and REALTIME take the kernel's high priority. */
+      const VkDeviceQueueGlobalPriorityCreateInfo *priority =
+         vk_find_struct_const(q->pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
+      device->queues[q->queueFamilyIndex].priority =
+         priority && priority->globalPriority >= VK_QUEUE_GLOBAL_PRIORITY_HIGH;
+      requested[q->queueFamilyIndex] = true;
+   }
    struct drm_apex_info caps = {0};
    if (fd >= 0 && ioctl(fd, DRM_IOCTL_APEX_INFO, &caps))
       return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -1900,18 +1916,12 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->vk.shader_ops = &apex_device_shader_ops;
    device->vk.command_buffer_ops = &apex_command_buffer_ops;
    device->fd = fd;
-   device->queue_id = 0;
-   device->status_va = 0;
-   device->status_map = device->doorbell_map = NULL;
-   device->ring_bo = device->retire = device->private_arena = (struct apex_bo){0};
-   device->ring = (struct apex_ring){0};
-   device->sequence = device->kwait = 0;
-   device->programs_uploaded = false;
    memset(device->internal, 0, sizeof(device->internal));
    device->empty_fragment = NULL;
-   device->bin_pool = (struct apex_bo){0};
-   list_inithead(&device->busy_arenas);
-   list_inithead(&device->free_arenas);
+   for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++) {
+      list_inithead(&device->queues[f].busy_arenas);
+      list_inithead(&device->queues[f].free_arenas);
+   }
    list_inithead(&device->memories);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
       vk_device_finish(&device->vk);
@@ -1929,8 +1939,16 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
       vk_device_enable_threaded_submit(&device->vk);
    }
-   result = vk_queue_init(&device->queue, &device->vk, &info->pQueueCreateInfos[0], 0);
+   for (uint32_t i = 0; i < info->queueCreateInfoCount && result == VK_SUCCESS; i++) {
+      const VkDeviceQueueCreateInfo *q = &info->pQueueCreateInfos[i];
+      result = vk_queue_init(&device->queues[q->queueFamilyIndex].vk, &device->vk, q, 0);
+      if (result == VK_SUCCESS)
+         device->queues[q->queueFamilyIndex].vk.driver_submit = submit_queue;
+   }
    if (result != VK_SUCCESS) {
+      for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++)
+         if (device->queues[f].vk.base.device)
+            vk_queue_finish(&device->queues[f].vk);
       util_vma_heap_finish(&device->va_heap);
       mtx_destroy(&device->memory_mutex);
       mtx_destroy(&device->va_mutex);
@@ -1939,7 +1957,9 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    }
    result = vk_meta_device_init(&device->vk, &device->meta);
    if (result != VK_SUCCESS) {
-      vk_queue_finish(&device->queue);
+      for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++)
+         if (device->queues[f].vk.base.device)
+            vk_queue_finish(&device->queues[f].vk);
       util_vma_heap_finish(&device->va_heap);
       mtx_destroy(&device->memory_mutex);
       mtx_destroy(&device->va_mutex);
@@ -1952,37 +1972,39 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    /* Meta draws rectangles with its own vertex shader writing gl_Layer. */
    device->meta.use_rect_list_pipeline = true;
    device->meta.use_gs_for_layer = false;
-   device->queue.driver_submit = submit_queue;
    if (fd >= 0) {
-      result = create_queue(device);
-      if (result != VK_SUCCESS) {
-         apex_device_finish(device);
-         return result;
+      for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++) {
+         if (!requested[f])
+            continue;
+         result = create_queue(device, &device->queues[f], f);
+         if (result != VK_SUCCESS) {
+            apex_device_finish(device);
+            return result;
+         }
       }
       device->vk.check_status = check_status;
    }
-   if (physical->supported_sync_types) {
-      result = vk_queue_enable_submit_thread(&device->queue);
-      if (result != VK_SUCCESS) {
-         apex_device_finish(device);
-         return result;
-      }
-   }
+   /* The runtime submits on the caller's thread and starts the submit thread
+    * only for a wait on a timeline point no submission has signalled yet. */
    return VK_SUCCESS;
 }
 
 void
 apex_device_finish(struct apex_device *device)
 {
-   vk_queue_finish(&device->queue);
-   /* A lost queue keeps its arenas mapped and reserved until file close. */
-   if (device->ring.map && wait_retired(device, device->sequence, 5000000000ull))
-      retire_arenas(device);
-   list_for_each_entry_safe(struct apex_arena, arena, &device->free_arenas, link)
-      destroy_arena(device, arena);
-   list_for_each_entry_safe(struct apex_arena, arena, &device->busy_arenas, link)
-      destroy_arena(device, arena);
-   destroy_queue(device);
+   for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++) {
+      struct apex_queue *queue = &device->queues[f];
+      if (queue->vk.base.device)
+         vk_queue_finish(&queue->vk);
+      /* A lost queue keeps its arenas mapped and reserved until file close. */
+      if (queue->ring.map && wait_retired(device, queue, queue->sequence, 5000000000ull))
+         retire_arenas(queue);
+      list_for_each_entry_safe(struct apex_arena, arena, &queue->free_arenas, link)
+         destroy_arena(device, arena);
+      list_for_each_entry_safe(struct apex_arena, arena, &queue->busy_arenas, link)
+         destroy_arena(device, arena);
+      destroy_queue(device, queue);
+   }
    apex_graphics_finish(device);
 
    vk_meta_device_finish(&device->vk, &device->meta);

@@ -222,7 +222,8 @@ void apex_descriptor_set_write_template(struct apex_descriptor_set *set,
                                         const struct vk_descriptor_update_template *templ,
                                         const void *data);
 /* Reuses the smallest retired arena that fits, else creates one. */
-struct apex_arena *apex_arena_get(struct apex_device *device, uint64_t bytes);
+struct apex_arena *apex_arena_get(struct apex_device *device, struct apex_queue *queue,
+                                  uint64_t bytes);
 /* The layout of a view's level: the decoded plane of ETC2/EAC images. */
 const struct apex_hw_layout *apex_image_layout(const struct apex_image *image, VkFormat view_format,
                                                uint64_t *va);
@@ -233,6 +234,6 @@ struct vk_meta_device;
 void apex_cmd_meta_init(struct vk_meta_device *meta);
 void apex_cmd_entrypoints(struct vk_device_entrypoint_table *table);
 /* Writes the command buffer's data, tables and patched IB into one arena. */
-VkResult apex_cmd_prepare(struct apex_device *device, struct apex_command_buffer *cmd,
-                          struct apex_arena **out, uint64_t *ib_va);
+VkResult apex_cmd_prepare(struct apex_device *device, struct apex_queue *queue,
+                          struct apex_command_buffer *cmd, struct apex_arena **out, uint64_t *ib_va);
 #endif

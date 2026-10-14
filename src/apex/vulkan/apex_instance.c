@@ -92,12 +92,19 @@ VKAPI_ATTR void VKAPI_CALL
 apex_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical, uint32_t *count,
                                              VkQueueFamilyProperties2 *properties)
 {
+   /* Family 0 runs every command; family 1 is a transfer queue on its own
+    * kernel queue. */
+   static const VkQueueFlags flags[APEX_QUEUE_FAMILIES] = {
+      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT, VK_QUEUE_TRANSFER_BIT,
+   };
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, properties, count);
+   for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++)
    vk_outarray_append_typed(VkQueueFamilyProperties2, &out, prop) {
       prop->queueFamilyProperties = (VkQueueFamilyProperties) {
-         .queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT,
+         .queueFlags = flags[f],
          .timestampValidBits = 64,
          .queueCount = 1,
+         .minImageTransferGranularity = {1, 1, 1},
       };
       /* LOW and MEDIUM run at the kernel's normal priority; HIGH needs the
        * DRM master or CAP_SYS_NICE. */
@@ -470,6 +477,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .shaderUniformBufferArrayDynamicIndexing = true,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
+      .shaderUniformTexelBufferArrayDynamicIndexing = true,
+      .shaderStorageTexelBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       /* Vulkan 1.2. */
       .uniformBufferStandardLayout = true,

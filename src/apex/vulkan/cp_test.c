@@ -218,16 +218,16 @@ test_device(const char *spirv_path)
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
    CHECK(apex_device_init(&device, &physical, &di, NULL, k.fd) == VK_SUCCESS);
    /* Queue creation: a readable LOCAL ring and a SYSTEM retirement word. */
-   CHECK(k.queue && k.ring_bytes == 65536 && device.queue_id == MOCK_QUEUE_ID &&
-         device.status_va == MOCK_STATUS_VA);
+   CHECK(k.queue && k.ring_bytes == 65536 && device.queues[0].id == MOCK_QUEUE_ID &&
+         device.queues[0].status_va == MOCK_STATUS_VA);
    CHECK(k.gems[1].va == k.ring_va && k.gems[1].vm_flags == APEX_VM_READ && !k.gems[1].flags);
    CHECK(k.gems[2].flags == APEX_GEM_SYSTEM && k.gems[2].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
    /* The private arena: 2 MiB of LOCAL, read-write at a 2 MiB-aligned GPUVA. */
-   CHECK(device.private_arena.handle == 3 && k.gems[3].va == device.private_arena.va &&
+   CHECK(device.queues[0].private_arena.handle == 3 && k.gems[3].va == device.queues[0].private_arena.va &&
          k.gems[3].va && !(k.gems[3].va % APEX_PRIVATE_BYTES) && k.gems[3].size == APEX_PRIVATE_BYTES &&
          !k.gems[3].flags && k.gems[3].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
    /* The bin pool: 32 MiB of LOCAL the geometry front end writes. */
-   CHECK(device.bin_pool.handle == 4 && k.gems[4].size == APEX_BIN_POOL_BYTES && !k.gems[4].flags &&
+   CHECK(device.queues[0].bin_pool.handle == 4 && k.gems[4].size == APEX_BIN_POOL_BYTES && !k.gems[4].flags &&
          k.gems[4].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
    VkDevice dev = apex_device_to_handle(&device);
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
@@ -347,10 +347,10 @@ test_device(const char *spirv_path)
       .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
    CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
    /* The first batch invalidates instruction caches after the program upload. */
-   const uint32_t *ring = device.ring_bo.map;
-   CHECK(device.ring.wptr == 12 && ring[0] == 0x240 && ring[1] == 0 &&
+   const uint32_t *ring = device.queues[0].ring_bo.map;
+   CHECK(device.queues[0].ring.wptr == 12 && ring[0] == 0x240 && ring[1] == 0 &&
          ring[2] == (APEX_CP_CACHE_INSTRUCTION | APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE));
-   CHECK(ring[3] == 0x301 && ring[7] == 0x451 && ring[8] == (uint32_t)device.retire.va && ring[10] == 1);
+   CHECK(ring[3] == 0x301 && ring[7] == 0x451 && ring[8] == (uint32_t)device.queues[0].retire.va && ring[10] == 1);
    CHECK(!k.fence_count && !k.wait_count);
    mock_cp_run(&k);
    CHECK(k.rptr == 12 && !k.blocked);
@@ -400,10 +400,10 @@ test_device(const char *spirv_path)
    for (unsigned i = 0; i < 3000; i++) {
       CHECK(v->QueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS);
       mock_cp_run(&k);
-      CHECK(*(uint64_t *)device.retire.map == i + 2);
+      CHECK(*(uint64_t *)device.queues[0].retire.map == i + 2);
    }
-   CHECK(k.ioctls == ioctls && device.ring.wptr == 12 + 3000 * 9 && seen.count == 3001);
-   CHECK(k.rptr == device.ring.wptr && mock_status32(&k, APEX_STATUS_RPTR) == k.rptr);
+   CHECK(k.ioctls == ioctls && device.queues[0].ring.wptr == 12 + 3000 * 9 && seen.count == 3001);
+   CHECK(k.rptr == device.queues[0].ring.wptr && mock_status32(&k, APEX_STATUS_RPTR) == k.rptr);
 
    /* A second command buffer in the same batch gets its own INDIRECT. */
    VkCommandBuffer second;
@@ -418,7 +418,7 @@ test_device(const char *spirv_path)
    unsigned indirect = k.packets[APEX_CP_INDIRECT];
    CHECK(v->QueueSubmit2(queue, 1, &submit2, VK_NULL_HANDLE) == VK_SUCCESS);
    mock_cp_run(&k);
-   CHECK(k.packets[APEX_CP_INDIRECT] == indirect + 2 && *(uint64_t *)device.retire.map == 3002);
+   CHECK(k.packets[APEX_CP_INDIRECT] == indirect + 2 && *(uint64_t *)device.queues[0].retire.map == 3002);
    for (unsigned i = 4096; i < 16384; i += 4)
       CHECK(*(uint32_t *)(map[1] + i) == 0x5a5a5a5a);
 
@@ -895,7 +895,7 @@ test_graphics(const char *vertex_path, const char *fragment_path, const char *xf
     * 64 tiles of one sample, the regions; color attachment 0 cleared and
     * stored, tiled at 4 tiles per row; the depth-stencil attachment
     * cleared, not stored. */
-   const uint64_t pool_va = device.bin_pool.va;
+   const uint64_t pool_va = device.queues[0].bin_pool.va;
    uint32_t record[128];
    mock_read(&k, pool_va, record, sizeof(record));
    CHECK(MOCK_U64(record, 0) == pool_va && record[2] == APEX_BIN_POOL_BYTES && record[3] == 0 &&

@@ -479,11 +479,12 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(get_image_format(physical, VK_FORMAT_R32_SINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
       VK_IMAGE_USAGE_STORAGE_BIT, 0, &image_props) == VK_SUCCESS);
    PROC(GetPhysicalDeviceQueueFamilyProperties, get_queues);
-   VkQueueFamilyProperties queue_props;
-   count = 1;
-   get_queues(physical, &count, &queue_props);
-   CHECK(count == 1 && queue_props.queueCount == 1 &&
-         queue_props.queueFlags == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT));
+   VkQueueFamilyProperties queue_props[2];
+   count = 2;
+   get_queues(physical, &count, queue_props);
+   CHECK(count == 2 && queue_props[0].queueCount == 1 && queue_props[1].queueCount == 1 &&
+         queue_props[0].queueFlags == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT) &&
+         queue_props[1].queueFlags == VK_QUEUE_TRANSFER_BIT);
    PROC(CreateDevice, create_device);
    PROC(GetDeviceProcAddr, gdpa);
    float priority = 0;
