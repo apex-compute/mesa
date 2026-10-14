@@ -2099,7 +2099,9 @@ record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, u
    uint32_t width = MIN2(extent.width, u_minify(image->vk.extent.width, level) - offset.x);
    uint32_t height = MIN2(extent.height, u_minify(image->vk.extent.height, level) - offset.y);
    const struct apex_hw_level *blocks = &image->layout.level[level];
-   uint64_t src = apex_image_va(image) + blocks->offset + (uint64_t)layer * image->layout.layer_stride +
+   /* 3D slices step by the level's plane, as in image_surface(). */
+   uint64_t slice = image->vk.image_type == VK_IMAGE_TYPE_3D ? blocks->plane : image->layout.layer_stride;
+   uint64_t src = apex_image_va(image) + blocks->offset + (uint64_t)layer * slice +
                   (uint64_t)(offset.y / 4) * blocks->pitch + (uint64_t)(offset.x / 4) * image->layout.bytes;
    uint32_t words[APEX_JOB_WORDS] = {0};
    image_surface(image, &image->decoded_layout, apex_image_va(image) + image->decoded, level, layer,
@@ -2107,11 +2109,13 @@ record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, u
    words[APEX_DECODE_SRC] = LO(src);
    words[APEX_DECODE_SRC + 1] = HI(src);
    words[APEX_DECODE_SRC_ROW] = blocks->pitch;
-   words[APEX_DECODE_SRC_SLICE] = image->layout.layer_stride;
+   words[APEX_DECODE_SRC_SLICE] = slice;
    words[APEX_DECODE_EXTENT] = width;
    words[APEX_DECODE_EXTENT + 1] = height;
    words[APEX_DECODE_EXTENT + 2] = layers;
    words[APEX_DECODE_KIND] = kind;
+   /* Dispatches overlap, so the decode waits for the copy of its blocks. */
+   apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
    /* The BC kernel takes a block per invocation, the ETC2 kernel a texel. */
    if (kind >= APEX_BC1_RGB)
       internal_dispatch(cmd, APEX_INTERNAL_BC, words,

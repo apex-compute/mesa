@@ -345,13 +345,17 @@ void main()
    Words src = Words(address(APEX_DECODE_SRC) + uint64_t(p.z) * job(APEX_DECODE_SRC_SLICE) +
                      uint64_t(p.y) * job(APEX_DECODE_SRC_ROW) + uint64_t(p.x) * (narrow ? 8u : 16u));
    uvec4 raw = uvec4(src.w[0], src.w[1], narrow ? 0u : src.w[2], narrow ? 0u : src.w[3]);
-   /* A block's row of four texels lies a texel apart in the plane. */
+   /* A block's row of four texels lies a texel apart in a linear plane, and
+    * in a tiled one whose origin is a multiple of 4 along x. */
    uint step = surface_texel_bytes(APEX_DECODE_DST);
+   bool contiguous = (job(APEX_DECODE_DST + APEX_SURFACE_FLAGS) & APEX_SURFACE_TILED) == 0u ||
+                     (job(APEX_DECODE_DST + APEX_SURFACE_ORIGIN) & 3u) == 0u;
    for (uint row = 0u; row < 4u && p.y * 4u + row < extent.y; row++) {
       uint64_t line = surface_address(APEX_DECODE_DST, p.x * 4u, p.y * 4u + row, p.z);
       for (uint col = 0u; col < 4u && p.x * 4u + col < extent.x; col++) {
          uvec2 texel = decode(kind, raw, row * 4u + col);
-         Words dst = Words(line + col * step);
+         Words dst = Words(contiguous ? line + col * step :
+                           surface_address(APEX_DECODE_DST, p.x * 4u + col, p.y * 4u + row, p.z));
          dst.w[0] = texel.x;
          if (wide)
             dst.w[1] = texel.y;
