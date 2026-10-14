@@ -78,8 +78,9 @@ struct apex_set_layout {
    struct vk_ycbcr_conversion_state *ycbcr;
    struct apex_binding_layout bindings[];
 };
-/* Update-after-bind bindings, and every binding of an update-after-bind
- * layout except inline uniform blocks, carry UPDATE_AFTER_BIND. */
+/* Update-after-bind bindings and every binding of an update-after-bind
+ * layout carry UPDATE_AFTER_BIND, except inline uniform blocks, which stay
+ * in table rows. */
 static inline bool
 apex_binding_in_memory(const struct apex_binding_layout *binding)
 {

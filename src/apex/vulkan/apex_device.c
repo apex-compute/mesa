@@ -1191,12 +1191,13 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
          binding_flags->pBindingFlags[i] : 0;
       bool type_ok = apex_descriptor_bucket(b->descriptorType) < APEX_DESCRIPTOR_BUCKETS;
       bool inline_block = b->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
-      bool memory = (flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
-                    (pool_layout && !inline_block);
+      /* Inline uniform blocks stay in table rows, which submission writes,
+       * so updates after binding reach them as well. */
+      bool memory = !inline_block && (pool_layout || (flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT));
       uint64_t r = binding_rows(b->descriptorType, binding_slots(b), b->descriptorCount);
       uint64_t table = memory ? !!b->descriptorCount : r;
       if (b->binding >= APEX_MAX_BINDINGS || !type_ok || (flags & ~supported_binding) ||
-          (inline_block && (b->descriptorCount > APEX_MAX_INLINE_BYTES || memory)) ||
+          (inline_block && b->descriptorCount > APEX_MAX_INLINE_BYTES) ||
           b->descriptorCount > APEX_MAX_BINDING_ELEMENTS ||
           r > APEX_MAX_SET_ROWS - rows || table > APEX_MAX_DESCRIPTORS - slots)
          return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -1231,7 +1232,9 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       layout->counts[apex_descriptor_bucket(binding->descriptorType)] += binding->descriptorCount;
       layout->bindings[b].flags = binding_flags && binding_flags->bindingCount ?
          binding_flags->pBindingFlags[i] : 0;
-      if (pool_layout && !inline_block)
+      if (inline_block)
+         layout->bindings[b].flags &= ~VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+      else if (pool_layout)
          layout->bindings[b].flags |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
       /* Immutable samplers are copied: the layout outlives the handles. */
       if (binding->pImmutableSamplers && (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
