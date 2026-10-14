@@ -2402,6 +2402,21 @@ access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bits, uint32_t align_mul
                                       .shift = nir_mem_access_shift_method_scalar};
 }
 
+/* The ALUs compute in 32 bits: 8- and 16-bit integer arithmetic widens. */
+static unsigned
+alu_bit_size(const nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (nir_op_infos[alu->op].is_conversion)
+      return 0;
+   unsigned bits = alu->def.bit_size;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+      bits = MIN2(bits, alu->src[i].src.ssa->bit_size == 1 ? 32 : alu->src[i].src.ssa->bit_size);
+   return bits == 8 || bits == 16 ? 32 : 0;
+}
+
 /* Adjacent dword accesses merge into 64-128-bit lane (or scalar) accesses. */
 static bool vectorize(unsigned align_mul, unsigned align_offset, unsigned bit_size,
                       unsigned num_components, int64_t hole_size, nir_intrinsic_instr *low,
@@ -2644,6 +2659,7 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
       /* Scalarized 64-bit vector reductions become 64-bit compares. */
       NIR_PASS(progress, nir, nir_lower_int64);
+      NIR_PASS(progress, nir, nir_lower_bit_size, alu_bit_size, NULL);
       NIR_PASS(progress, nir, nir_lower_phis_to_scalar, NULL, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_lower_pack);

@@ -260,8 +260,11 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
+   /* Memory is dword-granular: narrower stores become masked atomic updates
+    * that leave the neighbouring bytes intact. */
    const nir_lower_mem_access_bit_sizes_options buffer_sizes = {
       .callback = buffer_access_size, .modes = nir_var_mem_ssbo | nir_var_mem_ubo,
+      .may_lower_unaligned_stores_to_atomics = true,
    };
    NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &buffer_sizes);
    struct descriptor_lowering ctx = {.program = program};
