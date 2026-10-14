@@ -284,6 +284,10 @@ apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk_samp
    /* Every border is the custom RGBA of the resolved Vulkan border color:
     * binary32 for float borders, integers for integer ones. */
    put(d, APEX_HW_SAMPLER_BORDER, 3, 3);
+   /* The texture unit ignores bits 127:64; programs average this many
+    * samples along the footprint (apex_texture.c). */
+   unsigned anisotropy = info->anisotropyEnable ? CLAMP((unsigned)info->maxAnisotropy, 1, 16) : 1;
+   put(d, APEX_HW_SAMPLER_ANISOTROPY, 4, anisotropy - 1);
    memcpy(&d[4], sampler->border_color_value.uint32, 16);
 }
 

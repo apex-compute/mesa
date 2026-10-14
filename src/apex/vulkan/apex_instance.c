@@ -545,6 +545,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maintenance4 = true,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
+      /* Programs average samples along the footprint (apex_texture.c). */
+      .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       /* BC blocks decode at upload into a plane the texture unit samples. */
       .textureCompressionBC = true,
@@ -604,7 +606,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxFragmentCombinedOutputResources = 16,
       .maxColorAttachments = 8,
       .maxDrawIndexedIndexValue = UINT32_MAX, .maxDrawIndirectCount = 65535,
-      .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 1.0f,
+      .maxSamplerLodBias = 16.0f, .maxSamplerAnisotropy = 16.0f,
       .maxPushDescriptors = 32, .maxMultiviewViewCount = 32, .maxMultiviewInstanceIndex = (1u << 27) - 1,
       .maxViewports = APEX_HW_MAX_VIEWPORTS,
       /* Screen coordinates snap into signed Q17.8 and Mesa's guard band keeps

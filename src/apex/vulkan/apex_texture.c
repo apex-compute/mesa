@@ -601,12 +601,105 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
    return true;
 }
 
+/* Anisotropic filtering: a sampler with an anisotropy count above one
+ * averages up to that many explicit-LOD samples spaced along the footprint's
+ * major axis, at the LOD of the major axis over the sample count. Float 2D
+ * sampling with derivatives only; the branch is uniform. */
+static void
+lower_anisotropy(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
+{
+   nir_def *texture_deref = tex_src(tex, nir_tex_src_texture_deref);
+   nir_def *sampler_deref = tex_src(tex, nir_tex_src_sampler_deref);
+   if ((tex->op != nir_texop_txd && tex->op != nir_texop_tex && tex->op != nir_texop_txb) ||
+       (tex->op != nir_texop_txd && b->shader->info.stage != MESA_SHADER_FRAGMENT) ||
+       tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_sparse || tex->def.bit_size != 32 ||
+       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float || !texture_deref || !sampler_deref)
+      return;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *image = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false));
+   nir_def *sampler = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(sampler_deref)), true));
+   nir_def *coord = tex_src(tex, nir_tex_src_coord);
+   nir_def *xy = nir_trim_vector(b, coord, 2);
+   nir_def *dx = tex->op == nir_texop_txd ? tex_src(tex, nir_tex_src_ddx) : nir_ddx(b, xy);
+   nir_def *dy = tex->op == nir_texop_txd ? tex_src(tex, nir_tex_src_ddy) : nir_ddy(b, xy);
+   nir_def *size = nir_vec2(b, nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_WIDTH, 14), 1)),
+                            nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_HEIGHT, 14), 1)));
+   nir_def *px = nir_fmul(b, dx, size), *py = nir_fmul(b, dy, size);
+   nir_def *lx = nir_fsqrt(b, nir_fdot(b, px, px));
+   nir_def *ly = nir_fsqrt(b, nir_fdot(b, py, py));
+   nir_def *major = nir_fmax(b, lx, ly);
+   nir_def *extra = bits(b, sampler, APEX_HW_SAMPLER_ANISOTROPY, 4);
+   nir_def *count = nir_fceil(b, nir_fdiv(b, major, nir_fmax_imm(b, nir_fmin(b, lx, ly), 1e-6)));
+   count = nir_fmin(b, nir_fmax_imm(b, count, 1.0), nir_u2f32(b, nir_iadd_imm(b, extra, 1)));
+   nir_def *lod = nir_fmax_imm(b, nir_flog2(b, nir_fdiv(b, major, count)), -16.0);
+   if (tex->op == nir_texop_txb)
+      lod = nir_fadd(b, lod, tex_src(tex, nir_tex_src_bias));
+   nir_def *axis = nir_bcsel(b, nir_fge(b, lx, ly), dx, dy);
+   const struct glsl_type *type = glsl_vector_type(GLSL_TYPE_FLOAT, tex->def.num_components);
+   nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
+   nir_variable *sum = nir_local_variable_create(impl, type, "anisotropy_sum");
+   nir_variable *k = nir_local_variable_create(impl, glsl_float_type(), "anisotropy_k");
+   nir_push_if(b, nir_ine_imm(b, extra, 0));
+   nir_store_var(b, sum, nir_imm_zero(b, tex->def.num_components, 32), ~0u);
+   nir_store_var(b, k, nir_imm_float(b, 0.0f), 1);
+   nir_push_loop(b);
+   {
+      nir_def *i = nir_load_var(b, k);
+      nir_break_if(b, nir_fge(b, i, count));
+      nir_def *t = nir_fadd_imm(b, nir_fdiv(b, nir_fadd_imm(b, i, 0.5), count), -0.5);
+      nir_def *at = nir_fadd(b, xy, nir_fmul(b, axis, t));
+      if (coord->num_components > 2)
+         at = nir_vec3(b, nir_channel(b, at, 0), nir_channel(b, at, 1), nir_channel(b, coord, 2));
+      /* The explicit-LOD sample keeps the other sources: offsets,
+       * comparator, minimum LOD and the descriptors. */
+      nir_tex_instr *sample = nir_tex_instr_create(b->shader, tex->num_srcs + 1);
+      sample->op = nir_texop_txl;
+      sample->sampler_dim = tex->sampler_dim;
+      sample->dest_type = tex->dest_type;
+      sample->coord_components = tex->coord_components;
+      sample->is_array = tex->is_array;
+      sample->is_shadow = tex->is_shadow;
+      sample->texture_non_uniform = tex->texture_non_uniform;
+      sample->sampler_non_uniform = tex->sampler_non_uniform;
+      unsigned n = 0;
+      for (unsigned s = 0; s < tex->num_srcs; s++) {
+         nir_tex_src_type type = tex->src[s].src_type;
+         if (type == nir_tex_src_bias || type == nir_tex_src_ddx || type == nir_tex_src_ddy)
+            continue;
+         sample->src[n++] = nir_tex_src_for_ssa(type, type == nir_tex_src_coord ? at : tex->src[s].src.ssa);
+      }
+      sample->src[n++] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+      sample->num_srcs = n;
+      nir_def_init(&sample->instr, &sample->def, tex->def.num_components, 32);
+      nir_builder_instr_insert(b, &sample->instr);
+      nir_store_var(b, sum, nir_fadd(b, nir_load_var(b, sum), &sample->def), ~0u);
+      nir_store_var(b, k, nir_fadd_imm(b, i, 1.0), 1);
+   }
+   nir_pop_loop(b, NULL);
+   nir_def *filtered = nir_fdiv(b, nir_load_var(b, sum), count);
+   nir_push_else(b, NULL);
+   nir_instr *plain = nir_instr_clone(b->shader, &tex->instr);
+   nir_builder_instr_insert(b, plain);
+   nir_pop_if(b, NULL);
+   nir_def_replace(&tex->def, nir_if_phi(b, filtered, &nir_instr_as_tex(plain)->def));
+}
+
 bool
 apex_lower_textures(struct apex_program *program, nir_shader *nir)
 {
    struct texture_lowering ctx = {.program = program};
    struct util_dynarray list;
    util_dynarray_init(&list, NULL);
+   nir_builder b = nir_builder_create(nir_shader_get_entrypoint(nir));
+   nir_foreach_block_safe(block, nir_shader_get_entrypoint(nir)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_tex)
+            util_dynarray_append(&list, instr);
+      }
+   }
+   util_dynarray_foreach(&list, nir_instr *, instr)
+      lower_anisotropy(&b, nir_instr_as_tex(*instr), &ctx);
+   util_dynarray_clear(&list);
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -616,7 +709,6 @@ apex_lower_textures(struct apex_program *program, nir_shader *nir)
       }
    }
    bool progress = false;
-   nir_builder b = nir_builder_create(nir_shader_get_entrypoint(nir));
    util_dynarray_foreach(&list, nir_instr *, instr)
       progress |= (*instr)->type == nir_instr_type_tex ? lower_tex(&b, nir_instr_as_tex(*instr), &ctx) :
                   lower_storage(&b, nir_instr_as_intrinsic(*instr), &ctx);

@@ -104,6 +104,7 @@ uint64_t apex_hw_texel_offset(const struct apex_hw_layout *layout, unsigned leve
 #define APEX_HW_SAMPLER_MIN_LOD 37       /* Q4.8, 12 bits */
 #define APEX_HW_SAMPLER_MAX_LOD 49       /* Q4.8, 12 bits */
 #define APEX_HW_SAMPLER_BORDER 61        /* 3 = custom RGBA at bits 255:128 */
+#define APEX_HW_SAMPLER_ANISOTROPY 64    /* anisotropic samples - 1, 4 bits, read by programs */
 
 /* One image view as the texture unit reads it: the view's base level and
  * layer are folded into `va`, so level 0 of the descriptor is the view's
