@@ -124,19 +124,15 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
                                        VkPhysicalDeviceMemoryProperties2 *properties)
 {
    VK_FROM_HANDLE(apex_physical_device, device, physical);
-   /* LOCAL maps BAR2 write-combined; SYSTEM is cached shmem reached over PCIe. */
+   /* LOCAL, mapped through BAR2 write-combined. SYSTEM memory is not offered
+    * on the current image (Docs/architecture.md, Memory system). */
    properties->memoryProperties = (VkPhysicalDeviceMemoryProperties) {
-      .memoryTypeCount = 2,
+      .memoryTypeCount = 1,
       .memoryTypes[0] = {.propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT},
-      .memoryTypes[1] = {.propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                         .heapIndex = 1},
-      .memoryHeapCount = 2,
+      .memoryHeapCount = 1,
       .memoryHeaps[0] = {.size = device->local_bytes, .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT},
-      .memoryHeaps[1] = {.size = APEX_MAX_ALLOCATION},
    };
 }
 

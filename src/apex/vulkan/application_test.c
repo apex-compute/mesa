@@ -245,7 +245,7 @@ int main(int argc, char **argv)
       buffer_info.pNext = &external_buffer;
       CHECK(CreateBuffer(device, &buffer_info, NULL, &shared_buffer) == VK_SUCCESS);
       GetBufferMemoryRequirements(device, shared_buffer, &requirements);
-      CHECK(requirements.memoryTypeBits == 3);
+      CHECK(requirements.memoryTypeBits == 1);
       VkExportMemoryAllocateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
          .handleTypes = external_buffer.handleTypes};
       VkMemoryAllocateInfo shared_allocate = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -276,7 +276,7 @@ int main(int argc, char **argv)
       get.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
       CHECK(GetMemoryFdKHR(device, &get, &fd) == VK_SUCCESS);
       VkMemoryFdPropertiesKHR props = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
-      CHECK(GetMemoryFdPropertiesKHR(device, get.handleType, fd, &props) == VK_SUCCESS && props.memoryTypeBits == 3);
+      CHECK(GetMemoryFdPropertiesKHR(device, get.handleType, fd, &props) == VK_SUCCESS && props.memoryTypeBits == 1);
       import.handleType = get.handleType;
       import.fd = fd;
       CHECK(AllocateMemory(device, &shared_allocate, NULL, &shared_memory) == VK_SUCCESS);

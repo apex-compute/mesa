@@ -192,7 +192,7 @@ int main(void)
    const struct vk_device_dispatch_table *v = &device.vk.dispatch_table;
    VkMemoryFdPropertiesKHR props = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, objects[0], &props) == VK_SUCCESS);
-   CHECK(props.memoryTypeBits == 3 && !live && closes == 1 && fcntl(objects[0], F_GETFD) >= 0);
+   CHECK(props.memoryTypeBits == 1 && !live && closes == 1 && fcntl(objects[0], F_GETFD) >= 0);
    CHECK(!ftruncate(fd, 4096)); /* Valid extent, but not a PRIME-exported object. */
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &props) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
    VkExportMemoryAllocateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
@@ -200,7 +200,7 @@ int main(void)
    VkImportMemoryFdInfoKHR import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
       .pNext = &export, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .pNext = &import, .allocationSize = 8193, .memoryTypeIndex = 1};
+      .pNext = &import, .allocationSize = 8193, .memoryTypeIndex = 0};
    VkDeviceMemory memory[3];
    import.fd = dup(objects[0]);
    CHECK(import.fd >= 0);
@@ -239,7 +239,7 @@ int main(void)
       CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[i]) == VK_SUCCESS);
       VkMemoryRequirements req;
       v->GetBufferMemoryRequirements(dev, buffers[i], &req);
-      CHECK(req.size == 256 && req.alignment == 64 && req.memoryTypeBits == 3);
+      CHECK(req.size == 256 && req.alignment == 64 && req.memoryTypeBits == 1);
       CHECK(v->BindBufferMemory(dev, buffers[i], memory[i], 64 + i * 128) == VK_SUCCESS);
    }
    CHECK(vk_buffer_from_handle(buffers[1])->device_address - vk_buffer_from_handle(buffers[0])->device_address == 128);
@@ -280,7 +280,7 @@ int main(void)
    CHECK(!live);
    import.pNext = &export;
    /* Owned LOCAL export/self-import must share the original handle in either
-    * free order; the import is a view of the same object at either type. */
+    * free order. */
    for (unsigned order = 0; order < 2; order++) {
       ai.pNext = &export;
       ai.memoryTypeIndex = 0;
@@ -289,7 +289,6 @@ int main(void)
       CHECK(v->GetMemoryFdKHR(dev, &get, &import.fd) == VK_SUCCESS);
       import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
       ai.pNext = &import;
-      ai.memoryTypeIndex = order;
       CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_SUCCESS);
       CHECK(live == 1);
       before = closes;
@@ -313,14 +312,14 @@ int main(void)
    CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
    VkMemoryRequirements image_req;
    v->GetImageMemoryRequirements(dev, image, &image_req);
-   CHECK(image_req.size == 192 && image_req.memoryTypeBits == 3);
+   CHECK(image_req.size == 192 && image_req.memoryTypeBits == 1);
    VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
       .image = image};
    import = (VkImportMemoryFdInfoKHR) {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
       .pNext = &dedicated, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
       .fd = dup(objects[0])};
    ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &import,
-      .allocationSize = 192, .memoryTypeIndex = 1};
+      .allocationSize = 192, .memoryTypeIndex = 0};
    CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
    CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
    ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -361,12 +360,12 @@ int main(void)
    plane_layout.offset = 128;
    CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
    v->GetImageMemoryRequirements(dev, image, &image_req);
-   CHECK(image_req.size == 320 && image_req.memoryTypeBits == 3);
+   CHECK(image_req.size == 320 && image_req.memoryTypeBits == 1);
    VkDeviceImageMemoryRequirements device_req = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, .pCreateInfo = &image_info};
    VkMemoryRequirements2 req2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
    v->GetDeviceImageMemoryRequirements(dev, &device_req, &req2);
-   CHECK(req2.memoryRequirements.size == 320 && req2.memoryRequirements.memoryTypeBits == 3);
+   CHECK(req2.memoryRequirements.size == 320 && req2.memoryRequirements.memoryTypeBits == 1);
    v->GetImageSubresourceLayout(dev, image, &plane, &layout);
    CHECK(layout.offset == 128 && layout.rowPitch == 64);
    CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -375,61 +374,14 @@ int main(void)
    v->FreeMemory(dev, memory[0], NULL);
    CHECK(!live);
    device_finish(&device);
-   /* SYSTEM memory is cached shmem with the GEM flag and no fallback;
-    * flush and invalidate are validated no-ops; SYSTEM does not export. */
+   /* SYSTEM memory is not offered: the only type is LOCAL. */
    CHECK(device_init(&device, &physical, &di, fd) == VK_SUCCESS);
    ai = (VkMemoryAllocateInfo) {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = 8192, .memoryTypeIndex = 1};
    before = creates;
-   expected_create_flags = APEX_GEM_SYSTEM;
-   fail_create = true;
-   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   CHECK(!memory[0] && !live && creates == before + 1);
-   fail_create = false;
-   fail_bind = true;
-   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   CHECK(!memory[0] && !live);
-   fail_bind = false;
-   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) == VK_SUCCESS);
-   CHECK(v->MapMemory(dev, memory[0], 4096, 4096, 0, &map) == VK_SUCCESS);
-   uint32_t *words = map;
-   for (unsigned i = 0; i < 1024; i++) words[i] = 0x59f10000 + i * 37;
-   VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-      .memory = memory[0], .offset = 4096, .size = VK_WHOLE_SIZE};
-   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
-   range.size = 64;
-   CHECK(v->InvalidateMappedMemoryRanges(dev, 1, &range) == VK_SUCCESS);
-   for (unsigned i = 0; i < 1024; i++) CHECK(words[i] == 0x59f10000 + i * 37);
-   range.size = 4097;
-   CHECK(v->FlushMappedMemoryRanges(dev, 1, &range) == VK_ERROR_MEMORY_MAP_FAILED);
-   void *invalid = (void *)1;
-   CHECK(v->MapMemory(dev, memory[0], 8192, 1, 0, &invalid) == VK_ERROR_MEMORY_MAP_FAILED && !invalid);
-   bi.pNext = NULL;
-   CHECK(v->CreateBuffer(dev, &bi, NULL, &buffers[0]) == VK_SUCCESS);
-   VkMemoryRequirements req;
-   v->GetBufferMemoryRequirements(dev, buffers[0], &req);
-   CHECK(req.memoryTypeBits == 3);
-   CHECK(v->BindBufferMemory(dev, buffers[0], memory[0], 4096) == VK_SUCCESS);
-   image_info = (VkImageCreateInfo) {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R32_UINT,
-      .extent = {7, 3, 1}, .mipLevels = 1, .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
-      .usage = VK_IMAGE_USAGE_STORAGE_BIT};
-   CHECK(v->CreateImage(dev, &image_info, NULL, &image) == VK_SUCCESS);
-   v->GetImageMemoryRequirements(dev, image, &req);
-   CHECK(req.memoryTypeBits == 3);
-   CHECK(v->BindImageMemory(dev, image, memory[0], 0) == VK_SUCCESS);
-   ai.pNext = &export;
-   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[1]) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
-   get.memory = memory[0];
-   CHECK(v->GetMemoryFdKHR(dev, &get, &exported) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
-   v->DestroyImage(dev, image, NULL);
-   v->DestroyBuffer(dev, buffers[0], NULL);
-   v->UnmapMemory(dev, memory[0]);
-   v->FreeMemory(dev, memory[0], NULL);
-   CHECK(!live);
+   CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[0]) != VK_SUCCESS && creates == before && !live);
    device_finish(&device);
-   puts("PASS Apex SYSTEM memory: GEM flag/no fallback, range no-ops, buffer/image types, export rejection, cleanup (mock DRM)");
+   puts("PASS Apex memory types: LOCAL only, SYSTEM rejected (mock DRM)");
    CHECK(!close(fd));
    for (unsigned i = 0; i < object_count; i++) CHECK(!close(objects[i]));
    vk_physical_device_finish(&physical);

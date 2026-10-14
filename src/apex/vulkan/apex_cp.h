@@ -75,7 +75,6 @@ enum apex_cp_op {
 #define APEX_STATUS_RPTR 0
 #define APEX_STATUS_STATE 4
 #define APEX_STATUS_KFENCE 8
-#define APEX_STATUS_KWAIT 16
 #define APEX_STATUS_FAULT 24
 #define APEX_STATUS_FAULT_ADDRESS 32
 #define APEX_STATUS_FAULT_PACKET 40
@@ -154,7 +153,7 @@ void apex_ring_publish(struct apex_ring *ring);
  * when a kernel fence needs it. */
 struct apex_cp_batch {
    uint32_t acquire_cache;         /* BARRIER cache mask before the batch; 0 omits it */
-   uint64_t kwait_va, kwait_value; /* WAIT(status + 16, value) when value is nonzero */
+   uint64_t kwait_va, kwait_value; /* WAIT(kwait_va, value) when value is nonzero */
    uint32_t ib_count;
    const uint64_t *ib_va;
    const uint32_t *ib_dwords;

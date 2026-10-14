@@ -23,6 +23,7 @@
 } } while (0)
 
 #define MOCK_STATUS_VA 0x1000ull
+#define MOCK_KWAIT_VA 0x9000ull
 #define MOCK_QUEUE_ID 5u
 
 struct mock_gem {
@@ -224,7 +225,7 @@ mock_kernel_ioctl(struct mock_kernel *k, unsigned long request, void *arg)
    }
    case DRM_IOCTL_APEX_QUEUE_CREATE: {
       struct drm_apex_queue_create *r = arg;
-      MOCK_CHECK(!k->queue && !r->reserved && !r->queue_id && !r->status_va);
+      MOCK_CHECK(!k->queue && !r->reserved && !r->queue_id && !r->status_va && !r->kwait_va);
       MOCK_CHECK(r->ring_bytes >= 4096 && r->ring_bytes <= 1u << 20 &&
                  !(r->ring_bytes & (r->ring_bytes - 1)) && !(r->ring_va % 4096) && r->priority <= 1);
       mock_offset(k, r->ring_va, r->ring_bytes);
@@ -237,6 +238,7 @@ mock_kernel_ioctl(struct mock_kernel *k, unsigned long request, void *arg)
       mock_set_status32(k, APEX_STATUS_STATE, APEX_STATUS_ENABLED);
       r->queue_id = MOCK_QUEUE_ID;
       r->status_va = MOCK_STATUS_VA;
+      r->kwait_va = MOCK_KWAIT_VA;
       r->status_offset = k->status_offset;
       r->doorbell_offset = k->doorbell_offset;
       return 0;

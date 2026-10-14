@@ -238,7 +238,7 @@ apex_GetMemoryFdKHR(VkDevice dev, const VkMemoryGetFdInfoKHR *info, int *fd)
 
 /* Type 0 is LOCAL (BAR2 write-combined), type 1 SYSTEM (cached shmem); both
  * are host coherent. */
-#define APEX_MEMORY_TYPES 3u
+#define APEX_MEMORY_TYPES 1u
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits type,
@@ -266,7 +266,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
 {
    VK_FROM_HANDLE(apex_device, device, dev);
    *out = VK_NULL_HANDLE;
-   if (info->memoryTypeIndex > 1)
+   if (info->memoryTypeIndex > 0)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    const VkImportMemoryFdInfoKHR *import = vk_find_struct_const(info->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    if (import && !import->handleType)
@@ -275,11 +275,7 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    VkExternalMemoryHandleTypeFlags types = export ? export->handleTypes : 0;
    if ((import && (import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
                    import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ||
-       (types & ~APEX_EXTERNAL_MEMORY_TYPES) ||
-       /* PRIME exports LOCAL objects. Imports take either type (Zink binds
-        * them from its device-local heap): the exporter owns the placement
-        * and the import is mapped by GPU VA only, routed as SYSTEM. */
-       (types && !import && info->memoryTypeIndex != 0))
+       (types & ~APEX_EXTERNAL_MEMORY_TYPES))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    /* Every allocation has a device address; capture/replay is unsupported. */
    const VkMemoryAllocateFlagsInfo *flags = vk_find_struct_const(info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
@@ -310,8 +306,8 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
          vk_device_memory_destroy(&device->vk, alloc, &mem->vk);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
-      result = apex_bo_create(device, info->allocationSize, APEX_VM_READ | APEX_VM_WRITE,
-                         info->memoryTypeIndex == 1 ? APEX_GEM_SYSTEM : 0, 0, &mem->storage->bo);
+      result = apex_bo_create(device, info->allocationSize, APEX_VM_READ | APEX_VM_WRITE, 0, 0,
+                              &mem->storage->bo);
       if (result == VK_SUCCESS) {
          mem->data = mem->storage->bo.map;
          mem->storage->refs = 1;
@@ -1672,11 +1668,13 @@ apex_UpdateDescriptorSets(VkDevice dev, uint32_t write_count, const VkWriteDescr
 
 /* ---- Events and queries --------------------------------------------------- */
 
-/* Small host-read device words in cached SYSTEM memory. */
+/* Event, query and retirement words in LOCAL, read by the host through BAR2:
+ * the CP waits on and reads them, and only LOCAL is safe for that on the
+ * current image (Docs/architecture.md, Memory system). */
 static VkResult
-host_words_create(struct apex_device *device, uint64_t size, struct apex_bo *bo)
+device_words_create(struct apex_device *device, uint64_t size, struct apex_bo *bo)
 {
-   return apex_bo_create(device, size, APEX_VM_READ | APEX_VM_WRITE, APEX_GEM_SYSTEM, 0, bo);
+   return apex_bo_create(device, size, APEX_VM_READ | APEX_VM_WRITE, 0, 0, bo);
 }
 
 
@@ -1688,7 +1686,7 @@ apex_CreateEvent(VkDevice dev, const VkEventCreateInfo *info,
    struct apex_event *event = vk_object_zalloc(&device->vk, alloc, sizeof(*event), VK_OBJECT_TYPE_EVENT);
    if (!event)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   VkResult result = host_words_create(device, 4096, &event->bo);
+   VkResult result = device_words_create(device, 4096, &event->bo);
    if (result != VK_SUCCESS) {
       vk_object_free(&device->vk, alloc, event);
       return result;
@@ -1751,7 +1749,7 @@ apex_CreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo *info,
    struct apex_query_pool *pool = vk_query_pool_create(&device->vk, info, alloc, sizeof(*pool));
    if (!pool)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   VkResult result = host_words_create(device, (uint64_t)MAX2(info->queryCount, 1) * APEX_QUERY_STRIDE,
+   VkResult result = device_words_create(device, (uint64_t)MAX2(info->queryCount, 1) * APEX_QUERY_STRIDE,
                                        &pool->bo);
    if (result != VK_SUCCESS) {
       apex_bo_finish(device, &pool->bo);
@@ -1995,7 +1993,7 @@ submit_batch(struct apex_device *device, struct apex_queue *queue, struct vk_que
    const struct apex_cp_batch batch = {
       .acquire_cache = queue->programs_uploaded ?
          APEX_CP_CACHE_INSTRUCTION | APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE : 0,
-      .kwait_va = queue->status_va + APEX_STATUS_KWAIT, .kwait_value = kwait,
+      .kwait_va = queue->kwait_va, .kwait_value = kwait,
       .ib_count = count, .ib_va = ib_va, .ib_dwords = ib_dwords,
       .retire_va = queue->retire.va, .sequence = sequence,
       .kfence = submit->signal_count != 0,
@@ -2108,7 +2106,7 @@ create_queue(struct apex_device *device, struct apex_queue *queue, uint32_t fami
 {
    VkResult result = apex_bo_create(device, APEX_RING_BYTES, APEX_VM_READ, 0, 0, &queue->ring_bo);
    if (result == VK_SUCCESS)
-      result = host_words_create(device, 4096, &queue->retire);
+      result = device_words_create(device, 4096, &queue->retire);
    if (result == VK_SUCCESS) {
       mtx_lock(&device->va_mutex);
       uint64_t va = util_vma_heap_alloc(&device->va_heap, APEX_PRIVATE_BYTES, APEX_PRIVATE_BYTES);
@@ -2132,6 +2130,7 @@ create_queue(struct apex_device *device, struct apex_queue *queue, uint32_t fami
              VK_ERROR_INITIALIZATION_FAILED;
    queue->id = create.queue_id;
    queue->status_va = create.status_va;
+   queue->kwait_va = create.kwait_va;
    void *status = mmap(NULL, 4096, PROT_READ, MAP_SHARED, device->fd, create.status_offset);
    void *doorbell = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd,
                          create.doorbell_offset);
@@ -2158,7 +2157,7 @@ destroy_queue(struct apex_device *device, struct apex_queue *queue)
    if (queue->doorbell_map)
       munmap(queue->doorbell_map, 4096);
    queue->status_map = queue->doorbell_map = NULL;
-   queue->status_va = 0;
+   queue->status_va = queue->kwait_va = 0;
    queue->ring = (struct apex_ring){0};
    apex_bo_finish(device, &queue->bin_pool);
    apex_bo_finish(device, &queue->private_arena);

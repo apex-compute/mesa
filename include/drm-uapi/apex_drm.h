@@ -68,6 +68,7 @@ struct drm_apex_queue_create {
 	__u64 status_va;       /* out: read-only GPUVA of the status page */
 	__u64 status_offset;   /* out: mmap offset of the status page */
 	__u64 doorbell_offset; /* out: mmap offset of the doorbell page */
+	__u64 kwait_va;        /* out: read-only GPUVA of the u64 kwait in LOCAL */
 };
 
 struct drm_apex_queue_destroy {
@@ -83,7 +84,7 @@ struct drm_apex_queue_fence {
 };
 
 /* When the syncobj point signals, the kernel writes value to the queue's
- * kwait and rechecks its waits. Mesa appends WAIT(status_va + 16, value). */
+ * kwait and rechecks its waits. Mesa appends WAIT(kwait_va, value). */
 struct drm_apex_queue_wait {
 	__u32 queue_id, syncobj;
 	__u64 point, value;

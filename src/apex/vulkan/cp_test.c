@@ -217,11 +217,11 @@ test_device(const char *spirv_path)
    const VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
    CHECK(apex_device_init(&device, &physical, &di, NULL, k.fd) == VK_SUCCESS);
-   /* Queue creation: a readable LOCAL ring and a SYSTEM retirement word. */
+   /* Queue creation: a readable LOCAL ring and a LOCAL retirement word. */
    CHECK(k.queue && k.ring_bytes == 65536 && device.queues[0].id == MOCK_QUEUE_ID &&
          device.queues[0].status_va == MOCK_STATUS_VA);
    CHECK(k.gems[1].va == k.ring_va && k.gems[1].vm_flags == APEX_VM_READ && !k.gems[1].flags);
-   CHECK(k.gems[2].flags == APEX_GEM_SYSTEM && k.gems[2].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
+   CHECK(!k.gems[2].flags && k.gems[2].vm_flags == (APEX_VM_READ | APEX_VM_WRITE));
    /* The private arena: 2 MiB of LOCAL, read-write at a 2 MiB-aligned GPUVA. */
    CHECK(device.queues[0].private_arena.handle == 3 && k.gems[3].va == device.queues[0].private_arena.va &&
          k.gems[3].va && !(k.gems[3].va % APEX_PRIVATE_BYTES) && k.gems[3].size == APEX_PRIVATE_BYTES &&
@@ -234,17 +234,17 @@ test_device(const char *spirv_path)
    VkQueue queue;
    v->GetDeviceQueue(dev, 0, 0, &queue);
 
-   /* LOCAL and SYSTEM memory, both host visible and coherent. */
+   /* Two LOCAL allocations, host visible and coherent. */
    VkDeviceMemory memory[2];
    uint8_t *map[2];
    for (unsigned t = 0; t < 2; t++) {
       const VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = 65536, .memoryTypeIndex = t};
+         .allocationSize = 65536, .memoryTypeIndex = 0};
       CHECK(v->AllocateMemory(dev, &ai, NULL, &memory[t]) == VK_SUCCESS);
       CHECK(v->MapMemory(dev, memory[t], 0, VK_WHOLE_SIZE, 0, (void **)&map[t]) == VK_SUCCESS);
       memset(map[t], 0, 65536);
    }
-   CHECK(k.gems[5].flags == 0 && k.gems[6].flags == APEX_GEM_SYSTEM);
+   CHECK(k.gems[5].flags == 0 && k.gems[6].flags == 0);
    VkBuffer local, system;
    const VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16384,
       .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -253,7 +253,7 @@ test_device(const char *spirv_path)
    CHECK(v->CreateBuffer(dev, &bi, NULL, &system) == VK_SUCCESS);
    VkMemoryRequirements req;
    v->GetBufferMemoryRequirements(dev, local, &req);
-   CHECK(req.memoryTypeBits == 3 && req.alignment == 64);
+   CHECK(req.memoryTypeBits == 1 && req.alignment == 64);
    CHECK(v->BindBufferMemory(dev, local, memory[0], 0) == VK_SUCCESS);
    CHECK(v->BindBufferMemory(dev, system, memory[1], 0) == VK_SUCCESS);
    const uint64_t local_va = vk_buffer_from_handle(local)->device_address;
