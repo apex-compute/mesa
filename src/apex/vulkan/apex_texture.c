@@ -343,7 +343,10 @@ query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
    };
    /* A cube's footprint is the derivative of its face coordinates sc / |ma|
     * and tc / |ma|, which span the face's width over 2. */
-   nir_def *c[3] = {nir_channel(b, coord, 0), nir_channel(b, coord, 1), nir_channel(b, coord, 2)};
+   const unsigned axes = cube ? 3 : dims;
+   nir_def *c[3] = {NULL};
+   for (unsigned a = 0; a < axes; a++)
+      c[a] = nir_channel(b, coord, a);
    nir_def *z_major = NULL, *y_major = NULL;
    if (cube) {
       nir_def *ax = nir_fabs(b, c[0]), *ay = nir_fabs(b, c[1]), *az = nir_fabs(b, c[2]);
@@ -352,8 +355,8 @@ query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
    }
    nir_def *rho = nir_imm_float(b, 0.0f);
    for (unsigned axis = 0; axis < 2; axis++) {
-      nir_def *d[3];
-      for (unsigned a = 0; a < 3; a++)
+      nir_def *d[3] = {NULL};
+      for (unsigned a = 0; a < axes; a++)
          d[a] = axis ? nir_ddy(b, c[a]) : nir_ddx(b, c[a]);
       nir_def *length = nir_imm_float(b, 0.0f);
       if (cube) {
