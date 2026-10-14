@@ -43,6 +43,10 @@ struct apex_image {
    /* Explicit DRM plane offset from the memory binding. */
    VkDeviceSize plane_offset;
    struct apex_hw_layout layout, decoded_layout;
+   /* Planes 1 and 2 of a multi-planar YCbCr image, at their offsets from
+    * plane 0, which `layout` describes. */
+   struct apex_hw_layout chroma[2];
+   VkDeviceSize chroma_offset[2];
 };
 static inline uint64_t
 apex_image_va(const struct apex_image *image)
@@ -252,6 +256,10 @@ struct apex_arena *apex_arena_get(struct apex_device *device, struct apex_queue 
 /* The layout of a view's level: the decoded plane of ETC2/EAC images. */
 const struct apex_hw_layout *apex_image_layout(const struct apex_image *image, VkFormat view_format,
                                                uint64_t *va);
+/* Plane `plane` of an image: `layout` for plane 0, a YCbCr chroma plane
+ * otherwise. */
+const struct apex_hw_layout *apex_image_plane(const struct apex_image *image, unsigned plane,
+                                              uint64_t *va);
 
 /* apex_cmd.c */
 extern const struct vk_command_buffer_ops apex_command_buffer_ops;

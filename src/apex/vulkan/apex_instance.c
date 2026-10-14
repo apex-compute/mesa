@@ -365,6 +365,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_vertex_attribute_divisor = true,
       .EXT_scalar_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_sampler_ycbcr_conversion = true,
       .KHR_index_type_uint8 = true,
       .KHR_draw_indirect_count = true,
       .KHR_multiview = true,
@@ -438,6 +439,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* The vertex launch header carries the draw index, base vertex and
        * base instance. */
       .shaderDrawParameters = true,
+      /* Multi-planar images sample each plane and convert in the compiler
+       * (apex_texture.c, nir_vk_lower_ycbcr_tex). */
+      .samplerYcbcrConversion = true,
       /* Buffer pointers are {table row, element, offset} values (apex_pipeline.c),
        * so they select, merge and compare like any value. */
       .variablePointersStorageBuffer = true,
@@ -727,10 +731,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .polygonModePointSize = false,
       .nonStrictSinglePixelWideLinesUseParallelogram = false,
       .nonStrictWideLinesUseParallelogram = false,
-      /* VK_KHR_maintenance6: no multi-planar formats yet, so a combined
-       * image sampler takes one descriptor. */
       .blockTexelViewCompatibleMultipleLayers = true,
-      .maxCombinedImageSamplerDescriptorCount = 1,
+      /* VK_KHR_maintenance6: a three-plane YCbCr image takes three. */
+      .maxCombinedImageSamplerDescriptorCount = 3,
       .fragmentShadingRateClampCombinerInputs = false,
       /* VK_EXT_pipeline_robustness: buffer descriptors are always robust
        * (out-of-range loads read zero, stores and atomics drop), and image

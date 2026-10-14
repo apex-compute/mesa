@@ -1253,6 +1253,7 @@ write_layout(struct blob *blob, const struct apex_set_layout *layout)
    blob_write_bytes(blob, layout->counts, sizeof(layout->counts));
    blob_write_bytes(blob, layout->bindings, layout->binding_count * sizeof(layout->bindings[0]));
    blob_write_bytes(blob, layout->samplers, samplers * sizeof(layout->samplers[0]));
+   blob_write_bytes(blob, layout->ycbcr, samplers * sizeof(layout->ycbcr[0]));
 }
 
 static struct apex_set_layout *
@@ -1277,6 +1278,7 @@ read_layout(struct vk_device *device, struct blob_reader *blob)
    blob_copy_bytes(blob, layout->counts, sizeof(layout->counts));
    blob_copy_bytes(blob, layout->bindings, bindings * sizeof(layout->bindings[0]));
    blob_copy_bytes(blob, layout->samplers, samplers * sizeof(layout->samplers[0]));
+   blob_copy_bytes(blob, layout->ycbcr, samplers * sizeof(layout->ycbcr[0]));
    return layout;
 }
 

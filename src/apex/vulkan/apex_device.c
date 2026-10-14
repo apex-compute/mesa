@@ -537,6 +537,14 @@ image_features(VkFormat format, bool linear)
 {
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
                                           VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   /* Multi-planar YCbCr images sample each plane through a conversion
+    * lowered in the compiler (apex_texture.c). */
+   if (apex_ycbcr_info(format))
+      return linear ? 0 : transfer | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                          VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT |
+                          VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+                          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
    /* ETC2/EAC and BC images sample their decoded plane. */
    if (apex_decoded_format(format, NULL))
       return linear ? 0 : transfer | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
@@ -590,9 +598,10 @@ image_features(VkFormat format, bool linear)
 VkFormatFeatureFlags2
 apex_format_features(VkFormat format, bool buffer)
 {
-   /* Subsampled and multi-planar YCbCr formats are unsupported, as are
-    * values without a Mesa format (maintenance5 allows any enumerant) and
-    * D16_UNORM_S8_UINT. */
+   if (apex_ycbcr_info(format))
+      return buffer ? 0 : image_features(format, false);
+   /* Other YCbCr formats are unsupported, as are values without a Mesa
+    * format (maintenance5 allows any enumerant) and D16_UNORM_S8_UINT. */
    if (format == VK_FORMAT_UNDEFINED || format == VK_FORMAT_D16_UNORM_S8_UINT ||
        vk_format_get_ycbcr_info(format) || vk_format_to_pipe_format(format) == PIPE_FORMAT_NONE ||
        (format >= VK_FORMAT_G8B8G8R8_422_UNORM && format <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM))
@@ -720,12 +729,20 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
             .compatibleHandleTypes = APEX_EXTERNAL_MEMORY_TYPES,
          };
    }
+   /* Multi-planar images are 2D, single-level and single-layer. */
+   const struct vk_format_ycbcr_info *ycbcr = apex_ycbcr_info(info->format);
+   if (ycbcr && (info->type != VK_IMAGE_TYPE_2D || (info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props =
+      vk_find_struct(properties->pNext, SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES);
+   if (ycbcr_props)
+      ycbcr_props->combinedImageSamplerDescriptorCount = ycbcr ? ycbcr->n_planes : 1;
    bool three_d = info->type == VK_IMAGE_TYPE_3D;
    unsigned extent = three_d ? APEX_MAX_IMAGE_3D : APEX_MAX_IMAGE_2D;
    properties->imageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = {extent, info->type == VK_IMAGE_TYPE_1D ? 1 : extent, three_d ? APEX_MAX_IMAGE_3D : 1},
-      .maxMipLevels = linear ? 1 : util_logbase2(extent) + 1,
-      .maxArrayLayers = three_d || linear ? 1 : APEX_MAX_LAYERS,
+      .maxMipLevels = linear || ycbcr ? 1 : util_logbase2(extent) + 1,
+      .maxArrayLayers = three_d || linear || ycbcr ? 1 : APEX_MAX_LAYERS,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT, .maxResourceSize = 1ull << 31,
    };
    /* Multisampling: 2D optimal attachments of 2, 4 or 8 samples. */
@@ -744,6 +761,19 @@ static VkDeviceSize
 image_layout(const VkImageCreateInfo *info, struct apex_image *image)
 {
    VkFormat format = info->format;
+   /* A multi-planar image is its planes in order, each a tiled image of its
+    * plane format at the plane's subsampled extent. */
+   const struct vk_format_ycbcr_info *ycbcr = apex_ycbcr_info(format);
+   if (ycbcr) {
+      format = ycbcr->planes[0].format;
+      for (unsigned p = 1; p < ycbcr->n_planes; p++) {
+         VkExtent3D extent = {vk_format_get_plane_width(info->format, p, info->extent.width),
+                              vk_format_get_plane_height(info->format, p, info->extent.height), 1};
+         apex_hw_layout_init(&image->chroma[p - 1], vk_format_get_blocksize(ycbcr->planes[p].format),
+                             (VkExtent2D){1, 1}, false, extent, 1, 1, 1,
+                             info->tiling == VK_IMAGE_TILING_OPTIMAL);
+      }
+   }
    unsigned bytes = vk_format_get_blocksize(format);
    unsigned bw = vk_format_get_blockwidth(format), bh = vk_format_get_blockheight(format);
    bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
@@ -752,6 +782,10 @@ image_layout(const VkImageCreateInfo *info, struct apex_image *image)
    apex_hw_layout_init(&image->layout, bytes, (VkExtent2D){bw, bh}, three_d, info->extent, info->mipLevels,
                        info->arrayLayers, info->samples, tiled);
    VkDeviceSize size = image->layout.size;
+   for (unsigned p = 1; ycbcr && p < ycbcr->n_planes; p++) {
+      image->chroma_offset[p - 1] = align64(size, APEX_HW_TILE);
+      size = image->chroma_offset[p - 1] + image->chroma[p - 1].size;
+   }
    image->decoded = 0;
    VkFormat decoded = apex_decoded_format(format, NULL);
    if (decoded) {
@@ -761,6 +795,13 @@ image_layout(const VkImageCreateInfo *info, struct apex_image *image)
       size = image->decoded + image->decoded_layout.size;
    }
    return size;
+}
+
+const struct apex_hw_layout *
+apex_image_plane(const struct apex_image *image, unsigned plane, uint64_t *va)
+{
+   *va = apex_image_va(image) + (plane ? image->chroma_offset[plane - 1] : 0);
+   return plane ? &image->chroma[plane - 1] : &image->layout;
 }
 
 const struct apex_hw_layout *
@@ -940,11 +981,15 @@ static void
 subresource_layout(const struct apex_image *image, const VkImageSubresource *subresource,
                    VkSubresourceLayout2 *out)
 {
-   const struct apex_hw_layout *layout = &image->layout;
+   /* A plane aspect of a multi-planar image selects that plane. */
+   unsigned plane = subresource->aspectMask & VK_IMAGE_ASPECT_PLANE_1_BIT ? 1 :
+                    subresource->aspectMask & VK_IMAGE_ASPECT_PLANE_2_BIT ? 2 : 0;
+   const struct apex_hw_layout *layout = plane ? &image->chroma[plane - 1] : &image->layout;
    const struct apex_hw_level *l = &layout->level[subresource->mipLevel];
    unsigned planes = image->vk.image_type == VK_IMAGE_TYPE_3D ? l->depth : layout->samples;
    out->subresourceLayout = (VkSubresourceLayout) {
-      .offset = image->plane_offset + l->offset + layout->layer_stride * subresource->arrayLayer,
+      .offset = image->plane_offset + (plane ? image->chroma_offset[plane - 1] : 0) + l->offset +
+                layout->layer_stride * subresource->arrayLayer,
       .size = l->plane * planes,
       .rowPitch = layout->tiled ? 0 : l->pitch,
       .arrayPitch = layout->layer_stride,
@@ -978,9 +1023,13 @@ apex_CreateImageView(VkDevice dev, const VkImageViewCreateInfo *info,
    VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_image, image, info->image);
    *out = VK_NULL_HANDLE;
-   /* Views may reinterpret texels of the same size (mutable-format images). */
+   /* Views may reinterpret texels of the same size (mutable-format images);
+    * a plane view of a multi-planar image takes its plane format's size. */
+   VkFormat image_format = image ? image->vk.format : VK_FORMAT_UNDEFINED;
+   if (image && vk_format_get_plane_count(image_format) > 1)
+      image_format = vk_format_get_aspect_format(image_format, info->subresourceRange.aspectMask);
    if ((info->flags & ~VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) || !image ||
-       vk_format_get_blocksize(info->format) != vk_format_get_blocksize(image->vk.format))
+       vk_format_get_blocksize(info->format) != vk_format_get_blocksize(image_format))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    struct vk_image_view *view = vk_image_view_create(&device->vk, info, alloc, sizeof(*view));
    if (!view)
@@ -1024,11 +1073,28 @@ apex_DestroySampler(VkDevice dev, VkSampler handle, const VkAllocationCallbacks 
 /* Set rows of one binding of `count` elements, or bytes of an inline uniform
  * block: its buffer row and data rows. */
 static uint64_t
-binding_rows(VkDescriptorType type, uint32_t count)
+binding_rows(VkDescriptorType type, uint32_t slots, uint32_t count)
 {
    return type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
       (count ? 1 + DIV_ROUND_UP(count, sizeof(union apex_descriptor)) : 0) :
-      (uint64_t)count * apex_descriptor_slots(type);
+      (uint64_t)count * slots;
+}
+
+/* Rows of one element: a combined image sampler with YCbCr conversions
+ * takes an image row per plane before its sampler row. */
+static uint32_t
+binding_slots(const VkDescriptorSetLayoutBinding *b)
+{
+   uint32_t slots = apex_descriptor_slots(b->descriptorType);
+   if (b->descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !b->pImmutableSamplers)
+      return slots;
+   for (unsigned e = 0; e < b->descriptorCount; e++) {
+      const struct vk_ycbcr_conversion *conversion =
+         apex_sampler_from_handle(b->pImmutableSamplers[e])->vk.ycbcr_conversion;
+      if (conversion)
+         slots = MAX2(slots, 1 + vk_format_get_plane_count(conversion->state.format));
+   }
+   return slots;
 }
 
 uint32_t
@@ -1047,10 +1113,12 @@ apex_set_layout_alloc(struct apex_device *device, VkDescriptorSetLayoutCreateFla
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = flags,
    };
    size_t size = sizeof(struct apex_set_layout) + binding_count * sizeof(struct apex_binding_layout);
+   size_t ycbcr = size + samplers * 8 * sizeof(uint32_t);
    struct apex_set_layout *layout = vk_descriptor_set_layout_zalloc(&device->vk,
-      size + samplers * 8 * sizeof(uint32_t), &info);
+      ycbcr + samplers * sizeof(struct vk_ycbcr_conversion_state), &info);
    if (layout) {
       layout->samplers = (void *)((uint8_t *)layout + size);
+      layout->ycbcr = (void *)((uint8_t *)layout + ycbcr);
       layout->binding_count = binding_count;
    }
    return layout;
@@ -1085,7 +1153,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       bool inline_block = b->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
       bool memory = (flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
                     (pool_layout && !inline_block);
-      uint64_t r = binding_rows(b->descriptorType, b->descriptorCount);
+      uint64_t r = binding_rows(b->descriptorType, binding_slots(b), b->descriptorCount);
       uint64_t table = memory ? !!b->descriptorCount : r;
       if (b->binding >= APEX_MAX_BINDINGS || !type_ok || (flags & ~supported_binding) ||
           (inline_block && (b->descriptorCount > APEX_MAX_INLINE_BYTES || memory)) ||
@@ -1118,6 +1186,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       layout->bindings[b].count = inline_block ? !!binding->descriptorCount : binding->descriptorCount;
       layout->bindings[b].bytes = inline_block ? binding->descriptorCount : 0;
       layout->bindings[b].type = binding->descriptorType;
+      layout->bindings[b].slots = binding_slots(binding);
       layout->bindings[b].stages = binding->stageFlags;
       layout->counts[apex_descriptor_bucket(binding->descriptorType)] += binding->descriptorCount;
       layout->bindings[b].flags = binding_flags && binding_flags->bindingCount ?
@@ -1128,15 +1197,18 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
       if (binding->pImmutableSamplers && (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
                                           binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
          layout->bindings[b].immutable = immutable;
-         for (unsigned e = 0; e < binding->descriptorCount; e++)
-            memcpy(layout->samplers[immutable++],
-                   apex_sampler_from_handle(binding->pImmutableSamplers[e])->row, 8 * sizeof(uint32_t));
+         for (unsigned e = 0; e < binding->descriptorCount; e++, immutable++) {
+            const struct apex_sampler *sampler = apex_sampler_from_handle(binding->pImmutableSamplers[e]);
+            memcpy(layout->samplers[immutable], sampler->row, 8 * sizeof(uint32_t));
+            if (sampler->vk.ycbcr_conversion)
+               layout->ycbcr[immutable] = sampler->vk.ycbcr_conversion->state;
+         }
       }
    }
    unsigned row = 0, slot = 0, dynamic_index = 0;
    for (unsigned b = 0; b < count; b++) {
       struct apex_binding_layout *binding = &layout->bindings[b];
-      uint32_t r = binding_rows(binding->type, binding->bytes ? binding->bytes : binding->count);
+      uint32_t r = binding_rows(binding->type, binding->slots, binding->bytes ? binding->bytes : binding->count);
       binding->row = row;
       binding->slot = slot;
       binding->dynamic = dynamic_index;
@@ -1153,6 +1225,7 @@ apex_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateIn
    _mesa_blake3_update(&hash, &info->flags, sizeof(info->flags));
    _mesa_blake3_update(&hash, layout->bindings, count * sizeof(layout->bindings[0]));
    _mesa_blake3_update(&hash, layout->samplers, immutable * 8 * sizeof(uint32_t));
+   _mesa_blake3_update(&hash, layout->ycbcr, immutable * sizeof(layout->ycbcr[0]));
    _mesa_blake3_final(&hash, layout->vk.blake3);
    *out = vk_descriptor_set_layout_to_handle(&layout->vk);
    return VK_SUCCESS;
@@ -1295,8 +1368,8 @@ apex_descriptor_set_init(struct apex_descriptor_set *set, uint32_t variable)
    for (unsigned b = 0; b < layout->binding_count; b++) {
       const struct apex_binding_layout *binding = &layout->bindings[b];
       uint32_t count = apex_set_binding_count(set, binding);
-      unsigned slots = apex_descriptor_slots(binding->type);
-      set->row_count = binding->row + binding_rows(binding->type, count);
+      unsigned slots = binding->slots;
+      set->row_count = binding->row + binding_rows(binding->type, slots, count);
       switch (binding->type) {
       case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
          /* The table's copy takes the GPUVA of the data rows. */
@@ -1371,7 +1444,8 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
             for (unsigned b = 0; b < layout->binding_count; b++) {
                const struct apex_binding_layout *binding = &layout->bindings[b];
                if (binding->flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)
-                  bytes = (binding->row + binding_rows(binding->type, apex_set_binding_count(set, binding))) *
+                  bytes = (binding->row + binding_rows(binding->type, binding->slots,
+                                                       apex_set_binding_count(set, binding))) *
                           sizeof(union apex_descriptor);
             }
             uint64_t address = bytes && pool->bo.handle ? util_vma_heap_alloc(&pool->heap, bytes, 64) : 0;
@@ -1402,6 +1476,66 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
  * empty robust buffers and images of format class none, which read zero. A
  * dynamic buffer row of the whole buffer marks word 4, so binding subtracts
  * its dynamic offset from the range. */
+/* The texture-unit descriptor of plane `plane` of a view into rows[plane];
+ * a storage image adds the view's format words in the next row. A
+ * multi-planar view takes its plane's format and layout, a single-plane
+ * view of a multi-planar image the plane its aspect names. */
+static void
+image_row(union apex_descriptor *rows, const struct apex_image *image, const struct vk_image_view *view,
+          unsigned plane, bool storage)
+{
+   uint64_t va;
+   const struct apex_hw_layout *hw;
+   VkFormat format = view->format;
+   VkImageAspectFlags aspect = view->aspects;
+   if (vk_format_get_plane_count(view->format) > 1) {
+      hw = apex_image_plane(image, plane, &va);
+      format = vk_format_get_plane_format(view->format, plane);
+      aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+   } else if (aspect & (VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT)) {
+      hw = apex_image_plane(image, aspect & VK_IMAGE_ASPECT_PLANE_1_BIT ? 1 : 2, &va);
+      aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+   } else {
+      hw = apex_image_layout(image, view->format, &va);
+      if (aspect & VK_IMAGE_ASPECT_PLANE_0_BIT)
+         aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      VkFormat decoded = apex_decoded_format(view->format, NULL);
+      if (decoded)
+         format = decoded;
+   }
+   uint8_t code = 0, channel[4] = {0};
+   bool sampled = apex_hw_texture_format(format, aspect, &code, channel);
+   uint32_t words[3];
+   if ((!sampled && !storage) || (storage && !apex_format_encode(view->format, view->aspects, NULL, words)))
+      return;
+   unsigned level = view->base_mip_level;
+   const struct apex_hw_level *l = &hw->level[level];
+   bool three_d = image->vk.image_type == VK_IMAGE_TYPE_3D;
+   /* The view's base level and layer start the descriptor. */
+   struct apex_hw_image d = {
+      .va = va + l->offset + (three_d ? 0 : view->base_array_layer * hw->layer_stride),
+      .format = sampled ? code : 0, .tiled = hw->tiled,
+      .samples_log2 = util_logbase2(image->vk.samples),
+      .width = l->width, .height = l->height,
+      .depth = three_d ? l->depth : view->layer_count,
+      .levels = storage ? 1 : view->level_count,
+      .pitch64 = hw->tiled ? 0 : l->pitch / 64, .stride64 = hw->layer_stride / 64,
+   };
+   const VkComponentSwizzle mapping[4] = {view->swizzle.r, view->swizzle.g, view->swizzle.b, view->swizzle.a};
+   for (unsigned c = 0; c < 4; c++) {
+      VkComponentSwizzle s = mapping[c] == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_R + c : mapping[c];
+      d.swizzle[c] = s == VK_COMPONENT_SWIZZLE_ZERO ? APEX_HW_SWIZZLE_0 :
+                     s == VK_COMPONENT_SWIZZLE_ONE ? APEX_HW_SWIZZLE_1 :
+                     channel[s - VK_COMPONENT_SWIZZLE_R];
+   }
+   union apex_descriptor *row = &rows[plane];
+   apex_hw_image_descriptor(&d, row->words);
+   for (unsigned w = 0; w < 8; w++)
+      row->words[w] = util_cpu_to_le32(row->words[w]);
+   for (unsigned w = 0; storage && w < 3; w++)
+      rows[1].words[w] = util_cpu_to_le32(words[w]);
+}
+
 static void
 encode_descriptor(union apex_descriptor *rows, const struct apex_set_layout *layout,
                   const struct apex_binding_layout *binding, unsigned element, const void *value)
@@ -1419,54 +1553,18 @@ encode_descriptor(union apex_descriptor *rows, const struct apex_set_layout *lay
       if (binding->immutable != ~0u && sampler)
          return;
       if (!sampler) {
-         memset(rows, 0, (storage ? 2 : 1) * sizeof(rows[0]));
+         /* A combined image sampler keeps an image row per plane. */
+         unsigned image_rows = combined ? binding->slots - 1 : 1;
+         memset(rows, 0, (storage ? 2 : image_rows) * sizeof(rows[0]));
          VK_FROM_HANDLE(vk_image_view, view, info->imageView);
          const struct apex_image *image = view ? (const void *)view->image : NULL;
-         if (image && image->memory) {
-            uint64_t va;
-            const struct apex_hw_layout *hw = apex_image_layout(image, view->format, &va);
-            VkFormat format = apex_decoded_format(view->format, NULL);
-            if (!format)
-               format = view->format;
-            uint8_t code = 0, channel[4] = {0};
-            bool sampled = apex_hw_texture_format(format, view->aspects, &code, channel);
-            uint32_t words[3];
-            if ((sampled || storage) &&
-                (!storage || apex_format_encode(view->format, view->aspects, NULL, words))) {
-               unsigned level = view->base_mip_level;
-               const struct apex_hw_level *l = &hw->level[level];
-               bool three_d = image->vk.image_type == VK_IMAGE_TYPE_3D;
-               /* The view's base level and layer start the descriptor. */
-               struct apex_hw_image d = {
-                  .va = va + l->offset + (three_d ? 0 : view->base_array_layer * hw->layer_stride),
-                  .format = sampled ? code : 0, .tiled = hw->tiled,
-                  .samples_log2 = util_logbase2(image->vk.samples),
-                  .width = l->width, .height = l->height,
-                  .depth = three_d ? l->depth : view->layer_count,
-                  .levels = storage ? 1 : view->level_count,
-                  .pitch64 = hw->tiled ? 0 : l->pitch / 64, .stride64 = hw->layer_stride / 64,
-               };
-               const VkComponentSwizzle mapping[4] = {view->swizzle.r, view->swizzle.g, view->swizzle.b,
-                                                      view->swizzle.a};
-               for (unsigned c = 0; c < 4; c++) {
-                  VkComponentSwizzle s = mapping[c] == VK_COMPONENT_SWIZZLE_IDENTITY ?
-                     VK_COMPONENT_SWIZZLE_R + c : mapping[c];
-                  d.swizzle[c] = s == VK_COMPONENT_SWIZZLE_ZERO ? APEX_HW_SWIZZLE_0 :
-                                 s == VK_COMPONENT_SWIZZLE_ONE ? APEX_HW_SWIZZLE_1 :
-                                 channel[s - VK_COMPONENT_SWIZZLE_R];
-               }
-               apex_hw_image_descriptor(&d, rows[0].words);
-               for (unsigned w = 0; w < 8; w++)
-                  rows[0].words[w] = util_cpu_to_le32(rows[0].words[w]);
-               /* A storage image adds the view's format words. */
-               for (unsigned w = 0; storage && w < 3; w++)
-                  rows[1].words[w] = util_cpu_to_le32(words[w]);
-            }
-         }
+         unsigned planes = view ? vk_format_get_plane_count(view->format) : 0;
+         for (unsigned p = 0; image && image->memory && p < MIN2(planes, image_rows); p++)
+            image_row(rows, image, view, p, storage);
       }
       if ((sampler || combined) && binding->immutable == ~0u) {
          VK_FROM_HANDLE(apex_sampler, s, info->sampler);
-         uint32_t *out = rows[combined ? 1 : 0].words;
+         uint32_t *out = rows[combined ? binding->slots - 1 : 0].words;
          for (unsigned w = 0; w < 8; w++)
             out[w] = util_cpu_to_le32(s ? s->row[w] : 0);
       }
@@ -1525,17 +1623,17 @@ write_set(struct apex_descriptor_set *set, uint32_t binding, uint32_t element, u
                   b->row + 1 + DIV_ROUND_UP(element + count, sizeof(union apex_descriptor)));
       return;
    }
-   unsigned slots = apex_descriptor_slots(type), first = ~0u, end = 0;
+   unsigned first = ~0u, end = 0;
    for (unsigned d = 0; d < count; d++, element++) {
       while (element >= apex_set_binding_count(set, b)) {
          element -= apex_set_binding_count(set, b);
          b++;
          assert(b < layout->bindings + layout->binding_count && b->type == type);
       }
-      unsigned row = b->row + element * slots;
+      unsigned row = b->row + element * b->slots;
       encode_descriptor(&set->rows[row], layout, b, element, (const uint8_t *)data + d * stride);
       first = MIN2(first, row);
-      end = MAX2(end, row + slots);
+      end = MAX2(end, row + b->slots);
    }
    mirror_rows(set, first, end);
 }
@@ -1615,8 +1713,8 @@ apex_GetDescriptorSetLayoutSupport(VkDevice dev, const VkDescriptorSetLayoutCrea
             uint32_t table = APEX_MAX_DESCRIPTORS - last->slot;
             variable->maxVariableDescriptorCount = last->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
                APEX_MAX_INLINE_BYTES :
-               MIN3(APEX_MAX_BINDING_ELEMENTS, rows / apex_descriptor_slots(last->type),
-                    apex_binding_in_memory(last) ? UINT32_MAX : table / apex_descriptor_slots(last->type));
+               MIN3(APEX_MAX_BINDING_ELEMENTS, rows / last->slots,
+                    apex_binding_in_memory(last) ? UINT32_MAX : table / last->slots);
          }
       }
    }
@@ -1650,17 +1748,18 @@ apex_UpdateDescriptorSets(VkDevice dev, uint32_t write_count, const VkWriteDescr
                    from->type, (uint8_t *)&src->rows[from->row + 1] + copies[i].srcArrayElement, 0);
          continue;
       }
-      unsigned slots = apex_descriptor_slots(from->type), first = ~0u, end = 0;
+      unsigned first = ~0u, end = 0;
       unsigned s = copies[i].srcArrayElement, d = copies[i].dstArrayElement;
       for (unsigned k = 0; k < copies[i].descriptorCount; k++, s++, d++) {
          for (; s >= apex_set_binding_count(src, from); from++)
             s -= apex_set_binding_count(src, from);
          for (; d >= apex_set_binding_count(dst, to); to++)
             d -= apex_set_binding_count(dst, to);
-         unsigned row = to->row + d * slots;
-         memcpy(&dst->rows[row], &src->rows[from->row + s * slots], slots * sizeof(dst->rows[0]));
+         unsigned row = to->row + d * to->slots;
+         memcpy(&dst->rows[row], &src->rows[from->row + s * from->slots],
+                MIN2(from->slots, to->slots) * sizeof(dst->rows[0]));
          first = MIN2(first, row);
-         end = MAX2(end, row + slots);
+         end = MAX2(end, row + to->slots);
       }
       mirror_rows(dst, first, end);
    }

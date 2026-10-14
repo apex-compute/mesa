@@ -52,7 +52,8 @@ bits(nir_builder *b, nir_def *words, unsigned lo, unsigned width)
  * indices select the zero sentinel row of the table, or read zero from pool
  * memory. */
 static struct row
-deref_row(nir_builder *b, struct texture_lowering *ctx, nir_deref_instr *deref, bool sampler_part)
+deref_row(nir_builder *b, struct texture_lowering *ctx, nir_deref_instr *deref, bool sampler_part,
+          unsigned plane)
 {
    nir_def *index = nir_imm_int(b, 0);
    if (deref->deref_type == nir_deref_type_array) {
@@ -73,10 +74,10 @@ deref_row(nir_builder *b, struct texture_lowering *ctx, nir_deref_instr *deref, 
       return table;
    }
    const struct apex_binding_layout *bl = &layout->bindings[binding];
-   unsigned slots = apex_descriptor_slots(bl->type);
+   unsigned slots = bl->slots;
    unsigned base = program->set_offsets[var->data.descriptor_set] + bl->slot;
-   /* A combined descriptor keeps its sampler in the second row. */
-   unsigned part = sampler_part && bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 1 : 0;
+   /* A combined descriptor keeps an image row per plane, then its sampler. */
+   unsigned part = !sampler_part ? plane : bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? slots - 1 : 0;
    if (apex_binding_in_memory(bl)) {
       BITSET_SET(program->used_descriptors, base);
       nir_def *element = nir_umin(b, index, nir_imm_int(b, APEX_MAX_BINDING_ELEMENTS));
@@ -372,7 +373,14 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       ctx->invalid = true;
       return false;
    }
-   struct row image_row = deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false);
+   /* A YCbCr sample reads one plane's image row (nir_vk_lower_ycbcr_tex). */
+   unsigned plane = 0;
+   int p = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   if (p >= 0) {
+      plane = nir_src_as_uint(tex->src[p].src);
+      nir_tex_instr_remove_src(tex, p);
+   }
+   struct row image_row = deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false, plane);
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
       /* Texel buffers: address, byte range, elements, format words. */
       nir_def *coord = tex_src(tex, nir_tex_src_coord);
@@ -414,7 +422,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
          ctx->invalid = true;
          return false;
       }
-      sampler = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(sampler_deref)), true));
+      sampler = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(sampler_deref)), true, 0));
    }
    if (tex->op == nir_texop_lod) {
       nir_def_replace(&tex->def, query_lod(b, tex, image, sampler));
@@ -493,7 +501,7 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       ctx->invalid = true;
       return false;
    }
-   struct row row = deref_row(b, ctx, nir_src_as_deref(i->src[0]), false);
+   struct row row = deref_row(b, ctx, nir_src_as_deref(i->src[0]), false, 0);
    bool array = nir_intrinsic_image_array(i);
    struct image_info img;
    nir_def *inside, *address;
@@ -619,7 +627,7 @@ lower_anisotropy(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ct
    /* Only the sampler's count is read outside the branch, so samplers
     * without anisotropy pay one row load. The branch is uniform per
     * sampler, so quads stay whole for the implicit derivatives inside it. */
-   nir_def *sampler = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(sampler_deref)), true));
+   nir_def *sampler = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(sampler_deref)), true, 0));
    nir_def *extra = bits(b, sampler, APEX_HW_SAMPLER_ANISOTROPY, 4);
    const struct glsl_type *type = glsl_vector_type(GLSL_TYPE_FLOAT, tex->def.num_components);
    nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
@@ -630,7 +638,7 @@ lower_anisotropy(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ct
    nir_def *xy = nir_trim_vector(b, coord, 2);
    nir_def *dx = tex->op == nir_texop_txd ? tex_src(tex, nir_tex_src_ddx) : nir_ddx(b, xy);
    nir_def *dy = tex->op == nir_texop_txd ? tex_src(tex, nir_tex_src_ddy) : nir_ddy(b, xy);
-   nir_def *image = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false));
+   nir_def *image = row_words(b, deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false, 0));
    nir_def *size = nir_vec2(b, nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_WIDTH, 14), 1)),
                             nir_u2f32(b, nir_iadd_imm(b, bits(b, image, APEX_HW_IMAGE_HEIGHT, 14), 1)));
    nir_def *px = nir_fmul(b, dx, size), *py = nir_fmul(b, dy, size);

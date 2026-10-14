@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
+#include "vk_format.h"
 #include "util/format/u_formats.h"
 
 /* Format word 0: texel bytes [4:0], sRGB [5], output swizzle [19:8] (3 bits
@@ -27,6 +28,10 @@ bool apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComp
  * kind (APEX_ETC2_*, APEX_EAC_*, APEX_BC*), or VK_FORMAT_UNDEFINED for other
  * formats. */
 VkFormat apex_decoded_format(VkFormat format, uint32_t *kind);
+
+/* The planes of a multi-planar YCbCr format the texture unit samples (8-bit
+ * R8 and R8G8 planes), or NULL. */
+const struct vk_format_ycbcr_info *apex_ycbcr_info(VkFormat format);
 
 /* Table rows occupied by one element of a descriptor binding: combined
  * image samplers hold the image then the sampler descriptor, storage images

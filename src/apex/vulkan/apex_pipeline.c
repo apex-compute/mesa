@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "apex_pipeline.h"
+#include "vk_nir_convert_ycbcr.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -288,9 +289,26 @@ sampled_texture(const nir_tex_instr *tex, unsigned src, void *data)
    return tex->sampler_dim != GLSL_SAMPLER_DIM_BUF;
 }
 
+/* The conversion of an immutable YCbCr sampler of the program's layouts. */
+static const struct vk_ycbcr_conversion_state *
+ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t array_index)
+{
+   const struct apex_program *program = data;
+   const struct apex_set_layout *layout = set < program->set_count ? program->set_layouts[set] : NULL;
+   if (!layout || binding >= layout->binding_count)
+      return NULL;
+   const struct apex_binding_layout *bl = &layout->bindings[binding];
+   if (bl->immutable == ~0u || !bl->count)
+      return NULL;
+   const struct vk_ycbcr_conversion_state *state = &layout->ycbcr[bl->immutable + MIN2(array_index, bl->count - 1)];
+   return state->format ? state : NULL;
+}
+
 bool
 apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
 {
+   /* YCbCr samples become a sample per plane and the colour conversion. */
+   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion, program);
    const nir_lower_tex_options tex = {.lower_txp = ~0u, .lower_tg4_offsets = true};
    NIR_PASS(_, nir, nir_lower_tex, &tex);
    /* The texture unit takes one image and sampler per instruction, so a

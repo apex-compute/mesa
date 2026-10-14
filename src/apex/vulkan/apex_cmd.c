@@ -1949,6 +1949,22 @@ element_split(unsigned *bytes)
 static void record_decode(struct apex_command_buffer *cmd, const struct apex_image *image, unsigned level,
                           unsigned layer, unsigned layers, VkOffset3D offset, VkExtent3D extent);
 
+/* The format, layout and address of the plane an aspect names: a plane of a
+ * multi-planar image, or the image itself. */
+static VkFormat
+aspect_plane(const struct apex_image *image, VkImageAspectFlags aspect, const struct apex_hw_layout **layout,
+             uint64_t *va)
+{
+   if (vk_format_get_plane_count(image->vk.format) > 1) {
+      unsigned plane = aspect & VK_IMAGE_ASPECT_PLANE_1_BIT ? 1 : aspect & VK_IMAGE_ASPECT_PLANE_2_BIT ? 2 : 0;
+      *layout = apex_image_plane(image, plane, va);
+      return vk_format_get_plane_format(image->vk.format, plane);
+   }
+   *layout = &image->layout;
+   *va = apex_image_va(image);
+   return image->vk.format;
+}
+
 static void
 copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer, struct apex_image *image,
                   unsigned count, const VkBufferImageCopy2 *regions, bool to_image)
@@ -1960,7 +1976,9 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer, s
       bool three_d = image->vk.image_type == VK_IMAGE_TYPE_3D;
       unsigned first = three_d ? r->imageOffset.z : r->imageSubresource.baseArrayLayer;
       unsigned planes = three_d ? r->imageExtent.depth : vk_image_subresource_layer_count(&image->vk, &r->imageSubresource);
-      VkFormat format = image->vk.format;
+      const struct apex_hw_layout *hw;
+      uint64_t va;
+      VkFormat format = aspect_plane(image, r->imageSubresource.aspectMask, &hw, &va);
       unsigned bw = vk_format_get_blockwidth(format), bh = vk_format_get_blockheight(format);
       unsigned width = DIV_ROUND_UP(r->imageExtent.width, bw), height = DIV_ROUND_UP(r->imageExtent.height, bh);
       unsigned offset, bytes;
@@ -1968,11 +1986,10 @@ copy_buffer_image(struct apex_command_buffer *cmd, struct apex_buffer *buffer, s
       aspect_element(format, r->imageSubresource.aspectMask, &offset, &bytes, &mask);
       unsigned split = element_split(&bytes);
       uint32_t image_words[APEX_SURFACE_WORDS], buffer_words[APEX_SURFACE_WORDS];
-      image_surface(image, &image->layout, apex_image_va(image), l, first, r->imageOffset.x / bw * split,
-                    r->imageOffset.y / bh, image_words);
+      image_surface(image, hw, va, l, first, r->imageOffset.x / bw * split, r->imageOffset.y / bh, image_words);
       unsigned element = vk_format_has_depth(format) && vk_format_has_stencil(format) ? bytes :
                          vk_format_get_blocksize(format) / split;
-      image_words[APEX_SURFACE_TEXEL] = image->layout.bytes / split;
+      image_words[APEX_SURFACE_TEXEL] = hw->bytes / split;
       buffer_surface(buffer->vk.device_address + r->bufferOffset, layout.row_stride_B, layout.image_stride_B,
                      element, buffer_words);
       if (to_image)
@@ -2015,19 +2032,22 @@ apex_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
       unsigned dst_first = dst_3d ? r->dstOffset.z : r->dstSubresource.baseArrayLayer;
       /* 2D arrays and 3D images exchange layers for depth slices. */
       unsigned planes = src_3d ? r->extent.depth : vk_image_subresource_layer_count(&src->vk, &r->srcSubresource);
-      VkFormat format = src->vk.format;
+      const struct apex_hw_layout *src_hw, *dst_hw;
+      uint64_t src_va, dst_va;
+      VkFormat format = aspect_plane(src, r->srcSubresource.aspectMask, &src_hw, &src_va);
+      VkFormat dst_format = aspect_plane(dst, r->dstSubresource.aspectMask, &dst_hw, &dst_va);
       unsigned bw = vk_format_get_blockwidth(format), bh = vk_format_get_blockheight(format);
-      unsigned dbw = vk_format_get_blockwidth(dst->vk.format), dbh = vk_format_get_blockheight(dst->vk.format);
+      unsigned dbw = vk_format_get_blockwidth(dst_format), dbh = vk_format_get_blockheight(dst_format);
       unsigned width = DIV_ROUND_UP(r->extent.width, bw), height = DIV_ROUND_UP(r->extent.height, bh);
       unsigned offset, bytes, dst_offset, unused;
       uint32_t mask;
       aspect_element(format, r->srcSubresource.aspectMask, &offset, &bytes, &mask);
-      aspect_element(dst->vk.format, r->dstSubresource.aspectMask, &dst_offset, &unused, &mask);
+      aspect_element(dst_format, r->dstSubresource.aspectMask, &dst_offset, &unused, &mask);
       unsigned split = element_split(&bytes);
       uint32_t from[APEX_SURFACE_WORDS], to[APEX_SURFACE_WORDS];
-      image_surface(src, &src->layout, apex_image_va(src), r->srcSubresource.mipLevel, src_first,
+      image_surface(src, src_hw, src_va, r->srcSubresource.mipLevel, src_first,
                     r->srcOffset.x / bw * split, r->srcOffset.y / bh, from);
-      image_surface(dst, &dst->layout, apex_image_va(dst), r->dstSubresource.mipLevel, dst_first,
+      image_surface(dst, dst_hw, dst_va, r->dstSubresource.mipLevel, dst_first,
                     r->dstOffset.x / dbw * split, r->dstOffset.y / dbh, to);
       from[APEX_SURFACE_TEXEL] /= split;
       to[APEX_SURFACE_TEXEL] /= split;
@@ -2358,7 +2378,7 @@ write_table(struct apex_device *device, const struct apex_table *table, void *ma
       const struct apex_descriptor_set *set = bound ? bound->set : NULL;
       for (unsigned b = 0; b < layout->binding_count; b++) {
          const struct apex_binding_layout *binding = &layout->bindings[b];
-         unsigned slots = apex_descriptor_slots(binding->type);
+         unsigned slots = binding->slots;
          unsigned base = program->set_offsets[s] + binding->slot;
          unsigned elements = !binding->count ? 0 :
                              apex_binding_in_memory(binding) || binding->bytes ? 1 : binding->count;

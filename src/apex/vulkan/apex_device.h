@@ -6,6 +6,7 @@
 #include "vk_descriptor_set_layout.h"
 #include "vk_meta.h"
 #include "vk_sampler.h"
+#include "vk_ycbcr_conversion.h"
 #include "apex_format.h"
 #include "apex_job.h"
 #include "apex_cp.h"
@@ -48,7 +49,9 @@ apex_descriptor_bucket(VkDescriptorType type)
 #define APEX_EXTERNAL_MEMORY_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | \
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
 /* Set storage holds encoded table rows: `row` is the binding's first, with
- * apex_descriptor_slots() rows per element. `slot` is its first row in a
+ * `slots` rows per element (apex_descriptor_slots(), and a combined image
+ * sampler with YCbCr conversions an image row per plane before its sampler
+ * row). `slot` is its first row in a
  * pipeline's table; an update-after-bind binding takes one table row, a
  * buffer row over its rows in the set's pool memory, which the GPU reads at
  * execution. `dynamic` numbers a dynamic buffer binding's first dynamic
@@ -56,7 +59,7 @@ apex_descriptor_bucket(VkDescriptorType type)
  * array (~0 when absent). An inline uniform block is one element of `bytes`
  * bytes: a buffer row followed by the data rows. */
 struct apex_binding_layout {
-   uint32_t row, slot, dynamic, count, flags, immutable, bytes;
+   uint32_t row, slot, slots, dynamic, count, flags, immutable, bytes;
    VkDescriptorType type;
    VkShaderStageFlags stages;
 };
@@ -71,6 +74,8 @@ struct apex_set_layout {
    bool pool_memory;
    uint32_t counts[APEX_DESCRIPTOR_BUCKETS];
    uint32_t (*samplers)[8];
+   /* Each immutable sampler's YCbCr conversion; format 0 without one. */
+   struct vk_ycbcr_conversion_state *ycbcr;
    struct apex_binding_layout bindings[];
 };
 /* Update-after-bind bindings, and every binding of an update-after-bind

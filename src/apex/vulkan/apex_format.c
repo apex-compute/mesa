@@ -102,6 +102,18 @@ apex_format_encode(VkFormat format, VkImageAspectFlags aspect, const VkComponent
    return true;
 }
 
+const struct vk_format_ycbcr_info *
+apex_ycbcr_info(VkFormat format)
+{
+   const struct vk_format_ycbcr_info *info = vk_format_get_ycbcr_info(format);
+   if (!info || info->n_planes < 2)
+      return NULL;
+   for (unsigned p = 0; p < info->n_planes; p++)
+      if (info->planes[p].format != VK_FORMAT_R8_UNORM && info->planes[p].format != VK_FORMAT_R8G8_UNORM)
+         return NULL;
+   return info;
+}
+
 VkFormat
 apex_decoded_format(VkFormat format, uint32_t *kind)
 {
