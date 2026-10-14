@@ -380,6 +380,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .KHR_maintenance3 = true,
       .KHR_maintenance4 = true,
       .KHR_relaxed_block_layout = true,
+      .KHR_variable_pointers = true,
       .KHR_create_renderpass2 = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_driver_properties = true,
@@ -436,6 +437,10 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* The vertex launch header carries the draw index, base vertex and
        * base instance. */
       .shaderDrawParameters = true,
+      /* Buffer pointers are {table row, element, offset} values (apex_pipeline.c),
+       * so they select, merge and compare like any value. */
+      .variablePointersStorageBuffer = true,
+      .variablePointers = true,
       .shaderInt8 = true,
       .shaderInt16 = true,
       .storageBuffer8BitAccess = true,
