@@ -332,6 +332,19 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
    return VK_SUCCESS;
 }
 
+/* A placed mapping goes away, or with UNMAP_RESERVE leaves its range
+ * reserved and inaccessible. */
+static void
+unmap_placed(struct apex_memory *memory, bool reserve)
+{
+   size_t bytes = memory->storage->bo.size;
+   if (reserve)
+      mmap(memory->placed, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+   else
+      munmap(memory->placed, bytes);
+   memory->placed = NULL;
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks *alloc)
 {
@@ -339,6 +352,8 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
    VK_FROM_HANDLE(apex_memory, memory, handle);
    if (!memory)
       return;
+   if (memory->placed)
+      unmap_placed(memory, false);
    mtx_lock(&device->memory_mutex);
    if (!--memory->storage->refs) {
       list_del(&memory->storage->link);
@@ -349,14 +364,34 @@ apex_FreeMemory(VkDevice dev, VkDeviceMemory handle, const VkAllocationCallbacks
    vk_device_memory_destroy(&device->vk, alloc, &memory->vk);
 }
 
+/* Every object stays mapped from creation. A placed map maps the whole
+ * object again at the application's address, as WoW64 Wine needs mappings
+ * below 4 GiB. */
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_MapMemory2(VkDevice dev, const VkMemoryMapInfo *info, void **out)
 {
+   VK_FROM_HANDLE(apex_device, device, dev);
    VK_FROM_HANDLE(apex_memory, memory, info->memory);
    *out = NULL;
-   if (!memory->data || info->flags || info->offset >= memory->vk.size ||
+   if (!memory->data || (info->flags & ~VK_MEMORY_MAP_PLACED_BIT_EXT) ||
+       info->offset >= memory->vk.size ||
        (info->size != VK_WHOLE_SIZE && info->size > memory->vk.size - info->offset))
       return VK_ERROR_MEMORY_MAP_FAILED;
+   if (info->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
+      const VkMemoryMapPlacedInfoEXT *placed =
+         vk_find_struct_const(info->pNext, MEMORY_MAP_PLACED_INFO_EXT);
+      const struct apex_bo *bo = &memory->storage->bo;
+      struct drm_apex_gem_mmap map = {.handle = bo->handle};
+      if (ioctl(device->fd, DRM_IOCTL_APEX_GEM_MMAP, &map))
+         return VK_ERROR_MEMORY_MAP_FAILED;
+      void *ptr = mmap(placed->pPlacedAddress, bo->size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_FIXED, device->fd, map.offset);
+      if (ptr == MAP_FAILED)
+         return VK_ERROR_MEMORY_MAP_FAILED;
+      memory->placed = ptr;
+      *out = ptr;
+      return VK_SUCCESS;
+   }
    *out = (uint8_t *)memory->data + info->offset;
    return VK_SUCCESS;
 }
@@ -364,7 +399,12 @@ apex_MapMemory2(VkDevice dev, const VkMemoryMapInfo *info, void **out)
 static VKAPI_ATTR VkResult VKAPI_CALL
 apex_UnmapMemory2(VkDevice dev, const VkMemoryUnmapInfo *info)
 {
-   return info->flags ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS;
+   VK_FROM_HANDLE(apex_memory, memory, info->memory);
+   if (info->flags & ~VK_MEMORY_UNMAP_RESERVE_BIT_EXT)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (memory->placed)
+      unmap_placed(memory, info->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT);
+   return VK_SUCCESS;
 }
 
 /* Both memory types are host coherent: ranges are only validated. */

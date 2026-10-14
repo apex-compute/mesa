@@ -22,6 +22,9 @@ struct apex_memory_storage {
 struct apex_memory {
    struct vk_device_memory vk;
    void *data;
+   /* A second mapping of the whole object at an application address
+    * (VK_EXT_map_memory_placed), or NULL. */
+   void *placed;
    struct apex_memory_storage *storage;
 };
 struct apex_buffer {
