@@ -318,7 +318,7 @@ apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsIn
    for (unsigned s = 0; s < count; s++) {
       struct apex_descriptor_set *set = apex_descriptor_set_from_handle(sets[s]);
       struct apex_bound_set *bound = vk_zalloc(&cmd->vk.pool->alloc,
-         sizeof(*bound) + set->layout->descriptor_count * sizeof(bound->offsets[0]), 8,
+         sizeof(*bound) + set->layout->vk.dynamic_descriptor_count * sizeof(bound->offsets[0]), 8,
          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!bound) {
          fail(cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -327,13 +327,9 @@ apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsIn
       bound->set = set;
       bound->refs = 1;
       /* Consume in set, binding-number, array-element order, including unused bindings. */
-      for (unsigned b = 0; b < set->layout->binding_count; b++) {
-         const struct apex_binding_layout *binding = &set->layout->bindings[b];
-         if (!vk_descriptor_type_is_dynamic(binding->type))
-            continue;
-         for (unsigned d = 0; d < binding->count; d++)
-            bound->offsets[binding->offset + d] = offsets[consumed++];
-      }
+      unsigned dynamic = set->layout->vk.dynamic_descriptor_count;
+      memcpy(bound->offsets, offsets + consumed, dynamic * sizeof(bound->offsets[0]));
+      consumed += dynamic;
       bind_set(cmd, info->stageFlags, first + s, bound);
    }
 }
@@ -351,10 +347,10 @@ push_set(struct apex_command_buffer *cmd, VkShaderStageFlags stages, VkPipelineL
       return NULL;
    }
    struct apex_descriptor_set *set = vk_object_zalloc(cmd->vk.base.device, NULL,
-      sizeof(*set) + set_layout->descriptor_count * sizeof(set->descriptors[0]),
-      VK_OBJECT_TYPE_DESCRIPTOR_SET);
+      sizeof(*set) + set_layout->row_count * sizeof(set->rows[0]), VK_OBJECT_TYPE_DESCRIPTOR_SET);
    struct apex_bound_set *bound = vk_zalloc(&cmd->vk.pool->alloc, sizeof(*bound) +
-      set_layout->descriptor_count * sizeof(bound->offsets[0]), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      set_layout->vk.dynamic_descriptor_count * sizeof(bound->offsets[0]), 8,
+      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!set || !bound) {
       vk_object_free(cmd->vk.base.device, NULL, set);
       vk_free(&cmd->vk.pool->alloc, bound);
@@ -362,10 +358,10 @@ push_set(struct apex_command_buffer *cmd, VkShaderStageFlags stages, VkPipelineL
       return NULL;
    }
    set->layout = (void *)vk_descriptor_set_layout_ref(&set_layout->vk);
+   apex_descriptor_set_init(set, 0);
    const struct apex_descriptor_set *previous = cmd->pushed[index];
    if (previous && previous->layout == set_layout)
-      memcpy(set->descriptors, previous->descriptors,
-             set_layout->descriptor_count * sizeof(set->descriptors[0]));
+      memcpy(set->rows, previous->rows, set_layout->row_count * sizeof(set->rows[0]));
    list_addtail(&set->link, &cmd->push_sets);
    cmd->pushed[index] = set;
    bound->set = set;
@@ -2052,126 +2048,6 @@ bind_map_upload(struct vk_command_buffer *vk, struct vk_meta_device *meta,
 
 /* ---- Submission --------------------------------------------------------- */
 
-/* Rows for one descriptor element. Null descriptors and unused bindings keep
- * zero rows: buffers and texel buffers of zero bytes, and images of format
- * class none, which read zero. */
-static bool
-write_descriptor(union apex_descriptor *rows, const struct apex_binding_layout *binding,
-                 unsigned element, const struct apex_set_layout *layout,
-                 const struct apex_descriptor_set *set, uint32_t dynamic, const void *value)
-{
-   switch (binding->type) {
-   case VK_DESCRIPTOR_TYPE_SAMPLER:
-   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
-      const VkDescriptorImageInfo *info = value;
-      bool sampler = binding->type == VK_DESCRIPTOR_TYPE_SAMPLER;
-      bool combined = binding->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-      bool storage = binding->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      if (!sampler) {
-         VK_FROM_HANDLE(vk_image_view, view, info->imageView);
-         if (view) {
-            const struct apex_image *image = (void *)view->image;
-            if (!image->memory)
-               return false;
-            uint64_t va;
-            const struct apex_hw_layout *hw = apex_image_layout(image, view->format, &va);
-            VkFormat format = apex_decoded_format(view->format, NULL);
-            if (!format)
-               format = view->format;
-            uint8_t code, channel[4];
-            if (!apex_hw_texture_format(format, view->aspects, &code, channel)) {
-               if (!storage)
-                  return false;
-               code = 0;
-            }
-            unsigned level = view->base_mip_level;
-            const struct apex_hw_level *l = &hw->level[level];
-            bool three_d = image->vk.image_type == VK_IMAGE_TYPE_3D;
-            /* The view's base level and layer start the descriptor. */
-            struct apex_hw_image d = {
-               .va = va + l->offset + (three_d ? 0 : view->base_array_layer * hw->layer_stride),
-               .format = code, .tiled = hw->tiled, .samples_log2 = util_logbase2(image->vk.samples),
-               .width = l->width, .height = l->height,
-               .depth = three_d ? l->depth : view->layer_count,
-               .levels = storage ? 1 : view->level_count,
-               .pitch64 = hw->tiled ? 0 : l->pitch / 64, .stride64 = hw->layer_stride / 64,
-            };
-            const VkComponentSwizzle mapping[4] = {view->swizzle.r, view->swizzle.g, view->swizzle.b,
-                                                   view->swizzle.a};
-            for (unsigned c = 0; c < 4; c++) {
-               VkComponentSwizzle s = mapping[c] == VK_COMPONENT_SWIZZLE_IDENTITY ?
-                  VK_COMPONENT_SWIZZLE_R + c : mapping[c];
-               d.swizzle[c] = s == VK_COMPONENT_SWIZZLE_ZERO ? APEX_HW_SWIZZLE_0 :
-                              s == VK_COMPONENT_SWIZZLE_ONE ? APEX_HW_SWIZZLE_1 :
-                              channel[s - VK_COMPONENT_SWIZZLE_R];
-            }
-            apex_hw_image_descriptor(&d, rows[0].words);
-            for (unsigned w = 0; w < 8; w++)
-               rows[0].words[w] = util_cpu_to_le32(rows[0].words[w]);
-            if (storage) {
-               /* Format words of the view, then the texel bytes. */
-               uint32_t words[3];
-               if (!apex_format_encode(view->format, view->aspects, NULL, words))
-                  return false;
-               for (unsigned w = 0; w < 3; w++)
-                  rows[1].words[w] = util_cpu_to_le32(words[w]);
-            }
-         }
-      }
-      if (sampler || combined) {
-         const uint32_t *row = NULL;
-         if (binding->immutable != ~0u)
-            row = layout->samplers[binding->immutable + element];
-         else if (info->sampler)
-            row = apex_sampler_from_handle(info->sampler)->row;
-         uint32_t *out = rows[combined ? 1 : 0].words;
-         for (unsigned w = 0; row && w < 8; w++)
-            out[w] = util_cpu_to_le32(row[w]);
-      }
-      return true;
-   }
-   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
-      VK_FROM_HANDLE(vk_buffer_view, view, *(const VkBufferView *)value);
-      if (!view)
-         return true;
-      struct apex_buffer *buffer = (void *)view->buffer;
-      if (!buffer->memory)
-         return false;
-      uint64_t va = buffer->memory->storage->bo.va + buffer->offset + view->offset;
-      uint32_t format[3];
-      if (!apex_format_encode(view->format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, format))
-         return false;
-      uint32_t words[8] = {va, va >> 32, view->range, view->elements, format[0], format[1], format[2]};
-      for (unsigned w = 0; w < 8; w++)
-         rows[0].words[w] = util_cpu_to_le32(words[w]);
-      return true;
-   }
-   default: {
-      const VkDescriptorBufferInfo *info = value;
-      VK_FROM_HANDLE(apex_buffer, buffer, info->buffer);
-      if (!buffer)
-         return true;
-      if (!buffer->memory || info->offset >= buffer->vk.size)
-         return false;
-      uint64_t range = info->range == VK_WHOLE_SIZE ? buffer->vk.size - info->offset : info->range;
-      if ((info->range == VK_WHOLE_SIZE && dynamic) || dynamic % 4 ||
-          dynamic > buffer->vk.size - info->offset || !range || range > UINT32_MAX ||
-          range > buffer->vk.size - info->offset - dynamic)
-         return false;
-      uint64_t va = buffer->memory->storage->bo.va + buffer->offset + info->offset + dynamic;
-      rows->buffer = (struct apex_buffer_descriptor) {
-         util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range),
-         util_cpu_to_le32(APEX_BUFFER_ROBUST),
-      };
-      return true;
-   }
-   }
-}
-
 /* Table layout: (descriptor_count + 1) rows, the push image, the trailer. */
 static uint64_t
 table_bytes(const struct apex_table *table)
@@ -2214,35 +2090,60 @@ write_table(struct apex_device *device, const struct apex_table *table, void *ma
       trailer[w] = util_cpu_to_le32(LO(target));
       trailer[w + 1] = util_cpu_to_le32(HI(target));
    }
+   /* Set rows copy into the table; an update-after-bind binding's row
+    * addresses its rows in pool memory. */
    VkResult result = VK_ERROR_DEVICE_LOST;
    for (unsigned s = 0; s < program->set_count; s++) {
       const struct apex_set_layout *layout = program->set_layouts[s];
-      if (!layout || !layout->descriptor_count)
+      if (!layout || !layout->slot_count)
          continue;
       const struct apex_bound_set *bound = table->sets[s];
       const struct apex_descriptor_set *set = bound ? bound->set : NULL;
       for (unsigned b = 0; b < layout->binding_count; b++) {
          const struct apex_binding_layout *binding = &layout->bindings[b];
          unsigned slots = apex_descriptor_slots(binding->type);
-         for (unsigned e = 0; e < binding->count; e++) {
-            unsigned row = program->set_offsets[s] + binding->slot + e * slots;
-            unsigned d = binding->offset + e;
+         unsigned base = program->set_offsets[s] + binding->slot;
+         unsigned elements = !binding->count ? 0 :
+                             apex_binding_in_memory(binding) || binding->bytes ? 1 : binding->count;
+         for (unsigned e = 0; e < elements; e++) {
+            unsigned row = base + e * slots;
             if (!row_used(table, row))
                continue;
             if (!set || memcmp(set->layout->vk.blake3, layout->vk.blake3, BLAKE3_OUT_LEN))
                goto out;
-            if (binding->bytes) {
-               /* The buffer row is completed with the table address below. */
-               memcpy(&rows[row + 1], &set->descriptors[d], binding->bytes);
-               rows[row].buffer.bytes = util_cpu_to_le32(binding->bytes);
+            uint32_t count = apex_set_binding_count(set, binding);
+            if (apex_binding_in_memory(binding)) {
+               uint64_t va = set->va + binding->row * sizeof(union apex_descriptor);
+               rows[row].buffer = (struct apex_buffer_descriptor){
+                  util_cpu_to_le32(LO(va)), util_cpu_to_le32(HI(va)),
+                  util_cpu_to_le32(count * slots * sizeof(union apex_descriptor)),
+                  util_cpu_to_le32(APEX_BUFFER_ROBUST),
+               };
                continue;
             }
-            if (!write_descriptor(&rows[row], binding, e, layout, set, bound->offsets[d],
-                                  &set->descriptors[d]))
-               goto out;
+            if (binding->bytes) {
+               /* The buffer row is completed with the table address below. */
+               memcpy(&rows[row], &set->rows[binding->row],
+                      (count ? 1 + DIV_ROUND_UP(count, sizeof(union apex_descriptor)) : 0) * sizeof(rows[0]));
+               continue;
+            }
+            if (e >= count)
+               continue;
+            memcpy(&rows[row], &set->rows[binding->row + e * slots], slots * sizeof(rows[0]));
+            if (vk_descriptor_type_is_dynamic(binding->type)) {
+               uint32_t offset = bound->offsets[binding->dynamic + e];
+               uint64_t va = (util_le32_to_cpu(rows[row].buffer.low) |
+                              (uint64_t)util_le32_to_cpu(rows[row].buffer.high) << 32) + offset;
+               rows[row].buffer.low = util_cpu_to_le32(LO(va));
+               rows[row].buffer.high = util_cpu_to_le32(HI(va));
+               if (rows[row].words[4])
+                  rows[row].buffer.bytes = util_cpu_to_le32(util_le32_to_cpu(rows[row].buffer.bytes) - offset);
+               rows[row].words[4] = 0;
+            }
          }
       }
    }
+   /* Inline uniform block rows address their data rows in the table. */
    for (unsigned s = 0; s < program->set_count; s++) {
       const struct apex_set_layout *layout = program->set_layouts[s];
       for (unsigned b = 0; layout && b < layout->binding_count; b++) {
@@ -2250,8 +2151,8 @@ write_table(struct apex_device *device, const struct apex_table *table, void *ma
          if (!layout->bindings[b].bytes || !row_used(table, row))
             continue;
          uint64_t inline_va = va + (row + 1) * sizeof(union apex_descriptor);
-         rows[row].buffer.low = util_cpu_to_le32(inline_va);
-         rows[row].buffer.high = util_cpu_to_le32(inline_va >> 32);
+         rows[row].buffer.low = util_cpu_to_le32(LO(inline_va));
+         rows[row].buffer.high = util_cpu_to_le32(HI(inline_va));
       }
    }
    memcpy(map, rows, bytes);

@@ -15,20 +15,25 @@ struct texture_lowering {
    bool invalid;
 };
 
+/* A descriptor row: its byte offset in the table, or in the pool memory of
+ * an update-after-bind binding, which `buffer` (zero for the table)
+ * describes. */
+struct row {
+   nir_def *buffer, *offset;
+};
+
 static nir_def *
-row_word(nir_builder *b, nir_def *row, unsigned word)
+row_word(nir_builder *b, struct row row, unsigned word)
 {
-   return nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0),
-                        nir_iadd_imm(b, nir_imul_imm(b, row, sizeof(union apex_descriptor)), word * 4),
+   return nir_load_ssbo(b, 1, 32, row.buffer, nir_iadd_imm(b, row.offset, word * 4),
                         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
 }
 
 /* The eight dwords of a descriptor row. */
 static nir_def *
-row_words(nir_builder *b, nir_def *row)
+row_words(nir_builder *b, struct row row)
 {
-   return nir_load_ssbo(b, 8, 32, nir_imm_int(b, 0), nir_imul_imm(b, row, sizeof(union apex_descriptor)),
-                        .align_mul = 32,
+   return nir_load_ssbo(b, 8, 32, row.buffer, row.offset, .align_mul = 32,
                         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
 }
 
@@ -43,9 +48,10 @@ bits(nir_builder *b, nir_def *words, unsigned lo, unsigned width)
    return width == 32 ? x : nir_iand_imm(b, x, BITFIELD_MASK(width));
 }
 
-/* Resolves a texture or sampler deref to its first table row; out-of-range
- * array indices select the zero sentinel row. */
-static nir_def *
+/* Resolves a texture or sampler deref to its first row; out-of-range array
+ * indices select the zero sentinel row of the table, or read zero from pool
+ * memory. */
+static struct row
 deref_row(nir_builder *b, struct texture_lowering *ctx, nir_deref_instr *deref, bool sampler_part)
 {
    nir_def *index = nir_imm_int(b, 0);
@@ -55,25 +61,38 @@ deref_row(nir_builder *b, struct texture_lowering *ctx, nir_deref_instr *deref, 
    }
    nir_variable *var = deref->deref_type == nir_deref_type_var ? deref->var : NULL;
    struct apex_program *program = ctx->program;
+   struct row table = {nir_imm_int(b, 0), nir_imm_int(b, 0)};
    if (!var || var->data.descriptor_set >= program->set_count) {
       ctx->invalid = true;
-      return nir_imm_int(b, 0);
+      return table;
    }
    const struct apex_set_layout *layout = program->set_layouts[var->data.descriptor_set];
    unsigned binding = var->data.binding;
    if (!layout || binding >= layout->binding_count || !layout->bindings[binding].count) {
       ctx->invalid = true;
-      return nir_imm_int(b, 0);
+      return table;
    }
    const struct apex_binding_layout *bl = &layout->bindings[binding];
    unsigned slots = apex_descriptor_slots(bl->type);
    unsigned base = program->set_offsets[var->data.descriptor_set] + bl->slot;
-   BITSET_SET_COUNT(program->used_descriptors, base, bl->count * slots);
    /* A combined descriptor keeps its sampler in the second row. */
    unsigned part = sampler_part && bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 1 : 0;
-   return nir_bcsel(b, nir_ult_imm(b, index, bl->count),
-                    nir_iadd_imm(b, nir_imul_imm(b, index, slots), base + part),
-                    nir_imm_int(b, program->descriptor_count));
+   if (apex_binding_in_memory(bl)) {
+      BITSET_SET(program->used_descriptors, base);
+      nir_def *element = nir_umin(b, index, nir_imm_int(b, APEX_MAX_BINDING_ELEMENTS));
+      return (struct row){
+         nir_load_ssbo(b, 4, 32, nir_imm_int(b, 0), nir_imm_int(b, base * sizeof(union apex_descriptor)),
+                       .align_mul = 16,
+                       .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE),
+         nir_imul_imm(b, nir_iadd_imm(b, nir_imul_imm(b, element, slots), part), sizeof(union apex_descriptor)),
+      };
+   }
+   BITSET_SET_COUNT(program->used_descriptors, base, bl->count * slots);
+   table.offset = nir_imul_imm(b, nir_bcsel(b, nir_ult_imm(b, index, bl->count),
+                                            nir_iadd_imm(b, nir_imul_imm(b, index, slots), base + part),
+                                            nir_imm_int(b, program->descriptor_count)),
+                               sizeof(union apex_descriptor));
+   return table;
 }
 
 /* A texel format: the format words and texel bytes. */
@@ -353,7 +372,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       ctx->invalid = true;
       return false;
    }
-   nir_def *image_row = deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false);
+   struct row image_row = deref_row(b, ctx, nir_instr_as_deref(nir_def_instr(texture_deref)), false);
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
       /* Texel buffers: address, byte range, elements, format words. */
       nir_def *coord = tex_src(tex, nir_tex_src_coord);
@@ -474,7 +493,7 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       ctx->invalid = true;
       return false;
    }
-   nir_def *row = deref_row(b, ctx, nir_src_as_deref(i->src[0]), false);
+   struct row row = deref_row(b, ctx, nir_src_as_deref(i->src[0]), false);
    bool array = nir_intrinsic_image_array(i);
    struct image_info img;
    nir_def *inside, *address;
@@ -498,7 +517,7 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       unsigned dims = dim == GLSL_SAMPLER_DIM_1D ? 1 : three_d ? 3 : 2;
       nir_def *d = row_words(b, row);
       for (unsigned k = 0; k < 3; k++)
-         img.format[k] = row_word(b, nir_iadd_imm(b, row, 1), k);
+         img.format[k] = row_word(b, row, 8 + k);
       img.bytes = nir_iand_imm(b, img.format[0], 31);
       /* Storage images have one sample; null descriptors zero levels. */
       nir_def *null = nir_ieq_imm(b, bits(b, d, APEX_HW_IMAGE_LEVELS, 5), 0);

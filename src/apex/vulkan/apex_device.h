@@ -17,11 +17,23 @@ enum apex_internal {
    APEX_INTERNAL_COUNT
 };
 
-/* Host table limits; descriptors are ordinary LOCAL memory. */
+/* Table rows of a pipeline. The descriptor limits keep every pipeline
+ * layout within them: a combined image sampler counts as a sampler and a
+ * sampled image, a storage image takes two rows and inline uniform blocks at
+ * most 4 + 4096 / 32, so the limits sum to 3,852 rows. */
 #define APEX_MAX_DESCRIPTORS 4096
+#define APEX_SET_SAMPLERS 640
+#define APEX_SET_SAMPLED_IMAGES 2048
+#define APEX_SET_STORAGE_IMAGES 256
+#define APEX_SET_UNIFORM_BUFFERS 128
+#define APEX_SET_STORAGE_BUFFERS 256
+#define APEX_SET_DYNAMIC_BUFFERS 64
+#define APEX_SET_INPUT_ATTACHMENTS 8
+#define APEX_SET_DESCRIPTORS 1024
 /* Largest allocation: the per-client page tables map about 1 GiB. */
 #define APEX_MAX_ALLOCATION (1024ull * 1024 * 1024)
-#define APEX_MAX_BINDINGS 1024
+/* Binding numbers below this; layouts index bindings by number. */
+#define APEX_MAX_BINDINGS (1u << 16)
 #define APEX_MAX_INLINE_BYTES 4096
 /* Pool accounting buckets: core types, then inline uniform block bytes. */
 #define APEX_DESCRIPTOR_BUCKETS (VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 2)
@@ -34,23 +46,39 @@ apex_descriptor_bucket(VkDescriptorType type)
 #define APEX_MAX_PUSH_CONSTANTS 256
 #define APEX_EXTERNAL_MEMORY_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | \
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
-/* `offset` indexes set storage by array element; `slot` indexes table rows,
- * apex_descriptor_slots() per element. Immutable sampler rows start at
- * `immutable` in the layout's sampler array (~0 when absent). An inline
- * uniform block is one element of `bytes` bytes: set storage holds the bytes
- * and the table holds a buffer row followed by the data rows. */
+/* Set storage holds encoded table rows: `row` is the binding's first, with
+ * apex_descriptor_slots() rows per element. `slot` is its first row in a
+ * pipeline's table; an update-after-bind binding takes one table row, a
+ * buffer row over its rows in the set's pool memory, which the GPU reads at
+ * execution. `dynamic` numbers a dynamic buffer binding's first dynamic
+ * offset. Immutable sampler rows start at `immutable` in the layout's sampler
+ * array (~0 when absent). An inline uniform block is one element of `bytes`
+ * bytes: a buffer row followed by the data rows. */
 struct apex_binding_layout {
-   uint32_t offset, slot, count, flags, immutable, bytes;
+   uint32_t row, slot, dynamic, count, flags, immutable, bytes;
    VkDescriptorType type;
    VkShaderStageFlags stages;
 };
+/* Rows of set storage and of a table, and the elements of an
+ * update-after-bind binding. */
+#define APEX_MAX_SET_ROWS (1u << 21)
+#define APEX_MAX_BINDING_ELEMENTS (1u << 20)
 struct apex_set_layout {
    struct vk_descriptor_set_layout vk;
-   uint32_t binding_count, descriptor_count, slot_count;
+   uint32_t binding_count, row_count, slot_count;
+   /* Whether a binding is in pool memory: sets of the layout live there. */
+   bool pool_memory;
    uint32_t counts[APEX_DESCRIPTOR_BUCKETS];
    uint32_t (*samplers)[8];
    struct apex_binding_layout bindings[];
 };
+/* Update-after-bind bindings, and every binding of an update-after-bind
+ * layout except inline uniform blocks, carry UPDATE_AFTER_BIND. */
+static inline bool
+apex_binding_in_memory(const struct apex_binding_layout *binding)
+{
+   return binding->flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+}
 /* `row` is the texture-unit sampler descriptor. */
 struct apex_sampler {
    struct vk_sampler vk;
@@ -152,4 +180,9 @@ VkResult apex_device_init(struct apex_device *device,
                           const VkDeviceCreateInfo *info,
                           const VkAllocationCallbacks *alloc, int fd);
 void apex_device_finish(struct apex_device *device);
+/* A zeroed set layout of `binding_count` bindings and `samplers` immutable
+ * sampler rows. */
+struct apex_set_layout *apex_set_layout_alloc(struct apex_device *device, VkDescriptorSetLayoutCreateFlags flags,
+                                              unsigned binding_count, unsigned samplers);
+
 #endif

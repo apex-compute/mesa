@@ -47,28 +47,44 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *i, void *data)
          return false;
       }
       nir_def *index = i->src[0].ssa;
-      BITSET_SET_COUNT(ctx->program->used_descriptors,
-         ctx->program->set_offsets[set] + layout->bindings[binding].slot,
-         layout->bindings[binding].count);
-      /* Opaque resource references retain the binding bounds through reindex.
-       * The table is limited to 4096 entries, so base/count fit in 16 bits. */
-      unsigned base = ctx->program->set_offsets[set] + layout->bindings[binding].slot;
-      unsigned packed = base | (layout->bindings[binding].count << 16);
-      replacement = nir_vec2(b, nir_imm_int(b, packed), index);
+      const struct apex_binding_layout *bl = &layout->bindings[binding];
+      /* Opaque resource references retain the binding bounds through
+       * reindex: a table row and count below 2^15 each, or the row of an
+       * update-after-bind binding with bit 31. */
+      unsigned base = ctx->program->set_offsets[set] + bl->slot;
+      unsigned packed;
+      if (apex_binding_in_memory(bl)) {
+         BITSET_SET(ctx->program->used_descriptors, base);
+         packed = base | 1u << 31;
+      } else {
+         BITSET_SET_COUNT(ctx->program->used_descriptors, base, bl->count);
+         packed = base | bl->count << 16;
+      }
+      replacement = nir_vec3(b, nir_imm_int(b, packed), index, nir_imm_int(b, 0));
       break;
    }
    case nir_intrinsic_vulkan_resource_reindex:
-      replacement = nir_vec2(b, nir_channel(b, i->src[0].ssa, 0),
-         nir_iadd(b, nir_channel(b, i->src[0].ssa, 1), i->src[1].ssa));
+      replacement = nir_vec3(b, nir_channel(b, i->src[0].ssa, 0),
+         nir_iadd(b, nir_channel(b, i->src[0].ssa, 1), i->src[1].ssa), nir_imm_int(b, 0));
       break;
    case nir_intrinsic_load_vulkan_descriptor: {
+      /* The descriptor load changes the opaque reference into {table row,
+       * element, offset}: element ~0 is the row's own buffer, otherwise the
+       * row addresses the element's row in pool memory. */
       nir_def *packed = nir_channel(b, i->src[0].ssa, 0);
       nir_def *index = nir_channel(b, i->src[0].ssa, 1);
-      nir_def *slot = nir_bcsel(b, nir_ult(b, index, nir_ushr_imm(b, packed, 16)),
-         nir_iadd(b, nir_iand_imm(b, packed, 0xffff), index),
-         nir_imm_int(b, ctx->program->descriptor_count));
-      /* The descriptor load changes the opaque reference into index/offset. */
-      replacement = nir_vec2(b, slot, nir_imm_int(b, 0));
+      nir_def *row = nir_iand_imm(b, packed, 0x7fff);
+      nir_def *direct = nir_vec3(b,
+         nir_bcsel(b, nir_ult(b, index, nir_ubfe_imm(b, packed, 16, 15)), nir_iadd(b, row, index),
+                   nir_imm_int(b, ctx->program->descriptor_count)),
+         nir_imm_int(b, ~0), nir_imm_int(b, 0));
+      nir_def *memory = nir_vec3(b, row, nir_umin(b, index, nir_imm_int(b, APEX_MAX_BINDING_ELEMENTS)),
+                                 nir_imm_int(b, 0));
+      nir_scalar s = nir_scalar_resolved(packed, 0);
+      if (nir_scalar_is_const(s))
+         replacement = nir_scalar_as_uint(s) >> 31 ? memory : direct;
+      else
+         replacement = nir_bcsel(b, nir_ige_imm(b, packed, 0), direct, memory);
       break;
    }
    default:
@@ -101,14 +117,28 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
       ctx->invalid = true;
       return false;
    }
-   b->cursor = nir_before_instr(&i->instr);
    nir_src *index = &i->src[store ? 1 : 0];
+   /* Driver loads of the table itself (job words) index it directly. */
+   if (index->ssa->num_components == 1)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
    /* The table row holds the buffer descriptor {GPUVA, bytes, flags}; buffer
     * instructions check each access against it. Every slot, including the
-    * null sentinel, is backed independently of the application's range. */
-   nir_def *row = nir_imul_imm(b, index->ssa, sizeof(union apex_descriptor));
-   nir_def *descriptor = nir_load_ssbo(b, 4, 32, nir_imm_int(b, 0), row, .align_mul = 16,
-      .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
+    * null sentinel, is backed independently of the application's range. An
+    * update-after-bind element's descriptor is read through the row. */
+   const enum gl_access_qualifier access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE;
+   nir_def *row = nir_imul_imm(b, nir_channel(b, index->ssa, 0), sizeof(union apex_descriptor));
+   nir_def *descriptor = nir_load_ssbo(b, 4, 32, nir_imm_int(b, 0), row, .align_mul = 16, .access = access);
+   nir_def *element = nir_channel(b, index->ssa, 1);
+   nir_scalar e = nir_scalar_resolved(element, 0);
+   if (!nir_scalar_is_const(e) || nir_scalar_as_uint(e) != ~0u) {
+      nir_def *memory = nir_load_ssbo(b, 4, 32, descriptor,
+                                      nir_imul_imm(b, element, sizeof(union apex_descriptor)),
+                                      .align_mul = 16, .access = access);
+      memory = nir_vector_insert_imm(b, memory, nir_imm_int(b, APEX_BUFFER_ROBUST), 3);
+      descriptor = nir_scalar_is_const(e) ? memory :
+         nir_bcsel(b, nir_ieq_imm(b, element, ~0), descriptor, memory);
+   }
    if (size)
       nir_def_replace(&i->def, nir_channel(b, descriptor, 2));
    else
@@ -252,13 +282,27 @@ buffer_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bit_size, uint32_
    };
 }
 
+static bool
+sampled_texture(const nir_tex_instr *tex, unsigned src, void *data)
+{
+   return tex->sampler_dim != GLSL_SAMPLER_DIM_BUF;
+}
+
 bool
 apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
 {
    const nir_lower_tex_options tex = {.lower_txp = ~0u, .lower_tg4_offsets = true};
    NIR_PASS(_, nir, nir_lower_tex, &tex);
+   /* The texture unit takes one image and sampler per instruction, so a
+    * non-uniform sampled image loops over its distinct descriptors. Texel
+    * buffers, storage images and buffers address memory per lane. */
+   const nir_lower_non_uniform_access_options non_uniform = {
+      .types = nir_lower_non_uniform_texture_access | nir_lower_non_uniform_texture_query,
+      .tex_src_callback = sampled_texture,
+   };
+   NIR_PASS(_, nir, nir_lower_non_uniform_access, &non_uniform);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
-            nir_address_format_32bit_index_offset);
+            nir_address_format_vec2_index_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    /* Memory is dword-granular: narrower stores become masked atomic updates
     * that leave the neighbouring bytes intact. */
@@ -345,10 +389,13 @@ create_compute_pipeline(struct vk_device *device,
    if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
       return VK_PIPELINE_COMPILE_REQUIRED;
 
+   /* Programs without a layout address buffers as standalone programs do. */
+   const nir_address_format buffers = info->layout ? nir_address_format_vec2_index_32bit_offset :
+                                                     nir_address_format_32bit_index_offset;
    const struct spirv_to_nir_options spirv_options = {
       .environment = NIR_SPIRV_VULKAN,
-      .ssbo_addr_format = nir_address_format_32bit_index_offset,
-      .ubo_addr_format = nir_address_format_32bit_index_offset,
+      .ssbo_addr_format = buffers,
+      .ubo_addr_format = buffers,
       .shared_addr_format = nir_address_format_32bit_offset,
       .skip_os_break_in_debug_build = true,
    };

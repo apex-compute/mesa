@@ -1387,10 +1387,8 @@ static uint32_t texture_descriptor(struct ctx *c, nir_tex_instr *t, bool sampler
       failf(c, "texture without descriptors", NULL);
       return 0;
    }
-   if (t->src[k].src.ssa->divergent) {
-      failf(c, "non-uniform texture index", NULL);
-      return 0;
-   }
+   /* Non-uniform indices loop over their descriptors before this, so a
+    * divergent descriptor is dynamically uniform: the first lane's serves. */
    return scalar(c, sub(src(c, t->src[k].src, 0), 0, 8));
 }
 /* Bits lo .. lo + width - 1 of an image descriptor (architecture, Texture

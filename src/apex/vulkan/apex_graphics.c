@@ -832,8 +832,8 @@ apex_get_spirv_options(struct vk_physical_device *physical, mesa_shader_stage st
                        const struct vk_pipeline_robustness_state *rs)
 {
    return (struct spirv_to_nir_options) {
-      .ssbo_addr_format = nir_address_format_32bit_index_offset,
-      .ubo_addr_format = nir_address_format_32bit_index_offset,
+      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
       .shared_addr_format = nir_address_format_32bit_offset,
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .push_const_addr_format = nir_address_format_32bit_offset,
@@ -953,6 +953,9 @@ apex_internal_program(struct apex_device *device, enum apex_internal which, stru
       };
       struct spirv_to_nir_options options = apex_get_spirv_options(device->vk.physical,
                                                                    MESA_SHADER_COMPUTE, NULL);
+      /* Internal kernels address their table with one index. */
+      options.ssbo_addr_format = nir_address_format_32bit_index_offset;
+      options.ubo_addr_format = nir_address_format_32bit_index_offset;
       options.environment = NIR_SPIRV_VULKAN;
       options.capabilities = &caps;
       nir_shader *nir = spirv_to_nir(sources[which].code, sources[which].words, NULL,

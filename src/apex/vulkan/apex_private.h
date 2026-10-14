@@ -47,25 +47,32 @@ apex_image_va(const struct apex_image *image)
    return image->memory->storage->bo.va + image->offset;
 }
 
+/* A pool created for update-after-bind sets keeps their rows in LOCAL
+ * memory, `heap` allocating within `bo`. */
 struct apex_descriptor_pool {
    struct vk_object_base base;
    struct list_head sets;
    uint32_t capacity, allocated;
    uint64_t descriptors[APEX_DESCRIPTOR_BUCKETS];
    uint64_t used[APEX_DESCRIPTOR_BUCKETS];
+   struct apex_bo bo;
+   struct util_vma_heap heap;
 };
+/* `variable` is the element count of a variable-count last binding; `rows`
+ * are the encoded rows, mirrored at `va` (`map` on the host) for a set in
+ * pool memory. */
 struct apex_descriptor_set {
    struct vk_object_base base;
    struct list_head link;
    struct apex_descriptor_pool *pool;
    struct apex_set_layout *layout;
-   union {
-      VkDescriptorBufferInfo buffer;
-      VkDescriptorImageInfo image;
-      VkBufferView texel;
-   } descriptors[];
+   uint32_t variable, row_count;
+   uint64_t va;
+   void *map;
+   union apex_descriptor rows[];
 };
-/* Immutable command binding; tables retain the offsets supplied at bind. */
+/* Immutable command binding; tables retain the dynamic offsets supplied at
+ * bind, in binding and element order. */
 struct apex_bound_set {
    struct apex_descriptor_set *set;
    uint32_t refs;
@@ -217,6 +224,11 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(apex_query_pool, vk.base, VkQueryPool, VK_OBJECT_
 /* apex_device.c */
 struct vk_descriptor_update_template;
 void apex_descriptor_set_free(struct vk_device *device, struct apex_descriptor_set *set);
+/* Empty rows of a new set: null buffers and its immutable samplers. */
+void apex_descriptor_set_init(struct apex_descriptor_set *set, uint32_t variable);
+/* Elements of a binding in a set, bytes of an inline uniform block. */
+uint32_t apex_set_binding_count(const struct apex_descriptor_set *set,
+                                const struct apex_binding_layout *binding);
 void apex_descriptor_set_write(struct apex_descriptor_set *set, const VkWriteDescriptorSet *write);
 void apex_descriptor_set_write_template(struct apex_descriptor_set *set,
                                         const struct vk_descriptor_update_template *templ,
