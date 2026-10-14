@@ -1456,11 +1456,16 @@ apex_CmdResetQueryPool(VkCommandBuffer handle, VkQueryPool pool, uint32_t first,
 static void
 query_available(struct apex_command_buffer *cmd, uint64_t va)
 {
-   uint64_t available = va + APEX_QUERY_AVAILABLE;
-   if (cmd->rendering.active)
-      util_dynarray_append(&cmd->pass_availability, available);
-   else
-      record_word(cmd, available, 1);
+   /* Under multiview a query takes one index per view: the first holds the
+    * result and the others keep the zero of their reset. */
+   unsigned views = MAX2(util_bitcount(cmd->rendering.view_mask), 1);
+   for (unsigned v = 0; v < views; v++) {
+      uint64_t available = va + (uint64_t)v * APEX_QUERY_STRIDE + APEX_QUERY_AVAILABLE;
+      if (cmd->rendering.active)
+         util_dynarray_append(&cmd->pass_availability, available);
+      else
+         record_word(cmd, available, 1);
+   }
 }
 
 /* Occlusion queries take one of the raster back end's eight counter slots
@@ -1527,7 +1532,8 @@ apex_CmdWriteTimestamp2(VkCommandBuffer handle, VkPipelineStageFlags2 stage, VkQ
    /* Value, then availability; both after earlier work unless top of pipe. */
    apex_cp_timestamp(&cmd->ib, slot, stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT ||
                      stage == VK_PIPELINE_STAGE_2_NONE ? 0 : APEX_CP_AFTER_PRIOR_WORK);
-   record_word(cmd, slot + APEX_QUERY_AVAILABLE, 1);
+   for (unsigned v = 0; v < MAX2(util_bitcount(cmd->rendering.view_mask), 1); v++)
+      record_word(cmd, slot + (uint64_t)v * APEX_QUERY_STRIDE + APEX_QUERY_AVAILABLE, 1);
 }
 
 static VKAPI_ATTR void VKAPI_CALL
