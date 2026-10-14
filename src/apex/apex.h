@@ -121,14 +121,22 @@ int apex_tool(const char *mode, const char *input, const char *output);
  * an element of binding `binding`. A binding's elements are vertices, or
  * instances stepped every `divisor` instances (0: the first instance only).
  * With `robust`, an attribute reaching past its binding's exact byte size
- * (vertex input block dword 80 + b) reads zero. */
+ * (vertex input block, apex_vi_size) reads zero. */
 struct apex_vertex_attribute { uint32_t format, binding, offset; };
 struct apex_vertex_binding { bool instance; uint32_t divisor; };
+#define APEX_VERTEX_BINDINGS 32
+#define APEX_VERTEX_ATTRIBUTES 32
 struct apex_vertex_input {
-   struct apex_vertex_attribute attributes[16];
-   struct apex_vertex_binding bindings[16];
+   struct apex_vertex_attribute attributes[APEX_VERTEX_ATTRIBUTES];
+   struct apex_vertex_binding bindings[APEX_VERTEX_BINDINGS];
    bool robust;
 };
+/* Vertex input block dwords of binding `b`: its buffer descriptor, stride
+ * and exact byte size. Bindings 0-15 lie below the clip-distance count at
+ * dword 96, which the front end reads, and 16-31 follow it. */
+static inline unsigned apex_vi_descriptor(unsigned b) { return b < 16 ? 4 * b : 128 + 4 * (b - 16); }
+static inline unsigned apex_vi_stride(unsigned b) { return b < 16 ? 64 + b : 192 + b - 16; }
+static inline unsigned apex_vi_size(unsigned b) { return b < 16 ? 80 + b : 208 + b - 16; }
 /* Whether the vertex prolog converts `format` (an enum pipe_format). */
 bool apex_vertex_format(uint32_t format);
 /* The vertex prolog on load_input of a shader after nir_lower_io: it reads

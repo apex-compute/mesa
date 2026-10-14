@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
+#include "apex/apex.h"
 
 struct vk_dynamic_graphics_state;
 struct vk_sampler;
@@ -125,14 +126,14 @@ void apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk
                                 uint32_t d[8]);
 
 /* State blocks. */
-#define APEX_HW_VERTEX_INPUT_DWORDS 128
+#define APEX_HW_VERTEX_INPUT_DWORDS 224
 #define APEX_HW_RASTER_DWORDS 16
 #define APEX_HW_DEPTH_STENCIL_DWORDS 16
 #define APEX_HW_BLEND_DWORDS 64
 #define APEX_HW_VIEWPORT_DWORDS 256
 #define APEX_HW_DYNAMIC_DWORDS 13
-#define APEX_HW_MAX_BINDINGS 16
-#define APEX_HW_MAX_ATTRIBUTES 16
+#define APEX_HW_MAX_BINDINGS APEX_VERTEX_BINDINGS
+#define APEX_HW_MAX_ATTRIBUTES APEX_VERTEX_ATTRIBUTES
 #define APEX_HW_MAX_VIEWPORTS 16
 #define APEX_HW_MAX_COLOR 8
 
@@ -140,8 +141,8 @@ struct apex_hw_binding {
    uint64_t va, size;
 };
 /* Vertex input: each binding's buffer descriptor (robust with the vertex
- * program's robustness; bytes rounded up to a dword), stride (dword 64 + b)
- * and exact byte size (dword 80 + b), and the clip-distance count. */
+ * program's robustness; bytes rounded up to a dword), stride and exact byte
+ * size at the apex_vi_* dwords, and the clip-distance count at dword 96. */
 void apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
                                 const struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS],
                                 unsigned clip_distances, bool robust,

@@ -2193,8 +2193,8 @@ static nir_def *vertex_word(nir_builder *b, nir_def *descriptor, nir_def *byte, 
 
 /* The components in `mask` of attribute `location` through its binding's
  * descriptor and stride in the vertex input block (Docs/architecture.md,
- * State blocks): descriptor b at byte 16 b, stride b at byte 256 + 4 b,
- * exact byte size b at byte 320 + 4 b. */
+ * State blocks): binding b's descriptor, stride and exact byte size at the
+ * apex_vi_* dwords. */
 static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const struct apex_vertex_input *vi,
                                        unsigned location, unsigned mask)
 {
@@ -2205,16 +2205,16 @@ static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const str
          out[k] = k == 3 ? nir_imm_float(b, 1.0f) : zero;
       return nir_vec(b, out, 4);
    }
-   if (!apex_vertex_format(a->format) || a->binding >= 16)
+   if (!apex_vertex_format(a->format) || a->binding >= APEX_VERTEX_BINDINGS)
       return NULL;
    const struct util_format_description *d = util_format_description(a->format);
    const struct apex_vertex_binding *binding = &vi->bindings[a->binding];
    const enum gl_access_qualifier constant = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE;
    nir_def *descriptor = nir_load_global_2x32(b, 4, 32,
-      nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 16 * a->binding),
+      nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 4 * apex_vi_descriptor(a->binding)),
       .align_mul = 16, .access = constant);
    nir_def *stride = nir_load_global_2x32(b, 1, 32,
-      nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 256 + 4 * a->binding),
+      nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 4 * apex_vi_stride(a->binding)),
       .align_mul = 4, .access = constant);
    nir_def *index;
    if (!binding->instance)
@@ -2263,9 +2263,9 @@ static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const str
    }
    if (vi->robust) {
       /* The descriptor covers whole dwords; the binding's exact bytes at
-       * block byte 320 + 4 b bound the attribute. */
+       * apex_vi_size dword bound the attribute. */
       nir_def *size = nir_load_global_2x32(b, 1, 32,
-         nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 320 + 4 * a->binding),
+         nir_build_addr_iadd_imm(b, block, nir_address_format_2x32bit_global, nir_var_mem_global, 4 * apex_vi_size(a->binding)),
          .align_mul = 4, .access = constant);
       nir_def *inside = nir_iand(b, nir_ult(b, byte, size), nir_uge(b, size, nir_iadd_imm(b, byte, bytes)));
       u_foreach_bit(k, need)
@@ -2288,7 +2288,7 @@ bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    struct apex_vertex_input standalone = {0};
-   unsigned masks[16] = {0};
+   unsigned masks[APEX_VERTEX_ATTRIBUTES] = {0};
    struct util_dynarray loads;
    util_dynarray_init(&loads, NULL);
    bool ok = true;
@@ -2304,7 +2304,7 @@ bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input
          unsigned component = nir_intrinsic_component(i), n = i->def.num_components;
          if (!nir_src_is_const(*offset) || i->def.bit_size != 32 || component + n > 4 ||
              nir_intrinsic_io_semantics(i).location < VERT_ATTRIB_GENERIC0 ||
-             (location += nir_src_as_uint(*offset)) >= 16) {
+             (location += nir_src_as_uint(*offset)) >= APEX_VERTEX_ATTRIBUTES) {
             ok = false;
             continue;
          }
@@ -2323,8 +2323,8 @@ bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input
    if (ok && util_dynarray_num_elements(&loads, nir_intrinsic_instr *)) {
       nir_builder builder = nir_builder_at(nir_before_impl(impl)), *b = &builder;
       nir_def *block = nir_load_kernel_input(b, 2, 32, nir_imm_int(b, 0), .base = 88, .range = 8);
-      nir_def *values[16] = {0};
-      for (unsigned l = 0; l < 16 && ok; l++)
+      nir_def *values[APEX_VERTEX_ATTRIBUTES] = {0};
+      for (unsigned l = 0; l < APEX_VERTEX_ATTRIBUTES && ok; l++)
          ok = !masks[l] || (values[l] = fetch_vertex_attribute(b, block, vi, l, masks[l]));
       util_dynarray_foreach(&loads, nir_intrinsic_instr *, p) {
          nir_intrinsic_instr *i = *p;

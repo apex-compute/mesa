@@ -57,8 +57,9 @@ test_vertex_input(void)
    struct vk_dynamic_graphics_state dyn = {.vi = &vi};
    dyn.vi_binding_strides[0] = 28;
    dyn.vi_binding_strides[2] = 0x1000;
+   dyn.vi_binding_strides[17] = 44;
    struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS] = {
-      [0] = {0x12345678c0ull, 4096}, [2] = {0xab00001000ull, 0x10003},
+      [0] = {0x12345678c0ull, 4096}, [2] = {0xab00001000ull, 0x10003}, [17] = {0x2000ull, 88},
    };
    uint32_t w[APEX_HW_VERTEX_INPUT_DWORDS];
    apex_hw_vertex_input_block(&dyn, bindings, 5, true, w);
@@ -68,7 +69,10 @@ test_vertex_input(void)
    CHECK(w[8] == 0x00001000 && w[9] == 0xab && w[10] == 0x10004 && w[11] == 1);
    CHECK(w[64] == 28 && w[65] == 0 && w[66] == 0x1000);
    CHECK(w[80] == 4096 && w[81] == 0 && w[82] == 0x10003);
-   for (unsigned k = 97; k < APEX_HW_VERTEX_INPUT_DWORDS; k++)
+   /* Bindings 16-31 follow dword 96: descriptors from dword 128, strides
+    * from 192, exact sizes from 208. */
+   CHECK(w[132] == 0x2000 && w[134] == 88 && w[135] == 1 && w[193] == 44 && w[209] == 88);
+   for (unsigned k = 97; k < 128; k++)
       CHECK(!w[k]);
    /* Dword 96: clip-distance count. */
    CHECK(w[96] == 5);
