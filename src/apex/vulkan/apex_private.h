@@ -100,13 +100,11 @@ struct apex_arena {
    struct apex_bo bo;
    uint64_t sequence;
 };
-/* Recorded device memory created at first submission: a snapshot of host
- * bytes for vk_meta. */
+/* A command buffer's span of the device upload heap (apex_device.h). */
 struct apex_upload {
    struct list_head link;
-   struct apex_bo bo;
-   uint64_t reserved_va, size;
-   uint8_t data[];
+   struct apex_upload_chunk *chunk;
+   uint64_t va, size;
 };
 
 /* A descriptor table written at submission: the rows its programs use, the

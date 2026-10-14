@@ -146,6 +146,46 @@ fail:
    return result;
 }
 
+VkResult
+apex_upload_alloc(struct apex_device *device, uint64_t size, struct apex_upload *upload, void **map)
+{
+   uint64_t bytes = align64(MAX2(size, 1), 64);
+   mtx_lock(&device->upload_mutex);
+   struct apex_upload_chunk *found = NULL;
+   uint64_t va = 0;
+   list_for_each_entry(struct apex_upload_chunk, chunk, &device->upload_chunks, link) {
+      va = util_vma_heap_alloc(&chunk->heap, bytes, 64);
+      if (va) {
+         found = chunk;
+         break;
+      }
+   }
+   if (!found) {
+      found = calloc(1, sizeof(*found));
+      uint64_t chunk_bytes = MAX2(APEX_UPLOAD_CHUNK_BYTES, align64(bytes, 4096));
+      if (!found || apex_bo_create(device, chunk_bytes, APEX_VM_READ, 0, 0, &found->bo) != VK_SUCCESS) {
+         free(found);
+         mtx_unlock(&device->upload_mutex);
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+      util_vma_heap_init(&found->heap, found->bo.va, chunk_bytes);
+      list_addtail(&found->link, &device->upload_chunks);
+      va = util_vma_heap_alloc(&found->heap, bytes, 64);
+   }
+   mtx_unlock(&device->upload_mutex);
+   *upload = (struct apex_upload){.chunk = found, .va = va, .size = bytes};
+   *map = (uint8_t *)found->bo.map + (va - found->bo.va);
+   return VK_SUCCESS;
+}
+
+void
+apex_upload_free(struct apex_device *device, struct apex_upload *upload)
+{
+   mtx_lock(&device->upload_mutex);
+   util_vma_heap_free(&upload->chunk->heap, upload->va, upload->size);
+   mtx_unlock(&device->upload_mutex);
+}
+
 /* memory_mutex spans FD_TO_HANDLE and lookup through final GEM_CLOSE. PRIME
  * returns an existing handle without acquiring another handle reference. */
 static struct apex_memory_storage *
@@ -2149,18 +2189,6 @@ submit_queue(struct vk_queue *vk, struct vk_queue_submit *submit)
    struct apex_queue *queue = container_of(vk, struct apex_queue, vk);
    if (vk_queue_submit_has_bind(submit) || submit->is_protected || !queue->ring.map)
       return vk_queue_set_lost(vk, "unsupported Apex submission");
-   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
-      struct apex_command_buffer *cmd = (void *)submit->command_buffers[i];
-      list_for_each_entry(struct apex_upload, upload, &cmd->uploads, link) {
-         if (upload->bo.handle)
-            continue;
-         uint64_t va = upload->reserved_va;
-         upload->reserved_va = 0;
-         if (apex_bo_create(device, upload->size, APEX_VM_READ, 0, va, &upload->bo) != VK_SUCCESS)
-            return vk_queue_set_lost(vk, "Apex update allocation failed");
-         memcpy(upload->bo.map, upload->data, upload->size);
-      }
-   }
    if (submit_batch(device, queue, submit) != VK_SUCCESS)
       return vk_queue_set_lost(vk, "Apex submission failed");
    return VK_SUCCESS;
@@ -2356,11 +2384,18 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
       list_inithead(&device->queues[f].free_arenas);
    }
    list_inithead(&device->memories);
+   list_inithead(&device->upload_chunks);
    if (mtx_init(&device->va_mutex, mtx_plain) != thrd_success) {
       vk_device_finish(&device->vk);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    if (mtx_init(&device->memory_mutex, mtx_plain) != thrd_success) {
+      mtx_destroy(&device->va_mutex);
+      vk_device_finish(&device->vk);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (mtx_init(&device->upload_mutex, mtx_plain) != thrd_success) {
+      mtx_destroy(&device->memory_mutex);
       mtx_destroy(&device->va_mutex);
       vk_device_finish(&device->vk);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -2441,6 +2476,12 @@ apex_device_finish(struct apex_device *device)
    apex_graphics_finish(device);
 
    vk_meta_device_finish(&device->vk, &device->meta);
+   list_for_each_entry_safe(struct apex_upload_chunk, chunk, &device->upload_chunks, link) {
+      util_vma_heap_finish(&chunk->heap);
+      apex_bo_finish(device, &chunk->bo);
+      free(chunk);
+   }
+   mtx_destroy(&device->upload_mutex);
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->memory_mutex);
    mtx_destroy(&device->va_mutex);

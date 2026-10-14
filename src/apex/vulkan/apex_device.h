@@ -150,6 +150,17 @@ struct apex_queue {
    bool programs_uploaded;
 };
 
+/* vk_meta's host data (clear and blit vertices) in chunks of LOCAL that
+ * command buffers sub-allocate while recording and free at reset, so a
+ * clear needs no kernel call and no address is unmapped under the GPU. */
+#define APEX_UPLOAD_CHUNK_BYTES (1u << 20)
+struct apex_upload_chunk {
+   struct list_head link;
+   struct apex_bo bo;
+   struct util_vma_heap heap;
+};
+struct apex_upload;
+
 struct apex_device {
    struct vk_device vk;
    struct vk_device_dispatch_table cmd_dispatch;
@@ -161,6 +172,8 @@ struct apex_device {
    /* Serializes PRIME handle lookup and final backing destruction. */
    mtx_t memory_mutex;
    struct list_head memories;
+   mtx_t upload_mutex;
+   struct list_head upload_chunks;
    /* Internal programs and the empty fragment program of depth-only draws,
     * compiled on first use under memory_mutex. */
    struct apex_program *internal[APEX_INTERNAL_COUNT];
@@ -169,6 +182,9 @@ struct apex_device {
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
 void apex_bo_finish(struct apex_device *device, struct apex_bo *bo);
+/* Takes `size` bytes of the upload heap: their address and CPU mapping. */
+VkResult apex_upload_alloc(struct apex_device *device, uint64_t size, struct apex_upload *upload, void **map);
+void apex_upload_free(struct apex_device *device, struct apex_upload *upload);
 
 VkFormatFeatureFlags2 apex_format_features(VkFormat format, bool buffer);
 VkResult apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,

@@ -58,12 +58,7 @@ clear_commands(struct apex_command_buffer *cmd)
    struct apex_device *device = (void *)cmd->vk.base.device;
    list_for_each_entry_safe(struct apex_upload, upload, &cmd->uploads, link) {
       list_del(&upload->link);
-      if (upload->reserved_va) {
-         mtx_lock(&device->va_mutex);
-         util_vma_heap_free(&device->va_heap, upload->reserved_va, align64(upload->size, 4096));
-         mtx_unlock(&device->va_mutex);
-      }
-      apex_bo_finish(device, &upload->bo);
+      apex_upload_free(device, upload);
       vk_free(&cmd->vk.pool->alloc, upload);
    }
    list_for_each_entry_safe(struct apex_descriptor_set, set, &cmd->push_sets, link)
@@ -2388,8 +2383,8 @@ apex_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 
 /* ---- vk_meta uploads ---------------------------------------------------- */
 
-/* Recording snapshots host data and reserves an address without kernel waits.
- * Submission materializes this immutable source before publishing dependencies. */
+/* Recording writes vk_meta's host data straight into the upload heap; the
+ * command buffer frees its spans at reset, after the GPU has read them. */
 static VkResult
 bind_map_upload(struct vk_command_buffer *vk, struct vk_meta_device *meta,
                 VkBuffer handle, void **map_out)
@@ -2397,20 +2392,15 @@ bind_map_upload(struct vk_command_buffer *vk, struct vk_meta_device *meta,
    struct apex_command_buffer *cmd = (void *)vk;
    struct apex_device *device = (void *)vk->base.device;
    VK_FROM_HANDLE(vk_buffer, buffer, handle);
-   struct apex_upload *upload = vk_zalloc(&vk->pool->alloc, sizeof(*upload) + buffer->size,
-                                          8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   struct apex_upload *upload = vk_alloc(&vk->pool->alloc, sizeof(*upload), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!upload)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   upload->size = buffer->size;
-   mtx_lock(&device->va_mutex);
-   upload->reserved_va = util_vma_heap_alloc(&device->va_heap, align64(upload->size, 4096), 4096);
-   mtx_unlock(&device->va_mutex);
-   if (!upload->reserved_va) {
+   VkResult result = apex_upload_alloc(device, buffer->size, upload, map_out);
+   if (result != VK_SUCCESS) {
       vk_free(&vk->pool->alloc, upload);
-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      return result;
    }
-   buffer->device_address = upload->reserved_va;
-   *map_out = upload->data;
+   buffer->device_address = upload->va;
    list_addtail(&upload->link, &cmd->uploads);
    return VK_SUCCESS;
 }
