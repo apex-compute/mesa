@@ -3,12 +3,21 @@
  * Frame-time benchmark through the public loader: renders offscreen frames of
  * a representative scene and reports per-frame wall time from submit to idle.
  *
- *   apex-bench ICD desktop|game|bandwidth [frames]
+ *   apex-bench ICD desktop|game|draws|draws-sets|draws-pipelines|layers|layers-thin|bandwidth [frames]
  *
  * desktop: 1920x1080 RGBA8, a full-screen textured background plus eight
  *          blended 640x480 textured windows (compositor-like).
  * game:    1280x720 RGBA8 + D32, a textured, depth-tested grid of 64k
  *          triangles in 64 draws.
+ * draws:   the game grid in 4,096 draws of 16 triangles, so the difference
+ *          from game is the fixed cost of 4,032 draws; draws-sets binds one
+ *          of two identical descriptor sets and draws-pipelines one of two
+ *          identical pipelines before each draw.
+ * layers:  the game frame, then 900 draws of a full-screen quad behind the
+ *          grid that depth testing rejects, so the difference from game is
+ *          the cost of draws that touch every tile but shade nothing;
+ *          layers-thin draws a strip two pixels tall instead, which touches
+ *          one row of tiles.
  * bandwidth: streaming read, write and copy between the core and LOCAL over
  *          32 MiB buffers, in GB/s after subtracting an empty dispatch.
  */
@@ -53,8 +62,13 @@ int
 main(int argc, char **argv)
 {
    CHECK(argc >= 3 && (!strcmp(argv[2], "desktop") || !strcmp(argv[2], "game") ||
+                       !strncmp(argv[2], "draws", 5) || !strncmp(argv[2], "layers", 6) ||
                        !strcmp(argv[2], "bandwidth")));
-   const bool game = !strcmp(argv[2], "game"), bandwidth = !strcmp(argv[2], "bandwidth");
+   const bool many_draws = !strncmp(argv[2], "draws", 5);
+   const bool switch_sets = !strcmp(argv[2], "draws-sets");
+   const bool switch_pipelines = !strcmp(argv[2], "draws-pipelines");
+   const bool layers = !strncmp(argv[2], "layers", 6), thin = !strcmp(argv[2], "layers-thin");
+   const bool game = many_draws || layers || !strcmp(argv[2], "game"), bandwidth = !strcmp(argv[2], "bandwidth");
    const unsigned frames = argc > 3 ? atoi(argv[3]) : 10;
    const uint32_t width = game ? 1280 : 1920, height = game ? 720 : 1080;
    char dir[512];
@@ -221,7 +235,12 @@ main(int argc, char **argv)
    if (game) {
       const unsigned gx = 256, gy = 128;
       vertex_count = gx * gy * 6;
-      vertices = calloc(vertex_count, sizeof(*vertices));
+      /* Six more: the full-screen quad behind the grid. */
+      vertices = calloc(vertex_count + 6, sizeof(*vertices));
+      const float top = thin ? -1 + 4.0f / height : 1;
+      const float quad[6][2] = {{-1, -1}, {1, -1}, {-1, top}, {1, -1}, {1, top}, {-1, top}};
+      for (unsigned c = 0; c < 6; c++)
+         vertices[vertex_count + c] = (struct vertex){{quad[c][0], quad[c][1], 0.95f, 1}, {0, 0}};
       unsigned v = 0;
       for (unsigned y = 0; y < gy; y++) {
          for (unsigned x = 0; x < gx; x++) {
@@ -253,7 +272,7 @@ main(int argc, char **argv)
                                                    corner[c][1] == y0 ? 0.0f : 1.0f}};
       }
    }
-   const VkDeviceSize vertex_bytes = (VkDeviceSize)vertex_count * sizeof(struct vertex);
+   const VkDeviceSize vertex_bytes = (VkDeviceSize)(vertex_count + (game ? 6 : 0)) * sizeof(struct vertex);
    const VkDeviceSize texel_offset = (vertex_bytes + 4095) & ~4095ull;
    const VkDeviceSize texel_bytes = texture_size * texture_size * 4;
    const VkDeviceSize image_offset = (texel_offset + texel_bytes + 65535) & ~65535ull;
@@ -322,17 +341,19 @@ main(int argc, char **argv)
                                                    VK_SHADER_STAGE_FRAGMENT_BIT}}, NULL, &set_layout));
    VkDescriptorPool pool;
    VK(CreateDescriptorPool(device, &(VkDescriptorPoolCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1,
-      .pPoolSizes = &(VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}}, NULL, &pool));
-   VkDescriptorSet set;
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2, .poolSizeCount = 1,
+      .pPoolSizes = &(VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2}}, NULL, &pool));
+   VkDescriptorSet sets[2];
    VK(AllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool,
-      .descriptorSetCount = 1, .pSetLayouts = &set_layout}, &set));
-   UpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
-      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .descriptorCount = 1,
-      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-      .pImageInfo = &(VkDescriptorImageInfo){sampler, views[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}},
-      0, NULL);
+      .descriptorSetCount = 2, .pSetLayouts = (VkDescriptorSetLayout[]){set_layout, set_layout}}, sets));
+   for (unsigned i = 0; i < 2; i++)
+      UpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[i], .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+         .pImageInfo = &(VkDescriptorImageInfo){sampler, views[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}},
+         0, NULL);
+   const VkDescriptorSet set = sets[0];
 
    const unsigned attachments = game ? 2 : 1;
    VkRenderPass pass;
@@ -370,8 +391,7 @@ main(int argc, char **argv)
    VK(CreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
       .pSetLayouts = &set_layout}, NULL, &layout));
-   VkPipeline pipeline;
-   VK(CreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &(VkGraphicsPipelineCreateInfo){
+   const VkGraphicsPipelineCreateInfo pipeline_info = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2,
       .pStages = (VkPipelineShaderStageCreateInfo[]){
          {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -409,7 +429,11 @@ main(int argc, char **argv)
             .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
             .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
             .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf}},
-      .layout = layout, .renderPass = pass}, NULL, &pipeline));
+      .layout = layout, .renderPass = pass};
+   VkPipeline pipelines[2];
+   VK(CreateGraphicsPipelines(device, VK_NULL_HANDLE, 2,
+                              (VkGraphicsPipelineCreateInfo[]){pipeline_info, pipeline_info}, NULL, pipelines));
+   const VkPipeline pipeline = pipelines[0];
 
    VkCommandPool command_pool;
    VK(CreateCommandPool(device, &(VkCommandPoolCreateInfo){
@@ -432,8 +456,9 @@ main(int argc, char **argv)
       VK_NULL_HANDLE));
    VK(QueueWaitIdle(queue));
 
-   /* One frame: the game draws its grid in 64 slices, the desktop 9 quads. */
-   const unsigned draws = game ? 64 : 9;
+   /* One frame: the game draws its grid in 64 slices (4,096 for draws), the
+    * desktop 9 quads. */
+   const unsigned draws = many_draws ? 4096 : game ? 64 : 9;
    VK(BeginCommandBuffer(frame, &(VkCommandBufferBeginInfo){
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
    CmdBeginRenderPass(frame, &(VkRenderPassBeginInfo){
@@ -444,8 +469,15 @@ main(int argc, char **argv)
    CmdBindPipeline(frame, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
    CmdBindDescriptorSets(frame, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
    CmdBindVertexBuffers(frame, 0, 1, &vertex_buffer, &(VkDeviceSize){0});
-   for (unsigned d = 0; d < draws; d++)
+   for (unsigned d = 0; d < draws; d++) {
+      if (switch_sets)
+         CmdBindDescriptorSets(frame, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &sets[d & 1], 0, NULL);
+      if (switch_pipelines)
+         CmdBindPipeline(frame, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[d & 1]);
       CmdDraw(frame, vertex_count / draws, 1, d * (vertex_count / draws), 0);
+   }
+   for (unsigned l = 0; layers && l < 900; l++)
+      CmdDraw(frame, 6, 1, vertex_count, 0);
    CmdEndRenderPass(frame);
    VK(EndCommandBuffer(frame));
 
