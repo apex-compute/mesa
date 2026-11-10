@@ -111,6 +111,8 @@ struct apex_bo {
    bool system;
 };
 
+extern uint64_t apex_local_usage;
+
 /* Internal single-queue device on one user-mode ring. A negative fd builds an
  * offline device for compiler tests: no memory, queue or submission. */
 #define APEX_PRIVATE_BYTES (2u * 1024 * 1024)

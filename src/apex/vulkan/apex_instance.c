@@ -17,7 +17,9 @@
 #include "util/log.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
+#include "util/u_atomic.h"
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -39,6 +41,7 @@ struct apex_physical_device {
    /* Presentation through Mesa's display WSI on the device's primary node. */
    struct wsi_device wsi_device;
    int display_fd;
+   int info_fd;
 };
 VK_DEFINE_HANDLE_CASTS(apex_physical_device, vk.base, VkPhysicalDevice,
                       VK_OBJECT_TYPE_PHYSICAL_DEVICE);
@@ -134,6 +137,21 @@ apex_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physical,
       .memoryHeapCount = 1,
       .memoryHeaps[0] = {.size = device->local_bytes, .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT},
    };
+   VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget =
+      vk_find_struct(properties->pNext, PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT);
+   if (budget && device->vk.supported_extensions.EXT_memory_budget) {
+      uint64_t size = device->local_bytes;
+      uint64_t usage = MIN2(p_atomic_read(&apex_local_usage), size);
+      uint64_t others = 0;
+      struct drm_apex_info info = {0};
+      if (device->info_fd >= 0 && !ioctl(device->info_fd, DRM_IOCTL_APEX_INFO, &info) &&
+          (info.flags & APEX_INFO_LOCAL_USED) && info.local_used > usage)
+         others = MIN2(info.local_used - usage, size);
+      memset(budget->heapBudget, 0, sizeof(budget->heapBudget));
+      memset(budget->heapUsage, 0, sizeof(budget->heapUsage));
+      budget->heapUsage[0] = usage;
+      budget->heapBudget[0] = MAX3(size - others, usage, MIN2(size, 4096));
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -273,9 +291,28 @@ destroy_physical(struct vk_physical_device *vk)
    }
    if (physical->display_fd >= 0)
       close(physical->display_fd);
+   if (physical->info_fd >= 0)
+      close(physical->info_fd);
    vk_physical_device_finish(vk);
    vk_free(alloc, physical->render_node);
    vk_free(alloc, physical);
+}
+
+static bool
+is_kintex7(drmDevicePtr drm)
+{
+   char path[64];
+   unsigned profile = 0;
+   snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%u/profile",
+            drm->businfo.pci->domain, drm->businfo.pci->bus, drm->businfo.pci->dev,
+            drm->businfo.pci->func);
+   FILE *f = fopen(path, "r");
+   if (f) {
+      if (fscanf(f, "%u", &profile) != 1)
+         profile = 0;
+      fclose(f);
+   }
+   return profile == 3;
 }
 
 static VkResult
@@ -298,6 +335,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       close(fd);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
+   const bool k7 = is_kintex7(drm);
    struct vk_sync_type sync_type = vk_drm_syncobj_get_type(fd);
    /* VK_EXT_physical_device_drm: device numbers of the render and primary nodes. */
    struct stat render_stat, primary_stat;
@@ -314,6 +352,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       sizeof(*physical), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
    if (!physical)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   physical->display_fd = -1;
+   physical->info_fd = -1;
    struct vk_physical_device_dispatch_table dispatch;
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &apex_physical_device_entrypoints, true);
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch, &wsi_physical_device_entrypoints, false);
@@ -327,6 +367,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .EXT_image_drm_format_modifier = true,
       .KHR_map_memory2 = true,
       .EXT_map_memory_placed = true,
+      .EXT_memory_budget = k7,
       /* Swapchain images take MUTABLE_FORMAT and a view format list. */
       .KHR_swapchain_mutable_format = true,
       /* Mesa's DRM syncobj type supplies opaque-FD and sync-file payloads. */
@@ -550,6 +591,7 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       /* Vulkan 1.3. */
       .robustImageAccess = true,
       .inlineUniformBlock = true,
+      .descriptorBindingInlineUniformBlockUpdateAfterBind = k7,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       .shaderDemoteToHelperInvocation = true,
@@ -795,6 +837,8 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       destroy_physical(&physical->vk);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
+   if (k7)
+      physical->info_fd = open(node, O_RDWR | O_CLOEXEC);
    physical->sync_type = sync_type;
    physical->local_bytes = MIN2(caps.visible_bytes ? caps.visible_bytes : caps.local_bytes,
                                 caps.local_bytes);

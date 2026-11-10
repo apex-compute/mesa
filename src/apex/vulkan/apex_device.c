@@ -4,6 +4,7 @@
 #include "apex_pipeline.h"
 #include "drm-uapi/apex_drm.h"
 #include "drm-uapi/drm_fourcc.h"
+#include "util/u_atomic.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
 #include "vk_buffer_view.h"
@@ -92,6 +93,8 @@ gem_create(struct apex_device *device, uint64_t size, uint32_t flags,
    return VK_ERROR_MEMORY_MAP_FAILED;
 }
 
+uint64_t apex_local_usage;
+
 void
 apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
 {
@@ -110,6 +113,8 @@ apex_bo_finish(struct apex_device *device, struct apex_bo *bo)
    }
    if (bo->map)
       munmap(bo->map, bo->size);
+   if (bo->handle && !bo->system)
+      p_atomic_add(&apex_local_usage, -bo->size);
    if (bo->handle && gem_close(device, bo->handle))
       vk_device_set_lost(&device->vk, "Apex GEM close failed");
    *bo = (struct apex_bo){0};
@@ -126,6 +131,8 @@ apex_bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
    VkResult result = gem_create(device, bo->size, gem_flags, &bo->handle, &bo->map);
    if (result != VK_SUCCESS)
       goto fail;
+   if (!bo->system)
+      p_atomic_add(&apex_local_usage, bo->size);
    if (!va) {
       mtx_lock(&device->va_mutex);
       va = util_vma_heap_alloc(&device->va_heap, bo->size, 4096);

@@ -26,8 +26,12 @@ struct drm_apex_info {
 	__u32 queue_slots, vm_slots; /* per device; zero without a command processor */
 	__u32 queues_per_file;       /* 8 */
 	__u32 cores, texture_units, tile_planes;
-	__u64 reserved[4];
+	__u64 local_used;
+	__u64 flags;
+	__u64 reserved[2];
 };
+
+#define APEX_INFO_LOCAL_USED (1ull << 0)
 
 #define APEX_GEM_SYSTEM (1u << 0) /* cached host shmem, GPU access over PCIe */
 /* Without SYSTEM: contiguous zero-filled LOCAL, the class of dumb buffers and
