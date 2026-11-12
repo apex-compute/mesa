@@ -588,9 +588,9 @@ image_features(VkFormat format, bool linear)
    const VkFormatFeatureFlags2 transfer = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
                                           VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
    /* Multi-planar YCbCr images sample each plane through a conversion
-    * lowered in the compiler (apex_texture.c). */
+    * lowered in the compiler (apex_texture.c); linear ones are copied only. */
    if (apex_ycbcr_info(format))
-      return linear ? 0 : transfer | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+      return linear ? transfer : transfer | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
                           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                           VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT |
                           VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
@@ -618,8 +618,7 @@ image_features(VkFormat format, bool linear)
                     !(class == APEX_HW_CLASS_RGBA32 && type == APEX_HW_FLOAT);
       if (filter)
          features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-      /* Comparison applies to D16, D24 and R32F images. */
-      if (depth && format != VK_FORMAT_D32_SFLOAT_S8_UINT)
+      if (depth)
          features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
       if (!vk_format_is_scaled(format))
          features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
@@ -665,12 +664,12 @@ apex_format_features(VkFormat format, bool buffer)
    /* Texel-buffer loads also decode the packed B10G11R11 and E5B9G9R9 floats;
     * stores encode plain formats only. */
    bool packed_float = pformat == PIPE_FORMAT_R11G11B10_FLOAT || pformat == PIPE_FORMAT_R9G9B9E5_FLOAT;
-   if (util_format_is_srgb(pformat) || !desc ||
+   if (util_format_is_srgb(pformat) || !desc || vk_format_is_depth_or_stencil(format) ||
        (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN && !packed_float) ||
        !apex_format_encode(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, words))
       return 0;
    features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
-   if (!packed_float && !vk_format_is_depth_or_stencil(format) && desc->block.bits <= 128) {
+   if (!packed_float && desc->block.bits <= 128) {
       features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
@@ -694,7 +693,7 @@ linear_features(VkFormat format)
 bool
 apex_format_modifier_supported(VkFormat format)
 {
-   return linear_features(format) && !vk_format_is_depth_or_stencil(format);
+   return linear_features(format) && !vk_format_is_depth_or_stencil(format) && !apex_ycbcr_info(format);
 }
 
 VkFormatFeatureFlags2
