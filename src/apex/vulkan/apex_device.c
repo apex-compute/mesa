@@ -345,7 +345,10 @@ apex_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    VkResult result;
    if (import) {
+      /* A handle of this device's own memory shares its mapping. */
       result = import_memory(device, import->fd, info->allocationSize, &mem->storage);
+      if (result == VK_SUCCESS)
+         mem->data = mem->storage->bo.map;
    } else {
       mem->storage = vk_zalloc(&device->vk.alloc, sizeof(*mem->storage), 8,
                                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
