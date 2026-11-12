@@ -2619,7 +2619,7 @@ static bool hoist_repeated(nir_shader *nir)
                    !nir_instr_can_speculate(instr) || !nir_foreach_src(instr, available_before, before))
                   continue;
                nir_foreach_instr(later, after) {
-                  if (nir_instrs_equal(instr, later)) {
+                  if (later->type == instr->type && nir_instrs_equal(instr, later)) {
                      nir_instr_move(nir_after_block(before), instr);
                      moved = true;
                      break;
