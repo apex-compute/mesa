@@ -687,8 +687,23 @@ format_planes(VkFormat format)
 static void
 pack_color(VkFormat format, const VkClearColorValue *color, uint32_t texel[4])
 {
+   enum pipe_format pformat = vk_format_to_pipe_format(format);
+   const struct util_format_description *desc = util_format_description(pformat);
    memset(texel, 0, 4 * sizeof(uint32_t));
-   util_format_pack_rgba(vk_format_to_pipe_format(format), texel, color, 1);
+   /* A 64-bit channel takes two consecutive 32-bit words of the clear value. */
+   if (desc->channel[0].size == 64) {
+      memcpy(texel, color->uint32, MIN2(desc->block.bits / 8, 4 * sizeof(uint32_t)));
+      return;
+   }
+   /* A SCALED format is cleared with its integer value, as its INT twin. */
+   if (vk_format_is_scaled(format)) {
+      float value[4];
+      for (unsigned c = 0; c < 4; c++)
+         value[c] = desc->channel[0].type == UTIL_FORMAT_TYPE_SIGNED ? (float)color->int32[c] : (float)color->uint32[c];
+      util_format_pack_rgba(pformat, texel, value, 1);
+      return;
+   }
+   util_format_pack_rgba(pformat, texel, color, 1);
 }
 
 /* The stored clear texel of a depth/stencil format, depth and stencil
