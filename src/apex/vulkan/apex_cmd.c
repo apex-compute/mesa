@@ -2151,7 +2151,9 @@ aspect_element(VkFormat format, VkImageAspectFlags aspect, unsigned *offset, uns
    *offset = 0;
    *bytes = vk_format_get_blocksize(format);
    *mask = ~0u;
-   if (!vk_format_has_depth(format) || !vk_format_has_stencil(format))
+   /* Image copies may name both aspects: the whole texel. */
+   if (!vk_format_has_depth(format) || !vk_format_has_stencil(format) ||
+       aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
       return;
    bool stencil = aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
    if (format == VK_FORMAT_D24_UNORM_S8_UINT) {
