@@ -2789,8 +2789,8 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_texture_slots, nir_metadata_control_flow, NULL);
    const nir_lower_mem_access_bit_sizes_options mem = {
       .callback = access_size,
-      .modes = nir_var_mem_global | nir_var_function_temp | nir_var_mem_ssbo | nir_var_mem_ubo |
-               nir_var_mem_shared | nir_var_mem_push_const,
+      .modes = nir_var_mem_global | nir_var_mem_constant | nir_var_function_temp | nir_var_mem_ssbo |
+               nir_var_mem_ubo | nir_var_mem_shared | nir_var_mem_push_const,
       .may_lower_unaligned_stores_to_atomics = true,
    };
    NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &mem);

@@ -432,6 +432,8 @@ create_compute_pipeline(struct vk_device *device,
       .ssbo_addr_format = buffers,
       .ubo_addr_format = buffers,
       .shared_addr_format = nir_address_format_32bit_offset,
+      .phys_ssbo_addr_format = nir_address_format_64bit_global,
+      .push_const_addr_format = nir_address_format_32bit_offset,
       .skip_os_break_in_debug_build = true,
    };
    nir_shader *nir = NULL;
