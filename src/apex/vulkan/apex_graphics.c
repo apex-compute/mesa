@@ -923,6 +923,9 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_shader_out)
       var->data.driver_location = var->data.location;
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, attribute_slots, 0);
+   /* The per-vertex inputs are records now; a compute kernel has no arrayed inputs. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in, NULL);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    if (!apex_program_lower_resources(program, nir))
       return VK_ERROR_FEATURE_NOT_PRESENT;
