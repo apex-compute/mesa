@@ -16,6 +16,7 @@
 #include "vk_device_memory.h"
 #include "vk_drm_syncobj.h"
 #include "vk_format.h"
+#include "vk_format_info.h"
 #include "vk_image.h"
 #include "vk_query_pool.h"
 #include "vk_render_pass.h"
@@ -719,15 +720,23 @@ apex_image_format_properties(const VkPhysicalDeviceImageFormatInfo2 *info,
    bool linear = info->tiling == VK_IMAGE_TILING_LINEAR || drm;
    VkFormatFeatureFlags2 features = linear ? linear_features(info->format) :
                                     apex_format_features(info->format, false);
-   /* Extended usage needs each usage from one of the view formats. */
+   /* Extended usage needs each usage from one of the view formats: those
+    * listed, or without a list every format of a mutable image's class. */
    const VkImageFormatListCreateInfo *view_formats =
       vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
    VkFormatFeatureFlags2 view_features = features;
-   if ((info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) && view_formats)
+   if ((info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) && view_formats) {
       for (unsigned f = 0; f < view_formats->viewFormatCount; f++)
          if (vk_format_get_blocksize(view_formats->pViewFormats[f]) == vk_format_get_blocksize(info->format))
             view_features |= linear ? linear_features(view_formats->pViewFormats[f]) :
                              apex_format_features(view_formats->pViewFormats[f], false);
+   } else if ((info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
+              (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && features) {
+      const struct vk_format_class_info *class = vk_format_get_class_info(info->format);
+      for (unsigned f = 0; f < class->format_count; f++)
+         view_features |= linear ? linear_features(class->formats[f]) :
+                          apex_format_features(class->formats[f], false);
+   }
    if (drm) {
       const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier =
          vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
