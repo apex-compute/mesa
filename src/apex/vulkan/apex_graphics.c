@@ -42,7 +42,7 @@
  * slot (0 when the fragment stage reads no layer); the input record slots a
  * geometry shader reads. */
 struct link {
-   unsigned clip, cull, layer, primitive;
+   unsigned clip, cull, layer, viewport, primitive;
    uint64_t records;
    /* Varying slots a fragment stage reads; all when it is not known. */
    uint64_t varyings;
@@ -87,6 +87,29 @@ lower_view_index(nir_builder *b, nir_intrinsic_instr *i, void *data)
    return true;
 }
 
+/* A flat varying at `slot` that every store of output `location` also stores. */
+static nir_variable *
+link_output(nir_shader *nir, unsigned location, unsigned slot, const char *name)
+{
+   nir_variable *link = nir_variable_create(nir, nir_var_shader_out, glsl_int_type(), name);
+   link->data.location = slot;
+   link->data.interpolation = INTERP_MODE_FLAT;
+   nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+         nir_variable *var = store->intrinsic == nir_intrinsic_store_deref ?
+            nir_intrinsic_get_var(store, 0) : NULL;
+         if (!var || var->data.mode != nir_var_shader_out || var->data.location != location)
+            continue;
+         nir_builder after = nir_builder_at(nir_after_instr(instr));
+         nir_store_var(&after, link, store->src[1].ssa, 1);
+      }
+   }
+   return link;
+}
+
 static bool
 lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, struct link d)
 {
@@ -96,26 +119,9 @@ lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, st
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder builder = nir_builder_at(nir_after_impl(impl));
    nir_builder *b = &builder;
-   nir_variable *link = NULL;
-   if (d.layer) {
-      link = nir_variable_create(nir, nir_var_shader_out, glsl_int_type(), "apex_link_layer");
-      link->data.location = d.layer;
-      link->data.interpolation = INTERP_MODE_FLAT;
-      /* Every store of gl_Layer also stores the link. */
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr_safe(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
-            nir_variable *var = store->intrinsic == nir_intrinsic_store_deref ?
-               nir_intrinsic_get_var(store, 0) : NULL;
-            if (!var || var->data.mode != nir_var_shader_out || var->data.location != VARYING_SLOT_LAYER)
-               continue;
-            nir_builder after = nir_builder_at(nir_after_instr(instr));
-            nir_store_var(&after, link, store->src[1].ssa, 1);
-         }
-      }
-   }
+   nir_variable *link = d.layer ? link_output(nir, VARYING_SLOT_LAYER, d.layer, "apex_link_layer") : NULL;
+   if (d.viewport)
+      link_output(nir, VARYING_SLOT_VIEWPORT, d.viewport, "apex_link_viewport");
    /* A geometry shader's gl_PrimitiveID, which its pass-through program
     * carries, reaches a fragment stage reading it as a flat varying. */
    nir_variable *primitive = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_ID);
@@ -1329,8 +1335,9 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
    bool identity = true;
    for (unsigned a = 0; a < attachments; a++)
       identity &= cal->color_map[a] == a;
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_shader_out, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, true);
    if (!identity) {
-      NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, true);
       nir_foreach_shader_out_variable_safe(var, nir) {
          if (var->data.location < FRAG_RESULT_DATA0)
             continue;
@@ -1371,6 +1378,23 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
       layer = nir_imm_int(&start, 0);
    }
    nir_def *view = multiview ? layer : nir_imm_int(&start, 0);
+   nir_variable *viewport = nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_VIEWPORT);
+   if (viewport && d.viewport) {
+      viewport->data.location = d.viewport;
+      viewport->data.interpolation = INTERP_MODE_FLAT;
+   } else if (viewport) {
+      nir_foreach_block(block, entry) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+            if (load->intrinsic == nir_intrinsic_load_deref && nir_intrinsic_get_var(load, 0) == viewport) {
+               nir_builder at = nir_builder_at(nir_before_instr(instr));
+               nir_def_replace(&load->def, nir_imm_zero(&at, load->def.num_components, load->def.bit_size));
+            }
+         }
+      }
+   }
    nir_def *primitive = NULL;
    if (d.primitive) {
       nir_variable *in = nir_variable_create(nir, nir_var_shader_in, glsl_int_type(), "apex_link_primitive");
@@ -1392,6 +1416,10 @@ lower_fragment(nir_shader *nir, const struct vk_graphics_pipeline_state *state, 
       }
    }
    nir_progress(true, entry, nir_metadata_control_flow);
+   if (viewport && !d.viewport) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in, NULL);
+   }
    if (varyings) {
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_builder builder = nir_builder_at(nir_before_impl(impl));
@@ -1791,17 +1819,28 @@ layer_slot(nir_shader *vertex, nir_shader *fragment, bool multiview)
    return free_slot(vertex, fragment, 0);
 }
 
-/* The varying slot linking a geometry shader's gl_PrimitiveID to a fragment
- * stage that reads it, beside the layer's slot; zero otherwise. */
+/* The varying slot linking the viewport index to a fragment stage that reads
+ * it, beside `taken`; zero when the index is always zero or no slot is free. */
 static unsigned
-primitive_slot(nir_shader *geometry, nir_shader *fragment, unsigned layer)
+viewport_slot(nir_shader *last, nir_shader *fragment, uint32_t taken)
+{
+   if (!nir_find_variable_with_location(fragment, nir_var_shader_in, VARYING_SLOT_VIEWPORT) ||
+       !nir_find_variable_with_location(last, nir_var_shader_out, VARYING_SLOT_VIEWPORT))
+      return 0;
+   return free_slot(last, fragment, taken);
+}
+
+/* The varying slot linking a geometry shader's gl_PrimitiveID to a fragment
+ * stage that reads it, beside `taken`; zero otherwise. */
+static unsigned
+primitive_slot(nir_shader *geometry, nir_shader *fragment, uint32_t taken)
 {
    bool reads = BITSET_TEST(fragment->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID);
    nir_foreach_variable_with_modes(var, fragment, nir_var_system_value)
       reads |= var->data.location == SYSTEM_VALUE_PRIMITIVE_ID;
    if (!reads || !nir_find_variable_with_location(geometry, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_ID))
       return 0;
-   return free_slot(geometry, fragment, layer ? BITFIELD_BIT(layer - VARYING_SLOT_VAR0) : 0);
+   return free_slot(geometry, fragment, taken);
 }
 
 /* The lowest of varyings 0-29 that neither stage uses nor `taken` holds. */
@@ -1873,8 +1912,11 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
       if (link.clip + link.cull > 8)
          link.clip = link.cull = 0;
       link.layer = layer_slot(last, fragment, state && state->mv && state->mv->view_mask);
+      uint32_t taken = link.layer ? BITFIELD_BIT(link.layer - VARYING_SLOT_VAR0) : 0;
+      link.viewport = viewport_slot(last, fragment, taken);
+      taken |= link.viewport ? BITFIELD_BIT(link.viewport - VARYING_SLOT_VAR0) : 0;
       if (geometry)
-         link.primitive = primitive_slot(geometry, fragment, link.layer);
+         link.primitive = primitive_slot(geometry, fragment, taken);
    }
    VkResult result = VK_SUCCESS;
    for (uint32_t i = 0; i < count; i++) {
