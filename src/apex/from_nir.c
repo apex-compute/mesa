@@ -1865,9 +1865,11 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       emit(c, APEX_S_ANDN2, *state, *state, m, 0, 0);
       if (terminate) {
          set_exec(c, op2(c, APEX_S_ANDN2, false, apex_phys(APEX_EXEC), m));
-         if (c->loop && c->loop->divergent) {
-            emit(c, APEX_S_ANDN2, c->loop->iter, c->loop->iter, m, 0, 0);
-            emit(c, APEX_S_ANDN2, c->loop->live, c->loop->live, m, 0, 0);
+         for (struct loop_state *l = c->loop; l; l = l->parent) {
+            if (!l->divergent)
+               continue;
+            emit(c, APEX_S_ANDN2, l->iter, l->iter, m, 0, 0);
+            emit(c, APEX_S_ANDN2, l->live, l->live, m, 0, 0);
          }
          branch(c, APEX_S_CBRANCH_EXECZ, 0, c->restore);
       }
@@ -2755,6 +2757,121 @@ static bool forward_indirect_stores(nir_shader *nir)
    return progress;
 }
 
+static bool constant_path(nir_deref_instr *d)
+{
+   for (; d->deref_type != nir_deref_type_var; d = nir_deref_instr_parent(d)) {
+      if (d->deref_type == nir_deref_type_array ? !nir_src_is_const(d->arr.index) :
+          d->deref_type != nir_deref_type_struct)
+         return false;
+   }
+   return true;
+}
+
+static nir_deref_instr *rebuild_deref(nir_builder *b, nir_deref_instr *d)
+{
+   if (d->deref_type == nir_deref_type_var)
+      return nir_build_deref_var(b, d->var);
+   nir_deref_instr *parent = rebuild_deref(b, nir_deref_instr_parent(d));
+   if (d->deref_type == nir_deref_type_struct)
+      return nir_build_deref_struct(b, parent, d->strct.index);
+   return nir_build_deref_array_imm(b, parent, nir_src_as_int(d->arr.index));
+}
+
+struct constant_temp { bool bad; struct util_dynarray stores; };
+
+/* A local whose every write stores the same constant to a constant element
+ * reads that constant or undef, so its writes move to the start. */
+static bool hoist_constant_temps(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      struct hash_table *vars = _mesa_pointer_hash_table_create(NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *d = nir_instr_as_deref(instr);
+            nir_variable *var = nir_deref_instr_get_variable(d);
+            if (!var || !nir_deref_mode_is(d, nir_var_function_temp))
+               continue;
+            struct hash_entry *e = _mesa_hash_table_search(vars, var);
+            if (!e) {
+               struct constant_temp *t = rzalloc(vars, struct constant_temp);
+               util_dynarray_init(&t->stores, t);
+               e = _mesa_hash_table_insert(vars, var, t);
+            }
+            struct constant_temp *t = e->data;
+            nir_foreach_use_including_if(use, &d->def) {
+               if (nir_src_is_if(use)) {
+                  t->bad = true;
+                  continue;
+               }
+               nir_instr *user = nir_src_use_instr(use);
+               if (user->type == nir_instr_type_deref) {
+                  nir_deref_type type = nir_instr_as_deref(user)->deref_type;
+                  t->bad |= type != nir_deref_type_array && type != nir_deref_type_struct;
+                  continue;
+               }
+               nir_intrinsic_instr *i = user->type == nir_instr_type_intrinsic ? nir_instr_as_intrinsic(user) : NULL;
+               if (i && i->intrinsic == nir_intrinsic_load_deref)
+                  continue;
+               if (i && i->intrinsic == nir_intrinsic_store_deref && use == &i->src[0] &&
+                   nir_src_is_const(i->src[1]) && constant_path(d) &&
+                   nir_intrinsic_write_mask(i) == nir_component_mask(i->num_components)) {
+                  util_dynarray_append(&t->stores, i);
+                  continue;
+               }
+               t->bad = true;
+            }
+         }
+      }
+      hash_table_foreach(vars, e) {
+         struct constant_temp *t = e->data;
+         unsigned n = util_dynarray_num_elements(&t->stores, nir_intrinsic_instr *);
+         if (t->bad || !n)
+            continue;
+         nir_intrinsic_instr **stores = util_dynarray_begin(&t->stores);
+         bool *first = rzalloc_array(vars, bool, n);
+         bool consistent = true, moves = false;
+         for (unsigned a = 0; a < n && consistent; a++) {
+            first[a] = true;
+            moves |= stores[a]->instr.block != nir_start_block(impl);
+            for (unsigned b = 0; b < a; b++) {
+               nir_deref_instr *da = nir_src_as_deref(stores[a]->src[0]), *db = nir_src_as_deref(stores[b]->src[0]);
+               nir_deref_compare_result r = nir_compare_derefs(da, db);
+               if (r == nir_derefs_do_not_alias)
+                  continue;
+               if (!(r & nir_derefs_equal_bit) || stores[a]->num_components != stores[b]->num_components ||
+                   stores[a]->src[1].ssa->bit_size != stores[b]->src[1].ssa->bit_size) {
+                  consistent = false;
+                  break;
+               }
+               for (unsigned k = 0; k < stores[a]->num_components; k++)
+                  consistent &= nir_src_comp_as_uint(stores[a]->src[1], k) == nir_src_comp_as_uint(stores[b]->src[1], k);
+               first[a] = false;
+               break;
+            }
+         }
+         if (!consistent || !moves)
+            continue;
+         nir_builder b = nir_builder_at(nir_before_impl(impl));
+         for (unsigned a = 0; a < n; a++) {
+            if (first[a]) {
+               nir_def *value = nir_build_imm(&b, stores[a]->num_components, stores[a]->src[1].ssa->bit_size,
+                                              nir_src_as_const_value(stores[a]->src[1]));
+               nir_store_deref(&b, rebuild_deref(&b, nir_src_as_deref(stores[a]->src[0])), value,
+                               nir_component_mask(stores[a]->num_components));
+            }
+            nir_instr_remove(&stores[a]->instr);
+         }
+         progress = true;
+      }
+      _mesa_hash_table_destroy(vars, NULL);
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static void unroll(nir_shader *nir)
 {
    bool unrolled;
@@ -2835,6 +2952,7 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(_, nir, nir_lower_var_copies);
    }
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, hoist_constant_temps);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_opt_undef);
    /* Unroll before private arrays lower to memory, so constant indices
