@@ -706,6 +706,9 @@ lower_anisotropy(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ct
       sample->coord_components = tex->coord_components;
       sample->is_array = tex->is_array;
       sample->is_shadow = tex->is_shadow;
+      sample->is_new_style_shadow = tex->is_new_style_shadow;
+      sample->texture_index = tex->texture_index;
+      sample->sampler_index = tex->sampler_index;
       sample->texture_non_uniform = tex->texture_non_uniform;
       sample->sampler_non_uniform = tex->sampler_non_uniform;
       unsigned n = 0;
