@@ -9,6 +9,7 @@
 #include "apex_hw.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_format_convert.h"
 
 struct texture_lowering {
    struct apex_program *program;
@@ -263,7 +264,7 @@ decode_texel(nir_builder *b, const struct image_info *i, nir_def *address)
 static void
 encode_texel(nir_builder *b, const struct image_info *i, nir_def *address, nir_def *value)
 {
-   nir_def *words[4];
+   nir_def *words[4], *stored[4];
    for (unsigned w = 0; w < 4; w++)
       words[w] = nir_imm_int(b, 0);
    for (unsigned k = 0; k < 4; k++) {
@@ -277,6 +278,7 @@ encode_texel(nir_builder *b, const struct image_info *i, nir_def *address, nir_d
          nir_def *select = nir_iand_imm(b, nir_ushr_imm(b, i->format[0], 8 + 3 * c), 7);
          v = nir_bcsel(b, nir_ieq_imm(b, select, k), nir_channel(b, value, c), v);
       }
+      stored[k] = v;
       nir_def *full = nir_ieq_imm(b, size, 32);
       nir_def *mask = nir_bcsel(b, full, nir_imm_int(b, ~0u),
                                 nir_isub(b, nir_ishl(b, nir_imm_int(b, 1), size), nir_imm_int(b, 1)));
@@ -298,6 +300,14 @@ encode_texel(nir_builder *b, const struct image_info *i, nir_def *address, nir_d
          words[w] = nir_ior(b, words[w], nir_bcsel(b, nir_ieq_imm(b, nir_ushr_imm(b, shift, 5), w),
                                                     bits, nir_imm_int(b, 0)));
    }
+   /* Packed RGB formats replace word 0: the inverse of decode_texel. */
+   nir_def *packed9 = nir_ine_imm(b, nir_iand_imm(b, i->format[0], APEX_FORMAT_RGB9E5), 0);
+   nir_def *packed11 = nir_ine_imm(b, nir_iand_imm(b, i->format[0], APEX_FORMAT_R11G11B10), 0);
+   nir_def *small = nir_ior(b, apex_float_to_small(b, stored[0], 6, false),
+                            nir_ior(b, nir_ishl_imm(b, apex_float_to_small(b, stored[1], 6, false), 11),
+                                    nir_ishl_imm(b, apex_float_to_small(b, stored[2], 5, false), 22)));
+   nir_def *rgb9 = nir_format_pack_r9g9b9e5(b, nir_vec3(b, stored[0], stored[1], stored[2]));
+   words[0] = nir_bcsel(b, packed9, rgb9, nir_bcsel(b, packed11, small, words[0]));
    nir_def *byte = nir_channel(b, address, 0);
    nir_push_if(b, nir_ult_imm(b, i->bytes, 4));
    {
