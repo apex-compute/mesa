@@ -621,7 +621,7 @@ test_draw_pipeline(struct apex_device *device, const char *vertex_path, const ch
       const struct apex_shader *fragment = container_of(fs, struct apex_shader, vk);
       check_header(&fragment->program, 2);
       h = fragment->program.code.data;
-      CHECK((h[28] & 1) && (h[30] | h[31] << 8) == MAX2(inputs, 5));
+      CHECK((h[28] & 1) && (h[30] | h[31] << 8) == inputs);
       if (!gles)
          check_unorm16_export(&fragment->program);
    }

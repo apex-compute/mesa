@@ -3161,10 +3161,6 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    if (c.failed)
       goto done;
    place(&c, c.end);
-   /* The packer can overwrite a live wave's attribute block; five inputs
-    * (68-dword blocks, 4 waves in flight) leave the ring enough slack. */
-   if (stage == MESA_SHADER_FRAGMENT)
-      c.header.input_count = MAX2(c.header.input_count, 5);
    finish_outputs(&c);
    emit(&c, APEX_S_ENDPGM, 0, 0, 0, 0, 0);
    if (c.failed)
