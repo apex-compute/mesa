@@ -1578,6 +1578,12 @@ static void barrier(struct ctx *c, nir_intrinsic_instr *i)
    mesa_scope exec = nir_intrinsic_execution_scope(i), mem = nir_intrinsic_memory_scope(i);
    nir_variable_mode modes = nir_intrinsic_memory_modes(i);
    nir_memory_semantics sem = nir_intrinsic_memory_semantics(i);
+   /* A fence's wait makes earlier writes available at the L2; its acquire
+    * invalidates the L1 caches, making later reads see them. */
+   if (sem & NIR_MEMORY_MAKE_AVAILABLE)
+      sem = (sem & ~NIR_MEMORY_MAKE_AVAILABLE) | NIR_MEMORY_RELEASE;
+   if (sem & NIR_MEMORY_MAKE_VISIBLE)
+      sem = (sem & ~NIR_MEMORY_MAKE_VISIBLE) | NIR_MEMORY_ACQUIRE;
    if ((modes & ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_mem_global |
                   nir_var_mem_ubo | nir_var_image)) ||
        (sem & ~(NIR_MEMORY_ACQ_REL)) || exec > SCOPE_WORKGROUP) {
