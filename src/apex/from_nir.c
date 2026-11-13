@@ -4,6 +4,7 @@
 #include "apex.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_deref.h"
 #include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
@@ -1908,6 +1909,12 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       emit(c, APEX_COPY, sub(g, 1, 1), apex_phys(centroid ? 6 : 1), 0, 0, 0);
       return;
    }
+   case nir_intrinsic_load_point_coord: {
+      uint32_t g = define(c, d, true);
+      emit(c, APEX_COPY, sub(g, 0, 1), apex_phys(0), 0, 0, 0);
+      emit(c, APEX_COPY, sub(g, 1, 1), apex_phys(1), 0, 0, 0);
+      return;
+   }
    case nir_intrinsic_load_interpolated_input: case nir_intrinsic_load_input: {
       nir_io_semantics io = nir_intrinsic_io_semantics(i);
       unsigned component = nir_intrinsic_component(i);
@@ -2669,6 +2676,102 @@ static void keep_position_order(nir_shader *nir)
    util_dynarray_fini(&stack);
 }
 
+static bool touches_variable(nir_intrinsic_instr *i, nir_variable *var)
+{
+   for (unsigned k = 0; k < nir_intrinsic_infos[i->intrinsic].num_srcs; k++) {
+      nir_instr *def = nir_def_instr(i->src[k].ssa);
+      if (def->type != nir_instr_type_deref)
+         continue;
+      nir_deref_instr *d = nir_instr_as_deref(def);
+      if (!nir_deref_mode_may_be(d, nir_var_function_temp))
+         continue;
+      nir_variable *other = nir_deref_instr_get_variable(d);
+      if (!other || other == var)
+         return true;
+   }
+   return false;
+}
+
+static bool forwardable_store(nir_intrinsic_instr *store, nir_deref_instr *load)
+{
+   if (store->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_deref_instr *d = nir_src_as_deref(store->src[0]);
+   return d->deref_type == nir_deref_type_array && !nir_src_is_const(d->arr.index) &&
+          d->type == load->type && d->arr.index.ssa->bit_size == load->arr.index.ssa->bit_size &&
+          nir_intrinsic_write_mask(store) == nir_component_mask(glsl_get_vector_elements(d->type)) &&
+          (nir_compare_derefs(nir_deref_instr_parent(d), nir_deref_instr_parent(load)) & nir_derefs_equal_bit);
+}
+
+static bool forward_indirect_stores(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+            if (load->intrinsic != nir_intrinsic_load_deref)
+               continue;
+            nir_deref_instr *ld = nir_src_as_deref(load->src[0]);
+            nir_variable *var = nir_deref_instr_get_variable(ld);
+            if (!var || !nir_deref_mode_is(ld, nir_var_function_temp) || ld->deref_type != nir_deref_type_array ||
+                !glsl_type_is_vector_or_scalar(ld->type))
+               continue;
+            struct util_dynarray stores;
+            util_dynarray_init(&stores, NULL);
+            for (nir_instr *p = nir_instr_prev(instr), *next; p; p = next) {
+               next = nir_instr_prev(p);
+               if (p->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(p);
+               if (!touches_variable(i, var))
+                  continue;
+               if (!forwardable_store(i, ld))
+                  break;
+               nir_instr_remove(p);
+               nir_instr_insert_after(instr, p);
+               util_dynarray_append(&stores, i);
+            }
+            if (!util_dynarray_num_elements(&stores, nir_intrinsic_instr *)) {
+               util_dynarray_fini(&stores);
+               continue;
+            }
+            nir_builder b = nir_builder_at(nir_after_instr(instr));
+            nir_def *result = &load->def;
+            for (unsigned k = util_dynarray_num_elements(&stores, nir_intrinsic_instr *); k--;) {
+               nir_intrinsic_instr *store = *util_dynarray_element(&stores, nir_intrinsic_instr *, k);
+               nir_deref_instr *sd = nir_src_as_deref(store->src[0]);
+               result = nir_bcsel(&b, nir_ieq(&b, sd->arr.index.ssa, ld->arr.index.ssa), store->src[1].ssa, result);
+            }
+            nir_def_rewrite_uses_after_instr(&load->def, result, nir_def_instr(result));
+            util_dynarray_fini(&stores);
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+static void unroll(nir_shader *nir)
+{
+   bool unrolled;
+   do {
+      unrolled = false;
+      NIR_PASS(unrolled, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(unrolled, nir, nir_opt_copy_prop);
+      NIR_PASS(unrolled, nir, nir_opt_remove_phis);
+      NIR_PASS(unrolled, nir, nir_opt_dce);
+      NIR_PASS(unrolled, nir, nir_opt_constant_folding);
+      NIR_PASS(unrolled, nir, nir_opt_algebraic);
+      NIR_PASS(unrolled, nir, nir_opt_dead_cf);
+      NIR_PASS(unrolled, nir, nir_opt_deref);
+      NIR_PASS(unrolled, nir, nir_opt_loop_unroll);
+   } while (unrolled);
+}
+
 static int fail(struct apex_compile_result *output, const char *message)
 {
    snprintf(output->diagnostic, sizeof(output->diagnostic), "%s", message);
@@ -2732,28 +2835,20 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
       NIR_PASS(_, nir, nir_lower_var_copies);
    }
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
-   /* Graphics launches have no private base: dynamically indexed locals
-    * and inputs become selects over registers and constant slots. */
-   if (stage != MESA_SHADER_COMPUTE)
-      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp | nir_var_shader_in,
-               UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_opt_undef);
    /* Unroll before private arrays lower to memory, so constant indices
     * leave them in registers. */
-   bool unrolled;
-   do {
-      unrolled = false;
-      NIR_PASS(unrolled, nir, nir_lower_vars_to_ssa);
-      NIR_PASS(unrolled, nir, nir_opt_copy_prop);
-      NIR_PASS(unrolled, nir, nir_opt_remove_phis);
-      NIR_PASS(unrolled, nir, nir_opt_dce);
-      NIR_PASS(unrolled, nir, nir_opt_constant_folding);
-      NIR_PASS(unrolled, nir, nir_opt_algebraic);
-      NIR_PASS(unrolled, nir, nir_opt_dead_cf);
-      NIR_PASS(unrolled, nir, nir_opt_deref);
-      NIR_PASS(unrolled, nir, nir_opt_loop_unroll);
-   } while (unrolled);
+   unroll(nir);
+   /* Graphics launches have no private base: dynamically indexed locals
+    * and inputs become selects over registers and constant slots. */
+   if (stage != MESA_SHADER_COMPUTE) {
+      NIR_PASS(_, nir, nir_opt_peephole_select, &(nir_opt_peephole_select_options){.limit = 8});
+      NIR_PASS(_, nir, forward_indirect_stores);
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp | nir_var_shader_in,
+               UINT32_MAX);
+      unroll(nir);
+   }
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_in | nir_var_shader_out, NULL);
    if (stage != MESA_SHADER_COMPUTE) {
       nir_assign_io_var_locations(nir, nir_var_shader_in);
