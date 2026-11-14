@@ -293,7 +293,7 @@ bind_set(struct apex_command_buffer *cmd, VkShaderStageFlags stages, uint32_t in
       cmd->sets[index] = bound;
    }
    if (stages & VK_SHADER_STAGE_ALL_GRAPHICS) {
-      if (stages & VK_SHADER_STAGE_COMPUTE_BIT)
+      if ((stages & VK_SHADER_STAGE_COMPUTE_BIT) && bound)
          bound->refs++;
       bound_set_unref(cmd, cmd->graphics_sets[index]);
       cmd->graphics_sets[index] = bound;
@@ -313,9 +313,11 @@ apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsIn
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   /* A null set (graphics pipeline library independent sets) unbinds its index. */
    unsigned required = 0;
    for (unsigned s = 0; s < count; s++)
-      required += apex_descriptor_set_from_handle(sets[s])->layout->vk.dynamic_descriptor_count;
+      if (sets[s])
+         required += apex_descriptor_set_from_handle(sets[s])->layout->vk.dynamic_descriptor_count;
    if (required != info->dynamicOffsetCount) {
       fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -323,6 +325,10 @@ apex_CmdBindDescriptorSets2(VkCommandBuffer handle, const VkBindDescriptorSetsIn
    unsigned consumed = 0;
    for (unsigned s = 0; s < count; s++) {
       struct apex_descriptor_set *set = apex_descriptor_set_from_handle(sets[s]);
+      if (!set) {
+         bind_set(cmd, info->stageFlags, first + s, NULL);
+         continue;
+      }
       struct apex_bound_set *bound = vk_zalloc(&cmd->vk.pool->alloc,
          sizeof(*bound) + set->layout->vk.dynamic_descriptor_count * sizeof(bound->offsets[0]), 8,
          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
