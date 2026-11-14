@@ -474,6 +474,14 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       nir_def_replace(&tex->def, query_lod(b, tex, image, sampler));
       return true;
    }
+   /* The texture unit adds the sampler's bias to derived LODs only; an
+    * explicit LOD takes it here. */
+   if (tex->op == nir_texop_txl) {
+      int l = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_def *bias = nir_fmul_imm(b, nir_i2f32(b, nir_ishr_imm(b, nir_ishl_imm(b,
+         bits(b, sampler, APEX_HW_SAMPLER_BIAS, 14), 18), 18)), 1.0 / 256);
+      nir_src_rewrite(&tex->src[l].src, nir_fadd(b, tex->src[l].src.ssa, bias));
+   }
    /* The compiler encodes the instruction around both descriptors. */
    nir_tex_instr_remove_src(tex, nir_tex_instr_src_index(tex, nir_tex_src_texture_deref));
    int s = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
