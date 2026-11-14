@@ -140,13 +140,12 @@ void apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk
 struct apex_hw_binding {
    uint64_t va, size;
 };
-/* Vertex input: each binding's buffer descriptor (robust with the vertex
- * program's robustness; bytes rounded up to a dword), stride and exact byte
- * size at the apex_vi_* dwords, and the clip-distance count at dword 96. */
+/* Vertex input: each binding's robust buffer descriptor (bytes rounded up to
+ * a dword), stride and exact byte size at the apex_vi_* dwords, and the
+ * clip-distance count at dword 96. */
 void apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
                                 const struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS],
-                                unsigned clip_distances, bool robust,
-                                uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS]);
+                                unsigned clip_distances, uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS]);
 /* `late_depth` when the fragment program tests depth at commit. */
 void apex_hw_raster_block(const struct vk_dynamic_graphics_state *dyn, bool sample_shading,
                           bool late_depth, uint32_t out[APEX_HW_RASTER_DWORDS]);

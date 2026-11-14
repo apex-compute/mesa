@@ -1215,7 +1215,7 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
    uint32_t vi[APEX_HW_VERTEX_INPUT_DWORDS], raster[APEX_HW_RASTER_DWORDS];
    uint32_t ds[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS], vp[APEX_HW_VIEWPORT_DWORDS];
    apex_hw_vertex_input_block(dyn, cmd->bindings, geometry ? cmd->geometry->geometry.clip_distances :
-                              cmd->vertex->vertex.clip_distances, !geometry && cmd->vertex->vertex.robust, vi);
+                              cmd->vertex->vertex.clip_distances, vi);
    if (list) {
       struct vk_dynamic_graphics_state listed = *dyn;
       listed.ia.primitive_topology = list->topology;
@@ -1428,11 +1428,9 @@ record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *p
    }
    if (!inputs || !invocations)
       return;
-   /* The vertex shader's own vertex input block, with its clip distances
-    * and robustness. */
+   /* The vertex shader's own vertex input block, with its clip distances. */
    uint32_t vi[APEX_HW_VERTEX_INPUT_DWORDS];
-   apex_hw_vertex_input_block(dyn, cmd->bindings, cmd->vertex->vertex.clip_distances, cmd->vertex->vertex.robust,
-                              vi);
+   apex_hw_vertex_input_block(dyn, cmd->bindings, cmd->vertex->vertex.clip_distances, vi);
    uint64_t block = data_block(cmd, vi, sizeof(vi));
    uint32_t words[APEX_JOB_WORDS];
    draw_words(cmd, indexed, packet, indirect, draw, dyn->ia.primitive_topology, block, words);

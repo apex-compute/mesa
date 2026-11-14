@@ -62,7 +62,7 @@ test_vertex_input(void)
       [0] = {0x12345678c0ull, 4096}, [2] = {0xab00001000ull, 0x10003}, [17] = {0x2000ull, 88},
    };
    uint32_t w[APEX_HW_VERTEX_INPUT_DWORDS];
-   apex_hw_vertex_input_block(&dyn, bindings, 5, true, w);
+   apex_hw_vertex_input_block(&dyn, bindings, 5, w);
    /* Binding b at dword 4b: an ISA buffer descriptor {GPUVA 31:0, GPUVA
     * 39:32, bytes rounded up to a dword, robust}; its stride at dword 64 + b. */
    CHECK(w[0] == 0x345678c0 && w[1] == 0x12 && w[2] == 4096 && w[3] == 1);
@@ -76,8 +76,8 @@ test_vertex_input(void)
       CHECK(!w[k]);
    /* Dword 96: clip-distance count. */
    CHECK(w[96] == 5);
-   apex_hw_vertex_input_block(&dyn, bindings, 0, false, w);
-   CHECK(w[3] == 0 && w[11] == 0 && w[96] == 0);
+   apex_hw_vertex_input_block(&dyn, bindings, 0, w);
+   CHECK(w[96] == 0);
    /* The vertex prolog converts plain formats with 8- to 32-bit components. */
    const VkFormat vertex[] = {
       VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R16_SFLOAT, VK_FORMAT_A2B10G10R10_UNORM_PACK32,

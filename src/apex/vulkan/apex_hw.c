@@ -296,18 +296,21 @@ apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk_samp
 void
 apex_hw_vertex_input_block(const struct vk_dynamic_graphics_state *dyn,
                            const struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS],
-                           unsigned clip_distances, bool robust, uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS])
+                           unsigned clip_distances, uint32_t out[APEX_HW_VERTEX_INPUT_DWORDS])
 {
    memset(out, 0, APEX_HW_VERTEX_INPUT_DWORDS * 4);
    for (unsigned b = 0; b < APEX_HW_MAX_BINDINGS; b++) {
       /* An ISA buffer descriptor whose size covers the binding's last
        * dword, since the prolog fetches whole dwords, and the exact size
-       * for the robust prolog's attribute bounds. */
+       * for the robust prolog's attribute bounds. The descriptor is always
+       * robust: the prolog fetches every attribute a dynamically indexed
+       * input may select, and speculatively, so a non-robust program may
+       * also read past the binding. */
       uint32_t *w = &out[apex_vi_descriptor(b)];
       w[0] = (uint32_t)bindings[b].va;
       w[1] = (uint32_t)(bindings[b].va >> 32) & 0xff;
       w[2] = (uint32_t)MIN2(align64(bindings[b].size, 4), UINT32_MAX & ~3u);
-      w[3] = robust;
+      w[3] = 1;
       out[apex_vi_stride(b)] = dyn->vi_binding_strides[b];
       out[apex_vi_size(b)] = (uint32_t)MIN2(bindings[b].size, UINT32_MAX);
    }
