@@ -473,7 +473,9 @@ emit_dispatch(struct apex_command_buffer *cmd, struct apex_program *program, str
       apex_cp_dispatch(&cmd->ib, grid[0], grid[1], grid[2]);
 }
 
-/* Splits a grid into DISPATCHes whose waves fit the private arena. */
+/* Splits a grid into DISPATCHes whose waves fit the private arena and number
+ * at most 64Ki: each DISPATCH the CP issues is progress for the kernel's
+ * fence deadline, which a single long grid would otherwise outlast. */
 static void
 dispatch_grid(struct apex_command_buffer *cmd, struct apex_program *program, struct apex_table *table,
               const uint32_t origin[3], const uint32_t grid[3])
@@ -481,7 +483,10 @@ dispatch_grid(struct apex_command_buffer *cmd, struct apex_program *program, str
    table->trailer[0] = grid[0];
    table->trailer[1] = grid[1];
    table->trailer[2] = grid[2];
-   uint32_t limit = program->max_workgroups;
+   uint32_t local[3];
+   program_local_size(program, local);
+   uint32_t waves = DIV_ROUND_UP(local[0] * local[1] * local[2], 32);
+   uint32_t limit = MIN2(program->max_workgroups, MAX2(65536 / waves, 1));
    if ((uint64_t)grid[0] * grid[1] * grid[2] <= limit) {
       emit_dispatch(cmd, program, table, origin, grid, 0);
       return;
