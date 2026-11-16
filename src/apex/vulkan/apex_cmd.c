@@ -1230,10 +1230,14 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
    if (list) {
       struct vk_dynamic_graphics_state listed = *dyn;
       listed.ia.primitive_topology = list->topology;
-      apex_hw_raster_block(&listed, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
+      apex_hw_raster_block(&listed, false, apex_program_late_depth(fs), raster);
    } else {
-      apex_hw_raster_block(dyn, apex_program_sample_shading(fs), apex_program_late_depth(fs), raster);
+      apex_hw_raster_block(dyn, false, apex_program_late_depth(fs), raster);
    }
+   /* A per-sample program's pass covers its sample only. */
+   const bool per_sample = apex_program_sample_shading(fs);
+   if (per_sample)
+      raster[1] &= 1u << cmd->sample_pass;
    const struct apex_attachment *z = &cmd->rendering.depth;
    apex_hw_depth_stencil_block(dyn, z->image ? z->format : VK_FORMAT_UNDEFINED, cmd->rendering.has_depth,
                                cmd->rendering.has_stencil, ds);
@@ -1291,11 +1295,18 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
    emit_registers(cmd, APEX_STATE_FRAGMENT, cmd->state.fragment, fragment, ARRAY_SIZE(fragment),
                   fragment_patches, 5, cmd->state.fragment_program != fs);
    cmd->state.fragment_program = fs;
-   /* Fragment user data: s0:s1 table. */
-   if (!cmd->state.emitted || cmd->state.table != cmd->graphics_table) {
+   /* Fragment user data: s0:s1 table, s2 the pass's sample, s3 the
+    * rasterization sample count (from_nir.c, lower_sample_shading). */
+   const uint32_t fragment_user[2] = {
+      per_sample ? cmd->sample_pass : 0, MAX2(dyn->ms.rasterization_samples, 1),
+   };
+   if (!cmd->state.emitted || cmd->state.table != cmd->graphics_table ||
+       memcmp(cmd->state.fragment_user, fragment_user, sizeof(fragment_user))) {
       add_patch(cmd, cmd->ib.count + 2, (struct apex_patch){.kind = APEX_PATCH_TABLE,
                                                              .table = cmd->graphics_table});
-      apex_cp_set_state(&cmd->ib, APEX_STATE_FRAGMENT_USER, 2, (uint32_t[2]){0, 0});
+      apex_cp_set_state(&cmd->ib, APEX_STATE_FRAGMENT_USER, 4,
+                        (uint32_t[4]){0, 0, fragment_user[0], fragment_user[1]});
+      memcpy(cmd->state.fragment_user, fragment_user, sizeof(fragment_user));
    }
    cmd->state.table = cmd->graphics_table;
    cmd->state.view = view;
@@ -1358,6 +1369,24 @@ input_primitives(VkPrimitiveTopology topology, uint64_t vertices)
    if (!shared[topology])
       return vertices / size[topology];
    return vertices < size[topology] ? 0 : (vertices - shared[topology]) / (size[topology] - shared[topology]);
+}
+
+/* The hardware launches one fragment invocation per pixel, so a draw whose
+ * fragment program runs per sample (sample shading) replays once per sample
+ * of the sample mask, each pass with the mask cut to its sample: the
+ * samples the passes cover, or 0 for a single ordinary draw. Only the
+ * raster draws repeat: transform feedback and its queries record once, and
+ * each sample passes the depth unit, and counts into occlusion queries, in
+ * one pass only. */
+static uint32_t
+sample_passes(const struct apex_command_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!cmd->fragment || !apex_program_sample_shading(&cmd->fragment->program))
+      return 0;
+   uint32_t passes = dyn->ms.sample_mask & BITFIELD_MASK(MAX2(dyn->ms.rasterization_samples, 1));
+   /* With no sample in the mask one pass still runs the vertex stage. */
+   return passes ? passes : 1;
 }
 
 /* Transform feedback and the stream query of one draw: after the compute
@@ -1517,20 +1546,24 @@ record_geometry(struct apex_command_buffer *cmd, bool indexed, const uint32_t *p
    const struct list_draw list = {
       .table = table, .list = list_va, .list_bytes = invocations * list_bytes, .topology = lists[n],
    };
-   if (!emit_draw_state(cmd, true, view, &list))
-      return;
-   cmd->graphics_table = NULL;
-   if (indirect) {
-      add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_SCRATCH, .offset = arguments_va});
-      apex_cp_draw_indirect(&cmd->ib, true, 0, 1, 20, 0);
-      return;
-   }
    /* Pieces of whole list primitives whose vertices fit the vertex region. */
    uint64_t indices = invocations * gs->geometry.max_primitives * n;
    uint32_t capacity = APEX_POOL_VERTEX_BYTES / MAX2(gs->geometry.stride, 64) - 4 * 32;
    capacity -= capacity % n;
-   for (uint64_t first = 0; first < indices; first += capacity)
-      apex_cp_draw_indexed(&cmd->ib, MIN2(capacity, indices - first), 1, first, 0, 0);
+   u_foreach_bit(sample, sample_passes(cmd) ? sample_passes(cmd) : 1) {
+      cmd->sample_pass = sample;
+      if (!emit_draw_state(cmd, true, view, &list))
+         return;
+      cmd->graphics_table = NULL;
+      if (indirect) {
+         add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_SCRATCH,
+                                                                .offset = arguments_va});
+         apex_cp_draw_indirect(&cmd->ib, true, 0, 1, 20, 0);
+         continue;
+      }
+      for (uint64_t first = 0; first < indices; first += capacity)
+         apex_cp_draw_indexed(&cmd->ib, MIN2(capacity, indices - first), 1, first, 0, 0);
+   }
 }
 
 /* A draw of an adjacency topology without a geometry shader: the adjacency
@@ -1585,24 +1618,29 @@ record_adjacency(struct apex_command_buffer *cmd, bool indexed, const uint32_t *
       .list = list_va, .list_bytes = primitives * n * 4,
       .topology = n == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
    };
-   if (!emit_draw_state(cmd, true, view, &list))
-      return;
-   if (arguments_va) {
-      add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_SCRATCH, .offset = arguments_va});
-      apex_cp_draw_indirect(&cmd->ib, true, 0, 1, 20, 0);
-      return;
-   }
-   /* Pieces of whole list primitives, and of instances, whose vertices fit
-    * the vertex region. */
-   const uint64_t indices = primitives * n;
-   uint32_t capacity = APEX_POOL_VERTEX_BYTES / MAX2(cmd->vertex->vertex.stride, 64) - 4 * 32;
-   capacity -= capacity % n;
-   const int32_t offset = indexed ? (int32_t)packet[3] : 0;
-   const uint32_t first_instance = packet[indexed ? 4 : 3];
-   for (uint64_t first = 0; first < indices; first += capacity) {
-      uint32_t count = MIN2(capacity, indices - first), step = MAX2(capacity / count, 1);
-      for (uint32_t i = 0; i < packet[1]; i += step)
-         apex_cp_draw_indexed(&cmd->ib, count, MIN2(step, packet[1] - i), first, offset, first_instance + i);
+   u_foreach_bit(sample, sample_passes(cmd) ? sample_passes(cmd) : 1) {
+      cmd->sample_pass = sample;
+      if (!emit_draw_state(cmd, true, view, &list))
+         return;
+      if (arguments_va) {
+         add_patch(cmd, cmd->ib.count + 1, (struct apex_patch){.kind = APEX_PATCH_SCRATCH,
+                                                                .offset = arguments_va});
+         apex_cp_draw_indirect(&cmd->ib, true, 0, 1, 20, 0);
+         continue;
+      }
+      /* Pieces of whole list primitives, and of instances, whose vertices
+       * fit the vertex region. */
+      const uint64_t indices = primitives * n;
+      uint32_t capacity = APEX_POOL_VERTEX_BYTES / MAX2(cmd->vertex->vertex.stride, 64) - 4 * 32;
+      capacity -= capacity % n;
+      const int32_t offset = indexed ? (int32_t)packet[3] : 0;
+      const uint32_t first_instance = packet[indexed ? 4 : 3];
+      for (uint64_t first = 0; first < indices; first += capacity) {
+         uint32_t count = MIN2(capacity, indices - first), step = MAX2(capacity / count, 1);
+         for (uint32_t i = 0; i < packet[1]; i += step)
+            apex_cp_draw_indexed(&cmd->ib, count, MIN2(step, packet[1] - i), first, offset,
+                                 first_instance + i);
+      }
    }
 }
 
@@ -1624,7 +1662,8 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
                           topology <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
    cmd->rendering.whole |= cmd->geometry || adjacency || cmd->vertex->vertex.stores || cmd->xfb.active;
    cmd->rendering.vertices += indirect ? UINT32_MAX :
-      (uint64_t)packet[0] * packet[1] * MAX2(util_bitcount(cmd->rendering.view_mask), 1);
+      (uint64_t)packet[0] * packet[1] * MAX2(util_bitcount(cmd->rendering.view_mask), 1) *
+      MAX2(util_bitcount(sample_passes(cmd)), 1);
    uint32_t views = cmd->rendering.view_mask ? cmd->rendering.view_mask : 1;
    if (cmd->geometry) {
       u_foreach_bit(view, views) {
@@ -1643,18 +1682,23 @@ record_draw(struct apex_command_buffer *cmd, bool indexed, const uint32_t *packe
       }
       return;
    }
+   const uint32_t samples = sample_passes(cmd) ? sample_passes(cmd) : 1;
    u_foreach_bit(view, views) {
-      if (!emit_draw_state(cmd, indexed, cmd->rendering.view_mask ? view : 0, NULL))
-         return;
-      for (uint32_t d = 0; view == ffs(views) - 1 && d < (indirect ? indirect->count : 1); d++)
-         record_xfb(cmd, indexed, packet, indirect, d);
-      if (indirect)
-         apex_cp_draw_indirect(&cmd->ib, indexed, indirect->va, indirect->count, indirect->stride,
-                               indirect->count_va);
-      else if (indexed)
-         apex_cp_draw_indexed(&cmd->ib, packet[0], packet[1], packet[2], (int32_t)packet[3], packet[4]);
-      else
-         apex_cp_draw(&cmd->ib, packet[0], packet[1], packet[2], packet[3]);
+      u_foreach_bit(sample, samples) {
+         cmd->sample_pass = sample;
+         if (!emit_draw_state(cmd, indexed, cmd->rendering.view_mask ? view : 0, NULL))
+            return;
+         for (uint32_t d = 0; view == ffs(views) - 1 && sample == ffs(samples) - 1 &&
+                              d < (indirect ? indirect->count : 1); d++)
+            record_xfb(cmd, indexed, packet, indirect, d);
+         if (indirect)
+            apex_cp_draw_indirect(&cmd->ib, indexed, indirect->va, indirect->count, indirect->stride,
+                                  indirect->count_va);
+         else if (indexed)
+            apex_cp_draw_indexed(&cmd->ib, packet[0], packet[1], packet[2], (int32_t)packet[3], packet[4]);
+         else
+            apex_cp_draw(&cmd->ib, packet[0], packet[1], packet[2], packet[3]);
+      }
    }
 }
 

@@ -1892,15 +1892,30 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
    case nir_intrinsic_load_barycentric_sample: {
       bool centroid = i->intrinsic == nir_intrinsic_load_barycentric_centroid;
       bool linear = nir_intrinsic_interp_mode(i) == INTERP_MODE_NOPERSPECTIVE;
-      if (linear && centroid) {
-         failf(c, "noperspective centroid interpolation is unsupported", NULL);
-         return;
-      }
       if (centroid)
          c->header.flags |= 1u << 5;
       if (i->intrinsic == nir_intrinsic_load_barycentric_sample)
          c->header.flags |= 1u << 7;
       uint32_t g = define(c, d, true);
+      if (linear && centroid) {
+         /* Screen-space weights at the centroid from its perspective ones:
+          * weight k is proportional to its perspective weight over 1/w_k. */
+         uint32_t q[3], w[3];
+         for (unsigned k = 0; k < 3; k++) {
+            q[k] = value(c, true, 1);
+            emit(c, APEX_V_INTERP_FLAT, q[k], 0, 0, apex_raw(128 + k), 0);
+         }
+         w[1] = op2(c, APEX_V_MUL_F, true, apex_phys(5), op1(c, APEX_V_RCP, true, q[1]));
+         w[2] = op2(c, APEX_V_MUL_F, true, apex_phys(6), op1(c, APEX_V_RCP, true, q[2]));
+         uint32_t rest = op2(c, APEX_V_SUB_F, true, op2(c, APEX_V_SUB_F, true, constant(c, 0x3f800000u),
+                                                         apex_phys(5)), apex_phys(6));
+         w[0] = op2(c, APEX_V_MUL_F, true, rest, op1(c, APEX_V_RCP, true, q[0]));
+         uint32_t sum = op1(c, APEX_V_RCP, true, op2(c, APEX_V_ADD_F, true, op2(c, APEX_V_ADD_F, true, w[0], w[1]),
+                                                     w[2]));
+         emit(c, APEX_V_MUL_F, sub(g, 0, 1), w[1], sum, 0, 0);
+         emit(c, APEX_V_MUL_F, sub(g, 1, 1), w[2], sum, 0, 0);
+         return;
+      }
       if (linear) {
          /* Screen-space weights from the perspective ones: i Q / q1 and
           * j Q / q2 with the pixel's 1/w (v4) and the hidden 1/w1, 1/w2. */
@@ -1980,7 +1995,11 @@ static void emit_intrinsic(struct ctx *c, nir_intrinsic_instr *i)
       last(c)->f[3] = apex_raw(1);
       return;
    case nir_intrinsic_load_sample_id:
-      alias(c, d, launch_bits(c, 13, 3));
+      /* The pass's sample (lower_sample_shading). */
+      alias(c, d, copy(c, vec_def(c, d), apex_phys(APEX_SCALAR + 2)));
+      return;
+   case nir_intrinsic_load_rasterization_samples_amd:
+      alias(c, d, copy(c, vec_def(c, d), apex_phys(APEX_SCALAR + 3)));
       return;
    case nir_intrinsic_load_sample_mask_in:
       alias(c, d, launch_bits(c, 0, 8));
@@ -2072,6 +2091,190 @@ static void emit_cf(struct ctx *c, struct exec_list *list)
       default: failf(c, "unsupported control-flow node", NULL);
       }
    }
+}
+
+/* Sample shading and interpolation functions. The hardware launches one
+ * invocation per pixel and ignores per-sample programs, so the driver
+ * replays a per-sample program's draw once per sample with the sample mask
+ * cut to that sample (apex_cmd.c, sample_passes); fragment user data s2
+ * holds the pass's sample index (load_sample_id) and s3 the rasterization
+ * sample count (load_rasterization_samples_amd). The interpolator evaluates
+ * at pixel centres, so a barycentric at an offset extrapolates the planes
+ * that are linear in screen space: I = i Q, J = j Q and Q (1/w) for
+ * perspective weights, the weights themselves without perspective, and the
+ * depth. Their quad derivatives are taken at the top of the program, where
+ * every lane of each quad runs. */
+struct sample_planes {
+   nir_def *value[3], *dx[3], *dy[3];
+};
+
+static void
+sample_planes_build(nir_builder *b, struct sample_planes *p, nir_def **values, unsigned count)
+{
+   for (unsigned k = 0; k < count; k++) {
+      p->value[k] = values[k];
+      p->dx[k] = nir_ddx_fine(b, values[k]);
+      p->dy[k] = nir_ddy_fine(b, values[k]);
+   }
+}
+
+static nir_def *
+sample_plane_at(nir_builder *b, const struct sample_planes *p, unsigned k, nir_def *offset)
+{
+   nir_def *x = nir_fadd(b, p->value[k], nir_fmul(b, p->dx[k], nir_channel(b, offset, 0)));
+   return nir_fadd(b, x, nir_fmul(b, p->dy[k], nir_channel(b, offset, 1)));
+}
+
+/* Standard sample position of sample `n` of `samples` (1, 2, 4 or 8), in
+ * pixels from the pixel's corner: one byte {x 3:0, y 7:4} in sixteenths per
+ * sample. */
+static nir_def *
+standard_sample_position(nir_builder *b, nir_def *n, nir_def *samples)
+{
+   n = nir_iand(b, n, nir_iadd_imm(b, samples, -1));
+   nir_def *eight = nir_bcsel(b, nir_uge_imm(b, n, 4), nir_imm_int(b, 0x1ffb71d3), nir_imm_int(b, 0x359db759));
+   nir_def *word = nir_bcsel(b, nir_ieq_imm(b, samples, 8), eight,
+                   nir_bcsel(b, nir_ieq_imm(b, samples, 4), nir_imm_int(b, 0xeaa26e26),
+                   nir_bcsel(b, nir_ieq_imm(b, samples, 2), nir_imm_int(b, 0x44cc), nir_imm_int(b, 0x88))));
+   nir_def *byte = nir_ushr(b, word, nir_ishl_imm(b, nir_iand_imm(b, n, 3), 3));
+   nir_def *x = nir_u2f32(b, nir_iand_imm(b, byte, 15));
+   nir_def *y = nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, byte, 4), 15));
+   return nir_fmul_imm(b, nir_vec2(b, x, y), 1.0 / 16.0);
+}
+
+static bool
+lower_sample_shading(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   const bool per_sample = nir->info.fs.uses_sample_shading;
+   bool perspective = false, linear = false, depth = false, any = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+         switch (i->intrinsic) {
+         case nir_intrinsic_load_barycentric_sample:
+            if (!per_sample)
+               break;
+            FALLTHROUGH;
+         case nir_intrinsic_load_barycentric_at_offset: case nir_intrinsic_load_barycentric_at_sample:
+            if (nir_intrinsic_interp_mode(i) == INTERP_MODE_NOPERSPECTIVE)
+               linear = true;
+            else
+               perspective = true;
+            any = true;
+            break;
+         case nir_intrinsic_load_frag_coord:
+            if (per_sample)
+               depth = perspective = any = true;
+            break;
+         case nir_intrinsic_load_sample_pos: case nir_intrinsic_load_sample_pos_or_center:
+            any = true;
+            break;
+         case nir_intrinsic_load_sample_mask_in:
+            any |= per_sample;
+            break;
+         case nir_intrinsic_store_output:
+            any |= per_sample && nir_intrinsic_io_semantics(i).location == FRAG_RESULT_SAMPLE_MASK;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   if (!any)
+      return nir_no_progress(impl);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *sample = nir_load_sample_id(&b);
+   nir_def *samples = nir_load_rasterization_samples_amd(&b);
+   nir_def *position = standard_sample_position(&b, sample, samples);
+   nir_def *coord = NULL;
+   struct sample_planes persp = {0}, lin = {0}, z = {0};
+   if (perspective || depth)
+      coord = nir_load_frag_coord(&b);
+   if (perspective) {
+      nir_def *bary = nir_load_barycentric_pixel(&b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+      nir_def *q = nir_channel(&b, coord, 3);
+      nir_def *values[3] = {nir_fmul(&b, nir_channel(&b, bary, 0), q), nir_fmul(&b, nir_channel(&b, bary, 1), q), q};
+      sample_planes_build(&b, &persp, values, 3);
+   }
+   if (linear) {
+      nir_def *bary = nir_load_barycentric_pixel(&b, 32, .interp_mode = INTERP_MODE_NOPERSPECTIVE);
+      nir_def *values[2] = {nir_channel(&b, bary, 0), nir_channel(&b, bary, 1)};
+      sample_planes_build(&b, &lin, values, 2);
+   }
+   if (depth) {
+      nir_def *values[1] = {nir_channel(&b, coord, 2)};
+      sample_planes_build(&b, &z, values, 1);
+   }
+   nir_def *sample_offset = nir_fadd_imm(&b, position, -0.5);
+   nir_def *sample_bit = nir_ishl(&b, nir_imm_int(&b, 1), sample);
+   nir_instr *first = coord ? nir_def_instr(coord) : NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+         b.cursor = nir_after_instr(instr);
+         nir_def *offset = NULL, *r = NULL;
+         switch (i->intrinsic) {
+         case nir_intrinsic_load_barycentric_sample:
+            if (!per_sample)
+               continue;
+            offset = sample_offset;
+            break;
+         case nir_intrinsic_load_barycentric_at_offset:
+            offset = i->src[0].ssa;
+            break;
+         case nir_intrinsic_load_barycentric_at_sample:
+            b.cursor = nir_before_instr(instr);
+            offset = nir_fadd_imm(&b, standard_sample_position(&b, i->src[0].ssa, samples), -0.5);
+            break;
+         case nir_intrinsic_load_sample_pos: case nir_intrinsic_load_sample_pos_or_center:
+            r = position;
+            break;
+         case nir_intrinsic_load_frag_coord: {
+            /* Each pass's fragment is its sample's: the sample position,
+             * depth and 1/w there. */
+            if (!per_sample || instr == first)
+               continue;
+            nir_def *pixel = nir_ffloor(&b, nir_trim_vector(&b, &i->def, 2));
+            nir_def *xy = nir_fadd(&b, pixel, position);
+            r = nir_vec4(&b, nir_channel(&b, xy, 0), nir_channel(&b, xy, 1),
+                         sample_plane_at(&b, &z, 0, sample_offset), sample_plane_at(&b, &persp, 2, sample_offset));
+            nir_def_rewrite_uses_after(&i->def, r);
+            continue;
+         }
+         case nir_intrinsic_load_sample_mask_in:
+            if (!per_sample)
+               continue;
+            r = nir_iand(&b, &i->def, sample_bit);
+            nir_def_rewrite_uses_after(&i->def, r);
+            continue;
+         case nir_intrinsic_store_output:
+            if (!per_sample || nir_intrinsic_io_semantics(i).location != FRAG_RESULT_SAMPLE_MASK)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&i->src[0], nir_iand(&b, i->src[0].ssa, sample_bit));
+            continue;
+         default:
+            continue;
+         }
+         if (offset) {
+            b.cursor = nir_before_instr(instr);
+            if (nir_intrinsic_interp_mode(i) == INTERP_MODE_NOPERSPECTIVE) {
+               r = nir_vec2(&b, sample_plane_at(&b, &lin, 0, offset), sample_plane_at(&b, &lin, 1, offset));
+            } else {
+               nir_def *w = nir_frcp(&b, sample_plane_at(&b, &persp, 2, offset));
+               r = nir_vec2(&b, nir_fmul(&b, sample_plane_at(&b, &persp, 0, offset), w),
+                            nir_fmul(&b, sample_plane_at(&b, &persp, 1, offset), w));
+            }
+         }
+         nir_def_replace(&i->def, r);
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_control_flow);
 }
 
 /* Standalone resources and launch values. */
@@ -3017,6 +3220,8 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    NIR_PASS(_, nir, nir_lower_int64);
    NIR_PASS(_, nir, nir_lower_64bit_phis);
    NIR_PASS(_, nir, nir_lower_system_values);
+   if (stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, lower_sample_shading);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_launch, nir_metadata_control_flow, NULL);
    if (stage == MESA_SHADER_COMPUTE) {
       const nir_lower_compute_system_values_options geometry = {.lower_cs_local_id_to_index = true};
@@ -3157,7 +3362,8 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
          c.header.flags |= 1u << 3;
       if (nir->info.fs.early_fragment_tests || !(c.header.flags & 0x1e))
          c.header.flags |= 1u;
-      /* Sample shading runs every sample as its own lane. */
+      /* Sample shading: the driver replays the draw once per sample
+       * (lower_sample_shading); the hardware ignores the bit. */
       if (nir->info.fs.uses_sample_shading)
          c.header.flags |= 1u << 7;
    }

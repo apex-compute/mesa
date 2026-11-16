@@ -174,6 +174,9 @@ struct apex_command_buffer {
    struct vk_sample_locations_state sample_locations;
    struct apex_hw_binding bindings[APEX_HW_MAX_BINDINGS];
    struct { uint64_t va, size; uint32_t type; } index;
+   /* The sample a per-sample fragment program's draw is replaying
+    * (sample_passes). */
+   uint32_t sample_pass;
    /* The graphics table of the last draw, reused until bindings change. */
    struct apex_table *graphics_table;
    /* State blocks and registers last emitted: blocks by contents, register
@@ -183,7 +186,7 @@ struct apex_command_buffer {
       uint32_t vertex[11], fragment[10], dynamic[APEX_HW_DYNAMIC_DWORDS];
       struct apex_program *vertex_program, *fragment_program;
       struct apex_table *table;
-      uint32_t view;
+      uint32_t view, fragment_user[2];
       uint64_t blocks[5];
       uint32_t vertex_input[APEX_HW_VERTEX_INPUT_DWORDS], raster[APEX_HW_RASTER_DWORDS],
                depth_stencil[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS],
