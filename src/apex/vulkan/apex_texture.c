@@ -258,6 +258,21 @@ decode_texel(nir_builder *b, const struct image_info *i, nir_def *address)
    return nir_vec(b, out, 4);
 }
 
+/* An out-of-bounds texel under robust access: zero for the format's
+ * channels, and the swizzle's default (one for a missing alpha) for the rest. */
+static nir_def *
+oob_texel(nir_builder *b, const struct image_info *i)
+{
+   nir_def *integer = nir_ine_imm(b, nir_iand_imm(b, i->format[0], 1u << 20), 0);
+   nir_def *one = nir_bcsel(b, integer, nir_imm_int(b, 1), nir_imm_float(b, 1.0f));
+   nir_def *out[4];
+   for (unsigned c = 0; c < 4; c++) {
+      nir_def *select = nir_iand_imm(b, nir_ushr_imm(b, i->format[0], 8 + 3 * c), 7);
+      out[c] = nir_bcsel(b, nir_ieq_imm(b, select, APEX_SWIZZLE_1), one, nir_imm_int(b, 0));
+   }
+   return nir_vec(b, out, 4);
+}
+
 /* Stores RGBA components (FP32 bits or integers) as one texel of the format
  * words: the inverse of decode_texel. Sub-word texels merge into their word
  * with atomics so neighbouring invocations never overwrite each other. */
@@ -440,7 +455,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
          img.format[k] = row_word(b, image_row, 4 + k);
       img.bytes = nir_iand_imm(b, img.format[0], 31);
       nir_def *inside = nir_ult(b, coord, row_word(b, image_row, 3));
-      nir_def *zero = nir_imm_zero(b, 4, 32);
+      nir_def *zero = oob_texel(b, &img);
       nir_push_if(b, inside);
       nir_def *value = decode_texel(b, &img, nir_build_addr_iadd(b, address,
          nir_address_format_2x32bit_global, nir_var_mem_global, nir_imul(b, coord, img.bytes)));
@@ -635,7 +650,7 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       nir_def *base = nir_vec2(b, nir_channel(b, d, 0), nir_iand_imm(b, nir_channel(b, d, 1), 0xff));
       address = nir_build_addr_iadd(b, base, nir_address_format_2x32bit_global, nir_var_mem_global, offset);
    }
-   nir_def *zero = nir_imm_zero(b, load ? 4 : 1, 32);
+   nir_def *zero = load ? oob_texel(b, &img) : nir_imm_zero(b, 1, 32);
    nir_push_if(b, inside);
    nir_def *result = NULL;
    if (load) {
