@@ -271,14 +271,16 @@ apex_program_layout(struct apex_program *program, uint32_t set_count,
 }
 
 /* Buffer accesses become 32-bit components before descriptor lowering, which
- * addresses buffers in dwords: 64-bit values split into pairs. */
+ * addresses buffers in dwords: 64-bit values split into pairs. A store below
+ * dword alignment becomes masked atomics of one dword at a time. */
 static nir_mem_access_size_align
 buffer_access_size(nir_intrinsic_op op, uint8_t bytes, uint8_t bit_size, uint32_t align_mul,
                    uint32_t align_offset, bool offset_is_const, enum gl_access_qualifier access,
                    const void *data)
 {
+   bool unaligned_store = op == nir_intrinsic_store_ssbo && nir_combined_align(align_mul, align_offset) < 4;
    return (nir_mem_access_size_align){
-      .num_components = MAX2(MIN2(bytes / 4, 4), 1), .bit_size = 32, .align = 4,
+      .num_components = unaligned_store ? 1 : MAX2(MIN2(bytes / 4, 4), 1), .bit_size = 32, .align = 4,
       .shift = nir_mem_access_shift_method_scalar,
    };
 }
