@@ -922,7 +922,7 @@ test_graphics(const char *vertex_path, const char *fragment_path, const char *xf
    /* Binding 0's buffer descriptor and stride; the vertex prolog holds the
     * attribute formats. */
    CHECK(vi[0] == (uint32_t)(buffer_va + 64) && vi[1] == ((buffer_va + 64) >> 32) &&
-         vi[2] == 4096 - 64 && vi[3] == 0);
+         vi[2] == 4096 - 64 && vi[3] == 1);
    CHECK(vi[64] == 32 && vi[96] == 0);
    /* Topology TRIANGLE_STRIP; restart applies to indexed draws. */
    CHECK(d->state[APEX_STATE_VERTEX + 8] == 4 && !d->state[APEX_STATE_VERTEX + 9]);
