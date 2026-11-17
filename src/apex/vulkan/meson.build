@@ -24,15 +24,21 @@ apex_entrypoints = custom_target('apex_entrypoints',
              '--beta', with_vulkan_beta.to_string()],
   depend_files : vk_entrypoints_gen_depend_files,
 )
-# Uninstalled development driver: instance creation requires APEX_DEVELOPMENT=1.
 apex_instance = static_library('apex_instance', ['apex_instance.c', apex_entrypoints, sha1_h],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
   dependencies : [idep_vulkan_runtime_headers, idep_vulkan_wsi_headers, idep_mesautil, dep_libdrm],
 )
+# The X11 WSI's libraries are found only with -Dvulkan-drivers; Apex is built
+# through -Dapex-compiler, so it looks them up itself.
+apex_wsi_deps = []
+if with_platform_x11
+  apex_wsi_deps += [dependency('x11-xcb'), dependency('xcb-xfixes')]
+endif
+idep_apex_wsi = declare_dependency(dependencies : [idep_vulkan_wsi, apex_wsi_deps])
 apex_icd = shared_library('vulkan_apex',
   link_whole : [apex_instance],
   link_with : [apex_pipeline, apex_nir, apex_rs],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil, dep_libdrm],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil, dep_libdrm],
   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections],
   link_depends : vulkan_icd_link_depends,
   link_language : 'cpp', gnu_symbol_visibility : 'hidden', install : false,
@@ -48,7 +54,7 @@ apex_development_icd = custom_target('apex_development_icd',
 )
 apex_instance_test = executable('apex-instance-test', ['instance_test.c', apex_entrypoints[0]],
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil, dep_libdrm, dep_dl],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil, dep_libdrm, dep_dl],
   link_with : [apex_instance, apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=drmGetDevices2', '-Wl,--wrap=drmFreeDevices',
                '-Wl,--wrap=drmGetVersion', '-Wl,--wrap=drmFreeVersion',
@@ -124,7 +130,7 @@ foreach stage : ['comp', 'vert', 'frag']
 endforeach
 apex_pipeline_test = executable('apex-pipeline-test', 'pipeline_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_language : 'cpp', install : false,
 )
@@ -150,14 +156,14 @@ test('apex-pipeline', apex_pipeline_test,
   args : [apex_pipeline_spv, apex_descriptors_spv, apex_atomics_spv, apex_reindex_spv, apex_dispatch_spv, apex_multiple_spv, apex_scalar_spv, apex_images_spv, apex_rgba_spv] + apex_bench_test_spv, suite : ['apex'], env : apex_test_env)
 apex_hw_test = executable('apex-hw-test', 'hw_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_language : 'cpp', install : false,
 )
 test('apex-hw', apex_hw_test, suite : ['apex'], env : apex_test_env)
 apex_cp_test = executable('apex-cp-test', 'cp_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
@@ -165,7 +171,7 @@ apex_cp_test = executable('apex-cp-test', 'cp_test.c',
 
 apex_external_memory_test = executable('apex-external-memory-test', 'external_memory_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil],
   link_with : [apex_pipeline, apex_nir, apex_rs],
   link_args : ['-Wl,--wrap=ioctl'],
   link_language : 'cpp', install : false,
@@ -173,7 +179,7 @@ apex_external_memory_test = executable('apex-external-memory-test', 'external_me
 test('apex-external-memory', apex_external_memory_test, suite : ['apex'])
 apex_sync_test = executable('apex-sync-test', 'sync_test.c',
   include_directories : [inc_include, inc_src, inc_vulkan_util],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_wsi, idep_nir, idep_mesautil],
+  dependencies : [idep_vulkan_runtime, idep_apex_wsi, idep_nir, idep_mesautil],
   link_args : ['-Wl,--wrap=cnd_wait'],
   link_language : 'cpp', install : false,
 )

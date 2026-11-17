@@ -137,10 +137,6 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
    CHECK(!gipa(VK_NULL_HANDLE, "vkDestroyInstance"));
    CHECK(!gipa(VK_NULL_HANDLE, "vkNotAFunction"));
    VkInstanceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-   CHECK(!unsetenv("APEX_DEVELOPMENT"));
-   CHECK(create(&info, NULL, &instance) == VK_ERROR_INCOMPATIBLE_DRIVER);
-   CHECK(instance == VK_NULL_HANDLE);
-   CHECK(!setenv("APEX_DEVELOPMENT", "1", 1));
    const char *unsupported = "VK_KHR_win32_surface";
    info.enabledExtensionCount = 1;
    info.ppEnabledExtensionNames = &unsupported;

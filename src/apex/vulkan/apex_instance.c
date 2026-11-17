@@ -26,8 +26,8 @@
 #include <unistd.h>
 #include <xf86drm.h>
 
-/* Development protocol only. This compute subset is not a conformant Vulkan
- * device. The library/manifest are uninstalled and instance creation is opt-in. */
+/* Not a conformant Vulkan driver. The library and manifest are not installed:
+ * an application selects them with VK_DRIVER_FILES. */
 #define APEX_DEVELOPMENT_API VK_API_VERSION_1_4
 #define APEX_SAMPLE_COUNTS (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | \
                             VK_SAMPLE_COUNT_8_BIT)
@@ -867,9 +867,6 @@ apex_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallback
                      VkInstance *out)
 {
    *out = VK_NULL_HANDLE;
-   const char *development = os_get_option("APEX_DEVELOPMENT");
-   if (!development || strcmp(development, "1"))
-      return VK_ERROR_INCOMPATIBLE_DRIVER;
    alloc = alloc ? alloc : vk_default_allocator();
    struct vk_instance *instance = vk_zalloc(alloc, sizeof(*instance), 8,
                                            VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
@@ -885,7 +882,6 @@ apex_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallback
    }
    instance->physical_devices.try_create_for_drm = try_create_physical;
    instance->physical_devices.destroy = destroy_physical;
-   mesa_logw("Apex development driver");
    *out = vk_instance_to_handle(instance);
    return VK_SUCCESS;
 }
