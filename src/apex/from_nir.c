@@ -2811,6 +2811,93 @@ static bool widen_boolean_lane_read(nir_builder *b, nir_intrinsic_instr *i, void
 }
 
 /* A 32-bit boolean becomes a lane mask by comparing it with zero. */
+static nir_def *div64_digit(nir_builder *b, nir_def *q, nir_def *rhat, nir_def *vn1, nir_def *vn0,
+                            nir_def *un)
+{
+      nir_def *digit = nir_imm_int(b, 0x10000);
+   nir_def *c = nir_ior(b, nir_uge(b, q, digit),
+                        nir_ult(b, nir_iadd(b, nir_ishl_imm(b, rhat, 16), un), nir_imul(b, q, vn0)));
+   q = nir_isub(b, q, nir_b2i32(b, c));
+   rhat = nir_bcsel(b, c, nir_iadd(b, rhat, vn1), rhat);
+   nir_def *c2 = nir_iand(b, nir_iand(b, c, nir_ult(b, rhat, digit)),
+                          nir_ior(b, nir_uge(b, q, digit),
+                                  nir_ult(b, nir_iadd(b, nir_ishl_imm(b, rhat, 16), un),
+                                          nir_imul(b, q, vn0))));
+   return nir_isub(b, q, nir_b2i32(b, c2));
+}
+
+static nir_def *div64_by32(nir_builder *b, nir_def *u1, nir_def *u0, nir_def *v)
+{
+   nir_def *s = nir_isub_imm(b, 31, nir_ufind_msb(b, v));
+   nir_def *vn = nir_ishl(b, v, s);
+   nir_def *vn1 = nir_ushr_imm(b, vn, 16), *vn0 = nir_iand_imm(b, vn, 0xffff);
+      nir_def *un32 = nir_ior(b, nir_ishl(b, u1, s), nir_ushr(b, nir_ushr_imm(b, u0, 1), nir_isub_imm(b, 31, s)));
+   nir_def *un10 = nir_ishl(b, u0, s);
+   nir_def *un1 = nir_ushr_imm(b, un10, 16), *un0 = nir_iand_imm(b, un10, 0xffff);
+   nir_def *q1 = nir_udiv(b, un32, vn1);
+   q1 = div64_digit(b, q1, nir_isub(b, un32, nir_imul(b, q1, vn1)), vn1, vn0, un1);
+   nir_def *un21 = nir_isub(b, nir_iadd(b, nir_ishl_imm(b, un32, 16), un1), nir_imul(b, q1, vn));
+   nir_def *q0 = nir_udiv(b, un21, vn1);
+   q0 = div64_digit(b, q0, nir_isub(b, un21, nir_imul(b, q0, vn1)), vn1, vn0, un0);
+   return nir_iadd(b, nir_ishl_imm(b, q1, 16), q0);
+}
+
+static void udivmod64(nir_builder *b, nir_def *n, nir_def *d, nir_def **q, nir_def **r)
+{
+   nir_def *nl = nir_unpack_64_2x32_split_x(b, n), *nh = nir_unpack_64_2x32_split_y(b, n);
+   nir_def *dl = nir_unpack_64_2x32_split_x(b, d), *dh = nir_unpack_64_2x32_split_y(b, d);
+   nir_def *dh0 = nir_ieq_imm(b, dh, 0);
+      nir_def *qh = nir_udiv(b, nh, dl);
+   nir_def *rh = nir_isub(b, nh, nir_imul(b, qh, dl));
+      nir_def *s = nir_isub_imm(b, 31, nir_ufind_msb(b, dh));
+   nir_def *v1 = nir_ior(b, nir_ishl(b, dh, s), nir_ushr(b, nir_ushr_imm(b, dl, 1), nir_isub_imm(b, 31, s)));
+   nir_def *n1h = nir_ushr_imm(b, nh, 1);
+   nir_def *n1l = nir_ior(b, nir_ushr_imm(b, nl, 1), nir_ishl_imm(b, nh, 31));
+   nir_def *qd = div64_by32(b, nir_bcsel(b, dh0, rh, n1h), nir_bcsel(b, dh0, nl, n1l),
+                            nir_bcsel(b, dh0, dl, v1));
+   nir_def *q0 = nir_ushr(b, qd, nir_isub_imm(b, 31, s));
+   q0 = nir_isub(b, q0, nir_b2i32(b, nir_ine_imm(b, q0, 0)));
+   nir_def *plo = nir_imul(b, q0, dl);
+   nir_def *phi = nir_iadd(b, nir_umul_high(b, q0, dl), nir_imul(b, q0, dh));
+   nir_def *rlo = nir_isub(b, nl, plo);
+   nir_def *rhi = nir_isub(b, nir_isub(b, nh, phi), nir_b2i32(b, nir_ult(b, nl, plo)));
+   nir_def *ge = nir_ior(b, nir_ult(b, dh, rhi), nir_iand(b, nir_ieq(b, rhi, dh), nir_uge(b, rlo, dl)));
+   q0 = nir_iadd(b, q0, nir_b2i32(b, ge));
+   nir_def *ql = nir_bcsel(b, dh0, qd, q0);
+   qh = nir_bcsel(b, dh0, qh, nir_imm_int(b, 0));
+   nir_def *mlo = nir_imul(b, ql, dl);
+   nir_def *mhi = nir_iadd(b, nir_iadd(b, nir_umul_high(b, ql, dl), nir_imul(b, ql, dh)), nir_imul(b, qh, dl));
+   *q = nir_pack_64_2x32_split(b, ql, qh);
+   *r = nir_pack_64_2x32_split(b, nir_isub(b, nl, mlo),
+                               nir_isub(b, nir_isub(b, nh, mhi), nir_b2i32(b, nir_ult(b, nl, mlo))));
+}
+
+static bool lower_div64(nir_builder *b, nir_alu_instr *a, void *data)
+{
+   if (a->def.bit_size != 64 || (a->op != nir_op_udiv && a->op != nir_op_umod && a->op != nir_op_idiv &&
+                                 a->op != nir_op_imod && a->op != nir_op_irem))
+      return false;
+   b->cursor = nir_before_instr(&a->instr);
+   nir_def *n = nir_ssa_for_alu_src(b, a, 0), *d = nir_ssa_for_alu_src(b, a, 1), *q, *r, *result;
+   bool is_signed = a->op != nir_op_udiv && a->op != nir_op_umod;
+   nir_def *n_neg = nir_ilt_imm(b, nir_unpack_64_2x32_split_y(b, n), 0);
+   nir_def *d_neg = nir_ilt_imm(b, nir_unpack_64_2x32_split_y(b, d), 0);
+   udivmod64(b, is_signed ? nir_iabs(b, n) : n, is_signed ? nir_iabs(b, d) : d, &q, &r);
+      nir_def *rem = nir_bcsel(b, n_neg, nir_ineg(b, r), r);
+   switch (a->op) {
+   case nir_op_udiv: result = q; break;
+   case nir_op_umod: result = r; break;
+   case nir_op_idiv: result = nir_bcsel(b, nir_ine(b, n_neg, d_neg), nir_ineg(b, q), q); break;
+   case nir_op_irem: result = rem; break;
+   default:
+      result = nir_bcsel(b, nir_ieq_imm(b, r, 0), nir_imm_int64(b, 0),
+                         nir_bcsel(b, nir_ieq(b, n_neg, d_neg), rem, nir_iadd(b, rem, d)));
+      break;
+   }
+   nir_def_replace(&a->def, result);
+   return true;
+}
+
 static bool lower_b2b1(nir_builder *b, nir_alu_instr *a, void *data)
 {
    if (a->op != nir_op_b2b1)
@@ -3217,6 +3304,7 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    };
    NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &mem);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_global, nir_metadata_none, NULL);
+   NIR_PASS(_, nir, nir_shader_alu_pass, lower_div64, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_int64);
    NIR_PASS(_, nir, nir_lower_64bit_phis);
    NIR_PASS(_, nir, nir_lower_system_values);
