@@ -101,6 +101,7 @@ deref_row(nir_builder *b, struct texture_lowering *ctx, nir_deref_instr *deref, 
 struct image_info {
    nir_def *format[3];
    nir_def *bytes;
+   unsigned known;
 };
 
 /* Unsigned float with a 5-bit exponent (bias 15) and `mantissa` bits. */
@@ -178,9 +179,11 @@ decode_texel(nir_builder *b, const struct image_info *i, nir_def *address)
     * one word); 3- and 6-byte texels may start mid-word and span words, so
     * the covering words are loaded and funnel-shifted to the texel start. */
    nir_def *byte = nir_channel(b, address, 0);
-   nir_def *misalign = nir_iand_imm(b, byte, 3);
+   bool whole = i->known >= 4 && util_is_power_of_two_nonzero(i->known);
+   nir_def *misalign = whole ? nir_imm_int(b, 0) : nir_iand_imm(b, byte, 3);
    nir_def *aligned = nir_vec2(b, nir_iand_imm(b, byte, ~3u), nir_channel(b, address, 1));
-   nir_def *span = nir_iadd(b, i->bytes, misalign);
+   nir_def *span = i->known && util_is_power_of_two_nonzero(i->known) ?
+      nir_imm_int(b, MAX2(i->known, 4)) : nir_iadd(b, i->bytes, misalign);
    nir_def *raw[5], *words[4], *zero = nir_imm_int(b, 0);
    for (unsigned k = 0; k < 5; k++) {
       nir_def *present = nir_ult(b, nir_imm_int(b, k * 4), span);
@@ -449,7 +452,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
          nir_def_replace(&tex->def, row_word(b, image_row, 3));
          return true;
       }
-      struct image_info img;
+      struct image_info img = {0};
       nir_def *address = nir_vec2(b, row_word(b, image_row, 0), row_word(b, image_row, 1));
       for (unsigned k = 0; k < 3; k++)
          img.format[k] = row_word(b, image_row, 4 + k);
@@ -536,6 +539,59 @@ tiled_offset(nir_builder *b, nir_def *x, nir_def *y, nir_def *lb, nir_def *tiles
                    nir_ishl(b, within, lb));
 }
 
+static nir_def *
+image_address(nir_builder *b, const struct image_info *img, nir_def *d, nir_def *const extent[3],
+              nir_def *x, nir_def *y, nir_def *z, bool three_d)
+{
+   nir_def *tiled = nir_ine_imm(b, bits(b, d, APEX_HW_IMAGE_TILED, 1), 0);
+   nir_def *lb = img->known ? nir_imm_int(b, ffs(img->known) - 1) : nir_find_lsb(b, img->bytes);
+   /* Tiles are 64 x 64, 64 x 32, 32 x 32, 32 x 16 or 32 x 8 texels by lb;
+    * 3D slices are planes of the level, layers a layer stride apart. */
+   nir_def *tw = nir_bcsel(b, nir_ult_imm(b, lb, 2), nir_imm_int(b, 64), nir_imm_int(b, 32));
+   nir_def *th = nir_ishl(b, nir_imm_int(b, 8), nir_iadd_imm(b, nir_bcsel(b, nir_ieq_imm(b, lb, 0),
+      nir_imm_int(b, 3), nir_bcsel(b, nir_ult_imm(b, lb, 3), nir_imm_int(b, 2), nir_isub(b,
+      nir_imm_int(b, 4), lb))), 0));
+   nir_def *tiles = nir_udiv(b, nir_iadd(b, extent[0], nir_iadd_imm(b, tw, -1)), tw);
+   nir_def *plane = nir_imul_imm(b, nir_imul(b, tiles, nir_udiv(b, nir_iadd(b, extent[1],
+                                 nir_iadd_imm(b, th, -1)), th)), APEX_HW_TILE);
+   nir_def *layer_stride = nir_imul_imm(b, bits(b, d, APEX_HW_IMAGE_LAYER_STRIDE, 32), 64);
+   nir_def *linear = nir_iadd(b, nir_imul(b, y, nir_imul_imm(b, bits(b, d, APEX_HW_IMAGE_PITCH, 16), 64)),
+                              nir_imul(b, x, img->bytes));
+   nir_def *offset = nir_bcsel(b, tiled, tiled_offset(b, x, y, lb, tiles), linear);
+   offset = nir_iadd(b, offset, nir_imul(b, z, three_d ? plane : layer_stride));
+   nir_def *base = nir_vec2(b, nir_channel(b, d, 0), nir_iand_imm(b, nir_channel(b, d, 1), 0xff));
+   return nir_build_addr_iadd(b, base, nir_address_format_2x32bit_global, nir_var_mem_global, offset);
+}
+
+static nir_def *
+storage_access(nir_builder *b, nir_intrinsic_instr *i, const struct image_info *img,
+               nir_def *address, nir_def *inside)
+{
+   bool load = i->intrinsic == nir_intrinsic_image_deref_load;
+   bool store = i->intrinsic == nir_intrinsic_image_deref_store;
+   bool swap = i->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+   nir_def *zero = load ? oob_texel(b, img) : nir_imm_zero(b, 1, 32);
+   nir_push_if(b, inside);
+   nir_def *result = zero;
+   if (load) {
+      result = decode_texel(b, img, address);
+   } else if (store) {
+      nir_def *value = i->src[3].ssa;
+      nir_def *channels[4];
+      for (unsigned c = 0; c < 4; c++)
+         channels[c] = c < value->num_components ? nir_channel(b, value, c) : nir_imm_int(b, 0);
+      encode_texel(b, img, address, nir_vec(b, channels, 4));
+   } else if (swap) {
+      result = nir_global_atomic_swap_2x32(b, 32, address, i->src[3].ssa, i->src[4].ssa,
+                                           .atomic_op = nir_intrinsic_atomic_op(i));
+   } else {
+      result = nir_global_atomic_2x32(b, 32, address, i->src[3].ssa,
+                                      .atomic_op = nir_intrinsic_atomic_op(i));
+   }
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, result, zero);
+}
+
 /* Storage images take the image descriptor of the view's level and base
  * layer, then its format words; storage texel buffers the texel-buffer
  * row. Loads decode and stores encode through the view's format words, so
@@ -572,11 +628,10 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
    }
    struct row row = deref_row(b, ctx, nir_src_as_deref(i->src[0]), false, 0);
    bool array = nir_intrinsic_image_array(i);
-   struct image_info img;
-   nir_def *inside, *address;
+   struct image_info img = {0};
    nir_def *coord = size || samples ? NULL : i->src[1].ssa;
+   nir_def *result;
    if (dim == GLSL_SAMPLER_DIM_BUF) {
-      /* Texel buffers: address, byte range, elements, format words. */
       for (unsigned k = 0; k < 3; k++)
          img.format[k] = row_word(b, row, 4 + k);
       img.bytes = nir_iand_imm(b, img.format[0], 31);
@@ -585,10 +640,10 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
          return true;
       }
       nir_def *x = nir_channel(b, coord, 0);
-      inside = nir_ult(b, x, row_word(b, row, 3));
-      address = nir_build_addr_iadd(b, nir_vec2(b, row_word(b, row, 0), row_word(b, row, 1)),
-                                    nir_address_format_2x32bit_global, nir_var_mem_global,
-                                    nir_imul(b, x, img.bytes));
+      nir_def *address = nir_build_addr_iadd(b, nir_vec2(b, row_word(b, row, 0), row_word(b, row, 1)),
+                                             nir_address_format_2x32bit_global, nir_var_mem_global,
+                                             nir_imul(b, x, img.bytes));
+      result = storage_access(b, i, &img, address, nir_ult(b, x, row_word(b, row, 3)));
    } else {
       bool three_d = dim == GLSL_SAMPLER_DIM_3D, cube = dim == GLSL_SAMPLER_DIM_CUBE;
       unsigned dims = dim == GLSL_SAMPLER_DIM_1D ? 1 : three_d ? 3 : 2;
@@ -596,7 +651,6 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
       for (unsigned k = 0; k < 3; k++)
          img.format[k] = row_word(b, row, 8 + k);
       img.bytes = nir_iand_imm(b, img.format[0], 31);
-      /* Storage images have one sample; null descriptors zero levels. */
       nir_def *null = nir_ieq_imm(b, bits(b, d, APEX_HW_IMAGE_LEVELS, 5), 0);
       if (samples) {
          nir_def_replace(&i->def, nir_b2i32(b, nir_inot(b, null)));
@@ -621,60 +675,45 @@ lower_storage(nir_builder *b, nir_intrinsic_instr *i, struct texture_lowering *c
          return true;
       }
       nir_def *index[3];
-      inside = nir_inot(b, null);
+      nir_def *inside = nir_inot(b, null);
       for (unsigned a = 0; a < 3; a++) {
          index[a] = a < dims ? nir_channel(b, coord, a) : nir_imm_int(b, 0);
          if (a < dims)
             inside = nir_iand(b, inside, nir_ult(b, index[a], extent[a]));
       }
-      /* Cube images address a face (or a face of a cube) as a layer. */
       nir_def *z = three_d ? index[2] : array || cube ? nir_channel(b, coord, dims) : nir_imm_int(b, 0);
       if (!three_d)
          inside = nir_iand(b, inside, nir_ult(b, z, extent[2]));
-      nir_def *tiled = nir_ine_imm(b, bits(b, d, APEX_HW_IMAGE_TILED, 1), 0);
-      nir_def *lb = nir_find_lsb(b, img.bytes);
-      /* Tiles are 64 x 64, 64 x 32, 32 x 32, 32 x 16 or 32 x 8 texels by lb;
-       * 3D slices are planes of the level, layers a layer stride apart. */
-      nir_def *tw = nir_bcsel(b, nir_ult_imm(b, lb, 2), nir_imm_int(b, 64), nir_imm_int(b, 32));
-      nir_def *th = nir_ishl(b, nir_imm_int(b, 8), nir_iadd_imm(b, nir_bcsel(b, nir_ieq_imm(b, lb, 0),
-         nir_imm_int(b, 3), nir_bcsel(b, nir_ult_imm(b, lb, 3), nir_imm_int(b, 2), nir_isub(b,
-         nir_imm_int(b, 4), lb))), 0));
-      nir_def *tiles = nir_udiv(b, nir_iadd(b, extent[0], nir_iadd_imm(b, tw, -1)), tw);
-      nir_def *plane = nir_imul_imm(b, nir_imul(b, tiles, nir_udiv(b, nir_iadd(b, extent[1],
-                                    nir_iadd_imm(b, th, -1)), th)), APEX_HW_TILE);
-      nir_def *layer_stride = nir_imul_imm(b, bits(b, d, APEX_HW_IMAGE_LAYER_STRIDE, 32), 64);
-      nir_def *linear = nir_iadd(b, nir_imul(b, index[1], nir_imul_imm(b, bits(b, d, APEX_HW_IMAGE_PITCH, 16), 64)),
-                                 nir_imul(b, index[0], img.bytes));
-      nir_def *offset = nir_bcsel(b, tiled, tiled_offset(b, index[0], index[1], lb, tiles), linear);
-      offset = nir_iadd(b, offset, nir_imul(b, z, three_d ? plane : layer_stride));
-      nir_def *base = nir_vec2(b, nir_channel(b, d, 0), nir_iand_imm(b, nir_channel(b, d, 1), 0xff));
-      address = nir_build_addr_iadd(b, base, nir_address_format_2x32bit_global, nir_var_mem_global, offset);
+      uint32_t words[3];
+      enum pipe_format format = nir_intrinsic_format(i);
+      VkFormat vk_format = format == PIPE_FORMAT_NONE ? VK_FORMAT_UNDEFINED : vk_format_from_pipe_format(format);
+      if (vk_format != VK_FORMAT_UNDEFINED &&
+          apex_format_encode(vk_format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, words)) {
+         struct image_info known = {.known = words[0] & 31};
+         nir_def *match = nir_imm_true(b);
+         for (unsigned k = 0; k < 3; k++) {
+            known.format[k] = nir_imm_int(b, words[k]);
+            match = nir_iand(b, match, nir_ieq_imm(b, img.format[k], words[k]));
+         }
+         known.bytes = nir_imm_int(b, known.known);
+         nir_push_if(b, match);
+         nir_def *fast = storage_access(b, i, &known,
+            image_address(b, &known, d, extent, index[0], index[1], z, three_d), inside);
+         nir_push_else(b, NULL);
+         nir_def *generic = storage_access(b, i, &img,
+            image_address(b, &img, d, extent, index[0], index[1], z, three_d), inside);
+         nir_pop_if(b, NULL);
+         result = nir_if_phi(b, fast, generic);
+      } else {
+         result = storage_access(b, i, &img, image_address(b, &img, d, extent, index[0], index[1], z, three_d),
+                                 inside);
+      }
    }
-   nir_def *zero = load ? oob_texel(b, &img) : nir_imm_zero(b, 1, 32);
-   nir_push_if(b, inside);
-   nir_def *result = NULL;
-   if (load) {
-      result = decode_texel(b, &img, address);
-   } else if (store) {
-      nir_def *value = i->src[3].ssa;
-      nir_def *channels[4];
-      for (unsigned c = 0; c < 4; c++)
-         channels[c] = c < value->num_components ? nir_channel(b, value, c) : nir_imm_int(b, 0);
-      encode_texel(b, &img, address, nir_vec(b, channels, 4));
-   } else if (swap) {
-      result = nir_global_atomic_swap_2x32(b, 32, address, i->src[3].ssa, i->src[4].ssa,
-                                           .atomic_op = nir_intrinsic_atomic_op(i));
-   } else {
-      result = nir_global_atomic_2x32(b, 32, address, i->src[3].ssa,
-                                      .atomic_op = nir_intrinsic_atomic_op(i));
-   }
-   nir_pop_if(b, NULL);
-   if (store) {
+   if (i->intrinsic == nir_intrinsic_image_deref_store) {
       nir_instr_remove(&i->instr);
       return true;
    }
-   nir_def *phi = nir_if_phi(b, result, zero);
-   nir_def_replace(&i->def, nir_trim_vector(b, phi, i->def.num_components));
+   nir_def_replace(&i->def, nir_trim_vector(b, result, i->def.num_components));
    return true;
 }
 
