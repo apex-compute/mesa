@@ -632,11 +632,14 @@ static void emit_alu(struct ctx *c, nir_alu_instr *a)
       emit(c, vec ? APEX_V_MAX_I : APEX_S_MAX_I, define(c, d, vec), x, n, 0, 0);
       return;
    }
-   case nir_op_fneg: case nir_op_fabs:
-      emit(c, a->op == nir_op_fneg ? (vec ? APEX_V_XOR : APEX_S_XOR) : (vec ? APEX_V_AND : APEX_S_AND),
-           define(c, d, vec), alu_src(c, a, 0),
-           constant(c, a->op == nir_op_fneg ? 0x80000000u : 0x7fffffffu), 0, 0);
+   case nir_op_fneg: case nir_op_fabs: {
+      /* x × 1 with the modifier, so a subnormal flushes like any FP result. */
+      uint32_t hi = 0;
+      uint32_t x = fp_src(c, a, 0, 1, &hi);
+      hi = a->op == nir_op_fneg ? hi ^ 1u << 8 : (hi & ~(1u << 8)) | 1u << 11;
+      emit(c, vec ? APEX_V_MUL_F : APEX_S_MUL_F, define(c, d, vec), x, constant(c, 0x3f800000u), 0, hi);
       return;
+   }
    case nir_op_extract_u8: case nir_op_extract_i8: case nir_op_extract_u16:
    case nir_op_extract_i16: {
       unsigned bits = a->op == nir_op_extract_u8 || a->op == nir_op_extract_i8 ? 8 : 16;
