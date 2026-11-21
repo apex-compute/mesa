@@ -1,0 +1,20 @@
+#version 450
+// Uniform accumulators in a loop with a divergent trip count: the lanes
+// leaving the loop take the break side after the continuing lanes updated
+// the accumulators on the other side of a divergent if.
+layout(local_size_x = 32) in;
+layout(std430, set = 0, binding = 0) buffer Output { uint o[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Input { uint v[]; } src;
+layout(push_constant) uniform Parameters { uint n; } p;
+void main()
+{
+   uint l = gl_LocalInvocationIndex;
+   uint sum = 0u;
+   bool odd = false;
+   for (uint i = 0u; i < l + p.n; i++) {
+      sum += src.v[i];
+      odd = odd != ((src.v[i] & 1u) != 0u);
+   }
+   o[l] = sum;
+   o[32u + l] = odd ? 1u : 0u;
+}

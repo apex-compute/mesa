@@ -46,6 +46,9 @@ struct apex_shader {
       /* Tests run before shading even with alpha to coverage. */
       bool early_fragment_tests;
    } fragment;
+   /* A vertex stage whose fragment stage reads gl_PrimitiveID without a
+    * geometry stage draws through this pass-through geometry shader. */
+   struct apex_shader *implicit_geometry;
 };
 
 extern const struct vk_device_shader_ops apex_device_shader_ops;

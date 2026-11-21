@@ -2907,6 +2907,89 @@ static bool lower_b2b1(nir_builder *b, nir_alu_instr *a, void *data)
    return true;
 }
 
+/* A divergent if runs its then side before its else side (emit_if), while
+ * nir_convert_from_ssa coalesces a uniform phi web into one scalar register
+ * by the logical CFG: a then-side definition in the web overwrites the
+ * value the else side's lanes still read, such as a loop accumulator read
+ * by lanes leaving the loop. Else-side uses read a copy made before the if. */
+static bool web_member(nir_def *d)
+{
+   if (nir_def_instr(d)->type == nir_instr_type_phi)
+      return true;
+   nir_foreach_use(use, d)
+      if (nir_src_use_instr(use)->type == nir_instr_type_phi)
+         return true;
+   return false;
+}
+static nir_block *use_block(nir_src *use)
+{
+   if (nir_src_is_if(use))
+      return nir_cf_node_as_block(nir_cf_node_prev(&nir_src_use_if(use)->cf_node));
+   nir_instr *instr = nir_src_use_instr(use);
+   if (instr->type == nir_instr_type_phi)
+      return container_of(use, nir_phi_src, src)->pred;
+   return instr->block;
+}
+static bool within(nir_block *b, nir_block *first, nir_block *last)
+{
+   return b->index >= first->index && b->index <= last->index;
+}
+static bool copy_else_reads(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_metadata_require(impl, nir_metadata_block_index);
+   struct util_dynarray defs, copies;
+   util_dynarray_init(&defs, NULL);
+   util_dynarray_init(&copies, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         /* Constants and undefs are no registers. */
+         nir_def *d = nir_instr_def(instr);
+         if (d && !d->divergent && instr->type != nir_instr_type_load_const &&
+             instr->type != nir_instr_type_undef && web_member(d))
+            util_dynarray_append(&defs, d);
+      }
+   }
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+   util_dynarray_foreach(&defs, nir_def *, it) {
+      nir_def *d = *it;
+      nir_block *home = nir_def_block(d);
+      util_dynarray_clear(&copies);
+      nir_foreach_use_including_if_safe(use, d) {
+         nir_block *at = use_block(use);
+         nir_if *outer = NULL;
+         for (nir_cf_node *n = at->cf_node.parent; n; n = n->parent) {
+            if (n->type != nir_cf_node_if)
+               continue;
+            nir_if *nif = nir_cf_node_as_if(n);
+            if (nif->condition.ssa->divergent &&
+                within(at, nir_if_first_else_block(nif), nir_if_last_else_block(nif)) &&
+                !within(home, nir_if_first_then_block(nif), nir_if_last_else_block(nif)))
+               outer = nif;
+         }
+         if (!outer)
+            continue;
+         nir_def *copy = NULL;
+         for (unsigned k = 0; k + 1 < util_dynarray_num_elements(&copies, void *); k += 2)
+            if (*util_dynarray_element(&copies, void *, k) == outer)
+               copy = *util_dynarray_element(&copies, void *, k + 1);
+         if (!copy) {
+            b.cursor = nir_before_cf_node(&outer->cf_node);
+            copy = nir_mov(&b, d);
+            copy->divergent = false;
+            util_dynarray_append(&copies, (void *)outer);
+            util_dynarray_append(&copies, (void *)copy);
+         }
+         nir_src_rewrite(use, copy);
+         progress = true;
+      }
+   }
+   util_dynarray_fini(&defs);
+   util_dynarray_fini(&copies);
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
 static bool hoist_repeated(nir_shader *nir)
 {
    bool progress = false;
@@ -3392,6 +3475,7 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
     * uniform inside a loop with a divergent exit becomes divergent there. */
    NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
    nir_divergence_analysis(nir);
+   NIR_PASS(_, nir, copy_else_reads);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, true);
    NIR_PASS(_, nir, nir_trivialize_registers);
    nir_validate_shader(nir, "Apex normalized NIR");

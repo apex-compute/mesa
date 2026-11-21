@@ -589,6 +589,8 @@ apex_cmd_bind_shaders(struct vk_command_buffer *vk, uint32_t count,
       else if (stages[i] == MESA_SHADER_FRAGMENT)
          cmd->fragment = shader;
    }
+   if (!cmd->geometry && cmd->vertex)
+      cmd->geometry = cmd->vertex->implicit_geometry;
    cmd->graphics_table = NULL;
 }
 
