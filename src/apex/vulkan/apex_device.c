@@ -1566,6 +1566,9 @@ image_row(union apex_descriptor *rows, const struct apex_image *image, const str
    }
    uint8_t code = 0, channel[4] = {0};
    bool sampled = apex_hw_texture_format(format, aspect, &code, channel);
+   /* A format decoded to RGBA without alpha of its own, border texels included, reads alpha one. */
+   if (apex_decoded_format(view->format, NULL) && !vk_format_has_alpha(view->format))
+      channel[3] = APEX_HW_SWIZZLE_1;
    uint32_t words[3];
    if ((!sampled && !storage) || (storage && !apex_format_encode(view->format, view->aspects, NULL, words)))
       return;
