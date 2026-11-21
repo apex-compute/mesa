@@ -737,6 +737,34 @@ static void test_control(const char *dir)
    apex_compile_result_finish(&r);
 }
 
+/* scan.comp: per-lane prefix sum and parity through uniform accumulators. */
+static void test_scan(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "scan.comp.spv", &r);
+   struct world w = {0};
+   uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+   uint8_t *out = region(&w, 0x200000, 64 * 4);
+   uint8_t *in = region(&w, 0x300000, 32 * 4);
+   for (unsigned k = 0; k < 32; k++)
+      put(in + 4 * k, 0x01000193u * (k + 3) >> 8);
+   buffer_descriptor(root + slot(0, 0), 0x200000, 64 * 4);
+   buffer_descriptor(root + slot(0, 1), 0x300000, 32 * 4);
+   put(root + PUSH, 1);
+   uint32_t user[16];
+   root_user(user);
+   run(&r, &w, user, 1, NULL);
+   uint32_t sum = 0, odd = 0;
+   for (unsigned l = 0; l < 32; l++) {
+      sum += get(in + 4 * l);
+      odd ^= get(in + 4 * l) & 1;
+      CHECK(get(out + 4 * l) == sum);
+      CHECK(get(out + 4 * (32 + l)) == odd);
+   }
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
 /* texture.comp: an 8x4 RGBA8 image with a nearest, repeating sampler. */
 static void test_texture(const char *dir)
 {
@@ -883,6 +911,7 @@ int main(int argc, char **argv)
    test_spill(argv[1]);
    test_waterfall(argv[1]);
    test_control(argv[1]);
+   test_scan(argv[1]);
    test_texture(argv[1]);
    test_kill(argv[1], "discard.frag.spv", false);
    test_kill(argv[1], "demote.frag.spv", true);
