@@ -132,7 +132,21 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def *descriptor = nir_load_ssbo(b, 4, 32, nir_imm_int(b, 0), row, .align_mul = 16, .access = access);
    nir_def *element = nir_channel(b, index->ssa, 1);
    nir_scalar e = nir_scalar_resolved(element, 0);
-   if (!nir_scalar_is_const(e) || nir_scalar_as_uint(e) != ~0u) {
+   bool direct = nir_scalar_is_const(e) && nir_scalar_as_uint(e) == ~0u;
+   if (size) {
+      /* Word 5 of the row holds the exact size; word 2 is rounded up. */
+      nir_def *bytes = nir_load_ssbo(b, 1, 32, nir_imm_int(b, 0), nir_iadd_imm(b, row, 20),
+                                     .align_mul = 4, .access = access);
+      if (!direct) {
+         nir_def *memory = nir_load_ssbo(b, 1, 32, descriptor,
+                                         nir_iadd_imm(b, nir_imul_imm(b, element, sizeof(union apex_descriptor)), 20),
+                                         .align_mul = 4, .access = access);
+         bytes = nir_scalar_is_const(e) ? memory : nir_bcsel(b, nir_ieq_imm(b, element, ~0), bytes, memory);
+      }
+      nir_def_replace(&i->def, bytes);
+      return true;
+   }
+   if (!direct) {
       nir_def *memory = nir_load_ssbo(b, 4, 32, descriptor,
                                       nir_imul_imm(b, element, sizeof(union apex_descriptor)),
                                       .align_mul = 16, .access = access);
@@ -140,10 +154,7 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
       descriptor = nir_scalar_is_const(e) ? memory :
          nir_bcsel(b, nir_ieq_imm(b, element, ~0), descriptor, memory);
    }
-   if (size)
-      nir_def_replace(&i->def, nir_channel(b, descriptor, 2));
-   else
-      nir_src_rewrite(index, descriptor);
+   nir_src_rewrite(index, descriptor);
    return true;
 }
 

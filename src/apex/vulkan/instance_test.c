@@ -248,8 +248,8 @@ exercise(PFN_vkGetInstanceProcAddr gipa)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &robust_props,
    };
    get_properties2(physical, &properties2);
-   CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 1 &&
-         robust_props.robustUniformBufferAccessSizeAlignment == 1);
+   CHECK(robust_props.robustStorageBufferAccessSizeAlignment == 4 &&
+         robust_props.robustUniformBufferAccessSizeAlignment == 4);
    /* Zink matches its DRM fd's render node against these numbers. */
    CHECK(drm_props.hasRender && drm_props.renderMajor == 226 && drm_props.renderMinor == 128);
    CHECK(drm_props.hasPrimary && drm_props.primaryMajor == 1 && drm_props.primaryMinor == 5);

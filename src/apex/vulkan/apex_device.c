@@ -1654,13 +1654,17 @@ encode_descriptor(union apex_descriptor *rows, const struct apex_set_layout *lay
       if (!buffer || !buffer->memory || info->offset >= buffer->vk.size)
          return;
       bool whole = info->range == VK_WHOLE_SIZE;
-      uint64_t range = MIN2(whole ? buffer->vk.size - info->offset : info->range, UINT32_MAX);
+      uint64_t range = MIN2(whole ? buffer->vk.size - info->offset : info->range, UINT32_MAX & ~3u);
       uint64_t va = buffer->memory->storage->bo.va + buffer->offset + info->offset;
+      /* Accesses are whole dwords, so the checked range rounds up to the
+       * reported 4-byte robust access alignment; buffer memory sizes are
+       * 64-byte multiples. Word 5 keeps the exact size for length(). */
       rows->buffer = (struct apex_buffer_descriptor) {
-         util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(range),
+         util_cpu_to_le32(va), util_cpu_to_le32(va >> 32), util_cpu_to_le32(align64(range, 4)),
          util_cpu_to_le32(APEX_BUFFER_ROBUST),
       };
       rows->words[4] = util_cpu_to_le32(whole && vk_descriptor_type_is_dynamic(binding->type));
+      rows->words[5] = util_cpu_to_le32(range);
       return;
    }
    }

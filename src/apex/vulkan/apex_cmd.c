@@ -2707,8 +2707,10 @@ write_table(struct apex_device *device, const struct apex_table *table, void *ma
                               (uint64_t)util_le32_to_cpu(rows[row].buffer.high) << 32) + offset;
                rows[row].buffer.low = util_cpu_to_le32(LO(va));
                rows[row].buffer.high = util_cpu_to_le32(HI(va));
-               if (rows[row].words[4])
+               if (rows[row].words[4]) {
                   rows[row].buffer.bytes = util_cpu_to_le32(util_le32_to_cpu(rows[row].buffer.bytes) - offset);
+                  rows[row].words[5] = util_cpu_to_le32(util_le32_to_cpu(rows[row].words[5]) - offset);
+               }
                rows[row].words[4] = 0;
             }
          }

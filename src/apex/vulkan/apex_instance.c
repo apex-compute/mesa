@@ -700,16 +700,18 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .minMemoryMapAlignment = 4096,
       .minPlacedMemoryMapAlignment = 4096,
-      .minUniformBufferOffsetAlignment = 4,
-      .minStorageBufferOffsetAlignment = 4,
+      /* Accesses of n dwords round down to 4n bytes (scalar loads up to 32)
+       * from the descriptor base, so bases keep that alignment. */
+      .minUniformBufferOffsetAlignment = 64,
+      .minStorageBufferOffsetAlignment = 64,
       .nonCoherentAtomSize = 1,
       .optimalBufferCopyOffsetAlignment = 64,
       /* The device timebase the kernel reads from BAR0 TIMEBASE. */
       .timestampPeriod = 1e9f / caps.timestamp_hz, .timestampComputeAndGraphics = true,
       .optimalBufferCopyRowPitchAlignment = 64,
-      /* Descriptor bounds are checked without rounding, per 32-bit component. */
-      .robustStorageBufferAccessSizeAlignment = 1,
-      .robustUniformBufferAccessSizeAlignment = 1,
+      /* Descriptor ranges round up to whole dwords. */
+      .robustStorageBufferAccessSizeAlignment = 4,
+      .robustUniformBufferAccessSizeAlignment = 4,
       .subgroupSize = 32, .minSubgroupSize = 32, .maxSubgroupSize = 32,
       .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
