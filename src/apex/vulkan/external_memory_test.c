@@ -228,8 +228,13 @@ int main(void)
    CHECK(live == 1 && binds == 1 && !maps && closes == before);
    CHECK(v->GetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, objects[0], &props) == VK_SUCCESS);
    CHECK(live == 1 && closes == before);
-   void *map = (void *)1;
-   CHECK(v->MapMemory(dev, memory[0], 0, VK_WHOLE_SIZE, 0, &map) == VK_ERROR_MEMORY_MAP_FAILED && !map);
+   /* A foreign dma-buf is mapped through the dma-buf itself. */
+   void *map = NULL;
+   CHECK(v->MapMemory(dev, memory[0], 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS && map);
+   *(volatile uint8_t *)map = 0x5a;
+   uint8_t byte = 0;
+   CHECK(pread(objects[0], &byte, 1, 0) == 1 && byte == 0x5a);
+   v->UnmapMemory(dev, memory[0]);
    VkExternalMemoryBufferCreateInfo external = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
       .handleTypes = APEX_EXTERNAL_MEMORY_TYPES};
    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
