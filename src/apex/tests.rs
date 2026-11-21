@@ -541,6 +541,72 @@ fn allocation_and_spilling() {
 }
 
 #[test]
+fn unscheduled_fallback() {
+    // 40 independent four-dword loads, each reduced right after it to one
+    // dword by eight reads of its components, and the reductions summed as
+    // a tree: in order, about 50 vector registers are live. Every consumer
+    // but a load's last grows pressure, so at the schedule's limit the loads
+    // and their consumers all grow it and the loads, with the longest paths,
+    // go first: the schedule holds every loaded dword at once. A graphics
+    // program that does not fit the schedule keeps the order it came in.
+    let count = 40u32;
+    let mut values = vec![Value { class: Class::S, width: 1 }];
+    values.push(Value { class: Class::S, width: 2 });
+    let root = values.len() as u32 - 1;
+    let mut ops = vec![
+        mop(COPY, [Opnd::Val { id: root, off: 0, n: 1 }, phys(SCALAR), Opnd::None, Opnd::None]),
+        mop(COPY, [Opnd::Val { id: root, off: 1, n: 1 }, phys(SCALAR + 1), Opnd::None, Opnd::None]),
+    ];
+    let def = |values: &mut Vec<Value>, width| {
+        values.push(Value { class: Class::V, width });
+        values.len() as u32 - 1
+    };
+    let offset = def(&mut values, 1);
+    values.push(Value { class: Class::S, width: 1 });
+    ops.push(Op { imm: 4, ..mop(CONST, [v(offset + 1), Opnd::None, Opnd::None, Opnd::None]) });
+    ops.push(mop(op::V_SHL as u16, [v(offset), phys(isa::LANE), v(offset + 1), Opnd::None]));
+    let add = |ops: &mut Vec<Op>, d, a, b| ops.push(mop(op::V_ADD as u16, [v(d), a, b, Opnd::None]));
+    let mut sums = Vec::new();
+    for k in 0..count {
+        let t = def(&mut values, 4);
+        ops.push(Op { hi: (16 * k) | 3 << 20, flags: mir::REORDER, ..mop(op::GLOBAL_LOAD as u16,
+            [Opnd::Val { id: t, off: 0, n: 4 }, v(offset), Opnd::Val { id: root, off: 0, n: 2 }, Opnd::None]) });
+        let mut x = Vec::new();
+        for c in 0..8 {
+            x.push(def(&mut values, 1));
+            add(&mut ops, x[c], Opnd::Val { id: t, off: c as u8 % 4, n: 1 }, Opnd::Lit(k + c as u32));
+        }
+        while x.len() > 1 {
+            let d = def(&mut values, 1);
+            add(&mut ops, d, v(x[0]), v(x[1]));
+            x.splice(0..2, [d]);
+        }
+        sums.push(x[0]);
+    }
+    while sums.len() > 1 {
+        let mut next = Vec::new();
+        for pair in sums.chunks(2) {
+            if let [a, b] = *pair {
+                let d = def(&mut values, 1);
+                add(&mut ops, d, v(a), v(b));
+                next.push(d);
+            } else {
+                next.push(pair[0]);
+            }
+        }
+        sums = next;
+    }
+    ops.push(mop(op::GLOBAL_STORE as u16, [v(sums[0]), v(offset), Opnd::Val { id: root, off: 0, n: 2 }, Opnd::None]));
+    ops.push(mop(op::S_ENDPGM as u16, [Opnd::None; 4]));
+    let compile = |stage| mir::compile(ops.clone(), values.clone(), Program::new(stage, vec![]));
+    // The schedule itself overflows the register file: compute spills it.
+    let (_, stats) = compile(Stage::Compute).unwrap();
+    assert!(stats.spills > 0);
+    let (_, stats) = compile(Stage::Vertex).unwrap();
+    assert!(stats.spills == 0 && stats.vector <= 64, "{} vectors", stats.vector);
+}
+
+#[test]
 fn scalar_lane_spills() {
     // 110 uniform values live at once exceed 96 scalar registers; the excess
     // lives in vector lanes, including across a region with no active lane.

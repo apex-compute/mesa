@@ -1159,25 +1159,21 @@ fn spill(ops: &mut Vec<Op>, values: &mut Vec<Value>, align: &mut Vec<u8>, victim
     *ops = out;
 }
 
-pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) -> Result<(Program, Stats), String> {
-    check(&ops, &values)?;
-    dump("input", &ops);
-    fold_constants(&mut ops, &values);
-    eliminate_dead(&mut ops);
-    let mut fixed = bind_launch(&mut ops, &mut values);
-    let align = coalesce(&mut ops, &values, &mut fixed);
-    eliminate_dead(&mut ops);
-    dump("coalesced", &ops);
-    let mut ops = schedule::schedule(ops, &values);
-    let mut align = align;
+/// Allocates registers for a scheduled program, spilling scalars into lanes of
+/// vector registers and, in compute launches, vectors to private memory from
+/// dword `private` / 4 on. Returns the rewritten program, its homes, stats
+/// counting lane spills, and the private dwords spilled.
+#[allow(clippy::type_complexity)]
+fn assign(mut ops: Vec<Op>, mut values: Vec<Value>, mut align: Vec<u8>, fixed: &BTreeMap<u32, u8>,
+          compute: bool, private: u32)
+          -> Result<(Vec<Op>, Vec<Value>, BTreeMap<u32, u8>, Stats, u32), String> {
     let mut spilled = 0u32;
     // Compute launches spill vector values to private memory; scalars spill
     // into lanes of vector registers in every stage.
     let mut temps = std::collections::BTreeSet::new();
     let (mut lanes, mut bank, mut stats_lanes) = (0u32, 0u32, 0u32);
-    let compute = header.stage == isa::Stage::Compute;
     let (homes, mut stats) = loop {
-        match allocate(&ops, &values, &fixed, &align, Some(&temps)) {
+        match allocate(&ops, &values, fixed, &align, Some(&temps)) {
             Ok(result) => break result,
             Err(p) if p.live.is_empty() => return Err(p.message + " without spilling"),
             Err(p) => {
@@ -1201,7 +1197,7 @@ pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) ->
                         if !compute {
                             return Err("vector register pressure exceeds 128 registers without spilling".into());
                         }
-                        let slot = header.private / 4 + spilled;
+                        let slot = private / 4 + spilled;
                         spilled += width;
                         spill(&mut ops, &mut values, &mut align, victim, slot);
                     }
@@ -1210,7 +1206,35 @@ pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) ->
             }
         }
     };
-    stats.spills = spilled + stats_lanes;
+    stats.spills = stats_lanes;
+    Ok((ops, values, homes, stats, spilled))
+}
+
+pub fn compile(mut ops: Vec<Op>, mut values: Vec<Value>, mut header: Program) -> Result<(Program, Stats), String> {
+    check(&ops, &values)?;
+    dump("input", &ops);
+    fold_constants(&mut ops, &values);
+    eliminate_dead(&mut ops);
+    let mut fixed = bind_launch(&mut ops, &mut values);
+    let align = coalesce(&mut ops, &values, &mut fixed);
+    eliminate_dead(&mut ops);
+    dump("coalesced", &ops);
+    // The schedule bounds pressure only within a region and only when some
+    // candidate does not grow it, so it can hoist enough independent
+    // texture results to overflow the register file (fully unrolled
+    // fragment loops). Graphics programs cannot spill vectors: one that
+    // does not fit after scheduling keeps the order it came in.
+    let compute = header.stage == isa::Stage::Compute;
+    let scheduled = schedule::schedule(ops.clone(), &values);
+    let (ops, values, homes, mut stats, spilled) =
+        match assign(scheduled, values.clone(), align.clone(), &fixed, compute, header.private) {
+            Ok(result) => result,
+            Err(message) if !compute => {
+                assign(ops, values, align, &fixed, compute, header.private).map_err(|_| message)?
+            }
+            Err(message) => return Err(message),
+        };
+    stats.spills += spilled;
     header.private += 4 * spilled;
     header.code = lower(&ops, &values, &homes)?;
     stats.instructions = header.code.len() as u32;
