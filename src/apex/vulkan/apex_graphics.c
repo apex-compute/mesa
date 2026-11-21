@@ -1593,6 +1593,7 @@ apex_shader_serialize(struct vk_device *device, const struct vk_shader *vk, stru
    blob_write_uint8(blob, shader->vertex.clip_distances);
    blob_write_uint8(blob, shader->vertex.robust);
    blob_write_uint8(blob, shader->vertex.stores);
+   blob_write_uint8(blob, shader->fragment.early_fragment_tests);
    blob_write_bytes(blob, shader->xfb_strides, sizeof(shader->xfb_strides));
    write_program(blob, &shader->capture);
    blob_write_uint64(blob, shader->vertex.records);
@@ -1762,6 +1763,7 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
          .use_view_id_for_layer = state && state->mv && state->mv->view_mask,
       };
       NIR_PASS(_, nir, nir_lower_input_attachments, &options);
+      shader->fragment.early_fragment_tests = nir->info.fs.early_fragment_tests;
       if (!lower_fragment(nir, state, link))
          goto fail;
    }
@@ -1960,6 +1962,7 @@ apex_deserialize(struct vk_device *device, struct blob_reader *blob, uint32_t ve
    shader->vertex.clip_distances = blob_read_uint8(blob);
    shader->vertex.robust = blob_read_uint8(blob);
    shader->vertex.stores = blob_read_uint8(blob);
+   shader->fragment.early_fragment_tests = blob_read_uint8(blob);
    blob_copy_bytes(blob, shader->xfb_strides, sizeof(shader->xfb_strides));
    valid = valid && read_program(blob, &shader->capture, shader->set_layouts);
    shader->vertex.records = blob_read_uint64(blob);

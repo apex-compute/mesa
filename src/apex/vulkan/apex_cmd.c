@@ -1289,12 +1289,16 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
    uint32_t ds[APEX_HW_DEPTH_STENCIL_DWORDS], blend[APEX_HW_BLEND_DWORDS], vp[APEX_HW_VIEWPORT_DWORDS];
    apex_hw_vertex_input_block(dyn, cmd->bindings, geometry ? cmd->geometry->geometry.clip_distances :
                               cmd->vertex->vertex.clip_distances, vi);
+   /* Alpha to coverage removes samples before the tests unless the
+    * fragment shader asks for early tests. */
+   const bool late_depth = apex_program_late_depth(fs) ||
+      (dyn->ms.alpha_to_coverage_enable && !(cmd->fragment && cmd->fragment->fragment.early_fragment_tests));
    if (list) {
       struct vk_dynamic_graphics_state listed = *dyn;
       listed.ia.primitive_topology = list->topology;
-      apex_hw_raster_block(&listed, false, apex_program_late_depth(fs), raster);
+      apex_hw_raster_block(&listed, false, late_depth, raster);
    } else {
-      apex_hw_raster_block(dyn, false, apex_program_late_depth(fs), raster);
+      apex_hw_raster_block(dyn, false, late_depth, raster);
    }
    /* A per-sample program's pass covers its sample only. */
    const bool per_sample = apex_program_sample_shading(fs);

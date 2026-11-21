@@ -42,6 +42,10 @@ struct apex_shader {
       uint16_t max_vertices, max_primitives, invocations;
       uint8_t primitive_vertices, input_vertices;
    } geometry;
+   struct {
+      /* Tests run before shading even with alpha to coverage. */
+      bool early_fragment_tests;
+   } fragment;
 };
 
 extern const struct vk_device_shader_ops apex_device_shader_ops;
