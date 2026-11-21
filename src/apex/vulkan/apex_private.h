@@ -147,6 +147,13 @@ struct apex_attachment {
    VkImageAspectFlags aspects;
 };
 
+/* An occlusion query result summed from its segment counts. */
+struct apex_query_sum {
+   uint64_t va, segments;
+   uint32_t count;
+};
+#define APEX_QUERY_SEGMENTS 16
+
 struct apex_command_buffer {
    struct vk_command_buffer vk;
    /* Packets in recording order, beginning with a full barrier. `pending`
@@ -204,8 +211,18 @@ struct apex_command_buffer {
     * current pass (it rasterizes at its end, so they stay taken until
     * then), and availability writes waiting for the end of the pass. */
    uint8_t query_slots, pass_query_slots;
-   struct { uint64_t va; uint8_t slot; } queries[8];
-   struct util_dynarray pass_availability;
+   /* An active occlusion query ends a segment before driver-internal work
+    * and begins another after it; its result sums the segment counts in
+    * scratch at `segments` (APEX_QUERY_SEGMENTS u64). `count` is the
+    * number of segments ended, `paused` set during internal work. */
+   struct {
+      uint64_t va, segments;
+      uint8_t slot, count;
+      bool paused;
+   } queries[8];
+   /* Availability writes and segment sums (struct apex_query_sum) waiting
+    * for the end of the pass. */
+   struct util_dynarray pass_availability, pass_sums;
    unsigned meta;
    /* Conditional rendering: the predicate while active, whether PREDICATE
     * is on in the queue, and whether vk_meta work counts as the

@@ -75,6 +75,8 @@ clear_commands(struct apex_command_buffer *cmd)
    util_dynarray_clear(&cmd->data);
    util_dynarray_clear(&cmd->patches);
    util_dynarray_clear(&cmd->pass_availability);
+   util_dynarray_clear(&cmd->pass_sums);
+   memset(cmd->queries, 0, sizeof(cmd->queries));
    cmd->pipeline = NULL;
    cmd->vertex = cmd->geometry = cmd->fragment = NULL;
    cmd->graphics_table = NULL;
@@ -111,6 +113,7 @@ destroy_command_buffer(struct vk_command_buffer *vk)
    util_dynarray_fini(&cmd->data);
    util_dynarray_fini(&cmd->patches);
    util_dynarray_fini(&cmd->pass_availability);
+   util_dynarray_fini(&cmd->pass_sums);
    vk_command_buffer_finish(vk);
    vk_free(&pool->alloc, vk);
 }
@@ -138,6 +141,7 @@ create_command_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level,
    util_dynarray_init(&cmd->data, NULL);
    util_dynarray_init(&cmd->patches, NULL);
    util_dynarray_init(&cmd->pass_availability, NULL);
+   util_dynarray_init(&cmd->pass_sums, NULL);
    apex_ib_init(&cmd->ib);
    cmd->vk.dynamic_graphics_state.vi = &cmd->vertex_input;
    cmd->vk.dynamic_graphics_state.ms.sample_locations = &cmd->sample_locations;
@@ -546,27 +550,29 @@ apex_CmdDispatchIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize o
 
 /* An internal kernel over a grid of workgroups with its job words; job
  * word w holds a data offset for bit w of `relocs`. `user` kernels belong
- * to an application draw and share its predicate. */
-static void
+ * to an application draw and share its predicate. Returns the kernel's
+ * table, NULL when nothing was dispatched. */
+static struct apex_table *
 internal_dispatch(struct apex_command_buffer *cmd, enum apex_internal which, const uint32_t *words,
                   const uint32_t grid[3], uint32_t relocs, bool user)
 {
    struct apex_device *device = (void *)cmd->vk.base.device;
    if (!grid[0] || !grid[1] || !grid[2])
-      return;
+      return NULL;
    predicate(cmd, user && user_work(cmd));
    struct apex_program *program;
    VkResult result = apex_internal_program(device, which, &program);
    if (result != VK_SUCCESS) {
       fail(cmd, result);
-      return;
+      return NULL;
    }
    struct apex_table *table = table_create(cmd, program, NULL, NULL, NULL);
    if (!table)
-      return;
+      return NULL;
    memcpy(&table->trailer[APEX_TRAILER_WORDS], words, APEX_JOB_WORDS * 4);
    table->relocs = (uint64_t)relocs << APEX_TRAILER_WORDS;
    dispatch_grid(cmd, program, table, (uint32_t[3]){0}, grid);
+   return table;
 }
 
 void
@@ -603,9 +609,15 @@ struct saved_state {
    uint16_t strides[MESA_VK_MAX_VERTEX_BINDINGS];
 };
 
+static void pause_queries(struct apex_command_buffer *cmd);
+static void resume_queries(struct apex_command_buffer *cmd);
+
+/* Occlusion queries do not count the internal work. */
 static void
 meta_begin(struct apex_command_buffer *cmd, struct saved_state *s)
 {
+   if (!cmd->meta)
+      pause_queries(cmd);
    s->dyn = cmd->vk.dynamic_graphics_state;
    s->vertex_input = cmd->vertex_input;
    s->sample_locations = cmd->sample_locations;
@@ -653,6 +665,8 @@ meta_end(struct apex_command_buffer *cmd, struct saved_state *s)
    memcpy(cmd->graphics_push, s->graphics_push, sizeof(s->graphics_push));
    memcpy(cmd->bindings, s->bindings, sizeof(s->bindings));
    cmd->graphics_table = NULL;
+   if (!cmd->meta)
+      resume_queries(cmd);
 }
 
 /* ---- Render passes ------------------------------------------------------ */
@@ -838,6 +852,8 @@ rewrite_first_region(struct apex_command_buffer *cmd)
 
 /* END_PASS, each further region replaying the body, then the availability
  * of the queries the pass ended. */
+static void query_sum(struct apex_command_buffer *cmd, const struct apex_query_sum *sum);
+
 static void
 end_pass(struct apex_command_buffer *cmd)
 {
@@ -873,6 +889,13 @@ end_pass(struct apex_command_buffer *cmd)
    cmd->rendering.active = false;
    cmd->query_slots &= ~cmd->pass_query_slots;
    cmd->pass_query_slots = 0;
+   if (util_dynarray_num_elements(&cmd->pass_sums, struct apex_query_sum)) {
+      apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, APEX_CP_CACHE_L1);
+      util_dynarray_foreach(&cmd->pass_sums, struct apex_query_sum, sum)
+         query_sum(cmd, sum);
+      util_dynarray_clear(&cmd->pass_sums);
+      apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1);
+   }
    util_dynarray_foreach(&cmd->pass_availability, uint64_t, va)
       apex_cp_write(&cmd->ib, *va, APEX_CP_AFTER_PRIOR_WORK, 1, (uint32_t[1]){1});
    util_dynarray_clear(&cmd->pass_availability);
@@ -2018,6 +2041,88 @@ query_available(struct apex_command_buffer *cmd, uint64_t va)
    }
 }
 
+/* A free occlusion counter slot, else -1. Ending the pass frees the slots
+ * of the queries that ended in it. */
+static int
+query_slot(struct apex_command_buffer *cmd)
+{
+   if (cmd->query_slots == 0xff && cmd->rendering.active && cmd->pass_query_slots)
+      split_pass(cmd);
+   if (cmd->query_slots == 0xff) {
+      fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
+      return -1;
+   }
+   unsigned slot = ffs(~cmd->query_slots) - 1;
+   cmd->query_slots |= 1u << slot;
+   return slot;
+}
+
+/* A pass rasterizes at its end, so a slot ending inside it stays taken
+ * until then. */
+static void
+release_slot(struct apex_command_buffer *cmd, unsigned slot)
+{
+   if (cmd->rendering.active)
+      cmd->pass_query_slots |= 1u << slot;
+   else
+      cmd->query_slots &= ~(1u << slot);
+}
+
+/* Ends query q's slot into its next segment count. */
+static void
+end_segment(struct apex_command_buffer *cmd, unsigned q)
+{
+   if (!cmd->queries[q].count)
+      cmd->queries[q].segments = scratch_block(cmd, APEX_QUERY_SEGMENTS * 8);
+   uint64_t offset = cmd->queries[q].segments + cmd->queries[q].count++ * 8;
+   release_slot(cmd, cmd->queries[q].slot);
+   add_patch(cmd, cmd->ib.count + 2, (struct apex_patch){.kind = APEX_PATCH_SCRATCH, .offset = offset});
+   apex_cp_query_end(&cmd->ib, cmd->queries[q].slot, 0);
+}
+
+/* The result of a query from its segment counts, after they are written. */
+static void
+query_sum(struct apex_command_buffer *cmd, const struct apex_query_sum *sum)
+{
+   uint32_t words[APEX_JOB_WORDS] = {
+      [APEX_QUERY_SUM_SRC] = LO(sum->segments), [APEX_QUERY_SUM_SRC + 1] = HI(sum->segments),
+      [APEX_QUERY_SUM_DST] = LO(sum->va), [APEX_QUERY_SUM_DST + 1] = HI(sum->va),
+      [APEX_QUERY_SUM_COUNT] = sum->count,
+   };
+   struct apex_table *table = internal_dispatch(cmd, APEX_INTERNAL_QUERY_SUM, words, (uint32_t[3]){1, 1, 1}, 0, false);
+   if (table)
+      table->scratch_relocs = BITFIELD64_BIT(APEX_QUERY_SUM_SRC) << APEX_TRAILER_WORDS;
+}
+
+/* Active occlusion queries end a segment before internal work and begin
+ * another after it, up to APEX_QUERY_SEGMENTS. */
+static void
+pause_queries(struct apex_command_buffer *cmd)
+{
+   for (unsigned q = 0; q < ARRAY_SIZE(cmd->queries); q++) {
+      if (!cmd->queries[q].va || cmd->queries[q].count >= APEX_QUERY_SEGMENTS - 1)
+         continue;
+      cmd->rendering.whole |= cmd->rendering.active;
+      end_segment(cmd, q);
+      cmd->queries[q].paused = true;
+   }
+}
+
+static void
+resume_queries(struct apex_command_buffer *cmd)
+{
+   for (unsigned q = 0; q < ARRAY_SIZE(cmd->queries); q++) {
+      if (!cmd->queries[q].paused)
+         continue;
+      cmd->queries[q].paused = false;
+      int slot = query_slot(cmd);
+      if (slot < 0)
+         continue;
+      cmd->queries[q].slot = slot;
+      apex_cp_query_begin(&cmd->ib, slot);
+   }
+}
+
 /* Occlusion queries take one of the raster back end's eight counter slots
  * from QUERY_BEGIN to QUERY_END, which writes the 64-bit count. Stream
  * queries start from zero and count in each draw's transform feedback
@@ -2035,17 +2140,12 @@ apex_CmdBeginQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t 
       cmd->xfb.query = va;
       return;
    }
-   /* Ending the pass frees the slots of the queries that ended in it. */
-   if (cmd->query_slots == 0xff && cmd->rendering.active && cmd->pass_query_slots)
-      split_pass(cmd);
-   if (cmd->query_slots == 0xff) {
-      fail(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
+   int slot = query_slot(cmd);
+   if (slot < 0)
       return;
-   }
-   unsigned slot = ffs(~cmd->query_slots) - 1;
-   cmd->query_slots |= 1u << slot;
    for (unsigned q = 0; q < ARRAY_SIZE(cmd->queries); q++) {
       if (!cmd->queries[q].va) {
+         memset(&cmd->queries[q], 0, sizeof(cmd->queries[q]));
          cmd->queries[q].va = va;
          cmd->queries[q].slot = slot;
          break;
@@ -2069,13 +2169,20 @@ apex_CmdEndQueryIndexedEXT(VkCommandBuffer handle, VkQueryPool pool, uint32_t qu
    for (unsigned q = 0; q < ARRAY_SIZE(cmd->queries); q++) {
       if (cmd->queries[q].va != va)
          continue;
-      unsigned slot = cmd->queries[q].slot;
       cmd->queries[q].va = 0;
-      if (cmd->rendering.active)
-         cmd->pass_query_slots |= 1u << slot;
-      else
-         cmd->query_slots &= ~(1u << slot);
-      apex_cp_query_end(&cmd->ib, slot, va);
+      if (!cmd->queries[q].count) {
+         release_slot(cmd, cmd->queries[q].slot);
+         apex_cp_query_end(&cmd->ib, cmd->queries[q].slot, va);
+      } else {
+         end_segment(cmd, q);
+         const struct apex_query_sum sum = {va, cmd->queries[q].segments, cmd->queries[q].count};
+         if (cmd->rendering.active) {
+            util_dynarray_append(&cmd->pass_sums, sum);
+         } else {
+            apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, APEX_CP_CACHE_L1);
+            query_sum(cmd, &sum);
+         }
+      }
       query_available(cmd, va);
       return;
    }

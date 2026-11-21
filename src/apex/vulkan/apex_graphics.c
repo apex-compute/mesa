@@ -16,6 +16,7 @@
 #include "apex_copy_spv.h"
 #include "apex_clear_spv.h"
 #include "apex_querycopy_spv.h"
+#include "apex_querysum_spv.h"
 #include "apex_etc2_spv.h"
 #include "apex_bc_spv.h"
 #include "apex_xfb_spv.h"
@@ -2110,6 +2111,7 @@ apex_internal_program(struct apex_device *device, enum apex_internal which, stru
          [APEX_INTERNAL_COPY] = {apex_copy_spv, ARRAY_SIZE(apex_copy_spv)},
          [APEX_INTERNAL_CLEAR] = {apex_clear_spv, ARRAY_SIZE(apex_clear_spv)},
          [APEX_INTERNAL_QUERY_COPY] = {apex_querycopy_spv, ARRAY_SIZE(apex_querycopy_spv)},
+         [APEX_INTERNAL_QUERY_SUM] = {apex_querysum_spv, ARRAY_SIZE(apex_querysum_spv)},
          [APEX_INTERNAL_ETC2] = {apex_etc2_spv, ARRAY_SIZE(apex_etc2_spv)},
          [APEX_INTERNAL_BC] = {apex_bc_spv, ARRAY_SIZE(apex_bc_spv)},
          [APEX_INTERNAL_XFB] = {apex_xfb_spv, ARRAY_SIZE(apex_xfb_spv)},

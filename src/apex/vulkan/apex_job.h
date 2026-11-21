@@ -89,6 +89,10 @@
 #define APEX_QUERY_COUNT 5
 #define APEX_QUERY_FLAGS 6            /* VkQueryResultFlags */
 #define APEX_QUERY_VALUES 7           /* values per query: 1 or 2 */
+/* Query sum: the u64 at DST is the sum of COUNT u64 segment counts at SRC. */
+#define APEX_QUERY_SUM_SRC 0          /* VA lo, hi */
+#define APEX_QUERY_SUM_DST 2          /* VA lo, hi */
+#define APEX_QUERY_SUM_COUNT 4
 
 /* Kernels that redo a draw's vertex work: the transform feedback capture
  * and bookkeeping, and geometry shading (apex_graphics.c). The draw's
