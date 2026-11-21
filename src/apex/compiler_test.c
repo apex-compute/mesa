@@ -397,8 +397,8 @@ int main(int argc, char **argv)
       {SCOPE_WORKGROUP, nir_var_mem_ssbo, NIR_MEMORY_ACQ_REL, true},
       {SCOPE_DEVICE, nir_var_mem_ssbo, NIR_MEMORY_ACQ_REL, true},
       {SCOPE_DEVICE, nir_var_mem_global, NIR_MEMORY_ACQ_REL, true},
-      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_MAKE_AVAILABLE | NIR_MEMORY_RELEASE, false},
-      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_MAKE_VISIBLE | NIR_MEMORY_ACQUIRE, false},
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_MAKE_AVAILABLE | NIR_MEMORY_RELEASE, true},
+      {SCOPE_WORKGROUP, nir_var_mem_shared, NIR_MEMORY_MAKE_VISIBLE | NIR_MEMORY_ACQUIRE, true},
    };
    for (unsigned n = 0; n < ARRAY_SIZE(barriers); n++) {
       nir = shader(17);
