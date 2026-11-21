@@ -240,8 +240,11 @@ import_memory(struct apex_device *device, int fd, uint64_t size,
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto unlock;
    }
-   /* Foreign dma-bufs import as SYSTEM mappings without CPU access. */
-   storage->bo = (struct apex_bo){.handle = prime.handle, .size = extent, .system = true};
+   /* Foreign dma-bufs import as SYSTEM mappings; the host maps the dma-buf
+    * itself, as the only memory type is host visible. */
+   void *map = mmap(NULL, extent, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   storage->bo = (struct apex_bo){.handle = prime.handle, .size = extent, .system = true,
+                                  .map = map == MAP_FAILED ? NULL : map};
    mtx_lock(&device->va_mutex);
    uint64_t va = util_vma_heap_alloc(&device->va_heap, extent, 4096);
    mtx_unlock(&device->va_mutex);
