@@ -6,7 +6,11 @@
 #include "compiler/spirv/nir_spirv.h"
 #include "compiler/spirv/spirv.h"
 #include "compiler/spirv/spirv_info.h"
+/* libspirv.h defines kDefaultMaxIdBound with external linkage in C, and
+ * vtn_debug.c, linked into the same programs, includes it too. */
+#define kDefaultMaxIdBound apex_spirv_default_max_id_bound
 #include <spirv-tools/libspirv.h>
+#undef kDefaultMaxIdBound
 #include <stdio.h>
 
 int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_result *out)
