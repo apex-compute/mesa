@@ -943,6 +943,9 @@ build_geometry(struct vk_device *device, nir_shader *nir, uint64_t inputs, struc
    shader->geometry.invocations = ctx.invocations;
    shader->geometry.input_vertices = vertices;
    compute_kernel(nir);
+   /* The caller keeps the transform feedback info (still allocated with
+    * `nir`) for the capture kernel; a compute shader has none. */
+   nir->xfb_info = NULL;
 
    impl = nir_shader_get_entrypoint(nir);
    nir_cf_list body;
