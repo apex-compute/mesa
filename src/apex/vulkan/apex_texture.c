@@ -354,11 +354,18 @@ tex_src(nir_tex_instr *tex, nir_tex_src_type type)
    return index < 0 ? NULL : tex->src[index].src.ssa;
 }
 
-/* textureQueryLod: λ from the quad derivatives of the coordinates scaled by
- * the base level's size, with the sampler's bias and no clamp (y), and the
- * level a sample would read, clamped and rounded as sampling does (x). */
+/* The sampler's LOD bias, Q5.8. */
 static nir_def *
-query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
+sampler_bias(nir_builder *b, nir_def *sampler)
+{
+   return nir_fmul_imm(b, nir_i2f32(b, nir_ishr_imm(b, nir_ishl_imm(b,
+      bits(b, sampler, APEX_HW_SAMPLER_BIAS, 14), 18), 18)), 1.0 / 256);
+}
+
+/* λ without bias: log2 of the quad derivatives of the coordinates scaled by
+ * the base level's size. */
+static nir_def *
+derived_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image)
 {
    nir_def *coord = tex_src(tex, nir_tex_src_coord);
    bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
@@ -409,9 +416,15 @@ query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
       }
       rho = nir_fmax(b, rho, nir_fsqrt(b, length));
    }
-   nir_def *bias = nir_fmul_imm(b, nir_i2f32(b, nir_ishr_imm(b, nir_ishl_imm(b,
-      bits(b, sampler, APEX_HW_SAMPLER_BIAS, 14), 18), 18)), 1.0 / 256);
-   nir_def *lambda = nir_fadd(b, nir_flog2(b, rho), bias);
+   return nir_flog2(b, rho);
+}
+
+/* textureQueryLod: λ with the sampler's bias and no clamp (y), and the
+ * level a sample would read, clamped and rounded as sampling does (x). */
+static nir_def *
+query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
+{
+   nir_def *lambda = nir_fadd(b, derived_lod(b, tex, image), sampler_bias(b, sampler));
    nir_def *min_lod = nir_fmax(b,
       nir_fmul_imm(b, nir_u2f32(b, bits(b, sampler, APEX_HW_SAMPLER_MIN_LOD, 12)), 1.0 / 256),
       nir_fmul_imm(b, nir_u2f32(b, bits(b, image, APEX_HW_IMAGE_MIN_LOD, 12)), 1.0 / 256));
@@ -492,13 +505,25 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       nir_def_replace(&tex->def, query_lod(b, tex, image, sampler));
       return true;
    }
+   /* The texture unit derives a cube's LOD from the face coordinates, which
+    * jump where a quad straddles a face edge: an implicit cube LOD comes
+    * from the cube-aware derivatives instead, as an explicit LOD. */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && b->shader->info.stage == MESA_SHADER_FRAGMENT &&
+       (tex->op == nir_texop_tex || tex->op == nir_texop_txb)) {
+      nir_def *lod = nir_fmax_imm(b, derived_lod(b, tex, image), -16.0f);
+      int bias = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+      if (bias >= 0) {
+         lod = nir_fadd(b, lod, tex->src[bias].src.ssa);
+         nir_tex_instr_remove_src(tex, bias);
+      }
+      nir_tex_instr_add_src(tex, nir_tex_src_lod, lod);
+      tex->op = nir_texop_txl;
+   }
    /* The texture unit adds the sampler's bias to derived LODs only; an
     * explicit LOD takes it here. */
    if (tex->op == nir_texop_txl) {
       int l = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-      nir_def *bias = nir_fmul_imm(b, nir_i2f32(b, nir_ishr_imm(b, nir_ishl_imm(b,
-         bits(b, sampler, APEX_HW_SAMPLER_BIAS, 14), 18), 18)), 1.0 / 256);
-      nir_src_rewrite(&tex->src[l].src, nir_fadd(b, tex->src[l].src.ssa, bias));
+      nir_src_rewrite(&tex->src[l].src, nir_fadd(b, tex->src[l].src.ssa, sampler_bias(b, sampler)));
    }
    /* The compiler encodes the instruction around both descriptors. */
    nir_tex_instr_remove_src(tex, nir_tex_instr_src_index(tex, nir_tex_src_texture_deref));
