@@ -251,6 +251,7 @@ apex_hw_image_descriptor(const struct apex_hw_image *image, uint32_t d[8])
    put(d, APEX_HW_IMAGE_PITCH, 16, image->pitch64);
    put(d, APEX_HW_IMAGE_LAYER_STRIDE, 34, image->stride64);
    put(d, APEX_HW_IMAGE_MIN_LOD, 12, image->min_lod);
+   put(d, APEX_HW_IMAGE_FIRST, 2, image->first);
 }
 
 /* Q(n).8 fixed point, clamped to the field. */

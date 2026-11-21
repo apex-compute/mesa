@@ -1584,6 +1584,8 @@ image_row(union apex_descriptor *rows, const struct apex_image *image, const str
       .depth = three_d ? l->depth : view->layer_count,
       .levels = storage ? 1 : view->level_count,
       .pitch64 = hw->tiled ? 0 : l->pitch / 64, .stride64 = hw->layer_stride / 64,
+      /* Borders index format components: a stencil view's S is stored in channel 3 or 1. */
+      .first = channel[0] < 4 ? channel[0] : 0,
    };
    const VkComponentSwizzle mapping[4] = {view->swizzle.r, view->swizzle.g, view->swizzle.b, view->swizzle.a};
    for (unsigned c = 0; c < 4; c++) {

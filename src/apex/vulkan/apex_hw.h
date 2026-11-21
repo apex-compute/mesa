@@ -95,6 +95,7 @@ uint64_t apex_hw_texel_offset(const struct apex_hw_layout *layout, unsigned leve
 #define APEX_HW_IMAGE_PITCH 111          /* linear row pitch, 64-byte units, 16 bits */
 #define APEX_HW_IMAGE_LAYER_STRIDE 127   /* 64-byte units, 34 bits */
 #define APEX_HW_IMAGE_MIN_LOD 161        /* Q4.8, 12 bits */
+#define APEX_HW_IMAGE_FIRST 173          /* stored channel of component 0, 2 bits */
 /* Sampler descriptor (32 bytes) bit offsets. */
 #define APEX_HW_SAMPLER_ADDRESS 3        /* three 3-bit VkSamplerAddressMode */
 #define APEX_HW_SAMPLER_COMPARE 12
@@ -120,6 +121,7 @@ struct apex_hw_image {
    uint32_t pitch64;
    uint64_t stride64;
    uint32_t min_lod;     /* Q4.8 */
+   uint8_t first;        /* stored channel of component 0: a stencil view's S */
 };
 void apex_hw_image_descriptor(const struct apex_hw_image *image, uint32_t d[8]);
 void apex_hw_sampler_descriptor(const VkSamplerCreateInfo *info, const struct vk_sampler *sampler,
