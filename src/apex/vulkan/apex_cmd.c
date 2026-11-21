@@ -1068,10 +1068,31 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
                          ops[1] ? ops[1]->clearValue.depthStencil.stencil : 0, hw->clear);
       if (all_clear)
          hw->clear_depth = op->clearValue.depthStencil.depth;
-      struct apex_attachment target = attachment(NULL, op->resolveImageView);
-      if (op->resolveMode != VK_RESOLVE_MODE_NONE && target.image && !cmd->rendering.suspending) {
-         hw->resolve = true;
-         hw->resolve_surface = surface_of(&target);
+      /* The hardware resolves every aspect into a target of the attachment's
+       * format. A target of another format (a compatible render pass) or
+       * with an aspect that is not resolved takes sample 0 of the resolved
+       * aspects it has by copies after the pass, which stores the samples. */
+      struct apex_attachment target = {0};
+      VkImageAspectFlags resolve = 0;
+      for (unsigned i = 0; i < 2; i++) {
+         VkImageAspectFlags aspect = i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+         if ((format_aspects & aspect) && ops[i] && ops[i]->resolveMode != VK_RESOLVE_MODE_NONE &&
+             ops[i]->resolveImageView) {
+            target = attachment(NULL, ops[i]->resolveImageView);
+            resolve |= aspect;
+         }
+      }
+      resolve &= target.image ? vk_format_aspects(target.image->vk.format) : 0;
+      if (resolve && !cmd->rendering.suspending) {
+         if (resolve == vk_format_aspects(target.image->vk.format) &&
+             target.image->vk.format == ds.image->vk.format) {
+            hw->resolve = true;
+            hw->resolve_surface = surface_of(&target);
+         } else {
+            hw->store = true;
+            cmd->rendering.depth_resolve = target;
+            cmd->rendering.depth_resolve_aspects = resolve;
+         }
       }
    }
    pass->samples = samples;
@@ -1087,6 +1108,9 @@ apex_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
 
 static void resolve_pass(struct apex_command_buffer *cmd, const struct apex_attachment *from,
                          const struct apex_attachment *to, VkRect2D area, unsigned layers);
+static void resolve_aspect(struct apex_command_buffer *cmd, const struct apex_attachment *from,
+                           const struct apex_attachment *to, VkImageAspectFlags aspect, VkRect2D area,
+                           unsigned layer, unsigned layers);
 
 static VKAPI_ATTR void VKAPI_CALL
 apex_CmdEndRendering(VkCommandBuffer handle)
@@ -1100,6 +1124,21 @@ apex_CmdEndRendering(VkCommandBuffer handle)
    memcpy(resolve, cmd->rendering.resolve, sizeof(resolve));
    uint32_t views = cmd->rendering.view_mask;
    VkRect2D area = cmd->rendering.area;
+   VkImageAspectFlags depth_aspects = cmd->rendering.depth_resolve_aspects;
+   struct apex_attachment depth = cmd->rendering.depth, depth_resolve = cmd->rendering.depth_resolve;
+   if (depth_aspects) {
+      apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_GRAPHICS, APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE);
+      u_foreach_bit(a, depth_aspects) {
+         if (views) {
+            u_foreach_bit(view, views)
+               resolve_aspect(cmd, &depth, &depth_resolve, 1u << a, area, view, 1);
+         } else {
+            resolve_aspect(cmd, &depth, &depth_resolve, 1u << a, area, 0, cmd->rendering.layers);
+         }
+      }
+      /* Later graphics work waits only for graphics. */
+      apex_cp_barrier(&cmd->ib, APEX_CP_CLASS_COMPUTE, APEX_CP_CACHE_L1 | APEX_CP_CACHE_TEXTURE);
+   }
    for (unsigned k = 0; k < APEX_HW_MAX_COLOR; k++) {
       if (!resolve[k].image)
          continue;
@@ -2490,6 +2529,25 @@ resolve_pass(struct apex_command_buffer *cmd, const struct apex_attachment *from
    a->resolve_surface = surface_of(to);
    emit_pass(cmd);
    end_pass(cmd);
+}
+
+/* A sample-zero resolve of one depth-stencil aspect: copies sample 0 of
+ * each layer of the region into that aspect of the target. */
+static void
+resolve_aspect(struct apex_command_buffer *cmd, const struct apex_attachment *from,
+               const struct apex_attachment *to, VkImageAspectFlags aspect, VkRect2D area,
+               unsigned layer, unsigned layers)
+{
+   unsigned offset, bytes, dst_offset, unused;
+   uint32_t mask, src[APEX_SURFACE_WORDS], dst[APEX_SURFACE_WORDS];
+   aspect_element(from->image->vk.format, aspect, &offset, &bytes, &mask);
+   aspect_element(to->image->vk.format, aspect, &dst_offset, &unused, &mask);
+   image_surface(from->image, &from->image->layout, apex_image_va(from->image), from->level,
+                 from->layer + layer, area.offset.x, area.offset.y, src);
+   image_surface(to->image, &to->image->layout, apex_image_va(to->image), to->level,
+                 to->layer + layer, area.offset.x, area.offset.y, dst);
+   src[APEX_SURFACE_FLAGS] = (src[APEX_SURFACE_FLAGS] & ~(0xffu << 4)) | 1u << 4;
+   copy_surfaces(cmd, src, dst, area.extent.width, area.extent.height, layers, bytes, offset, dst_offset, mask);
 }
 
 /* Resolves run as passes that load the multisampled region and resolve

@@ -222,6 +222,10 @@ struct apex_command_buffer {
       /* Color resolves of a pass whose view mask is not a run from view 0,
        * done per view after the pass ends. */
       struct apex_attachment resolve[APEX_HW_MAX_COLOR];
+      /* The depth-stencil resolve target and its aspects when it has an
+       * aspect that is not resolved, done by copies after the pass. */
+      struct apex_attachment depth_resolve;
+      VkImageAspectFlags depth_resolve_aspects;
       bool has_depth, has_stencil;
       struct apex_hw_pass pass;
       /* A pass of more bins than the raster back end takes renders in
