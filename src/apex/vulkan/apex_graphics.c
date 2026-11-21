@@ -1466,6 +1466,8 @@ apex_shader_destroy(struct vk_device *device, struct vk_shader *vk,
    apex_program_finish((struct apex_device *)device, &shader->program);
    apex_program_finish((struct apex_device *)device, &shader->capture);
    apex_program_finish((struct apex_device *)device, &shader->geometry.draw);
+   if (shader->implicit_geometry)
+      apex_shader_destroy(device, &shader->implicit_geometry->vk, alloc);
    for (unsigned s = 0; s < ARRAY_SIZE(shader->set_layouts); s++)
       if (shader->set_layouts[s])
          vk_descriptor_set_layout_unref(device, shader->set_layouts[s]);
@@ -1605,6 +1607,9 @@ apex_shader_serialize(struct vk_device *device, const struct vk_shader *vk, stru
    blob_write_uint16(blob, shader->geometry.invocations);
    blob_write_uint8(blob, shader->geometry.primitive_vertices);
    blob_write_uint8(blob, shader->geometry.input_vertices);
+   blob_write_uint8(blob, shader->implicit_geometry != NULL);
+   if (shader->implicit_geometry && !apex_shader_serialize(device, &shader->implicit_geometry->vk, blob))
+      return false;
    return !blob->out_of_memory;
 }
 
@@ -1797,6 +1802,92 @@ fail:
 
 static unsigned free_slot(nir_shader *vertex, nir_shader *fragment, uint32_t taken);
 
+static bool
+reads_primitive_id(nir_shader *fragment)
+{
+   nir_shader_gather_info(fragment, nir_shader_get_entrypoint(fragment));
+   bool reads = BITSET_TEST(fragment->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID);
+   nir_foreach_variable_with_modes(var, fragment, nir_var_system_value)
+      reads |= var->data.location == SYSTEM_VALUE_PRIMITIVE_ID;
+   return reads;
+}
+
+/* Only the geometry path counts primitives: a fragment stage reading
+ * gl_PrimitiveID without a geometry stage draws through this geometry
+ * shader, which copies the vertex outputs of each input primitive's
+ * vertices (without adjacency) and writes gl_PrimitiveID. NULL for
+ * patches. */
+static nir_shader *
+implicit_geometry(nir_shader *vertex, VkPrimitiveTopology topology)
+{
+   static const uint8_t points[] = {0}, lines[] = {0, 1}, triangles[] = {0, 1, 2};
+   static const uint8_t lines_adjacency[] = {1, 2}, triangles_adjacency[] = {0, 2, 4};
+   enum mesa_prim in, out;
+   const uint8_t *emit;
+   unsigned count;
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+      in = out = MESA_PRIM_POINTS, emit = points, count = 1;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+      in = MESA_PRIM_LINES, out = MESA_PRIM_LINE_STRIP, emit = lines, count = 2;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+      in = MESA_PRIM_TRIANGLES, out = MESA_PRIM_TRIANGLE_STRIP, emit = triangles, count = 3;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+      in = MESA_PRIM_LINES_ADJACENCY, out = MESA_PRIM_LINE_STRIP, emit = lines_adjacency, count = 2;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+      in = MESA_PRIM_TRIANGLES_ADJACENCY, out = MESA_PRIM_TRIANGLE_STRIP, emit = triangles_adjacency, count = 3;
+      break;
+   default:
+      return NULL;
+   }
+   nir_builder builder = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, vertex->options,
+                                                        "apex_primitive_id");
+   nir_builder *b = &builder;
+   nir_shader *nir = b->shader;
+   nir->info.gs.input_primitive = in;
+   nir->info.gs.output_primitive = out;
+   nir->info.gs.vertices_in = input_vertices(in);
+   nir->info.gs.vertices_out = count;
+   nir->info.gs.invocations = 1;
+   nir->info.gs.active_stream_mask = 1;
+   nir->info.clip_distance_array_size = vertex->info.clip_distance_array_size;
+   nir->info.cull_distance_array_size = vertex->info.cull_distance_array_size;
+   struct util_dynarray pairs;
+   util_dynarray_init(&pairs, NULL);
+   nir_foreach_variable_with_modes(var, vertex, nir_var_shader_out) {
+      nir_variable *input = nir_variable_clone(var, nir);
+      input->data.mode = nir_var_shader_in;
+      input->type = glsl_array_type(var->type, nir->info.gs.vertices_in, 0);
+      nir_shader_add_variable(nir, input);
+      nir_variable *output = nir_variable_clone(var, nir);
+      nir_shader_add_variable(nir, output);
+      util_dynarray_append(&pairs, input);
+      util_dynarray_append(&pairs, output);
+   }
+   nir_variable *primitive = nir_variable_create(nir, nir_var_shader_out, glsl_int_type(), "apex_primitive_id");
+   primitive->data.location = VARYING_SLOT_PRIMITIVE_ID;
+   primitive->data.interpolation = INTERP_MODE_FLAT;
+   for (unsigned k = 0; k < count; k++) {
+      for (unsigned p = 0; p < util_dynarray_num_elements(&pairs, nir_variable *); p += 2) {
+         nir_variable *input = *util_dynarray_element(&pairs, nir_variable *, p);
+         nir_variable *output = *util_dynarray_element(&pairs, nir_variable *, p + 1);
+         nir_copy_deref(b, nir_build_deref_var(b, output),
+                        nir_build_deref_array_imm(b, nir_build_deref_var(b, input), emit[k]));
+      }
+      nir_store_var(b, primitive, nir_load_primitive_id(b), 1);
+      nir_emit_vertex(b, 0);
+   }
+   nir_end_primitive(b, 0);
+   util_dynarray_fini(&pairs);
+   return nir;
+}
+
 /* The varying slot linking the layer to a fragment stage that reads it, the
  * view index or an input attachment: the lowest of varyings 0-29 that
  * neither stage uses. Zero when the layer is always zero or no slot is free. */
@@ -1868,15 +1959,19 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
    /* Clip and cull distances of the vertex stage reach a fragment stage
     * compiled with it as varyings. */
    struct link link = {.varyings = ~0ull};
-   nir_shader *vertex = NULL, *geometry = NULL, *fragment = NULL;
+   nir_shader *vertex = NULL, *geometry = NULL, *fragment = NULL, *implicit = NULL;
+   uint32_t vertex_info = 0;
    for (uint32_t i = 0; i < count; i++) {
       if (infos[i].stage == MESA_SHADER_VERTEX)
-         vertex = infos[i].nir;
+         vertex = infos[i].nir, vertex_info = i;
       if (infos[i].stage == MESA_SHADER_GEOMETRY)
          geometry = infos[i].nir;
       if (infos[i].stage == MESA_SHADER_FRAGMENT)
          fragment = infos[i].nir;
    }
+   if (vertex && fragment && !geometry && state && state->ia &&
+       !(vertex->xfb_info && vertex->xfb_info->output_count) && reads_primitive_id(fragment))
+      geometry = implicit = implicit_geometry(vertex, state->ia->primitive_topology);
    /* The geometry shader's inputs are its records; its outputs, through the
     * pass-through program, reach the fragment stage. */
    if (geometry) {
@@ -1927,6 +2022,18 @@ apex_compile(struct vk_device *device, uint32_t count, struct vk_shader_compile_
       }
       result = compile_stage(device, &infos[i], state, link, alloc, &shaders[i]);
    }
+   if (implicit && result == VK_SUCCESS) {
+      struct vk_shader_compile_info info = infos[vertex_info];
+      info.stage = MESA_SHADER_GEOMETRY;
+      info.nir = implicit;
+      struct vk_shader *shader;
+      result = compile_stage(device, &info, state, link, alloc, &shader);
+      if (result == VK_SUCCESS)
+         container_of(shaders[vertex_info], struct apex_shader, vk)->implicit_geometry =
+            container_of(shader, struct apex_shader, vk);
+   } else {
+      ralloc_free(implicit);
+   }
    if (result != VK_SUCCESS) {
       for (uint32_t i = 0; i < count; i++)
          if (shaders[i])
@@ -1972,6 +2079,12 @@ apex_deserialize(struct vk_device *device, struct blob_reader *blob, uint32_t ve
    shader->geometry.invocations = blob_read_uint16(blob);
    shader->geometry.primitive_vertices = blob_read_uint8(blob);
    shader->geometry.input_vertices = blob_read_uint8(blob);
+   if (valid && blob_read_uint8(blob) && !blob->overrun) {
+      struct vk_shader *implicit;
+      valid = apex_deserialize(device, blob, version, alloc, &implicit) == VK_SUCCESS;
+      if (valid)
+         shader->implicit_geometry = container_of(implicit, struct apex_shader, vk);
+   }
    valid = valid && !blob->overrun;
    if (!valid) {
       apex_shader_destroy(device, &shader->vk, alloc);
@@ -2011,6 +2124,9 @@ apex_hash_state(struct vk_physical_device *physical, const struct vk_graphics_pi
    _mesa_blake3_init(&hash);
    if (state && (stages & VK_SHADER_STAGE_VERTEX_BIT) && state->vi)
       _mesa_blake3_update(&hash, state->vi, sizeof(*state->vi));
+   /* The topology selects an implicit geometry shader's input primitive. */
+   if (state && (stages & VK_SHADER_STAGE_VERTEX_BIT) && state->ia)
+      _mesa_blake3_update(&hash, &state->ia->primitive_topology, sizeof(state->ia->primitive_topology));
    if (state && state->mv)
       _mesa_blake3_update(&hash, &state->mv->view_mask, sizeof(state->mv->view_mask));
    if (state && state->rp) {

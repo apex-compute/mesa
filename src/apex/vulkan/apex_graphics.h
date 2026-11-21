@@ -42,6 +42,9 @@ struct apex_shader {
       uint16_t max_vertices, max_primitives, invocations;
       uint8_t primitive_vertices, input_vertices;
    } geometry;
+   /* A vertex stage whose fragment stage reads gl_PrimitiveID without a
+    * geometry stage draws through this pass-through geometry shader. */
+   struct apex_shader *implicit_geometry;
 };
 
 extern const struct vk_device_shader_ops apex_device_shader_ops;
