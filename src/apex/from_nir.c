@@ -3366,7 +3366,6 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    const nir_load_store_vectorize_options vector_access = {
       .callback = vectorize,
       .modes = nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_shared | nir_var_mem_push_const,
-      .bounds_checked_modes = nir_var_mem_ssbo | nir_var_mem_ubo,
    };
    bool vectorized = false;
    NIR_PASS(vectorized, nir, nir_opt_load_store_vectorize, &vector_access);

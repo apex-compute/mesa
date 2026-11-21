@@ -140,10 +140,14 @@ lower_buffer(nir_builder *b, nir_intrinsic_instr *i, void *data)
       descriptor = nir_scalar_is_const(e) ? memory :
          nir_bcsel(b, nir_ieq_imm(b, element, ~0), descriptor, memory);
    }
-   if (size)
+   if (size) {
       nir_def_replace(&i->def, nir_channel(b, descriptor, 2));
-   else
-      nir_src_rewrite(index, descriptor);
+      return true;
+   }
+   nir_src_rewrite(index, descriptor);
+   if (!atomic && (i->intrinsic == nir_intrinsic_load_ubo ? ctx->program->robust_uniform :
+                                                            ctx->program->robust_storage))
+      nir_intrinsic_set_access(i, nir_intrinsic_access(i) | ACCESS_KEEP_SCALAR);
    return true;
 }
 
@@ -456,6 +460,10 @@ create_compute_pipeline(struct vk_device *device,
    /* Without a layout the program keeps binding 0 as its raw storage buffer:
     * the RTL benches' fixtures. Submission requires a descriptor table. */
    if (layout) {
+      struct vk_pipeline_robustness_state rs;
+      vk_pipeline_robustness_state_fill(&device->robustness_state, &rs, info->pNext, info->stage.pNext);
+      pipeline->program.robust_storage = rs.storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+      pipeline->program.robust_uniform = rs.uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
       pipeline->layout = vk_pipeline_layout_ref(layout);
       if (!apex_program_layout(&pipeline->program, layout->set_count, layout->set_layouts,
                                layout->push_range_count, layout->push_ranges,

@@ -15,7 +15,10 @@
  * uploads lazily on the submit thread. `table` is false only for
  * layout-less fixtures. User data s0:s1 hold the table's GPUVA; compute
  * user data s2:s3 the address of the dispatch grid, vertex user data s2 the
- * view index. `max_workgroups` bounds a DISPATCH by the private arena. */
+ * view index. `max_workgroups` bounds a DISPATCH by the private arena.
+ * Under robust storage or uniform buffer access, such accesses stay
+ * unmerged: the hardware zeroes or drops a whole access that leaves its
+ * buffer (Docs/isa.md), which would take in-range dwords with it. */
 #define APEX_USER_GRID 2
 struct apex_program {
    struct apex_compile_result code;
@@ -27,6 +30,7 @@ struct apex_program {
    uint32_t descriptor_count;
    uint32_t push_size;
    uint32_t max_workgroups;
+   bool robust_storage, robust_uniform;
    BITSET_DECLARE(used_descriptors, APEX_MAX_DESCRIPTORS);
 };
 

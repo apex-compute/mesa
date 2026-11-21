@@ -1691,6 +1691,10 @@ compile_stage(struct vk_device *device, struct vk_shader_compile_info *info,
                             info->push_constant_range_count, info->push_constant_ranges,
                             VK_SHADER_STAGE_ALL_GRAPHICS))
       goto fail;
+   shader->program.robust_storage = info->robustness &&
+      info->robustness->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+   shader->program.robust_uniform = info->robustness &&
+      info->robustness->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
    struct apex_vertex_input vi;
    if (info->stage == MESA_SHADER_VERTEX && link.records) {
       if (!vertex_input(state, info->robustness, &vi))
