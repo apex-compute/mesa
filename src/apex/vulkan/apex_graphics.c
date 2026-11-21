@@ -77,14 +77,16 @@ distance_variable(nir_shader *nir, nir_variable_mode mode, unsigned offset)
 
 /* ---- Vertex stage -------------------------------------------------------- */
 
-/* Multiview: the view index is vertex user data s2 and the layer. */
+/* Multiview (`data` non-NULL): the view index is vertex user data s2 and
+ * the layer. Without multiview it is 0. */
 static bool
 lower_view_index(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
    if (i->intrinsic != nir_intrinsic_load_view_index)
       return false;
    b->cursor = nir_before_instr(&i->instr);
-   nir_def_replace(&i->def, nir_load_kernel_input(b, 1, 32, nir_imm_int(b, 0), .base = 8, .range = 4));
+   nir_def_replace(&i->def, data ? nir_load_kernel_input(b, 1, 32, nir_imm_int(b, 0), .base = 8, .range = 4) :
+                                   nir_imm_int(b, 0));
    return true;
 }
 
@@ -143,6 +145,9 @@ lower_vertex(nir_shader *nir, const struct vk_graphics_pipeline_state *state, st
       nir_store_var(b, layer, view, 1);
       if (link)
          nir_store_var(b, link, view, 1);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_view_index, nir_metadata_control_flow, nir);
+   } else {
+      NIR_PASS(_, nir, nir_lower_system_values);
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_view_index, nir_metadata_control_flow, NULL);
    }
    if (varyings) {
