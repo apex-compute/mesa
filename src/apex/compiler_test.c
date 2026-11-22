@@ -105,7 +105,7 @@ static void check_binary(const struct apex_compile_result *r, uint32_t constant)
 
 static void reject(nir_shader *nir, struct apex_compile_result *result, const char *diagnostic)
 {
-   CHECK(apex_from_nir(nir, NULL, result) != 0);
+   CHECK(apex_from_nir(nir, NULL, false, result) != 0);
    ralloc_free(nir);
    CHECK(!result->data && result->size == 0);
    CHECK(strstr(result->diagnostic, diagnostic));
@@ -151,7 +151,7 @@ static void test_vertex_prolog(bool robust)
       nir_store_var(&b, out, nir_load_var(&b, in), 0xf);
    }
    struct apex_compile_result r = {0};
-   if (apex_from_nir(b.shader, &vi, &r))
+   if (apex_from_nir(b.shader, &vi, false, &r))
       fprintf(stderr, "%s\n", r.diagnostic);
    ralloc_free(b.shader);
    CHECK(r.data && !r.spills);
@@ -246,10 +246,10 @@ int main(int argc, char **argv)
    glsl_type_singleton_init_or_ref();
    struct apex_compile_result a = {0}, b = {0};
    nir_shader *nir = shader(0x13579bdf);
-   CHECK(apex_from_nir(nir, NULL, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, false, &a) == 0);
    ralloc_free(nir);
    nir = shader(0x2468ace0);
-   CHECK(apex_from_nir(nir, NULL, &b) == 0);
+   CHECK(apex_from_nir(nir, NULL, false, &b) == 0);
    ralloc_free(nir);
    CHECK(a.data != b.data);
    check_binary(&a, 0x13579bdf);
@@ -266,7 +266,7 @@ int main(int argc, char **argv)
       var->constant_initializer = rzalloc(init, nir_constant);
       var->constant_initializer->values[0].u32 = 0x2468ace0;
       nir_store_ssbo(&ib, nir_load_var(&ib, var), nir_imm_int(&ib, 0), nir_imm_int(&ib, 12), .align_mul = 4);
-      CHECK(apex_from_nir(init, NULL, &a) == 0);
+      CHECK(apex_from_nir(init, NULL, false, &a) == 0);
       nir_intrinsic_instr *store = nir_instr_as_intrinsic(nir_block_last_instr(
          nir_start_block(nir_shader_get_entrypoint(init))));
       CHECK(store->intrinsic == nir_intrinsic_store_ssbo);
@@ -303,7 +303,7 @@ int main(int argc, char **argv)
       nir_pop_if(l, NULL);
       nir_store_var(l, index, nir_iadd_imm(l, iteration, 1), 1);
       nir_pop_loop(l, NULL);
-      if (apex_from_nir(s, NULL, &a))
+      if (apex_from_nir(s, NULL, false, &a))
          fprintf(stderr, "%s\n", a.diagnostic);
       CHECK(a.data);
       unsigned loads = 0;
@@ -335,7 +335,7 @@ int main(int argc, char **argv)
    };
    for (unsigned i = 0; i < ARRAY_SIZE(valid_wide); i++) {
       nir = geometry_shader(valid_wide[i][0], valid_wide[i][1], valid_wide[i][2]);
-      CHECK(apex_from_nir(nir, NULL, &a) == 0);
+      CHECK(apex_from_nir(nir, NULL, false, &a) == 0);
       ralloc_free(nir);
       unsigned invocations = valid_wide[i][0] * valid_wide[i][1] * valid_wide[i][2];
       CHECK(word(a.data + 16) == (valid_wide[i][0] | valid_wide[i][1] << 16) &&
@@ -409,7 +409,7 @@ int main(int argc, char **argv)
          reject(nir, &a, "barrier");
          continue;
       }
-      CHECK(apex_from_nir(nir, NULL, &a) == 0);
+      CHECK(apex_from_nir(nir, NULL, false, &a) == 0);
       ralloc_free(nir);
       check_binary(&a, 17);
       CHECK(has_opcode(&a, APEX_S_FENCE) && !has_opcode(&a, APEX_S_BARRIER));
@@ -420,7 +420,7 @@ int main(int argc, char **argv)
    nb = builder(nir);
    nir_barrier(&nb, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
                .memory_modes = nir_var_mem_shared, .memory_semantics = NIR_MEMORY_ACQ_REL);
-   CHECK(apex_from_nir(nir, NULL, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, false, &a) == 0);
    ralloc_free(nir);
    CHECK(has_opcode(&a, APEX_S_BARRIER));
    check_binary(&a, 17);
@@ -428,7 +428,7 @@ int main(int argc, char **argv)
 
    /* Paired global addresses: descriptors in the root, data elsewhere. */
    nir = global_shader(4, 4);
-   CHECK(apex_from_nir(nir, NULL, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, false, &a) == 0);
    ralloc_free(nir);
    {
       const uint64_t data_va = 0xfeffff0000ull; /* the low word carries */
@@ -462,7 +462,7 @@ int main(int argc, char **argv)
                                   .align_mul = 4);
    nir_store_ssbo(&nb, nir_usub_sat(&nb, left, right), nir_imm_int(&nb, 0),
                   nir_iadd_imm(&nb, offset, 256), .align_mul = 4);
-   CHECK(apex_from_nir(nir, NULL, &a) == 0);
+   CHECK(apex_from_nir(nir, NULL, false, &a) == 0);
    ralloc_free(nir);
    {
       uint8_t root[384] = {0};

@@ -32,6 +32,9 @@ struct drm_apex_info {
 };
 
 #define APEX_INFO_LOCAL_USED (1ull << 0)
+/* Vertex and fragment waves have private memory: state registers 0x04a-0x04b
+ * and up to 4 KiB of private bytes per lane (BAR0 CAP_GRAPHICS_SCRATCH). */
+#define APEX_INFO_GRAPHICS_SCRATCH (1ull << 1)
 
 #define APEX_GEM_SYSTEM (1u << 0) /* cached host shmem, GPU access over PCIe */
 /* Without SYSTEM: contiguous zero-filled LOCAL, the class of dumb buffers and

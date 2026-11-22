@@ -13,7 +13,8 @@
 #undef kDefaultMaxIdBound
 #include <stdio.h>
 
-int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_result *out)
+int apex_compile_spirv(const uint32_t *words, size_t count, bool graphics_scratch,
+                       struct apex_compile_result *out)
 {
    *out = (struct apex_compile_result){0};
    if (count < 5 || words[0] != SpvMagicNumber) {
@@ -81,7 +82,7 @@ int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_
    nir_shader *nir = spirv_to_nir(words, count, NULL, stage, "main", &spv, &apex_nir_options);
    int result = 1;
    if (nir)
-      result = apex_from_nir(nir, NULL, out);
+      result = apex_from_nir(nir, NULL, graphics_scratch, out);
    else
       snprintf(out->diagnostic, sizeof(out->diagnostic), "SPIR-V translation failed");
    ralloc_free(nir);

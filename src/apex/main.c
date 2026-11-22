@@ -7,10 +7,16 @@
 
 int main(int argc, char **argv)
 {
+   /* --graphics-scratch compiles for a device with graphics private memory. */
+   bool graphics_scratch = argc == 4 && !strcmp(argv[1], "--graphics-scratch");
+   if (graphics_scratch) {
+      argv++;
+      argc--;
+   }
    if (argc == 4 && argv[1][0] == '-')
       return apex_tool(argv[1], argv[2], argv[3]);
    if (argc != 3) {
-      fprintf(stderr, "usage: apex-compile input.spv output.apx\n"
+      fprintf(stderr, "usage: apex-compile [--graphics-scratch] input.spv output.apx\n"
               "       apex-compile --assemble|--disassemble|--validate input output\n");
       return 1;
    }
@@ -26,7 +32,7 @@ int main(int argc, char **argv)
    fclose(f);
    if (got != (size_t)size) { free(words); return 1; }
    struct apex_compile_result compiled;
-   int result = apex_compile_spirv(words, size / 4, &compiled);
+   int result = apex_compile_spirv(words, size / 4, graphics_scratch, &compiled);
    free(words);
    if (result) {
       fprintf(stderr, "apex: %s\n", compiled.diagnostic);

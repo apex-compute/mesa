@@ -87,8 +87,10 @@ static inline uint32_t apex_raw(unsigned v) { return 1u << 29 | v; }
 #define APEX_EXEC 224u
 #define APEX_LANE 225u
 enum apex_stage { APEX_COMPUTE, APEX_VERTEX, APEX_FRAGMENT };
+/* `graphics_scratch`: a vertex or fragment program that does not fit the
+ * register file may spill to private memory (APEX_INFO_GRAPHICS_SCRATCH). */
 struct apex_header {
-   uint32_t stage, flags, local[3], shared, private_bytes, output, input_count;
+   uint32_t stage, flags, local[3], shared, private_bytes, output, input_count, graphics_scratch;
    uint8_t inputs[32]; /* bit 7 flat; input k is vertex output varying k */
 };
 int apex_emit(const struct apex_op *, size_t, const struct apex_value *, size_t,
@@ -149,10 +151,15 @@ bool apex_vertex_format(uint32_t format);
 bool apex_nir_lower_vertex_input(struct nir_shader *, const struct apex_vertex_input *vi);
 /* Mutates caller-owned NIR; the caller retains its lifetime and GLSL type ref.
  * Compute, vertex and fragment stages; `vi` is the vertex stage's input
- * state (apex_nir_lower_vertex_input). */
-int apex_from_nir(struct nir_shader *, const struct apex_vertex_input *vi, struct apex_compile_result *);
+ * state (apex_nir_lower_vertex_input). With `graphics_scratch` (the device
+ * reports APEX_INFO_GRAPHICS_SCRATCH) a vertex or fragment program that does
+ * not fit the register file spills vectors to private memory; programs that
+ * fit compile to the same code either way. */
+int apex_from_nir(struct nir_shader *, const struct apex_vertex_input *vi, bool graphics_scratch,
+                  struct apex_compile_result *);
 /* Late algebraic rules (apex_nir_algebraic.py). */
 bool apex_nir_opt_late(struct nir_shader *);
 /* Validates Vulkan 1.3 SPIR-V and compiles its first entry point (standalone). */
-int apex_compile_spirv(const uint32_t *words, size_t count, struct apex_compile_result *);
+int apex_compile_spirv(const uint32_t *words, size_t count, bool graphics_scratch,
+                       struct apex_compile_result *);
 #endif

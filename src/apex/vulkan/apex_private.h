@@ -190,6 +190,8 @@ struct apex_command_buffer {
     * groups by value; `emitted` false forces every group. */
    struct {
       bool emitted;
+      /* The graphics private base registers hold the device's area. */
+      bool graphics_private;
       uint32_t vertex[11], fragment[10], dynamic[APEX_HW_DYNAMIC_DWORDS];
       struct apex_program *vertex_program, *fragment_program;
       struct apex_table *table;

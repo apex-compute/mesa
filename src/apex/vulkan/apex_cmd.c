@@ -1376,6 +1376,19 @@ emit_draw_state(struct apex_command_buffer *cmd, bool indexed, uint32_t view, co
                         (uint32_t[4]){0, 0, fragment_user[0], fragment_user[1]});
       memcpy(cmd->state.fragment_user, fragment_user, sizeof(fragment_user));
    }
+   /* A program that spills reads the device's graphics private area; the
+    * area never moves, so the registers are written once per state epoch. */
+   if ((!cmd->state.emitted || !cmd->state.graphics_private) &&
+       (apex_program_private_bytes(vs) || apex_program_private_bytes(fs))) {
+      uint64_t va;
+      VkResult result = apex_device_graphics_private(device, &va);
+      if (result != VK_SUCCESS) {
+         fail(cmd, result);
+         return false;
+      }
+      apex_cp_set_state(&cmd->ib, APEX_STATE_GRAPHICS_PRIVATE, 2, (uint32_t[2]){LO(va), HI(va)});
+      cmd->state.graphics_private = true;
+   }
    cmd->state.table = cmd->graphics_table;
    cmd->state.view = view;
    uint32_t dynamic[APEX_HW_DYNAMIC_DWORDS];

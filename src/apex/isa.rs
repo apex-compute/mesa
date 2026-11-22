@@ -797,6 +797,9 @@ pub const INVERSE_W: u8 = 64;
 pub const PER_SAMPLE: u8 = 128;
 
 /// Program header (64 bytes, Docs/isa.md "Program header") and code.
+/// Private bytes per lane a vertex or fragment program may use: a wave
+/// slot's 128 KiB of the 2 MiB graphics private area (Docs/isa.md).
+pub const GRAPHICS_PRIVATE: u32 = 4096;
 #[derive(Clone, Debug)]
 pub struct Program {
     pub stage: Stage,
@@ -829,7 +832,7 @@ impl Program {
             || !(1..=256).contains(&self.invocations())
             || self.shared > 32768
             || self.private % 4 != 0
-            || (!compute && (n != [32, 1, 1] || self.shared != 0 || self.private != 0))
+            || (!compute && (n != [32, 1, 1] || self.shared != 0 || self.private > GRAPHICS_PRIVATE))
             || (self.stage != Stage::Fragment && (self.flags != 0 || !self.inputs.is_empty()))
             || (self.stage == Stage::Fragment && self.output >> 9 != 0)
             || (self.stage == Stage::Vertex && (self.output % 64 != 0 || self.output > 0xffff))

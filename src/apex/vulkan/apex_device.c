@@ -1614,6 +1614,23 @@ image_row(union apex_descriptor *rows, const struct apex_image *image, const str
       rows[1].words[w] = util_cpu_to_le32(words[w]);
 }
 
+VkResult
+apex_device_graphics_private(struct apex_device *device, uint64_t *va)
+{
+   VkResult result = VK_SUCCESS;
+   mtx_lock(&device->memory_mutex);
+   if (!device->graphics_private.va) {
+      mtx_lock(&device->va_mutex);
+      uint64_t at = util_vma_heap_alloc(&device->va_heap, APEX_PRIVATE_BYTES, APEX_PRIVATE_BYTES);
+      mtx_unlock(&device->va_mutex);
+      result = at ? apex_bo_create(device, APEX_PRIVATE_BYTES, APEX_VM_READ | APEX_VM_WRITE, 0, at,
+                                   &device->graphics_private) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   *va = device->graphics_private.va;
+   mtx_unlock(&device->memory_mutex);
+   return result;
+}
+
 /* The null-image memory's address, created on first use; zero without
  * it, which leaves the row null (white). */
 static uint64_t
@@ -2459,6 +2476,8 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    memset(device->internal, 0, sizeof(device->internal));
    device->empty_fragment = NULL;
    device->null_image = (struct apex_bo){0};
+   device->graphics_scratch = caps.flags & APEX_INFO_GRAPHICS_SCRATCH;
+   device->graphics_private = (struct apex_bo){0};
    for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++) {
       list_inithead(&device->queues[f].busy_arenas);
       list_inithead(&device->queues[f].free_arenas);
@@ -2562,6 +2581,7 @@ apex_device_finish(struct apex_device *device)
       free(chunk);
    }
    apex_bo_finish(device, &device->null_image);
+   apex_bo_finish(device, &device->graphics_private);
    mtx_destroy(&device->upload_mutex);
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->memory_mutex);

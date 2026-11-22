@@ -102,14 +102,14 @@ static uint32_t *read_file(const char *path, size_t *words)
 
 static unsigned total_instructions, max_vector, max_scalar, shaders;
 
-static void compile_spilling(const char *dir, const char *name, struct apex_compile_result *r,
-                             bool spills)
+static void compile_scratch(const char *dir, const char *name, struct apex_compile_result *r,
+                            bool spills, bool graphics_scratch)
 {
    char path[4096];
    snprintf(path, sizeof(path), "%s/%s", dir, name);
    size_t words;
    uint32_t *spirv = read_file(path, &words);
-   if (apex_compile_spirv(spirv, words, r)) {
+   if (apex_compile_spirv(spirv, words, graphics_scratch, r)) {
       fprintf(stderr, "%s: %s\n", name, r->diagnostic);
       abort();
    }
@@ -121,6 +121,12 @@ static void compile_spilling(const char *dir, const char *name, struct apex_comp
    max_vector = r->vector > max_vector ? r->vector : max_vector;
    max_scalar = r->scalar > max_scalar ? r->scalar : max_scalar;
    shaders++;
+}
+
+static void compile_spilling(const char *dir, const char *name, struct apex_compile_result *r,
+                             bool spills)
+{
+   compile_scratch(dir, name, r, spills, false);
 }
 
 static void compile(const char *dir, const char *name, struct apex_compile_result *r)
@@ -682,6 +688,56 @@ static void test_spill(const char *dir)
    apex_compile_result_finish(&r);
 }
 
+/* spill.vert and spill.frag: without graphics private memory they do not
+ * compile; with it they spill, and every lane keeps its own values. Lane l
+ * of the fragment wave is pixel (2(l / 4) + l % 2, l / 2 % 2), index 2x + y. */
+static void test_graphics_spill(const char *dir, const char *name, bool fragment)
+{
+   char path[4096];
+   snprintf(path, sizeof(path), "%s/%s", dir, name);
+   size_t n;
+   uint32_t *spirv = read_file(path, &n);
+   struct apex_compile_result r;
+   CHECK(apex_compile_spirv(spirv, n, false, &r) && strstr(r.diagnostic, "without spilling"));
+   apex_compile_result_finish(&r);
+   free(spirv);
+   compile_scratch(dir, name, &r, true, true);
+   const uint32_t private_bytes = get(r.data + 24);
+   CHECK(private_bytes > 0 && private_bytes <= 4096);
+   struct world w = {0};
+   uint8_t *root = region(&w, ROOT, ROOT_BYTES);
+   const unsigned words = APEX_LANES * 34 * 4;
+   uint8_t *src = region(&w, 0x200000, words * 4);
+   uint8_t *dst = region(&w, 0x400000, words * 4);
+   for (unsigned i = 0; i < words; i++)
+      put(src + 4 * i, 0x2545f491u * (i + 7));
+   buffer_descriptor(root + slot(0, 0), 0x200000, words * 4);
+   buffer_descriptor(root + slot(0, 1), 0x400000, words * 4);
+   put(root + PUSH, 1);
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   uint32_t attributes[APEX_ATTRIBUTE_BLOCK] = {0};
+   if (fragment) {
+      fragment_wave(wave, attributes);
+   } else {
+      vertex_wave(&w, wave);
+   }
+   run(&r, &w, wave->scalar, 1, wave);
+   for (unsigned lane = 0; lane < APEX_LANES; lane++) {
+      const unsigned l = fragment ? 4 * (lane / 4) + 2 * (lane % 2) + lane / 2 % 2 : lane;
+      for (unsigned k = 0; k < 17; k++) {
+         for (unsigned c = 0; c < 4; c++) {
+            uint32_t b = get(src + 16 * (l * 34 + 17 + 16 - k) + 4 * c);
+            uint32_t a = get(src + 16 * (l * 34 + 16 - k) + 4 * c);
+            CHECK(get(dst + 16 * (l * 34 + k) + 4 * c) == b + k);
+            CHECK(get(dst + 16 * (l * 34 + 17 + k) + 4 * c) == (a ^ l));
+         }
+      }
+   }
+   free(wave);
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
 /* waterfall.comp: three buffers selected per lane. */
 static void test_waterfall(const char *dir)
 {
@@ -938,6 +994,8 @@ int main(int argc, char **argv)
    test_uniform(argv[1]);
    test_features(argv[1]);
    test_spill(argv[1]);
+   test_graphics_spill(argv[1], "spill.vert.spv", false);
+   test_graphics_spill(argv[1], "spill.frag.spv", true);
    test_waterfall(argv[1]);
    test_control(argv[1]);
    test_scan(argv[1]);
@@ -947,7 +1005,7 @@ int main(int argc, char **argv)
    test_depth(argv[1]);
    test_captured(argv[2], 24);
    test_captured(argv[3], 54);
-   printf("PASS Apex shaders: %u programs, %u instructions, max s%u v%u, spills only in spill.comp\n", shaders,
+   printf("PASS Apex shaders: %u programs, %u instructions, max s%u v%u, spills only in spill.{comp,vert,frag}\n", shaders,
           total_instructions, max_scalar, max_vector);
    return 0;
 }
