@@ -336,9 +336,13 @@ apex_program_lower_resources(struct apex_program *program, nir_shader *nir)
    /* YCbCr samples become a sample per plane and the colour conversion. */
    NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion, program);
    /* Explicit gradients take two axes: 3D and cube samples with gradients
-    * select their level in the shader. */
+    * select their level in the shader. The texture unit takes the
+    * gradients of each quad's lane 0 (Docs/isa.md, Texture and export):
+    * outside fragment programs a quad's lanes are unrelated invocations,
+    * so every gradient sample selects its level per lane in the shader. */
    const nir_lower_tex_options tex = {
       .lower_txp = ~0u, .lower_tg4_offsets = true, .lower_txd_3d = true, .lower_txd_cube_map = true,
+      .lower_txd = nir->info.stage != MESA_SHADER_FRAGMENT,
       .lower_offset_filter = dynamic_offset,
    };
    NIR_PASS(_, nir, nir_lower_tex, &tex);
