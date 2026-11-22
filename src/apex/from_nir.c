@@ -2418,7 +2418,7 @@ static nir_def *vertex_word(nir_builder *b, nir_def *descriptor, nir_def *byte, 
  * State blocks): binding b's descriptor, stride and exact byte size at the
  * apex_vi_* dwords. */
 static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const struct apex_vertex_input *vi,
-                                       unsigned location, unsigned mask)
+                                       unsigned location, unsigned mask, bool speculate)
 {
    const struct apex_vertex_attribute *a = &vi->attributes[location];
    nir_def *zero = nir_imm_int(b, 0), *out[4];
@@ -2457,7 +2457,7 @@ static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const str
    nir_def *word[4] = {0};
    if (align % 4 == 0) {
       u_foreach_bit(k, need)
-         word[k] = vertex_word(b, descriptor, nir_iadd_imm(b, byte, 4 * k), true);
+         word[k] = vertex_word(b, descriptor, nir_iadd_imm(b, byte, 4 * k), speculate);
    } else {
       /* Dword k of the attribute joins dwords k and k + 1 of the aligned
        * window; the window's last dword loads only when the attribute
@@ -2469,7 +2469,7 @@ static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const str
             continue;
          nir_def *at = nir_iadd_imm(b, aligned, 4 * k);
          if (k < words) {
-            window[k] = vertex_word(b, descriptor, at, true);
+            window[k] = vertex_word(b, descriptor, at, speculate);
             continue;
          }
          nir_push_if(b, nir_ugt_imm(b, nir_iadd_imm(b, skew, bytes), 4 * words));
@@ -2506,11 +2506,27 @@ static nir_def *fetch_vertex_attribute(nir_builder *b, nir_def *block, const str
    return nir_vec(b, out, 4);
 }
 
+/* An input load and the fetch that serves it: the first load of its
+ * attribute in its block, which fetches every component that block reads. */
+struct vertex_load {
+   nir_intrinsic_instr *load;
+   nir_block *block;
+   unsigned location, mask;
+   struct vertex_load *first;
+   nir_def *value;
+};
+
+/* Each block fetches the attributes it reads ahead of its first read, so a
+ * value lives from its first use, not from the start of the program: a
+ * shader that reads every attribute through an indexed array (one select
+ * tree per access) keeps one attribute live at a time instead of all of
+ * them. CSE merges a fetch into one in a dominating block. A fetch in a
+ * conditional block does not speculate, so loop-invariant code motion
+ * leaves it in its branch. */
 bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input *vi)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    struct apex_vertex_input standalone = {0};
-   unsigned masks[APEX_VERTEX_ATTRIBUTES] = {0};
    struct util_dynarray loads;
    util_dynarray_init(&loads, NULL);
    bool ok = true;
@@ -2530,31 +2546,43 @@ bool apex_nir_lower_vertex_input(nir_shader *nir, const struct apex_vertex_input
             ok = false;
             continue;
          }
-         masks[location] |= BITFIELD_RANGE(component, n);
          nir_alu_type type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(i));
          standalone.attributes[location] = (struct apex_vertex_attribute){
             type == nir_type_float ? PIPE_FORMAT_R32G32B32A32_FLOAT :
             type == nir_type_int ? PIPE_FORMAT_R32G32B32A32_SINT : PIPE_FORMAT_R32G32B32A32_UINT,
             location, 0,
          };
-         util_dynarray_append(&loads, i);
+         struct vertex_load load = {i, block, location, BITFIELD_RANGE(component, n)};
+         util_dynarray_append(&loads, load);
       }
    }
    if (!vi)
       vi = &standalone;
-   if (ok && util_dynarray_num_elements(&loads, nir_intrinsic_instr *)) {
+   if (ok && util_dynarray_num_elements(&loads, struct vertex_load)) {
+      /* Group the loads by block and attribute before fetching splits
+       * blocks. */
+      util_dynarray_foreach(&loads, struct vertex_load, p) {
+         for (struct vertex_load *q = util_dynarray_begin(&loads); q < p && !p->first; q++) {
+            if (q->first == q && q->block == p->block && q->location == p->location) {
+               p->first = q;
+               q->mask |= p->mask;
+            }
+         }
+         if (!p->first)
+            p->first = p;
+      }
       nir_builder builder = nir_builder_at(nir_before_impl(impl)), *b = &builder;
       nir_def *block = nir_load_kernel_input(b, 2, 32, nir_imm_int(b, 0), .base = 88, .range = 8);
-      nir_def *values[APEX_VERTEX_ATTRIBUTES] = {0};
-      for (unsigned l = 0; l < APEX_VERTEX_ATTRIBUTES && ok; l++)
-         ok = !masks[l] || (values[l] = fetch_vertex_attribute(b, block, vi, l, masks[l]));
-      util_dynarray_foreach(&loads, nir_intrinsic_instr *, p) {
-         nir_intrinsic_instr *i = *p;
-         if (!ok)
-            break;
-         unsigned location = nir_intrinsic_io_semantics(i).location - VERT_ATTRIB_GENERIC0 +
-                             nir_src_as_uint(*nir_get_io_offset_src(i));
-         nir_def_replace(&i->def, nir_channels(b, values[location],
+      util_dynarray_foreach(&loads, struct vertex_load, p) {
+         nir_intrinsic_instr *i = p->load;
+         b->cursor = nir_before_instr(&i->instr);
+         if (p->first == p) {
+            bool conditional = p->block->cf_node.parent->type == nir_cf_node_if;
+            p->value = fetch_vertex_attribute(b, block, vi, p->location, p->mask, !conditional);
+            if (!(ok = p->value))
+               break;
+         }
+         nir_def_replace(&i->def, nir_channels(b, p->first->value,
                                                BITFIELD_RANGE(nir_intrinsic_component(i), i->def.num_components)));
       }
       nir_progress(true, impl, nir_metadata_none);
@@ -3254,6 +3282,50 @@ static bool hoist_constant_temps(nir_shader *nir)
    return progress;
 }
 
+/* Graphics launches have no private base, so an array a loop indexes by
+ * a varying index becomes a select tree over every element per access,
+ * and the trees' merges stay live across the whole loop (out-of-SSA
+ * vector registers are masked read-modify-writes). A loop with a known
+ * trip count of at most max_unroll_iterations that indexes an input or
+ * local array unrolls whatever its size, so the indices fold. */
+static bool indexes_array(nir_block *block)
+{
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_deref)
+         continue;
+      nir_deref_instr *d = nir_instr_as_deref(instr);
+      if (d->deref_type == nir_deref_type_array && !nir_src_is_const(d->arr.index) &&
+          nir_deref_mode_may_be(d, nir_var_shader_in | nir_var_function_temp))
+         return true;
+   }
+   return false;
+}
+
+static bool unroll_indexed_loops(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool marked = false;
+      nir_metadata_require(impl, nir_metadata_loop_analysis, nir->options->force_indirect_unrolling,
+                           nir->options->force_indirect_unrolling_sampler);
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         while (parent && parent->type != nir_cf_node_loop)
+            parent = parent->parent;
+         if (!parent || !indexes_array(block))
+            continue;
+         nir_loop *loop = nir_cf_node_as_loop(parent);
+         if (loop->control == nir_loop_control_none && loop->info && loop->info->exact_trip_count_known &&
+             loop->info->max_trip_count <= nir->options->max_unroll_iterations) {
+            loop->control = nir_loop_control_unroll;
+            marked = true;
+         }
+      }
+      progress |= nir_progress(marked, impl, nir_metadata_all);
+   }
+   return progress;
+}
+
 static void unroll(nir_shader *nir)
 {
    bool unrolled;
@@ -3267,6 +3339,8 @@ static void unroll(nir_shader *nir)
       NIR_PASS(unrolled, nir, nir_opt_algebraic);
       NIR_PASS(unrolled, nir, nir_opt_dead_cf);
       NIR_PASS(unrolled, nir, nir_opt_deref);
+      if (nir->info.stage != MESA_SHADER_COMPUTE)
+         NIR_PASS(_, nir, unroll_indexed_loops);
       NIR_PASS(unrolled, nir, nir_opt_loop_unroll);
    } while (unrolled);
 }

@@ -203,17 +203,17 @@ static uint8_t *vertex_wave(struct world *w, struct apex_sim_wave *wave)
    wave->scalar[22] = (uint32_t)VERTEX_INPUT;
    for (unsigned l = 0; l < APEX_LANES; l++)
       wave->vector[0][l] = l;
-   return region(w, VERTEX_INPUT, 512);
+   return region(w, VERTEX_INPUT, 4 * (apex_vi_size(APEX_VERTEX_BINDINGS - 1) + 1));
 }
 /* Binding `b` over `bytes` at `va`, `stride` bytes per element. */
 static void vertex_binding(uint8_t *block, unsigned b, uint64_t va, uint32_t bytes, uint32_t stride, bool robust)
 {
-   put(block + 16 * b, (uint32_t)va);
-   put(block + 16 * b + 4, va >> 32);
-   put(block + 16 * b + 8, bytes);
-   put(block + 16 * b + 12, robust);
-   put(block + 256 + 4 * b, stride);
-   put(block + 320 + 4 * b, bytes);
+   put(block + 4 * apex_vi_descriptor(b), (uint32_t)va);
+   put(block + 4 * apex_vi_descriptor(b) + 4, va >> 32);
+   put(block + 4 * apex_vi_descriptor(b) + 8, bytes);
+   put(block + 4 * apex_vi_descriptor(b) + 12, robust);
+   put(block + 4 * apex_vi_stride(b), stride);
+   put(block + 4 * apex_vi_size(b), bytes);
 }
 /* Standalone attribute location L reads four dwords of vertex v from
  * binding L at 16 v: base + v / 4 + c. */
@@ -250,6 +250,34 @@ static void test_vertex(const char *dir, const char *name, unsigned varying_comp
       for (unsigned c = 0; c < varying_components; c++)
          CHECK(get(out + l * stride + 64 + 4 * c) == bits(vertex_value(l, c, -3.0f)));
    }
+   free(wave);
+   world_free(&w);
+   apex_compile_result_finish(&r);
+}
+
+/* attributes.vert: 31 attributes through an indexed array in a loop fit
+ * the register file, and every component matches. */
+static void test_attributes(const char *dir)
+{
+   struct apex_compile_result r;
+   compile(dir, "attributes.vert.spv", &r);
+   uint32_t stride = r.data[28] | r.data[29] << 8;
+   struct world w = {0};
+   uint8_t *out = region(&w, 0x800000, APEX_LANES * stride);
+   region(&w, ROOT, ROOT_BYTES);
+   struct apex_sim_wave *wave = calloc(1, sizeof(*wave));
+   uint8_t *block = vertex_wave(&w, wave);
+   /* Binding L at 0x600000 + 0x1000 L, as vertex_inputs places it. */
+   uint8_t *data = region(&w, 0x600000, 0x1000 * 32);
+   for (unsigned location = 1; location < 32; location++) {
+      for (unsigned v = 0; v < APEX_LANES; v++)
+         for (unsigned c = 0; c < 4; c++)
+            put(data + 0x1000 * location + 16 * v + 4 * c, bits(vertex_value(v, c, location)));
+      vertex_binding(block, location, 0x600000 + 0x1000 * location, 16 * APEX_LANES, 16, false);
+   }
+   run(&r, &w, wave->scalar, 1, wave);
+   for (unsigned l = 0; l < APEX_LANES; l++)
+      CHECK(get(out + l * stride) == bits(124.0f));
    free(wave);
    world_free(&w);
    apex_compile_result_finish(&r);
@@ -904,6 +932,7 @@ int main(int argc, char **argv)
    test_fragment(argv[1], "triangle.frag.spv", false, false);
    test_fragment(argv[1], "compositor.frag.spv", true, true);
    test_transform(argv[1]);
+   test_attributes(argv[1]);
    test_mix(argv[1]);
    test_hoist(argv[1]);
    test_uniform(argv[1]);
