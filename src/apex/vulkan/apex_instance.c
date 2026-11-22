@@ -815,6 +815,9 @@ try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    blake3_hasher cache_hash;
    blake3_hash cache_id;
    _mesa_blake3_init(&cache_hash);
+   /* Programs spill to graphics private memory only where the device has it. */
+   const bool graphics_scratch = caps.flags & APEX_INFO_GRAPHICS_SCRATCH;
+   _mesa_blake3_update(&cache_hash, &graphics_scratch, sizeof(graphics_scratch));
    if (disk_cache_get_function_identifier((void *)try_create_physical, &cache_hash)) {
       _mesa_blake3_final(&cache_hash, cache_id);
       memcpy(properties.pipelineCacheUUID, cache_id, VK_UUID_SIZE);

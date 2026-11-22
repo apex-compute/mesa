@@ -3361,7 +3361,8 @@ static unsigned type_size(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
-int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct apex_compile_result *output)
+int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, bool graphics_scratch,
+                  struct apex_compile_result *output)
 {
    *output = (struct apex_compile_result){0};
    mesa_shader_stage stage = nir->info.stage;
@@ -3573,6 +3574,7 @@ int apex_from_nir(nir_shader *nir, const struct apex_vertex_input *vi, struct ap
    memcpy(c.header.local, local, sizeof(local));
    c.header.shared = stage == MESA_SHADER_COMPUTE ? nir->info.shared_size : 0;
    c.header.private_bytes = stage == MESA_SHADER_COMPUTE ? align(nir->scratch_size, 4) : 0;
+   c.header.graphics_scratch = graphics_scratch;
    classify(&c, impl);
    c.root = value(&c, false, 2);
    emit(&c, APEX_COPY, sub(c.root, 0, 1), apex_phys(APEX_SCALAR + 0), 0, 0, 0);

@@ -118,7 +118,8 @@ fn wave_beats(stage: u64, w: &Wave) -> Vec<Bits> {
     let mut out = Vec::new();
     if stage == 1 {
         h.push(s(16) | s(17) << 32, 40).push(s(18), 32).push(s(19), 32).push(s(20), 32).push(s(21), 32);
-        h.push(s(22) | s(23) << 32, 40).push(0, 194);
+        // The graphics private base (zero) and the reserved bits.
+        h.push(s(22) | s(23) << 32, 40).push(0, 19).push(0, 175);
         out.push(beat(0, 0, 0, 0, &h));
     } else {
         let quad = |q: usize| (w.vector[2][4 * q] as u64, w.vector[3][4 * q] as u64);

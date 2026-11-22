@@ -26,6 +26,7 @@ pub struct Header {
     private_bytes: u32,
     output: u32,
     input_count: u32,
+    graphics_scratch: u32,
     inputs: [u8; 32],
 }
 #[repr(C)]
@@ -117,7 +118,7 @@ pub unsafe extern "C" fn apex_emit(
         p.private = header.private_bytes;
         p.output = header.output;
         p.inputs = header.inputs[..(header.input_count as usize).min(32)].to_vec();
-        let (p, stats) = mir::compile(ops, values, p)?;
+        let (p, stats) = mir::compile(ops, values, p, header.graphics_scratch != 0)?;
         Ok((p.bytes()?, stats))
     })
     .unwrap_or_else(|_| Err("compiler panic".into()));

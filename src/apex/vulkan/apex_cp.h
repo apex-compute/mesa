@@ -48,6 +48,7 @@ enum apex_cp_op {
 #define APEX_STATE_VERTEX 0x020
 #define APEX_STATE_VERTEX_USER 0x030
 #define APEX_STATE_FRAGMENT 0x040
+#define APEX_STATE_GRAPHICS_PRIVATE 0x04a  /* low, high: 2 MiB aligned */
 #define APEX_STATE_FRAGMENT_USER 0x050
 #define APEX_STATE_DYNAMIC 0x060
 #define APEX_STATE_PASS 0x080              /* 128-dword pass record */

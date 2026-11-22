@@ -384,7 +384,7 @@ apex_program_compile(struct vk_device *device, struct apex_program *program, nir
 {
    uint64_t invocations = nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
       nir->info.workgroup_size[2];
-   if (apex_from_nir(nir, vi, &program->code))
+   if (apex_from_nir(nir, vi, ((struct apex_device *)device)->graphics_scratch, &program->code))
       return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                        "Apex compile: %s", program->code.diagnostic);
    uint32_t private_bytes;

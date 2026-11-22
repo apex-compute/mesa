@@ -34,6 +34,15 @@ struct apex_program {
    BITSET_DECLARE(used_descriptors, APEX_MAX_DESCRIPTORS);
 };
 
+/* The program header's private bytes per lane. */
+static inline uint32_t
+apex_program_private_bytes(const struct apex_program *program)
+{
+   uint32_t bytes;
+   memcpy(&bytes, program->code.data + 24, sizeof(bytes));
+   return util_le32_to_cpu(bytes);
+}
+
 /* Byte offset of the trailer after descriptors and push data. */
 static inline uint32_t
 apex_program_trailer(const struct apex_program *program)

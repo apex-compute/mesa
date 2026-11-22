@@ -184,6 +184,12 @@ struct apex_device {
    /* The memory null sampled-image descriptors address, created by the
     * first such write under memory_mutex (apex_device.c). */
    struct apex_bo null_image;
+   /* The device reports APEX_INFO_GRAPHICS_SCRATCH: vertex and fragment
+    * programs may spill to private memory, in the 2 MiB graphics private
+    * area that the first draw of such a program creates under memory_mutex
+    * (apex_device_graphics_private). */
+   bool graphics_scratch;
+   struct apex_bo graphics_private;
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
@@ -200,6 +206,11 @@ VkFormatFeatureFlags2 apex_linear_format_features(VkFormat format);
 
 VkResult apex_bo_create(struct apex_device *device, uint64_t size, uint32_t flags,
                         uint32_t gem_flags, uint64_t reserved_va, struct apex_bo *bo);
+/* The graphics private area's GPUVA (state registers 0x04a-0x04b), created
+ * on first use: 2 MiB of LOCAL at a 2 MiB-aligned GPUVA, whose 128 KiB per
+ * core wave slot hold the private memory of the slot's vertex or fragment
+ * wave (Docs/isa.md, scratch). */
+VkResult apex_device_graphics_private(struct apex_device *device, uint64_t *va);
 struct apex_program;
 /* Uploads a program on first use; the next batch invalidates instruction caches. */
 VkResult apex_program_upload(struct apex_device *device, struct apex_program *program);

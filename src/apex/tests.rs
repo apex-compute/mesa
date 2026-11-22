@@ -164,9 +164,11 @@ fn header() {
     assert_eq!(&bytes[16..24], &[0, 1, 1, 0, 1, 0, 0, 0]);
     compute.local = [256, 2, 1];
     assert!(compute.bytes().is_err());
-    // Private memory belongs to compute launches.
+    // A graphics program's private memory is its wave slot's 4 KiB per lane.
     let mut vertex = Program::new(Stage::Vertex, vec![Inst::new(op::S_ENDPGM)]);
-    vertex.private = 4;
+    vertex.private = isa::GRAPHICS_PRIVATE;
+    assert!(vertex.bytes().is_ok());
+    vertex.private = isa::GRAPHICS_PRIVATE + 4;
     assert!(vertex.bytes().is_err());
 }
 
@@ -481,7 +483,7 @@ fn mop(op: u16, f: [Opnd; 4]) -> Op {
 }
 
 /// `count` vector values live at once: each is lane + k, then all are summed.
-fn pressure(count: u32, stage: Stage) -> Result<(Program, mir::Stats), String> {
+fn pressure(count: u32, stage: Stage, graphics_scratch: bool) -> Result<(Program, mir::Stats), String> {
     let mut values = vec![Value { class: Class::S, width: 1 }];
     let mut ops = Vec::new();
     for k in 0..count {
@@ -516,12 +518,12 @@ fn pressure(count: u32, stage: Stage) -> Result<(Program, mir::Stats), String> {
     if stage == Stage::Fragment {
         header.output = 0;
     }
-    mir::compile(ops, values, header)
+    mir::compile(ops, values, header, graphics_scratch)
 }
 
 #[test]
 fn allocation_and_spilling() {
-    let (p, stats) = pressure(126, Stage::Compute).unwrap();
+    let (p, stats) = pressure(126, Stage::Compute, false).unwrap();
     assert_eq!(stats.spills, 0);
     assert!(stats.vector <= 128);
     assert!(!p.code.iter().any(|i| i.op == op::S_NOP), "the scoreboard owns hazards");
@@ -533,11 +535,39 @@ fn allocation_and_spilling() {
     let expect = |n: u32| (0..32).map(|l| (0..n).map(|k| l + k * 3 + 1000).sum::<u32>()).collect::<Vec<_>>();
     assert_eq!(run(&p), expect(126));
     // Beyond the register file a compute program spills and still computes.
-    let (p, stats) = pressure(140, Stage::Compute).unwrap();
+    let (p, stats) = pressure(140, Stage::Compute, false).unwrap();
     assert!(stats.spills > 0 && p.private == 4 * stats.spills);
     assert_eq!(run(&p), expect(140));
-    // Graphics launches have no private memory to spill into.
-    assert!(pressure(140, Stage::Vertex).unwrap_err().contains("without spilling"));
+    // Without graphics private memory a graphics program cannot spill.
+    for stage in [Stage::Vertex, Stage::Fragment] {
+        assert!(pressure(140, stage, false).unwrap_err().contains("without spilling"));
+    }
+}
+
+#[test]
+fn graphics_spilling() {
+    // With graphics private memory, vertex and fragment programs beyond the
+    // register file spill vectors and still compute; programs that fit
+    // compile to the same code with or without it.
+    let expect = |n: u32| (0..32).map(|l| (0..n).map(|k| l + k * 3 + 1000).sum::<u32>()).collect::<Vec<_>>();
+    for stage in [Stage::Vertex, Stage::Fragment] {
+        let (a, sa) = pressure(126, stage, false).unwrap();
+        let (b, sb) = pressure(126, stage, true).unwrap();
+        assert_eq!(a.bytes().unwrap(), b.bytes().unwrap());
+        assert_eq!((sa.spills, sb.spills, b.private), (0, 0, 0));
+        let (p, stats) = pressure(140, stage, true).unwrap();
+        assert!(stats.spills > 0 && p.private == 4 * stats.spills && p.private <= isa::GRAPHICS_PRIVATE);
+        let mut w = model::Wave::default();
+        w.scalar[0] = 0x1000;
+        for l in 0..32 {
+            w.vector[3][l] = 0xff;
+        }
+        let mut m = vec![0u8; 128];
+        model::run(&p.bytes().unwrap(), &Launch::Wave(&w), &mut [Region { gpuva: 0x1000, data: &mut m }]).unwrap();
+        assert_eq!(words(&m, 0, 32), expect(140));
+    }
+    // A program needing more than 4 KiB per lane does not compile.
+    assert!(pressure(1300, Stage::Vertex, true).unwrap_err().contains("graphics private memory exceeds"));
 }
 
 #[test]
@@ -598,7 +628,7 @@ fn unscheduled_fallback() {
     }
     ops.push(mop(op::GLOBAL_STORE as u16, [v(sums[0]), v(offset), Opnd::Val { id: root, off: 0, n: 2 }, Opnd::None]));
     ops.push(mop(op::S_ENDPGM as u16, [Opnd::None; 4]));
-    let compile = |stage| mir::compile(ops.clone(), values.clone(), Program::new(stage, vec![]));
+    let compile = |stage| mir::compile(ops.clone(), values.clone(), Program::new(stage, vec![]), false);
     // The schedule itself overflows the register file: compute spills it.
     let (_, stats) = compile(Stage::Compute).unwrap();
     assert!(stats.spills > 0);
@@ -640,7 +670,7 @@ fn scalar_lane_spills() {
     ops.push(mop(COPY, [Opnd::Val { id: root, off: 1, n: 1 }, phys(SCALAR + 1), Opnd::None, Opnd::None]));
     ops.push(mop(op::GLOBAL_STORE as u16, [v(x), Opnd::None, Opnd::Val { id: root, off: 0, n: 2 }, Opnd::None]));
     for stage in [Stage::Compute, Stage::Vertex] {
-        let (p, stats) = mir::compile(ops.clone(), values.clone(), Program::new(stage, vec![])).unwrap();
+        let (p, stats) = mir::compile(ops.clone(), values.clone(), Program::new(stage, vec![]), false).unwrap();
         assert!(stats.spills > 0 && stats.scalar <= 96 && p.private == 0);
         assert!(p.code.iter().any(|i| i.op == op::V_WRITELANE));
         if stage == Stage::Compute {
@@ -688,7 +718,7 @@ fn divergent_loop_lifetimes() {
         mop(op::GLOBAL_STORE as u16, [v(x), v(offset), pair, Opnd::None]),
         mop(op::S_ENDPGM as u16, [Opnd::None; 4]),
     ];
-    let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
+    let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![]), false).unwrap();
     let mut m = vec![0u8; 256];
     compute(&p, [1, 1, 1], 0, &mut m).unwrap();
     assert_eq!(words(&m, 0, 32), (0..32).map(|l| 10 * (l + 1)).collect::<Vec<_>>());
@@ -719,7 +749,7 @@ fn copy_into_live_group() {
         Op { hi: 128, ..mop(op::GLOBAL_STORE as u16, [v(g), v(offset), pair, Opnd::None]) },
         mop(op::S_ENDPGM as u16, [Opnd::None; 4]),
     ];
-    let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
+    let (p, _) = mir::compile(ops, values, Program::new(Stage::Compute, vec![]), false).unwrap();
     let mut m = vec![0u8; 256];
     compute(&p, [1, 1, 1], 0, &mut m).unwrap();
     assert_eq!(words(&m, 0, 32), (0..32).map(|l| l + 5).collect::<Vec<_>>());
@@ -744,7 +774,7 @@ fn coalescing_and_constants() {
     ops.push(mop(COPY, [Opnd::Val { id: 6, off: 0, n: 1 }, phys(SCALAR), Opnd::None, Opnd::None]));
     ops.push(mop(COPY, [Opnd::Val { id: 6, off: 1, n: 1 }, phys(SCALAR + 1), Opnd::None, Opnd::None]));
     ops.push(Op { hi: 3 << 20, ..mop(op::GLOBAL_STORE as u16, [Opnd::Val { id: g, off: 0, n: 4 }, Opnd::None, Opnd::Val { id: 6, off: 0, n: 2 }, Opnd::None]) });
-    let (p, stats) = mir::compile(ops, values, Program::new(Stage::Compute, vec![])).unwrap();
+    let (p, stats) = mir::compile(ops, values, Program::new(Stage::Compute, vec![]), false).unwrap();
     assert_eq!(stats.instructions, 6, "{}", isa::disassemble(&p.code));
     assert!(p.code.iter().all(|i| i.op != op::V_MOV && i.op != op::S_MOV));
     let _ = Access::Use;
