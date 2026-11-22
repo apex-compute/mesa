@@ -1087,7 +1087,12 @@ apex_CreateImageView(VkDevice dev, const VkImageViewCreateInfo *info,
    /* Views may reinterpret texels of the same size (mutable-format images);
     * a plane view of a multi-planar image takes its plane format's size. */
    VkFormat image_format = image ? image->vk.format : VK_FORMAT_UNDEFINED;
-   if (image && vk_format_get_plane_count(image_format) > 1)
+   const VkImageAspectFlags planes = VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT |
+                                     VK_IMAGE_ASPECT_PLANE_2_BIT;
+   /* A COLOR view of a multi-planar image keeps the image's format (it samples
+    * through a YCbCr conversion); only a single-plane view has the plane's. */
+   if (image && vk_format_get_plane_count(image_format) > 1 &&
+       !(info->subresourceRange.aspectMask & ~planes))
       image_format = vk_format_get_aspect_format(image_format, info->subresourceRange.aspectMask);
    if ((info->flags & ~VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) || !image ||
        vk_format_get_blocksize(info->format) != vk_format_get_blocksize(image_format))
