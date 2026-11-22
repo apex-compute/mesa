@@ -1539,7 +1539,11 @@ apex_AllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *inf
 /* The rows of one descriptor element. Missing resources leave null rows:
  * empty robust buffers and images of format class none, which read zero. A
  * dynamic buffer row of the whole buffer marks word 4, so binding subtracts
- * its dynamic offset from the range. */
+ * its dynamic offset from the range. A null sampled image (nullDescriptor)
+ * instead reads the device's null-image memory through a one-texel R8 row
+ * swizzled to zero: the texture unit reads format class none as white.
+ * Without levels it reads zero at every level, and texture lowering zeroes
+ * its size and sample count (apex_texture.c). */
 /* The texture-unit descriptor of plane `plane` of a view into rows[plane];
  * a storage image adds the view's format words in the next row. A
  * multi-planar view takes its plane's format and layout, a single-plane
@@ -1605,9 +1609,38 @@ image_row(union apex_descriptor *rows, const struct apex_image *image, const str
       rows[1].words[w] = util_cpu_to_le32(words[w]);
 }
 
+/* The null-image memory's address, created on first use; zero without
+ * it, which leaves the row null (white). */
+static uint64_t
+null_image_va(struct apex_device *device)
+{
+   if (device->fd < 0)
+      return 0;
+   mtx_lock(&device->memory_mutex);
+   if (!device->null_image.va)
+      apex_bo_create(device, APEX_HW_TILE, APEX_VM_READ, 0, 0, &device->null_image);
+   uint64_t va = device->null_image.va;
+   mtx_unlock(&device->memory_mutex);
+   return va;
+}
+
+static void
+null_image_row(union apex_descriptor *row, uint64_t va)
+{
+   const struct apex_hw_image d = {
+      .va = va, .format = APEX_HW_FORMAT(APEX_HW_CLASS_R8, APEX_HW_UNORM, 0),
+      .swizzle = {APEX_HW_SWIZZLE_0, APEX_HW_SWIZZLE_0, APEX_HW_SWIZZLE_0, APEX_HW_SWIZZLE_0},
+      .width = 1, .height = 1, .depth = 1,
+   };
+   apex_hw_image_descriptor(&d, row->words);
+   for (unsigned w = 0; w < 8; w++)
+      row->words[w] = util_cpu_to_le32(row->words[w]);
+}
+
 static void
 encode_descriptor(union apex_descriptor *rows, const struct apex_set_layout *layout,
-                  const struct apex_binding_layout *binding, unsigned element, const void *value)
+                  const struct apex_binding_layout *binding, unsigned element, const void *value,
+                  struct apex_device *device)
 {
    switch (binding->type) {
    case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -1630,6 +1663,11 @@ encode_descriptor(union apex_descriptor *rows, const struct apex_set_layout *lay
          unsigned planes = view ? vk_format_get_plane_count(view->format) : 0;
          for (unsigned p = 0; image && image->memory && p < MIN2(planes, image_rows); p++)
             image_row(rows, image, view, p, storage);
+         if (!view && !storage) {
+            const uint64_t va = null_image_va(device);
+            for (unsigned p = 0; va && p < image_rows; p++)
+               null_image_row(&rows[p], va);
+         }
       }
       if ((sampler || combined) && binding->immutable == ~0u) {
          VK_FROM_HANDLE(apex_sampler, s, info->sampler);
@@ -1696,6 +1734,7 @@ write_set(struct apex_descriptor_set *set, uint32_t binding, uint32_t element, u
                   b->row + 1 + DIV_ROUND_UP(element + count, sizeof(union apex_descriptor)));
       return;
    }
+   struct apex_device *device = (struct apex_device *)set->base.device;
    unsigned first = ~0u, end = 0;
    for (unsigned d = 0; d < count; d++, element++) {
       while (element >= apex_set_binding_count(set, b)) {
@@ -1704,7 +1743,8 @@ write_set(struct apex_descriptor_set *set, uint32_t binding, uint32_t element, u
          assert(b < layout->bindings + layout->binding_count && b->type == type);
       }
       unsigned row = b->row + element * b->slots;
-      encode_descriptor(&set->rows[row], layout, b, element, (const uint8_t *)data + d * stride);
+      encode_descriptor(&set->rows[row], layout, b, element, (const uint8_t *)data + d * stride,
+                        device);
       first = MIN2(first, row);
       end = MAX2(end, row + b->slots);
    }
@@ -2413,6 +2453,7 @@ apex_device_init(struct apex_device *device, struct vk_physical_device *physical
    device->fd = fd;
    memset(device->internal, 0, sizeof(device->internal));
    device->empty_fragment = NULL;
+   device->null_image = (struct apex_bo){0};
    for (unsigned f = 0; f < APEX_QUEUE_FAMILIES; f++) {
       list_inithead(&device->queues[f].busy_arenas);
       list_inithead(&device->queues[f].free_arenas);
@@ -2515,6 +2556,7 @@ apex_device_finish(struct apex_device *device)
       apex_bo_finish(device, &chunk->bo);
       free(chunk);
    }
+   apex_bo_finish(device, &device->null_image);
    mtx_destroy(&device->upload_mutex);
    util_vma_heap_finish(&device->va_heap);
    mtx_destroy(&device->memory_mutex);

@@ -440,6 +440,15 @@ query_lod(nir_builder *b, nir_tex_instr *tex, nir_def *image, nir_def *sampler)
    return nir_bcsel(b, nir_ieq_imm(b, levels, 0), nir_imm_zero(b, 2, 32), nir_vec2(b, level, lambda));
 }
 
+/* All ones for an image row with levels, zero for a null descriptor: the
+ * one-texel row a null sampled image reads (apex_device.c) zeroes texels
+ * but not its size or sample count. */
+static nir_def *
+null_mask(nir_builder *b, nir_def *image)
+{
+   return nir_ineg(b, nir_umin(b, bits(b, image, APEX_HW_IMAGE_LEVELS, 5), nir_imm_int(b, 1)));
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
 {
@@ -483,7 +492,8 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
    nir_def *image = row_words(b, image_row);
    switch (tex->op) {
    case nir_texop_texture_samples:
-      nir_def_replace(&tex->def, nir_ishl(b, nir_imm_int(b, 1), bits(b, image, APEX_HW_IMAGE_SAMPLES, 3)));
+      nir_def_replace(&tex->def, nir_iand(b, nir_ishl(b, nir_imm_int(b, 1),
+         bits(b, image, APEX_HW_IMAGE_SAMPLES, 3)), null_mask(b, image)));
       return true;
    case nir_texop_samples_identical:
       nir_def_replace(&tex->def, nir_imm_false(b));
@@ -532,6 +542,11 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct texture_lowering *ctx)
       nir_tex_instr_remove_src(tex, s);
    nir_tex_instr_add_src(tex, nir_tex_src_backend1, image);
    nir_tex_instr_add_src(tex, nir_tex_src_backend2, sampler);
+   if (tex->op == nir_texop_txs) {
+      b->cursor = nir_after_instr(&tex->instr);
+      nir_def *size = nir_iand(b, &tex->def, nir_replicate(b, null_mask(b, image), tex->def.num_components));
+      nir_def_rewrite_uses_after(&tex->def, size);
+   }
    return true;
 }
 

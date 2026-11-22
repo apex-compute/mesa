@@ -181,6 +181,9 @@ struct apex_device {
     * compiled on first use under memory_mutex. */
    struct apex_program *internal[APEX_INTERNAL_COUNT];
    struct apex_program *empty_fragment;
+   /* The memory null sampled-image descriptors address, created by the
+    * first such write under memory_mutex (apex_device.c). */
+   struct apex_bo null_image;
 };
 VK_DEFINE_HANDLE_CASTS(apex_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE);
 
